@@ -21,6 +21,14 @@ class HttpGatewayClient:
     def infer_once(self,envelope:GatewayEnvelope,principal:str)->ProviderResult:
         body={"schema_version":"restricted-gateway-envelope.v1",**envelope.__dict__};reply=self._post("/infer",body)
         return ProviderResult(reply["status"],reply.get("message"))
+    def ready(self, policy_epoch:str, policy_digest:str)->bool:
+        with httpx.Client(timeout=httpx.Timeout(5,read=5,write=5,pool=5),follow_redirects=False,trust_env=False) as client:
+            response=client.get(self.url+"/readyz",params={"policy_epoch":policy_epoch,"policy_digest":policy_digest},headers={"Authorization":"Bearer "+self.tokens()})
+        if response.status_code!=200:return False
+        try:
+            body=response.json()
+        except ValueError:return False
+        return body=={"status":"ready","policy_epoch":policy_epoch,"policy_digest":policy_digest}
     def status(self, tenant_id: str, turn_id: str, *, client_request_id: str, policy_epoch: str, policy_digest: str):
         from .contracts import AttemptState
         identity={"tenant_id":tenant_id,"turn_id":turn_id,"client_request_id":client_request_id,"policy_epoch":policy_epoch,"policy_digest":policy_digest}

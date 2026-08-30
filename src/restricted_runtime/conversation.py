@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 from dataclasses import dataclass, replace
 from typing import Protocol
@@ -42,6 +43,7 @@ class ConversationService:
     data_keys: DataKeyWrapper
     policy: PolicyBundle
     tenant_id: str
+    lease_heartbeat_seconds: float = 20
 
     def _aad(self, row: TurnRow, direction: str) -> bytes:
         return content_aad(tenant_id=row.tenant_id, conversation_id=row.conversation_id, conversation_epoch=row.conversation_epoch, turn_id=row.turn_id, client_request_id=row.client_request_id, direction=direction, policy_digest=row.policy_digest)
@@ -105,11 +107,23 @@ class ConversationService:
         if hasattr(self.store,"renew_lease") and not self.store.renew_lease(self.tenant_id,row.turn_id,row.lease_generation):
             raise ContractError("lease renewal failed before provider dispatch")
         envelope = GatewayEnvelope(self.tenant_id, conversation_id, request.conversation_epoch, row.turn_id, request.client_request_id, self.policy.epoch, self.policy.digest, "restricted-phi-system.v1", SYSTEM_INSTRUCTION, "PHI", messages_for_turn, self.policy.values["max_canonical_input_utf8_bytes"])
+        lease_stop=threading.Event();lease_lost=threading.Event()
+        def heartbeat():
+            while not lease_stop.wait(self.lease_heartbeat_seconds):
+                if not self.store.renew_lease(self.tenant_id,row.turn_id,row.lease_generation):
+                    lease_lost.set();return
+        heartbeat_thread=threading.Thread(target=heartbeat,name="restricted-lease-heartbeat",daemon=True)
+        heartbeat_thread.start()
         try:
             result = self.gateway.infer_once(envelope, principal)
         except Exception as exc:
             self._mark_indeterminate(row)
             raise ContractError("inference outcome is indeterminate") from exc
+        finally:
+            lease_stop.set();heartbeat_thread.join(timeout=1)
+        if lease_lost.is_set():
+            self._mark_indeterminate(row)
+            raise ContractError("lease lost during provider operation")
         if result.state != "SUCCEEDED" or result.text is None:
             target = TurnState.FAILED if result.state in {"FAILED","CANCELLED_NO_DISPATCH"} else TurnState.INDETERMINATE
             if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.INFERENCE_PENDING, target):

@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import time
 from dataclasses import replace
 
 from restricted_runtime.contracts import ProviderResult, TurnRequest, TurnState, jcs_bytes
@@ -52,3 +53,15 @@ def test_same_key_association_mismatch_never_releases_existing_content():
     import pytest
     with pytest.raises(Exception):svc.submit(request(),principal="svc@example.com",conversation_id="other")
     assert gateway.calls==1
+
+def test_lost_lease_during_blocking_gateway_call_prevents_commit_or_release():
+    class RenewingStore(Store):
+        def __init__(self):super().__init__();self.renewals=0
+        def renew_lease(self,*_):self.renewals+=1;return self.renewals==1
+    class BlockingGateway(Gateway):
+        def infer_once(self,*args):time.sleep(.04);return super().infer_once(*args)
+    p=policy();store=RenewingStore();gateway=BlockingGateway();svc=ConversationService(store,gateway,LocalHmacKey("k","v",b"x"*32),Keys(),p,"tenant",lease_heartbeat_seconds=.005)
+    import pytest
+    with pytest.raises(Exception):svc.submit(request(),principal="svc@example.com",conversation_id="one")
+    assert gateway.calls==1
+    assert all(row.state is not TurnState.COMMITTED for row in store.rows.values())
