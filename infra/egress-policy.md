@@ -1,5 +1,10 @@
 # Required controlled-egress boundary (apply blocker)
 
+Status for the synthetic diagnostic: **UNDETERMINED**.  The Terraform baseline
+uses Private Google Access and intentionally has no NAT, but it does not claim
+an inspected FQDN/SNI/certificate witness.  This residual result prevents
+`READY`, `CLOSED`, and any PHI authorization claim.
+
 Cloud Run and Terraform alone do not prove host/SNI enforcement. The deployment
 owner must bind both services to a controlled DNS resolver and an inspected
 egress proxy/firewall that validates request hostname plus TLS SNI/certificate.

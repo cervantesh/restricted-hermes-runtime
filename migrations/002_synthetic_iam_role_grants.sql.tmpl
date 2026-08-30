@@ -1,0 +1,6 @@
+-- Render only by the isolated migration job; never place a password in this file.
+-- Values are Cloud SQL IAM service-account role names supplied by Terraform.
+GRANT restricted_content_runtime TO "${CONVERSATION_IAM_DB_USER}";
+GRANT restricted_ledger_runtime TO "${GATEWAY_IAM_DB_USER}";
+REVOKE ALL ON SCHEMA inference_ledger FROM "${CONVERSATION_IAM_DB_USER}";
+REVOKE ALL ON SCHEMA restricted_content FROM "${GATEWAY_IAM_DB_USER}";
