@@ -1,6 +1,10 @@
 CREATE SCHEMA IF NOT EXISTS restricted_content;
 CREATE SCHEMA IF NOT EXISTS inference_ledger;
 REVOKE ALL ON SCHEMA restricted_content, inference_ledger FROM PUBLIC;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='restricted_content_runtime') THEN CREATE ROLE restricted_content_runtime NOLOGIN; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='restricted_ledger_runtime') THEN CREATE ROLE restricted_ledger_runtime NOLOGIN; END IF;
+END $$;
 
 CREATE TYPE restricted_content.turn_state AS ENUM ('RECEIVED','REQUEST_COMMITTED','INFERENCE_PENDING','RESPONSE_RECEIVED','COMMITTED','REJECTED','FAILED','INDETERMINATE');
 CREATE TABLE restricted_content.conversations (
@@ -20,6 +24,8 @@ CREATE TABLE restricted_content.turns (
 );
 CREATE UNIQUE INDEX one_active_turn_per_conversation ON restricted_content.turns(tenant_id, conversation_id, conversation_epoch)
  WHERE state NOT IN ('COMMITTED','REJECTED','FAILED','INDETERMINATE');
+GRANT USAGE ON SCHEMA restricted_content TO restricted_content_runtime;
+GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA restricted_content TO restricted_content_runtime;
 
 CREATE TYPE inference_ledger.attempt_state AS ENUM ('RESERVED','DISPATCH_STARTED','SUCCEEDED','FAILED','INDETERMINATE','CANCELLED_NO_DISPATCH');
 CREATE TABLE inference_ledger.dispatch_guards (
@@ -40,3 +46,5 @@ CREATE TABLE inference_ledger.cancellation_tombstones (
   tenant_id text NOT NULL, turn_id uuid NOT NULL, client_request_id uuid NOT NULL, policy_epoch text NOT NULL, policy_digest text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT transaction_timestamp(), PRIMARY KEY (tenant_id, turn_id), UNIQUE (tenant_id, client_request_id)
 );
+GRANT USAGE ON SCHEMA inference_ledger TO restricted_ledger_runtime;
+GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA inference_ledger TO restricted_ledger_runtime;

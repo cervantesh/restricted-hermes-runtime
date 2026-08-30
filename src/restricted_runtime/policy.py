@@ -10,7 +10,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .contracts import ContractError, jcs_bytes
+from .contracts import ContractError, jcs_bytes, load_closed_json
 
 POLICY_SCHEMA = "restricted-phi-inference-policy.v1"
 REQUIRED_FIELDS = {
@@ -46,7 +46,7 @@ class PolicyBundle:
 def load_signed_policy(path: Path, signature_path: Path, public_key_b64: str) -> PolicyBundle:
     raw = path.read_bytes()
     try:
-        values = json.loads(raw)
+        values = load_closed_json(raw)
         signature = base64.b64decode(signature_path.read_text(encoding="ascii"), validate=True)
         key = Ed25519PublicKey.from_public_bytes(base64.b64decode(public_key_b64, validate=True))
         key.verify(signature, jcs_bytes(values))

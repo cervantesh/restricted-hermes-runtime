@@ -3,7 +3,8 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 COPY pyproject.toml ./
 COPY src ./src
+COPY policy ./policy
 RUN pip install --no-cache-dir . && useradd --system --uid 10001 restricted
 USER 10001
 EXPOSE 8080
-CMD ["uvicorn", "restricted_runtime.services.restricted_api:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "restricted_runtime.services.production_conversation:app", "--host", "0.0.0.0", "--port", "8080"]

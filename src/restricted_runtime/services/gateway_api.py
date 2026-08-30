@@ -27,7 +27,7 @@ def create_app(gateway:Gateway,authenticator:Authenticator)->FastAPI:
         try:
             auth(request);body=load_closed_json(await request.body())
             if not isinstance(body,dict) or set(body)!={"schema_version",*_IDENTITY} or body["schema_version"]!="restricted-gateway-status.v1":raise ContractError("closed status schema")
-            state=gateway.status(body["tenant_id"],body["turn_id"])
+            state=gateway.status(body["tenant_id"],body["turn_id"],client_request_id=body["client_request_id"],policy_epoch=body["policy_epoch"],policy_digest=body["policy_digest"])
             return {"status":"NOT_FOUND" if state is None else state.value}
         except ContractError as exc:raise HTTPException(400,"gateway status rejected") from exc
     @app.post("/fence")

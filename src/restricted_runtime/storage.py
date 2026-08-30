@@ -46,9 +46,15 @@ class PostgresLedger:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("UPDATE inference_ledger.attempts SET state=%s,failure_class=%s,provider_request_id=%s,updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND state='DISPATCH_STARTED'",(state,result.failure_class,result.request_id,tenant_id,turn_id))
             if cur.rowcount != 1: raise ContractError("ledger terminal CAS failed")
-    def status(self, tenant_id: str, turn_id: str) -> AttemptState|None:
+    def status(self, tenant_id: str, turn_id: str, *, client_request_id: str|None=None, policy_epoch: str|None=None, policy_digest: str|None=None) -> AttemptState|None:
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT state FROM inference_ledger.attempts WHERE tenant_id=%s AND turn_id=%s",(tenant_id,turn_id)); row=cur.fetchone(); return AttemptState(row["state"]) if row else None
+            cur.execute("SELECT * FROM inference_ledger.attempts WHERE tenant_id=%s AND turn_id=%s",(tenant_id,turn_id)); row=cur.fetchone()
+            if row:
+                if not all((client_request_id,policy_epoch,policy_digest)) or (str(row["client_request_id"]),row["policy_epoch"],row["policy_digest"]) != (client_request_id,policy_epoch,policy_digest):raise ContractError("status identity mismatch")
+                return AttemptState(row["state"])
+            cur.execute("SELECT * FROM inference_ledger.cancellation_tombstones WHERE tenant_id=%s AND turn_id=%s",(tenant_id,turn_id)); tomb=cur.fetchone()
+            if tomb and (not all((client_request_id,policy_epoch,policy_digest)) or (str(tomb["client_request_id"]),tomb["policy_epoch"],tomb["policy_digest"]) != (client_request_id,policy_epoch,policy_digest)):raise ContractError("tombstone identity mismatch")
+            return AttemptState.CANCELLED_NO_DISPATCH if tomb else None
     def fence(self, tenant_id: str, turn_id: str, *, client_request_id: str|None=None, policy_epoch: str|None=None, policy_digest: str|None=None) -> AttemptState:
         with self._connect() as conn, conn.cursor() as cur:
             if not all((client_request_id,policy_epoch,policy_digest)):

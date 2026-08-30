@@ -52,5 +52,5 @@ class Gateway:
         result = self.vertex.generate_content(envelope.messages)
         self.ledger.finish(envelope.tenant_id, envelope.turn_id, result)
         return result
-    def status(self, tenant_id: str, turn_id: str) -> AttemptState | None: return self.ledger.status(tenant_id, turn_id)
+    def status(self, tenant_id: str, turn_id: str, *, client_request_id: str, policy_epoch: str, policy_digest: str) -> AttemptState | None: return self.ledger.status(tenant_id, turn_id,client_request_id=client_request_id,policy_epoch=policy_epoch,policy_digest=policy_digest)
     def fence(self, tenant_id: str, turn_id: str) -> AttemptState: return self.ledger.fence(tenant_id, turn_id)
