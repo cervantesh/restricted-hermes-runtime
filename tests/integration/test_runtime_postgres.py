@@ -6,9 +6,11 @@ import psycopg,pytest
 from restricted_runtime.contracts import AttemptState,ContractError,TurnState,jcs_bytes
 from restricted_runtime.conversation import TurnRow
 from restricted_runtime.crypto import GATEWAY_MAC_DOMAIN,LocalHmacKey,kms_mac_input
-from restricted_runtime.gateway import GatewayEnvelope
+from restricted_runtime.gateway import GatewayEnvelope,Gateway
 from restricted_runtime.policy import PolicyBundle,SYSTEM_INSTRUCTION
 from restricted_runtime.storage import PostgresContentStore,PostgresLedger
+from restricted_runtime.reconciliation import Reconciler
+from restricted_runtime.reconciliation_driver import ReconciliationDriver
 
 DATABASE_URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
 pytestmark=pytest.mark.skipif(not DATABASE_URL,reason="isolated PostgreSQL database unavailable: set RESTRICTED_RUNTIME_TEST_DATABASE_URL; SQLite/mocks are prohibited")
@@ -53,3 +55,54 @@ def test_fence_races_and_fault_boundaries_never_redispatch():
     tomb_turn=str(uuid.uuid4());tomb_req=str(uuid.uuid4());assert ledger.fence("tenant",tomb_turn,client_request_id=tomb_req,policy_epoch=p.epoch,policy_digest=p.digest) is AttemptState.CANCELLED_NO_DISPATCH
     tomb=GatewayEnvelope("tenant","c","e",tomb_turn,tomb_req,p.epoch,p.digest,"restricted-phi-system.v1",SYSTEM_INSTRUCTION,"PHI",[],0)
     assert ledger.reserve(tomb,"caller",record.mac,record.key_resource,record.key_version) is AttemptState.CANCELLED_NO_DISPATCH
+
+def test_reserve_and_not_found_fence_interleave_on_one_durable_guard():
+    """The reserve/fence race converges on one tombstone, never a late dispatch."""
+    p=policy();key=LocalHmacKey("gateway-key","1",b"m"*32);turn_id=str(uuid.uuid4());request_id=str(uuid.uuid4())
+    envelope=GatewayEnvelope("tenant","c","e",turn_id,request_id,p.epoch,p.digest,"restricted-phi-system.v1",SYSTEM_INSTRUCTION,"PHI",[],p.values["max_canonical_input_utf8_bytes"])
+    record=key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN,envelope.canonical("caller")))
+    barrier=threading.Barrier(2)
+    class RacingLedger(PostgresLedger):
+        def reserve(self,*args):
+            barrier.wait();return super().reserve(*args)
+        def fence(self,*args,**kwargs):
+            barrier.wait();return super().fence(*args,**kwargs)
+    ledger=RacingLedger(DATABASE_URL,p,key)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reserved,fenced=list(pool.map(lambda op: op(), (
+            lambda: ledger.reserve(envelope,"caller",record.mac,record.key_resource,record.key_version),
+            lambda: ledger.fence("tenant",turn_id,client_request_id=request_id,policy_epoch=p.epoch,policy_digest=p.digest),
+        )))
+    assert {reserved,fenced} <= {AttemptState.RESERVED,AttemptState.CANCELLED_NO_DISPATCH}
+    assert ledger.status("tenant",turn_id,client_request_id=request_id,policy_epoch=p.epoch,policy_digest=p.digest) is AttemptState.CANCELLED_NO_DISPATCH
+    assert not ledger.start_dispatch("tenant",turn_id)
+
+def test_admission_builds_history_only_while_conversation_row_is_locked():
+    """A second connection cannot update the admission row while history builds."""
+    p=policy();store=PostgresContentStore(DATABASE_URL);blocked=[]
+    request_id=str(uuid.uuid4());conversation="locked-conversation";epoch=store.create_conversation("tenant",conversation)
+    row=turn(key=request_id,conversation=conversation,epoch=epoch)
+    def build(history):
+        with psycopg.connect(DATABASE_URL,autocommit=True) as conn:
+            try:
+                conn.execute("SELECT 1 FROM restricted_content.conversations WHERE tenant_id=%s AND conversation_id=%s FOR UPDATE NOWAIT",("tenant",conversation))
+            except psycopg.errors.LockNotAvailable:
+                blocked.append(True)
+        return row
+    admitted,created=store.admit_with_history(tenant_id="tenant",conversation_id=conversation,conversation_epoch=epoch,client_request_id=request_id,build_row=build)
+    assert created and admitted.turn_id==row.turn_id and blocked==[True]
+
+def test_db_time_lease_heartbeat_scanner_and_stale_handler_cas():
+    p=policy();store=PostgresContentStore(DATABASE_URL);key=LocalHmacKey("gateway-key","1",b"m"*32);ledger=PostgresLedger(DATABASE_URL,p,key)
+    candidate=turn(key=str(uuid.uuid4()),conversation="heartbeat")
+    assert store.admit(candidate)[1]
+    assert store.set_state_cas("tenant",candidate.turn_id,0,TurnState.RECEIVED,TurnState.INFERENCE_PENDING)
+    assert store.renew_lease("tenant",candidate.turn_id,0,seconds=30)
+    with psycopg.connect(DATABASE_URL,autocommit=True) as conn:
+        conn.execute("UPDATE restricted_content.turns SET lease_expires_at=transaction_timestamp()-interval '1 second' WHERE tenant_id=%s AND turn_id=%s",("tenant",candidate.turn_id))
+    # The scanner and claim use transaction_timestamp(), not replica wall time.
+    reconciler=Reconciler(store,Gateway(p,key,ledger,object()))
+    assert ReconciliationDriver(store,reconciler,"scanner","1").run_once()==1
+    assert store.read_turn("tenant",candidate.turn_id).state is TurnState.FAILED
+    assert not store.renew_lease("tenant",candidate.turn_id,0)
+    assert not store.set_state_cas("tenant",candidate.turn_id,0,TurnState.INFERENCE_PENDING,TurnState.COMMITTED,response_ciphertext=b"x",response_nonce=b"n"*12)

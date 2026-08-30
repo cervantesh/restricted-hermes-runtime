@@ -21,5 +21,12 @@ class HttpGatewayClient:
     def infer_once(self,envelope:GatewayEnvelope,principal:str)->ProviderResult:
         body={"schema_version":"restricted-gateway-envelope.v1",**envelope.__dict__};reply=self._post("/infer",body)
         return ProviderResult(reply["status"],reply.get("message"))
-    def status(self,identity:dict)->str:self._post("/status",{"schema_version":"restricted-gateway-status.v1",**identity});return ""
-    def fence(self,identity:dict)->str:self._post("/fence",{"schema_version":"restricted-gateway-fence.v1",**identity});return ""
+    def status(self, tenant_id: str, turn_id: str, *, client_request_id: str, policy_epoch: str, policy_digest: str):
+        from .contracts import AttemptState
+        identity={"tenant_id":tenant_id,"turn_id":turn_id,"client_request_id":client_request_id,"policy_epoch":policy_epoch,"policy_digest":policy_digest}
+        result=self._post("/status",{"schema_version":"restricted-gateway-status.v1",**identity})
+        return None if result.get("status")=="NOT_FOUND" else AttemptState(result["status"])
+    def fence(self, tenant_id: str, turn_id: str, *, client_request_id: str, policy_epoch: str, policy_digest: str):
+        from .contracts import AttemptState
+        identity={"tenant_id":tenant_id,"turn_id":turn_id,"client_request_id":client_request_id,"policy_epoch":policy_epoch,"policy_digest":policy_digest}
+        return AttemptState(self._post("/fence",{"schema_version":"restricted-gateway-fence.v1",**identity})["status"])

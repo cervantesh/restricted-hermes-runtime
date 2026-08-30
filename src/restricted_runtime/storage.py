@@ -100,6 +100,36 @@ class PostgresContentStore:
             cur.execute("INSERT INTO restricted_content.turns (tenant_id,conversation_id,conversation_epoch,turn_id,client_request_id,authenticated_caller_principal,schema_version,request_mac,mac_key_resource,mac_key_version,request_ciphertext,request_nonce,wrapped_data_key,policy_digest,state,lease_owner,lease_generation,lease_expires_at) VALUES (%s,%s,%s,%s,%s,%s,'restricted-turn.v1',%s,%s,%s,%s,%s,%s,%s,%s,'handler',0,transaction_timestamp()+interval '90 seconds') ON CONFLICT (tenant_id,client_request_id) DO NOTHING",(c.tenant_id,c.conversation_id,c.conversation_epoch,c.turn_id,c.client_request_id,c.principal,c.request_mac,c.mac_key_resource,c.mac_key_version,c.request_ciphertext,c.request_nonce,c.wrapped_data_key,c.policy_digest,c.state.value))
             if cur.rowcount:return c,True
             cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND client_request_id=%s FOR UPDATE",(c.tenant_id,c.client_request_id)); return self._row(cur.fetchone()),False
+    def admit_with_history(self, *, tenant_id: str, conversation_id: str, conversation_epoch: str,
+                           client_request_id: str, build_row) -> tuple[TurnRow, bool]:
+        """Admit a turn while the conversation lock also protects its history read.
+
+        ``build_row`` is called only after the idempotency lookup and the
+        conversation row lock have both succeeded.  This keeps the exact
+        ordered history encrypted into a newly admitted request from racing a
+        terminal turn committed by another replica.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND client_request_id=%s FOR UPDATE", (tenant_id, client_request_id)); old=cur.fetchone()
+            if old:
+                return self._row(old), False
+            cur.execute("INSERT INTO restricted_content.conversations (tenant_id,conversation_id,conversation_epoch) VALUES (%s,%s,%s) ON CONFLICT (tenant_id,conversation_id) DO NOTHING", (tenant_id,conversation_id,conversation_epoch))
+            cur.execute("SELECT * FROM restricted_content.conversations WHERE tenant_id=%s AND conversation_id=%s FOR UPDATE", (tenant_id,conversation_id)); conversation=cur.fetchone()
+            if not conversation or conversation["conversation_epoch"] != conversation_epoch:
+                raise ContractError("stale conversation epoch")
+            cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND client_request_id=%s FOR UPDATE", (tenant_id, client_request_id)); old=cur.fetchone()
+            if old:
+                return self._row(old), False
+            cur.execute("SELECT 1 FROM restricted_content.turns WHERE tenant_id=%s AND conversation_id=%s AND conversation_epoch=%s AND state NOT IN ('COMMITTED','REJECTED','FAILED','INDETERMINATE')", (tenant_id,conversation_id,conversation_epoch))
+            if cur.fetchone():
+                raise ContractError("ACTIVE_TURN")
+            cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND conversation_id=%s AND conversation_epoch=%s AND state='COMMITTED' ORDER BY created_at,turn_id", (tenant_id,conversation_id,conversation_epoch))
+            history=[self._row(row) for row in cur.fetchall()]
+            candidate = build_row(history)
+            cur.execute("INSERT INTO restricted_content.turns (tenant_id,conversation_id,conversation_epoch,turn_id,client_request_id,authenticated_caller_principal,schema_version,request_mac,mac_key_resource,mac_key_version,request_ciphertext,request_nonce,wrapped_data_key,policy_digest,state,lease_owner,lease_generation,lease_expires_at) VALUES (%s,%s,%s,%s,%s,%s,'restricted-turn.v1',%s,%s,%s,%s,%s,%s,%s,%s,'handler',0,transaction_timestamp()+interval '90 seconds') ON CONFLICT (tenant_id,client_request_id) DO NOTHING", (candidate.tenant_id,candidate.conversation_id,candidate.conversation_epoch,candidate.turn_id,candidate.client_request_id,candidate.principal,candidate.request_mac,candidate.mac_key_resource,candidate.mac_key_version,candidate.request_ciphertext,candidate.request_nonce,candidate.wrapped_data_key,candidate.policy_digest,candidate.state.value))
+            if cur.rowcount:
+                return candidate, True
+            cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND client_request_id=%s FOR UPDATE", (tenant_id,client_request_id)); return self._row(cur.fetchone()),False
     def committed_history(self,t:str,c:str,e:str)->list[TurnRow]:
         with self._connect() as conn,conn.cursor() as cur:
             cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND conversation_id=%s AND conversation_epoch=%s AND state='COMMITTED' ORDER BY created_at,turn_id",(t,c,e));return [self._row(x) for x in cur.fetchall()]

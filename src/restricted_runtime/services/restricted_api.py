@@ -21,7 +21,7 @@ def create_app(runtime: ConversationService, authenticator: Authenticator) -> Fa
             turn=TurnRequest.parse(load_closed_json(await request.body()))
             principal=authenticator.authenticate(request.headers.get("authorization"))
             return runtime.submit(turn,principal=principal,conversation_id=conversation_id)
-        except ContractError as exc: raise HTTPException(409 if str(exc) in {"ACTIVE_TURN","idempotency association conflict"} else 400,"restricted turn rejected") from exc
+        except ContractError as exc: raise HTTPException(409 if str(exc) in {"ACTIVE_TURN","idempotency association conflict","idempotency MAC verification failed","stale conversation epoch"} else 400,"restricted turn rejected") from exc
     @app.post("/v1/restricted/conversations/{conversation_id}/reset")
     async def reset(conversation_id:str,request:Request):
         try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import threading
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -53,10 +54,25 @@ class Ciphertext:
     ciphertext: bytes
 
 
+_nonce_lock = threading.Lock()
+_seen_nonces: dict[bytes, set[bytes]] = {}
+
+
 def encrypt(data_key: bytes, plaintext: bytes, aad: bytes) -> Ciphertext:
     if len(data_key) != 32:
         raise ContractError("AES-256 requires a 256-bit data key")
-    nonce = os.urandom(12)
+    key_id = hashlib.sha256(data_key).digest()
+    with _nonce_lock:
+        used = _seen_nonces.setdefault(key_id, set())
+        nonce = None
+        for _ in range(4):
+            candidate = os.urandom(12)
+            if candidate not in used:
+                used.add(candidate)
+                nonce = candidate
+                break
+        if nonce is None:
+            raise ContractError("content nonce reuse detected")
     return Ciphertext(nonce, AESGCM(data_key).encrypt(nonce, plaintext, aad))
 
 

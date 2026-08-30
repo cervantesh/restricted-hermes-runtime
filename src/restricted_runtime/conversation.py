@@ -52,6 +52,24 @@ class ConversationService:
         record = MacRecord(row.mac_key_resource, row.mac_key_version, row.request_mac)
         if not self.mac_key.verify(record, kms_mac_input(SERVICE_MAC_DOMAIN, canonical)):
             raise ContractError("idempotency MAC verification failed")
+
+    def _mark_indeterminate(self, row: TurnRow) -> None:
+        """Best-effort durable truth for an exception after admission.
+
+        An exception crossing the provider or durable-response boundary is an
+        ambiguous outcome.  The handler must not turn it into success or try a
+        second provider call.  CAS keeps a reconciler/new lease owner from
+        being overwritten by this stale handler.
+        """
+        try:
+            if row.state == TurnState.INFERENCE_PENDING and self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.INFERENCE_PENDING, TurnState.INDETERMINATE, failure_class="HANDLER_EXCEPTION"):
+                return
+            if self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.RESPONSE_RECEIVED, TurnState.INDETERMINATE, failure_class="RESPONSE_COMMIT_FAILURE"):
+                return
+        except Exception:
+            # The original exception remains the observable failure.  A
+            # reconciler can fence/claim the still non-terminal row later.
+            pass
     def submit(self, request: TurnRequest, *, principal: str, conversation_id: str) -> dict[str, str]:
         canonical = jcs_bytes(request.identity(principal=principal, tenant_id=self.tenant_id, conversation_id=conversation_id))
         if len(canonical) > self.policy.values["max_canonical_input_utf8_bytes"]:
@@ -59,13 +77,25 @@ class ConversationService:
         key_record = self.mac_key.sign(kms_mac_input(SERVICE_MAC_DOMAIN, canonical))
         data_key = os.urandom(32)
         turn_id = str(uuid.uuid4())
-        initial = TurnRow(self.tenant_id, conversation_id, request.conversation_epoch, turn_id, request.client_request_id, principal, key_record.mac, key_record.key_resource, key_record.key_version, self.policy.digest, TurnState.REQUEST_COMMITTED, b"", b"", None, None, self.data_keys.wrap(data_key), 0)
-        history = self.store.committed_history(self.tenant_id, conversation_id, request.conversation_epoch)
-        messages = self._decrypt_history(history) + [{"role": "user", "text": request.message}]
-        request_payload = jcs_bytes({"system_instruction": SYSTEM_INSTRUCTION, "messages": messages})
-        encrypted = encrypt(data_key, request_payload, self._aad(initial, "request"))
-        initial = replace(initial, request_ciphertext=encrypted.ciphertext, request_nonce=encrypted.nonce)
-        row, created = self.store.admit(initial)
+        messages_for_turn: list[dict[str, str]] = []
+        def build_initial(history: list[TurnRow]) -> TurnRow:
+            nonlocal messages_for_turn
+            initial = TurnRow(self.tenant_id, conversation_id, request.conversation_epoch, turn_id, request.client_request_id, principal, key_record.mac, key_record.key_resource, key_record.key_version, self.policy.digest, TurnState.REQUEST_COMMITTED, b"", b"", None, None, self.data_keys.wrap(data_key), 0)
+            messages_for_turn = self._decrypt_history(history) + [{"role": "user", "text": request.message}]
+            request_payload = jcs_bytes({"system_instruction": SYSTEM_INSTRUCTION, "messages": messages_for_turn})
+            encrypted = encrypt(data_key, request_payload, self._aad(initial, "request"))
+            return replace(initial, request_ciphertext=encrypted.ciphertext, request_nonce=encrypted.nonce)
+        if hasattr(self.store, "admit_with_history"):
+            row, created = self.store.admit_with_history(tenant_id=self.tenant_id, conversation_id=conversation_id, conversation_epoch=request.conversation_epoch, client_request_id=request.client_request_id, build_row=build_initial)
+            if created:
+                # The just-built request carries the authoritative history. It
+                # is needed for the gateway envelope, so decrypt that payload
+                # after admission rather than reading history outside the lock.
+                key = self.data_keys.unwrap(row.wrapped_data_key)
+                import json
+                messages_for_turn = json.loads(decrypt(key, Ciphertext(row.request_nonce, row.request_ciphertext), self._aad(row, "request")))['messages']
+        else:
+            row, created = self.store.admit(build_initial(self.store.committed_history(self.tenant_id, conversation_id, request.conversation_epoch)))
         self._verify_duplicate(row, request, principal, conversation_id)
         if not created:
             return self._duplicate_result(row)
@@ -74,18 +104,26 @@ class ConversationService:
         row = self.store.read_turn(self.tenant_id, row.turn_id)
         if hasattr(self.store,"renew_lease") and not self.store.renew_lease(self.tenant_id,row.turn_id,row.lease_generation):
             raise ContractError("lease renewal failed before provider dispatch")
-        envelope = GatewayEnvelope(self.tenant_id, conversation_id, request.conversation_epoch, row.turn_id, request.client_request_id, self.policy.epoch, self.policy.digest, "restricted-phi-system.v1", SYSTEM_INSTRUCTION, "PHI", messages, self.policy.values["max_canonical_input_utf8_bytes"])
-        result = self.gateway.infer_once(envelope, principal)
+        envelope = GatewayEnvelope(self.tenant_id, conversation_id, request.conversation_epoch, row.turn_id, request.client_request_id, self.policy.epoch, self.policy.digest, "restricted-phi-system.v1", SYSTEM_INSTRUCTION, "PHI", messages_for_turn, self.policy.values["max_canonical_input_utf8_bytes"])
+        try:
+            result = self.gateway.infer_once(envelope, principal)
+        except Exception as exc:
+            self._mark_indeterminate(row)
+            raise ContractError("inference outcome is indeterminate") from exc
         if result.state != "SUCCEEDED" or result.text is None:
             target = TurnState.FAILED if result.state in {"FAILED","CANCELLED_NO_DISPATCH"} else TurnState.INDETERMINATE
             if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.INFERENCE_PENDING, target):
                 raise ContractError("terminal transition did not commit")
             return {"schema_version": "restricted-turn-status.v1", "turn_id": row.turn_id, "conversation_epoch": row.conversation_epoch, "status": target.value}
-        response_cipher = encrypt(data_key, result.text.encode("utf-8"), self._aad(row, "response"))
-        if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.INFERENCE_PENDING, TurnState.RESPONSE_RECEIVED):
-            raise ContractError("response received transition failed")
-        if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.RESPONSE_RECEIVED, TurnState.COMMITTED, response_ciphertext=response_cipher.ciphertext, response_nonce=response_cipher.nonce):
-            raise ContractError("response durable commit failed")
+        try:
+            response_cipher = encrypt(data_key, result.text.encode("utf-8"), self._aad(row, "response"))
+            if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.INFERENCE_PENDING, TurnState.RESPONSE_RECEIVED):
+                raise ContractError("response received transition failed")
+            if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.RESPONSE_RECEIVED, TurnState.COMMITTED, response_ciphertext=response_cipher.ciphertext, response_nonce=response_cipher.nonce):
+                raise ContractError("response durable commit failed")
+        except Exception as exc:
+            self._mark_indeterminate(row)
+            raise ContractError("response is not durably committed") from exc
         return self._committed_result(self.store.read_turn(self.tenant_id, row.turn_id))
     def _decrypt_history(self, rows: list[TurnRow]) -> list[dict[str, str]]:
         history: list[dict[str, str]] = []
