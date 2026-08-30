@@ -20,7 +20,12 @@ def create_app(gateway:Gateway,authenticator:Authenticator)->FastAPI:
             principal=auth(request);body=load_closed_json(await request.body())
             if not isinstance(body,dict) or set(body)!={"schema_version",*_ENVELOPE} or body["schema_version"]!="restricted-gateway-envelope.v1":raise ContractError("closed inference envelope")
             result=gateway.infer_once(GatewayEnvelope(**{k:body[k] for k in _ENVELOPE}),principal)
-            return {"status":result.state,"message":result.text} if result.state=="SUCCEEDED" else {"status":result.state}
+            if result.state=="SUCCEEDED":
+                if not result.decision_id or result.policy_epoch is None or result.policy_digest is None:raise ContractError("gateway success lacks durable association")
+                body={"status":result.state,"message":result.text,"decision_id":result.decision_id,"policy_epoch":result.policy_epoch,"policy_digest":result.policy_digest}
+                if result.provider_request_id is not None:body["provider_request_id"]=result.provider_request_id
+                return body
+            return {"status":result.state}
         except ContractError as exc:raise HTTPException(400,"gateway inference rejected") from exc
     @app.post("/status")
     async def status(request:Request):

@@ -24,6 +24,9 @@ class TurnRow:
     principal: str; request_mac: bytes; mac_key_resource: str; mac_key_version: str; policy_digest: str
     state: TurnState; request_ciphertext: bytes; request_nonce: bytes; response_ciphertext: bytes | None; response_nonce: bytes | None; wrapped_data_key: bytes
     lease_generation: int
+    policy_epoch: str = "legacy"
+    gateway_decision_id: str | None = None
+    gateway_attempt_classification: str | None = None
 
 class ContentStore(Protocol):
     def admit(self, row: TurnRow) -> tuple[TurnRow, bool]: ...
@@ -82,7 +85,7 @@ class ConversationService:
         messages_for_turn: list[dict[str, str]] = []
         def build_initial(history: list[TurnRow]) -> TurnRow:
             nonlocal messages_for_turn
-            initial = TurnRow(self.tenant_id, conversation_id, request.conversation_epoch, turn_id, request.client_request_id, principal, key_record.mac, key_record.key_resource, key_record.key_version, self.policy.digest, TurnState.REQUEST_COMMITTED, b"", b"", None, None, self.data_keys.wrap(data_key), 0)
+            initial = TurnRow(self.tenant_id, conversation_id, request.conversation_epoch, turn_id, request.client_request_id, principal, key_record.mac, key_record.key_resource, key_record.key_version, self.policy.digest, TurnState.REQUEST_COMMITTED, b"", b"", None, None, self.data_keys.wrap(data_key), 0, policy_epoch=self.policy.epoch)
             messages_for_turn = self._decrypt_history(history) + [{"role": "user", "text": request.message}]
             request_payload = jcs_bytes({"system_instruction": SYSTEM_INSTRUCTION, "messages": messages_for_turn})
             encrypted = encrypt(data_key, request_payload, self._aad(initial, "request"))
@@ -140,11 +143,14 @@ class ConversationService:
             if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.INFERENCE_PENDING, target):
                 raise ContractError("terminal transition did not commit")
             return {"schema_version": "restricted-turn-status.v1", "turn_id": row.turn_id, "conversation_epoch": row.conversation_epoch, "status": target.value}
+        if (result.policy_epoch,result.policy_digest)!=(row.policy_epoch,row.policy_digest) or not result.decision_id:
+            self._mark_indeterminate(row)
+            raise ContractError("gateway result association mismatch")
         try:
             response_cipher = encrypt(data_key, result.text.encode("utf-8"), self._aad(row, "response"))
             if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.INFERENCE_PENDING, TurnState.RESPONSE_RECEIVED):
                 raise ContractError("response received transition failed")
-            if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.RESPONSE_RECEIVED, TurnState.COMMITTED, response_ciphertext=response_cipher.ciphertext, response_nonce=response_cipher.nonce):
+            if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.RESPONSE_RECEIVED, TurnState.COMMITTED, response_ciphertext=response_cipher.ciphertext, response_nonce=response_cipher.nonce, gateway_decision_id=result.decision_id, gateway_attempt_classification=result.state):
                 raise ContractError("response durable commit failed")
         except Exception as exc:
             self._mark_indeterminate(row)
@@ -162,7 +168,7 @@ class ConversationService:
                 history.append({"role": "model", "text": decrypt(key, Ciphertext(row.response_nonce, row.response_ciphertext), self._aad(row, "response")).decode("utf-8")})
         return history
     def _committed_result(self, row: TurnRow) -> dict[str, str]:
-        if row.state != TurnState.COMMITTED or not row.response_ciphertext or not row.response_nonce:
+        if row.state != TurnState.COMMITTED or not row.response_ciphertext or not row.response_nonce or not row.gateway_decision_id or row.gateway_attempt_classification != "SUCCEEDED":
             raise ContractError("committed readback unavailable")
         key = self.data_keys.unwrap(row.wrapped_data_key)
         text = decrypt(key, Ciphertext(row.response_nonce, row.response_ciphertext), self._aad(row, "response")).decode("utf-8")

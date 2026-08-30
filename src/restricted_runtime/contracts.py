@@ -52,7 +52,10 @@ class ProviderResult:
     state: str
     text: str | None = None
     failure_class: str | None = None
-    request_id: str | None = None
+    provider_request_id: str | None = None
+    decision_id: str | None = None
+    policy_epoch: str | None = None
+    policy_digest: str | None = None
 
 
 def _no_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

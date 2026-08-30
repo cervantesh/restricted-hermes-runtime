@@ -15,4 +15,4 @@ def test_only_exact_stop_single_text_is_releasable():
 def test_recorded_raw_synthetic_smoke_response_is_parsed_by_production_profile():
     raw=Path("tests/fixtures/vertex/synthetic_non_phi_smoke_response.json").read_bytes()
     result=parse_vertex_response(200,raw)
-    assert result.state=="SUCCEEDED" and result.text=="Synthetic administrative response." and result.request_id=="synthetic-response-2026-08-30"
+    assert result.state=="SUCCEEDED" and result.text=="Synthetic administrative response." and result.provider_request_id=="synthetic-response-2026-08-30"

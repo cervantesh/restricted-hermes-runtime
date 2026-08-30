@@ -29,6 +29,10 @@ def policy():
     v=json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"));v.update(policy_epoch="1",caller_principal="caller",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
     return PolicyBundle(v,hashlib.sha256(jcs_bytes(v)).hexdigest())
 
+def policy_at(epoch):
+    v=json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"));v.update(policy_epoch=epoch,caller_principal="caller",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
+    return PolicyBundle(v,hashlib.sha256(jcs_bytes(v)).hexdigest())
+
 class Keys:
     def wrap(self,k): return k
     def unwrap(self,k): return k
@@ -95,3 +99,25 @@ def test_conversation_readiness_requires_matching_gateway_policy_and_no_last_kno
     app=create_app(object(),object(),lambda: True)
     response=TestClient(app).get("/readyz")
     assert response.status_code==200 and response.json()["status"]=="ready"
+
+def test_expired_e1_turn_reconciles_with_its_persisted_policy_pair_after_e2_rollout():
+    e1,e2=policy_at("E1"),policy_at("E2");store=PostgresContentStore(URL);key=LocalHmacKey("gateway","1",b"g"*32);turn_id=str(uuid.uuid4())
+    row=__import__("restricted_runtime.conversation",fromlist=["TurnRow"]).TurnRow("tenant","c","epoch",turn_id,str(uuid.uuid4()),"caller",b"m","service","1",e1.digest,TurnState.REQUEST_COMMITTED,b"cipher",b"123456789012",None,None,b"wrapped",0,policy_epoch=e1.epoch)
+    assert store.admit(row)[1]
+    with psycopg.connect(URL,autocommit=True) as conn:conn.execute("UPDATE restricted_content.turns SET lease_expires_at=transaction_timestamp()-interval '1 second' WHERE turn_id=%s",(turn_id,))
+    assert ReconciliationDriver(store,Reconciler(store,Gateway(e2,key,PostgresLedger(URL,e2,key),ExplodingProvider())),"scanner",e2.epoch).run_once()==1
+    with psycopg.connect(URL) as conn:
+        pair=conn.execute("SELECT policy_epoch,policy_digest FROM inference_ledger.cancellation_tombstones WHERE turn_id=%s",(turn_id,)).fetchone()
+    assert pair==(e1.epoch,e1.digest)
+
+def test_gateway_policy_rollout_mismatch_creates_no_ledger_reservation_or_provider_dispatch():
+    e1,e2=policy_at("E1"),policy_at("E2");store=PostgresContentStore(URL);key=LocalHmacKey("gateway","1",b"g"*32)
+    class Provider:
+        def __init__(self):self.calls=0
+        def generate_content(self,messages):self.calls+=1;return ProviderResult("SUCCEEDED",text="must not happen")
+    provider=Provider();service=ConversationService(store,Gateway(e2,key,PostgresLedger(URL,e2,key),provider),LocalHmacKey("service","1",b"s"*32),Keys(),e1,"tenant")
+    request=TurnRequest.parse({"schema_version":"restricted-turn.v1","client_request_id":str(uuid.uuid4()),"conversation_epoch":"epoch","message":"synthetic"})
+    with pytest.raises(Exception,match="indeterminate"):
+        service.submit(request,principal="caller",conversation_id="rollout")
+    with psycopg.connect(URL) as conn:assert conn.execute("SELECT count(*) FROM inference_ledger.attempts").fetchone()[0]==0
+    assert provider.calls==0

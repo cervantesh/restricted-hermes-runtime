@@ -10,6 +10,7 @@ from ..gateway_client import HttpGatewayClient
 from ..google_kms import GoogleKmsDataKeyWrapper,GoogleKmsHmacKey
 from ..kms_config import parse_retired_versions
 from ..policy import load_signed_policy
+from ..policy_binding import require_policy_pair
 from ..storage import PostgresContentStore
 from ..reconciliation import Reconciler
 from ..reconciliation_driver import ReconciliationDriver
@@ -24,6 +25,7 @@ def retired_versions(name:str,active_resource:str,active_version:str)->dict[tupl
 def build_app():
     if os.environ.get("RESTRICTED_RUNTIME_MODE","production")!="production":raise RuntimeError("synthetic composition is prohibited in production image")
     policy=load_signed_policy(Path(required("RESTRICTED_POLICY_PATH")),Path(required("RESTRICTED_POLICY_SIGNATURE_PATH")),required("RESTRICTED_POLICY_PUBLIC_KEY_B64"))
+    require_policy_pair(policy,epoch=required("RESTRICTED_POLICY_EPOCH"),digest=required("RESTRICTED_POLICY_DIGEST"))
     if policy.values["tenant_id"]!=required("RESTRICTED_TENANT_ID"):raise RuntimeError("policy tenant mismatch")
     active_resource=required("RESTRICTED_SERVICE_MAC_KEY_RESOURCE");active_version=required("RESTRICTED_SERVICE_MAC_KEY_VERSION")
     active=GoogleKmsHmacKey(active_resource,active_version,retired_versions("RESTRICTED_SERVICE_RETIRED_MAC_KEYS_JSON",active_resource,active_version))

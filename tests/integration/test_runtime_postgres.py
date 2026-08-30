@@ -40,7 +40,7 @@ def test_different_key_active_turn_and_reset_are_serialized():
 def test_commit_readback_conflict_replay_and_stale_lease_cas():
     store=PostgresContentStore(DATABASE_URL);row=turn(key=str(uuid.uuid4()));assert store.admit(row)[1]
     assert store.set_state_cas("tenant",row.turn_id,0,TurnState.RECEIVED,TurnState.RESPONSE_RECEIVED)
-    assert store.set_state_cas("tenant",row.turn_id,0,TurnState.RESPONSE_RECEIVED,TurnState.COMMITTED,response_ciphertext=b"response",response_nonce=b"abcdefghijkl")
+    assert store.set_state_cas("tenant",row.turn_id,0,TurnState.RESPONSE_RECEIVED,TurnState.COMMITTED,response_ciphertext=b"response",response_nonce=b"abcdefghijkl",gateway_decision_id="00000000-0000-0000-0000-000000000001",gateway_attempt_classification="SUCCEEDED")
     assert store.read_turn("tenant",row.turn_id).response_ciphertext==b"response"
     existing,created=store.admit(turn(key=row.client_request_id,conversation="other"));assert not created and existing.turn_id==row.turn_id
     lease=turn(key=str(uuid.uuid4()),conversation="lease");store.admit(lease)
@@ -105,4 +105,4 @@ def test_db_time_lease_heartbeat_scanner_and_stale_handler_cas():
     assert ReconciliationDriver(store,reconciler,"scanner","1").run_once()==1
     assert store.read_turn("tenant",candidate.turn_id).state is TurnState.FAILED
     assert not store.renew_lease("tenant",candidate.turn_id,0)
-    assert not store.set_state_cas("tenant",candidate.turn_id,0,TurnState.INFERENCE_PENDING,TurnState.COMMITTED,response_ciphertext=b"x",response_nonce=b"n"*12)
+    assert not store.set_state_cas("tenant",candidate.turn_id,0,TurnState.INFERENCE_PENDING,TurnState.COMMITTED,response_ciphertext=b"x",response_nonce=b"n"*12,gateway_decision_id="00000000-0000-0000-0000-000000000002",gateway_attempt_classification="SUCCEEDED")

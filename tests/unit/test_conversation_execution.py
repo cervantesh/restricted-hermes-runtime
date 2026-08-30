@@ -36,7 +36,7 @@ class Store:
     def reset(self,*_): raise AssertionError
 class Gateway:
     def __init__(self): self.calls=0
-    def infer_once(self,envelope,principal): self.calls+=1;return ProviderResult("SUCCEEDED",text="stored response")
+    def infer_once(self,envelope,principal): self.calls+=1;return ProviderResult("SUCCEEDED",text="stored response",decision_id="00000000-0000-0000-0000-000000000002",policy_epoch=envelope.policy_epoch,policy_digest=envelope.policy_digest)
 
 def request(key="00000000-0000-0000-0000-000000000001",message="hello"):
     return TurnRequest.parse({"schema_version":"restricted-turn.v1","client_request_id":key,"conversation_epoch":"epoch","message":message})

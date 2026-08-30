@@ -2,6 +2,7 @@
 from __future__ import annotations
 import uuid
 from typing import Any
+from dataclasses import dataclass
 import psycopg
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
@@ -9,6 +10,14 @@ from .contracts import AttemptState, ContractError, ProviderResult, TurnState
 from .crypto import GATEWAY_MAC_DOMAIN, MacRecord, kms_mac_input
 from .conversation import TurnRow
 from .gateway import GatewayEnvelope
+
+@dataclass(frozen=True)
+class LedgerAttempt:
+    state: AttemptState
+    decision_id: str
+    provider_request_id: str | None
+    policy_epoch: str
+    policy_digest: str
 
 class PostgresLedger:
     def __init__(self, connection_string: str, policy, mac_key=None): self.connection_string, self.policy, self.mac_key = connection_string, policy, mac_key
@@ -44,8 +53,16 @@ class PostgresLedger:
     def finish(self, tenant_id: str, turn_id: str, result: ProviderResult) -> None:
         state=result.state if result.state in {"SUCCEEDED","FAILED","INDETERMINATE"} else "INDETERMINATE"
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("UPDATE inference_ledger.attempts SET state=%s,failure_class=%s,provider_request_id=%s,updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND state='DISPATCH_STARTED'",(state,result.failure_class,result.request_id,tenant_id,turn_id))
+            cur.execute("UPDATE inference_ledger.attempts SET state=%s,failure_class=%s,provider_request_id=%s,updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND state='DISPATCH_STARTED'",(state,result.failure_class,result.provider_request_id,tenant_id,turn_id))
             if cur.rowcount != 1: raise ContractError("ledger terminal CAS failed")
+    def lookup(self, tenant_id: str, turn_id: str, *, client_request_id: str, policy_epoch: str, policy_digest: str) -> LedgerAttempt | None:
+        """Return the minimal durable attempt association after exact identity validation."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT state,decision_id,provider_request_id,client_request_id,policy_epoch,policy_digest FROM inference_ledger.attempts WHERE tenant_id=%s AND turn_id=%s",(tenant_id,turn_id)); row=cur.fetchone()
+            if not row:return None
+            if (str(row["client_request_id"]),row["policy_epoch"],row["policy_digest"]) != (client_request_id,policy_epoch,policy_digest):
+                raise ContractError("attempt lookup identity mismatch")
+            return LedgerAttempt(AttemptState(row["state"]),str(row["decision_id"]),row["provider_request_id"],row["policy_epoch"],row["policy_digest"])
     def status(self, tenant_id: str, turn_id: str, *, client_request_id: str|None=None, policy_epoch: str|None=None, policy_digest: str|None=None) -> AttemptState|None:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM inference_ledger.attempts WHERE tenant_id=%s AND turn_id=%s",(tenant_id,turn_id)); row=cur.fetchone()
@@ -84,7 +101,7 @@ class PostgresContentStore:
             cur.execute("SELECT conversation_epoch FROM restricted_content.conversations WHERE tenant_id=%s AND conversation_id=%s",(tenant_id,conversation_id));return cur.fetchone()["conversation_epoch"]
     @staticmethod
     def _row(r:dict[str,Any])->TurnRow:
-        return TurnRow(r["tenant_id"],r["conversation_id"],r["conversation_epoch"],str(r["turn_id"]),str(r["client_request_id"]),r["authenticated_caller_principal"],bytes(r["request_mac"]),r["mac_key_resource"],r["mac_key_version"],r["policy_digest"],TurnState(r["state"]),bytes(r["request_ciphertext"]),bytes(r["request_nonce"]),bytes(r["response_ciphertext"]) if r["response_ciphertext"] else None,bytes(r["response_nonce"]) if r["response_nonce"] else None,bytes(r["wrapped_data_key"]),r["lease_generation"])
+        return TurnRow(r["tenant_id"],r["conversation_id"],r["conversation_epoch"],str(r["turn_id"]),str(r["client_request_id"]),r["authenticated_caller_principal"],bytes(r["request_mac"]),r["mac_key_resource"],r["mac_key_version"],r["policy_digest"],TurnState(r["state"]),bytes(r["request_ciphertext"]),bytes(r["request_nonce"]),bytes(r["response_ciphertext"]) if r["response_ciphertext"] else None,bytes(r["response_nonce"]) if r["response_nonce"] else None,bytes(r["wrapped_data_key"]),r["lease_generation"],r["policy_epoch"],str(r["gateway_decision_id"]) if r["gateway_decision_id"] else None,r["gateway_attempt_classification"])
     def admit(self,c:TurnRow)->tuple[TurnRow,bool]:
         with self._connect() as conn,conn.cursor() as cur:
             cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND client_request_id=%s FOR UPDATE",(c.tenant_id,c.client_request_id)); old=cur.fetchone()
@@ -97,7 +114,7 @@ class PostgresContentStore:
             if old:return self._row(old),False
             cur.execute("SELECT 1 FROM restricted_content.turns WHERE tenant_id=%s AND conversation_id=%s AND conversation_epoch=%s AND state NOT IN ('COMMITTED','REJECTED','FAILED','INDETERMINATE')",(c.tenant_id,c.conversation_id,c.conversation_epoch))
             if cur.fetchone():raise ContractError("ACTIVE_TURN")
-            cur.execute("INSERT INTO restricted_content.turns (tenant_id,conversation_id,conversation_epoch,turn_id,client_request_id,authenticated_caller_principal,schema_version,request_mac,mac_key_resource,mac_key_version,request_ciphertext,request_nonce,wrapped_data_key,policy_digest,state,lease_owner,lease_generation,lease_expires_at) VALUES (%s,%s,%s,%s,%s,%s,'restricted-turn.v1',%s,%s,%s,%s,%s,%s,%s,%s,'handler',0,transaction_timestamp()+interval '90 seconds') ON CONFLICT (tenant_id,client_request_id) DO NOTHING",(c.tenant_id,c.conversation_id,c.conversation_epoch,c.turn_id,c.client_request_id,c.principal,c.request_mac,c.mac_key_resource,c.mac_key_version,c.request_ciphertext,c.request_nonce,c.wrapped_data_key,c.policy_digest,c.state.value))
+            cur.execute("INSERT INTO restricted_content.turns (tenant_id,conversation_id,conversation_epoch,turn_id,client_request_id,authenticated_caller_principal,schema_version,request_mac,mac_key_resource,mac_key_version,request_ciphertext,request_nonce,wrapped_data_key,policy_epoch,policy_digest,state,lease_owner,lease_generation,lease_expires_at) VALUES (%s,%s,%s,%s,%s,%s,'restricted-turn.v1',%s,%s,%s,%s,%s,%s,%s,%s,%s,'handler',0,transaction_timestamp()+interval '90 seconds') ON CONFLICT (tenant_id,client_request_id) DO NOTHING",(c.tenant_id,c.conversation_id,c.conversation_epoch,c.turn_id,c.client_request_id,c.principal,c.request_mac,c.mac_key_resource,c.mac_key_version,c.request_ciphertext,c.request_nonce,c.wrapped_data_key,c.policy_epoch,c.policy_digest,c.state.value))
             if cur.rowcount:return c,True
             cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND client_request_id=%s FOR UPDATE",(c.tenant_id,c.client_request_id)); return self._row(cur.fetchone()),False
     def admit_with_history(self, *, tenant_id: str, conversation_id: str, conversation_epoch: str,
@@ -126,7 +143,7 @@ class PostgresContentStore:
             cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND conversation_id=%s AND conversation_epoch=%s AND state='COMMITTED' ORDER BY created_at,turn_id", (tenant_id,conversation_id,conversation_epoch))
             history=[self._row(row) for row in cur.fetchall()]
             candidate = build_row(history)
-            cur.execute("INSERT INTO restricted_content.turns (tenant_id,conversation_id,conversation_epoch,turn_id,client_request_id,authenticated_caller_principal,schema_version,request_mac,mac_key_resource,mac_key_version,request_ciphertext,request_nonce,wrapped_data_key,policy_digest,state,lease_owner,lease_generation,lease_expires_at) VALUES (%s,%s,%s,%s,%s,%s,'restricted-turn.v1',%s,%s,%s,%s,%s,%s,%s,%s,'handler',0,transaction_timestamp()+interval '90 seconds') ON CONFLICT (tenant_id,client_request_id) DO NOTHING", (candidate.tenant_id,candidate.conversation_id,candidate.conversation_epoch,candidate.turn_id,candidate.client_request_id,candidate.principal,candidate.request_mac,candidate.mac_key_resource,candidate.mac_key_version,candidate.request_ciphertext,candidate.request_nonce,candidate.wrapped_data_key,candidate.policy_digest,candidate.state.value))
+            cur.execute("INSERT INTO restricted_content.turns (tenant_id,conversation_id,conversation_epoch,turn_id,client_request_id,authenticated_caller_principal,schema_version,request_mac,mac_key_resource,mac_key_version,request_ciphertext,request_nonce,wrapped_data_key,policy_epoch,policy_digest,state,lease_owner,lease_generation,lease_expires_at) VALUES (%s,%s,%s,%s,%s,%s,'restricted-turn.v1',%s,%s,%s,%s,%s,%s,%s,%s,%s,'handler',0,transaction_timestamp()+interval '90 seconds') ON CONFLICT (tenant_id,client_request_id) DO NOTHING", (candidate.tenant_id,candidate.conversation_id,candidate.conversation_epoch,candidate.turn_id,candidate.client_request_id,candidate.principal,candidate.request_mac,candidate.mac_key_resource,candidate.mac_key_version,candidate.request_ciphertext,candidate.request_nonce,candidate.wrapped_data_key,candidate.policy_epoch,candidate.policy_digest,candidate.state.value))
             if cur.rowcount:
                 return candidate, True
             cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND client_request_id=%s FOR UPDATE", (tenant_id,client_request_id)); return self._row(cur.fetchone()),False
@@ -139,7 +156,9 @@ class PostgresContentStore:
             if not row:raise ContractError("turn not found")
             return self._row(row)
     def set_state_cas(self,t:str,turn:str,g:int,expected:TurnState,target:TurnState,**u:object)->bool:
-        if set(u)-{"response_ciphertext","response_nonce"}:raise ContractError("unapproved content transition field")
+        if set(u)-{"response_ciphertext","response_nonce","gateway_decision_id","gateway_attempt_classification","failure_class"}:raise ContractError("unapproved content transition field")
+        if target is TurnState.COMMITTED and set(u)!={"response_ciphertext","response_nonce","gateway_decision_id","gateway_attempt_classification"}:
+            raise ContractError("committed response requires durable gateway association")
         sets=["state=%s","updated_at=transaction_timestamp()"]+[f"{k}=%s" for k in u]
         with self._connect() as conn,conn.cursor() as cur:
             cur.execute(f"UPDATE restricted_content.turns SET {','.join(sets)} WHERE tenant_id=%s AND turn_id=%s AND lease_generation=%s AND state=%s",[target.value,*u.values(),t,turn,g,expected.value]);return cur.rowcount==1

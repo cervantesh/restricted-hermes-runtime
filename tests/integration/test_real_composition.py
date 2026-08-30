@@ -35,3 +35,5 @@ def test_real_composition_admits_dispatches_commits_reads_once_and_duplicate_is_
     with psycopg.connect(URL) as c:
         assert c.execute("SELECT count(*) FROM restricted_content.turns").fetchone()[0]==1
         assert c.execute("SELECT state FROM inference_ledger.attempts").fetchone()[0]=="SUCCEEDED"
+        row=c.execute("SELECT policy_epoch,policy_digest,gateway_decision_id,gateway_attempt_classification FROM restricted_content.turns").fetchone()
+        assert row[0]==p.epoch and row[1]==p.digest and row[2] is not None and row[3]=="SUCCEEDED"

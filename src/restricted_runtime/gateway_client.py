@@ -20,7 +20,15 @@ class HttpGatewayClient:
         return response.json()
     def infer_once(self,envelope:GatewayEnvelope,principal:str)->ProviderResult:
         body={"schema_version":"restricted-gateway-envelope.v1",**envelope.__dict__};reply=self._post("/infer",body)
-        return ProviderResult(reply["status"],reply.get("message"))
+        if reply.get("status")!="SUCCEEDED":
+            return ProviderResult(reply["status"])
+        allowed={"status","message","decision_id","provider_request_id","policy_epoch","policy_digest"}
+        required={"status","message","decision_id","policy_epoch","policy_digest"}
+        if not isinstance(reply,dict) or not required<=set(reply) or set(reply)-allowed or not all(isinstance(reply[key],str) and reply[key] for key in required):
+            raise ContractError("gateway success response association malformed")
+        if "provider_request_id" in reply and (not isinstance(reply["provider_request_id"],str) or not reply["provider_request_id"]):
+            raise ContractError("gateway provider request association malformed")
+        return ProviderResult("SUCCEEDED",reply["message"],decision_id=reply["decision_id"],provider_request_id=reply.get("provider_request_id"),policy_epoch=reply["policy_epoch"],policy_digest=reply["policy_digest"])
     def ready(self, policy_epoch:str, policy_digest:str)->bool:
         with httpx.Client(timeout=httpx.Timeout(5,read=5,write=5,pool=5),follow_redirects=False,trust_env=False) as client:
             response=client.get(self.url+"/readyz",params={"policy_epoch":policy_epoch,"policy_digest":policy_digest},headers={"Authorization":"Bearer "+self.tokens()})

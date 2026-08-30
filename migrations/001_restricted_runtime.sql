@@ -17,9 +17,9 @@ CREATE TABLE restricted_content.turns (
   authenticated_caller_principal text NOT NULL, schema_version text NOT NULL,
   request_mac bytea NOT NULL, mac_key_resource text NOT NULL, mac_key_version text NOT NULL,
   request_ciphertext bytea NOT NULL, request_nonce bytea NOT NULL, response_ciphertext bytea, response_nonce bytea,
-  wrapped_data_key bytea NOT NULL, policy_digest text NOT NULL, state restricted_content.turn_state NOT NULL,
+  wrapped_data_key bytea NOT NULL, policy_epoch text NOT NULL, policy_digest text NOT NULL, state restricted_content.turn_state NOT NULL,
   lease_owner text, lease_generation bigint NOT NULL DEFAULT 0, lease_expires_at timestamptz,
-  gateway_decision_id uuid, failure_class text, created_at timestamptz NOT NULL DEFAULT transaction_timestamp(), updated_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+  gateway_decision_id uuid, gateway_attempt_classification text, failure_class text, created_at timestamptz NOT NULL DEFAULT transaction_timestamp(), updated_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
   UNIQUE (tenant_id, client_request_id), UNIQUE (tenant_id, turn_id)
 );
 CREATE UNIQUE INDEX one_active_turn_per_conversation ON restricted_content.turns(tenant_id, conversation_id, conversation_epoch)

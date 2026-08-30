@@ -80,7 +80,7 @@ def parse_vertex_response(status_code: int, raw: bytes) -> ProviderResult:
         if not isinstance(parts, list) or len(parts) != 1 or not isinstance(parts[0], dict) or set(parts[0]) != {"text"} or not isinstance(parts[0]["text"], str) or not parts[0]["text"]:
             raise ContractError("text part")
         if reason != "STOP": return ProviderResult("INDETERMINATE", failure_class="NON_FINAL_FINISH")
-        return ProviderResult("SUCCEEDED", text=parts[0]["text"], request_id=root.get("responseId"))
+        return ProviderResult("SUCCEEDED", text=parts[0]["text"], provider_request_id=root.get("responseId"))
     except ContractError:
         return ProviderResult("INDETERMINATE", failure_class="MALFORMED_RESPONSE")
 

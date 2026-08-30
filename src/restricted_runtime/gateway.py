@@ -1,7 +1,7 @@
 """Gateway envelope validation and one-attempt state transitions."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from .contracts import AttemptState, Classification, ContractError, ProviderResult, jcs_bytes
@@ -21,6 +21,7 @@ class Ledger(Protocol):
     def reserve(self, envelope: GatewayEnvelope, principal: str, mac: bytes, key_resource: str, key_version: str) -> AttemptState: ...
     def start_dispatch(self, tenant_id: str, turn_id: str) -> bool: ...
     def finish(self, tenant_id: str, turn_id: str, result: ProviderResult) -> None: ...
+    def lookup(self, tenant_id: str, turn_id: str, *, client_request_id: str, policy_epoch: str, policy_digest: str): ...
     def status(self, tenant_id: str, turn_id: str) -> AttemptState | None: ...
     def fence(self, tenant_id: str, turn_id: str, *, client_request_id: str, policy_epoch: str, policy_digest: str) -> AttemptState: ...
 
@@ -45,12 +46,16 @@ class Gateway:
         canonical = self.validate(envelope, principal)
         record = self.mac_key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN, canonical))
         state = self.ledger.reserve(envelope, principal, record.mac, record.key_resource, record.key_version)
+        attempt = self.ledger.lookup(envelope.tenant_id,envelope.turn_id,client_request_id=envelope.client_request_id,policy_epoch=envelope.policy_epoch,policy_digest=envelope.policy_digest)
         if state != AttemptState.RESERVED:
-            return ProviderResult(state)
+            return ProviderResult(str(state),decision_id=attempt.decision_id if attempt else None,provider_request_id=attempt.provider_request_id if attempt else None,policy_epoch=envelope.policy_epoch,policy_digest=envelope.policy_digest)
         if not self.ledger.start_dispatch(envelope.tenant_id, envelope.turn_id):
-            return ProviderResult("CANCELLED_NO_DISPATCH")
+            return ProviderResult("CANCELLED_NO_DISPATCH",decision_id=attempt.decision_id if attempt else None,policy_epoch=envelope.policy_epoch,policy_digest=envelope.policy_digest)
         result = self.vertex.generate_content(envelope.messages)
         self.ledger.finish(envelope.tenant_id, envelope.turn_id, result)
-        return result
+        attempt = self.ledger.lookup(envelope.tenant_id,envelope.turn_id,client_request_id=envelope.client_request_id,policy_epoch=envelope.policy_epoch,policy_digest=envelope.policy_digest)
+        if not attempt:
+            raise ContractError("ledger association unavailable after dispatch")
+        return replace(result,decision_id=attempt.decision_id,provider_request_id=attempt.provider_request_id,policy_epoch=attempt.policy_epoch,policy_digest=attempt.policy_digest)
     def status(self, tenant_id: str, turn_id: str, *, client_request_id: str, policy_epoch: str, policy_digest: str) -> AttemptState | None: return self.ledger.status(tenant_id, turn_id,client_request_id=client_request_id,policy_epoch=policy_epoch,policy_digest=policy_digest)
     def fence(self, tenant_id: str, turn_id: str, *, client_request_id: str, policy_epoch: str, policy_digest: str) -> AttemptState: return self.ledger.fence(tenant_id, turn_id, client_request_id=client_request_id, policy_epoch=policy_epoch, policy_digest=policy_digest)
