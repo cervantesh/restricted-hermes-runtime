@@ -12,10 +12,10 @@ separate VPC connector; this baseline does not inspect application hostnames.
 
 The frozen Vertex sink remains `aiplatform.us.rep.googleapis.com` with
 `location=us`. It is **not** sent to the restricted VIP. Terraform creates a
-dedicated `10.77.5.0/28` PSC subnet and internal address, a regional Network
-Connectivity endpoint with `target_google_api` exactly
+dedicated `10.77.5.0/28` PSC subnet and a regional Network Connectivity
+endpoint with `target_google_api` exactly
 `aiplatform.us.rep.googleapis.com`, an exact private DNS apex A record to that
-PSC address, and a gateway-only TCP/443 firewall allow to that single address
+endpoint-managed PSC address, and a gateway-only TCP/443 firewall allow to that single address
 before deny-all. The more-specific DNS zone wins over the general
 `googleapis.com` zone. This matches Google's PSC pattern for regional or
 multi-regional API endpoints; those endpoints are not reached through Private

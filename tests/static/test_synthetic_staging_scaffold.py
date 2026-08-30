@@ -88,6 +88,17 @@ def test_connectors_fit_the_official_weighted_name_limit_and_sql_users_are_trimm
     assert "local.conversation_db_user" in runtime and "local.gateway_db_user" in runtime
 
 
+def test_connectors_have_explicit_supported_capacity_and_psc_owns_its_address():
+    main=(ROOT/"main.tf").read_text(encoding="utf-8")
+    assert main.count("min_instances = 2") == 4
+    assert main.count("max_instances = 3") == 4
+    assert 'resource "google_compute_address" "vertex_psc"' not in main
+    endpoint=main.split('resource "google_network_connectivity_regional_endpoint" "vertex_us" {',1)[1].split("}",1)[0]
+    assert "address" not in endpoint
+    assert 'rrdatas      = [google_network_connectivity_regional_endpoint.vertex_us.address]' in main
+    assert 'destination_ranges = ["${google_network_connectivity_regional_endpoint.vertex_us.address}/32"]' in main
+
+
 def test_durable_dispatch_control_starts_disabled_and_is_not_mutable_by_gateway_role():
     migration=Path("migrations/001_restricted_runtime.sql").read_text(encoding="utf-8")
     storage=Path("src/restricted_runtime/storage.py").read_text(encoding="utf-8")
@@ -107,7 +118,7 @@ def test_vertex_us_sink_uses_its_own_psc_dns_and_not_the_restricted_vip():
     assert 'target_google_api = "aiplatform.us.rep.googleapis.com"' in main
     assert 'dns_name   = "aiplatform.us.rep.googleapis.com."' in main
     assert 'name         = "aiplatform.us.rep.googleapis.com."' in main
-    assert 'destination_ranges = ["${google_compute_address.vertex_psc.address}/32"]' in main
+    assert 'destination_ranges = ["${google_network_connectivity_regional_endpoint.vertex_us.address}/32"]' in main
     assert 'target_tags        = [local.gateway_connector_tag]' in main
     assert "It is **not** sent to the restricted VIP" in egress
 

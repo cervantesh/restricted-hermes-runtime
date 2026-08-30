@@ -132,24 +132,32 @@ resource "google_vpc_access_connector" "conversation" {
   region        = var.region
   network       = google_compute_network.restricted.name
   ip_cidr_range = "10.77.1.0/28"
+  min_instances = 2
+  max_instances = 3
 }
 resource "google_vpc_access_connector" "gateway" {
   name          = "rr-gw-eg"
   region        = var.region
   network       = google_compute_network.restricted.name
   ip_cidr_range = "10.77.2.0/28"
+  min_instances = 2
+  max_instances = 3
 }
 resource "google_vpc_access_connector" "runner" {
   name          = "rr-run-eg"
   region        = var.region
   network       = google_compute_network.restricted.name
   ip_cidr_range = "10.77.3.0/28"
+  min_instances = 2
+  max_instances = 3
 }
 resource "google_vpc_access_connector" "migration" {
   name          = "rr-mig-eg"
   region        = var.region
   network       = google_compute_network.restricted.name
   ip_cidr_range = "10.77.4.0/28"
+  min_instances = 2
+  max_instances = 3
 }
 
 locals {
@@ -203,12 +211,6 @@ resource "google_compute_subnetwork" "vertex_psc" {
   ip_cidr_range            = "10.77.5.0/28"
   private_ip_google_access = true
 }
-resource "google_compute_address" "vertex_psc" {
-  name         = "restricted-vertex-psc"
-  region       = var.region
-  subnetwork   = google_compute_subnetwork.vertex_psc.id
-  address_type = "INTERNAL"
-}
 resource "google_network_connectivity_regional_endpoint" "vertex_us" {
   name              = "restricted-vertex-us"
   location          = var.region
@@ -216,7 +218,6 @@ resource "google_network_connectivity_regional_endpoint" "vertex_us" {
   target_google_api = "aiplatform.us.rep.googleapis.com"
   network           = google_compute_network.restricted.id
   subnetwork        = google_compute_subnetwork.vertex_psc.id
-  address           = google_compute_address.vertex_psc.address
   depends_on        = [google_project_service.network_connectivity]
 }
 resource "google_dns_managed_zone" "vertex_us_rep" {
@@ -232,7 +233,7 @@ resource "google_dns_record_set" "vertex_us_rep_apex" {
   name         = "aiplatform.us.rep.googleapis.com."
   type         = "A"
   ttl          = 300
-  rrdatas      = [google_compute_address.vertex_psc.address]
+  rrdatas      = [google_network_connectivity_regional_endpoint.vertex_us.address]
   depends_on   = [google_network_connectivity_regional_endpoint.vertex_us]
 }
 # Internal Cloud Run URLs remain on run.app even when default routes are
@@ -291,7 +292,7 @@ resource "google_compute_firewall" "allow_vertex_psc" {
   direction          = "EGRESS"
   priority           = 1005
   target_tags        = [local.gateway_connector_tag]
-  destination_ranges = ["${google_compute_address.vertex_psc.address}/32"]
+  destination_ranges = ["${google_network_connectivity_regional_endpoint.vertex_us.address}/32"]
   allow {
     protocol = "tcp"
     ports    = ["443"]
