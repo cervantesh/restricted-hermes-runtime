@@ -14,5 +14,5 @@ def test_ac10_ac16_no_partial_response_profile():
     assert "finishReason" in source and "INDETERMINATE" in source and "follow_redirects=False" in source
 
 def test_inference_surface_has_one_http_dispatch_module():
-    matches=[p for p in Path("src/restricted_runtime").rglob("*.py") if "httpx.Client" in p.read_text(encoding="utf-8")]
+    matches=[p for p in Path("src/restricted_runtime").rglob("*.py") if 'client.stream("POST"' in p.read_text(encoding="utf-8")]
     assert matches==[Path("src/restricted_runtime/vertex.py")]

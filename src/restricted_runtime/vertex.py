@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from typing import Any, Protocol
 
 import httpx
@@ -97,12 +98,16 @@ class VertexClient:
         url = "https://" + self.policy.values["hostname"] + self.policy.values["generate_content_path"]
         self.dispatch_count += 1
         try:
+            started=time.monotonic(); data=bytearray()
             with httpx.Client(follow_redirects=False, trust_env=False, timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5)) as client:
-                response = client.post(url, headers={"Authorization": "Bearer " + self._token_supplier(), "Content-Type": "application/json", "Accept-Encoding": "identity"}, content=json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-            declared = response.headers.get("content-length")
-            if declared is not None and (not declared.isdigit() or int(declared) > 1_048_576):
-                return ProviderResult("INDETERMINATE", failure_class="RESPONSE_TOO_LARGE")
-            return parse_vertex_response(response.status_code, response.content)
+                with client.stream("POST",url,headers={"Authorization": "Bearer " + self._token_supplier(), "Content-Type": "application/json", "Accept-Encoding": "identity"}, content=json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) as response:
+                    declared=response.headers.get("content-length")
+                    if declared is not None and (not declared.isdigit() or int(declared)>1_048_576):return ProviderResult("INDETERMINATE",failure_class="RESPONSE_TOO_LARGE")
+                    for chunk in response.iter_bytes():
+                        if time.monotonic()-started>40:return ProviderResult("INDETERMINATE",failure_class="TOTAL_DEADLINE")
+                        data.extend(chunk)
+                        if len(data)>1_048_576:return ProviderResult("INDETERMINATE",failure_class="RESPONSE_TOO_LARGE")
+                    return parse_vertex_response(response.status_code,bytes(data))
         except httpx.TransportError:
             return ProviderResult("INDETERMINATE", failure_class="TRANSPORT_AFTER_DISPATCH")
 

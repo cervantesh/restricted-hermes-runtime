@@ -72,6 +72,8 @@ class ConversationService:
         if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.REQUEST_COMMITTED, TurnState.INFERENCE_PENDING):
             raise ContractError("admitted turn lease lost")
         row = self.store.read_turn(self.tenant_id, row.turn_id)
+        if hasattr(self.store,"renew_lease") and not self.store.renew_lease(self.tenant_id,row.turn_id,row.lease_generation):
+            raise ContractError("lease renewal failed before provider dispatch")
         envelope = GatewayEnvelope(self.tenant_id, conversation_id, request.conversation_epoch, row.turn_id, request.client_request_id, self.policy.epoch, self.policy.digest, "restricted-phi-system.v1", SYSTEM_INSTRUCTION, "PHI", messages, self.policy.values["max_canonical_input_utf8_bytes"])
         result = self.gateway.infer_once(envelope, principal)
         if result.state != "SUCCEEDED" or result.text is None:

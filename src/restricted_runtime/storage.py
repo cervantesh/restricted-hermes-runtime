@@ -97,7 +97,7 @@ class PostgresContentStore:
             if old:return self._row(old),False
             cur.execute("SELECT 1 FROM restricted_content.turns WHERE tenant_id=%s AND conversation_id=%s AND conversation_epoch=%s AND state NOT IN ('COMMITTED','REJECTED','FAILED','INDETERMINATE')",(c.tenant_id,c.conversation_id,c.conversation_epoch))
             if cur.fetchone():raise ContractError("ACTIVE_TURN")
-            cur.execute("INSERT INTO restricted_content.turns (tenant_id,conversation_id,conversation_epoch,turn_id,client_request_id,authenticated_caller_principal,schema_version,request_mac,mac_key_resource,mac_key_version,request_ciphertext,request_nonce,wrapped_data_key,policy_digest,state,lease_owner,lease_generation,lease_expires_at) VALUES (%s,%s,%s,%s,%s,%s,'restricted-turn.v1',%s,%s,%s,%s,%s,%s,%s,%s,'handler',0,transaction_timestamp()+interval '30 seconds') ON CONFLICT (tenant_id,client_request_id) DO NOTHING",(c.tenant_id,c.conversation_id,c.conversation_epoch,c.turn_id,c.client_request_id,c.principal,c.request_mac,c.mac_key_resource,c.mac_key_version,c.request_ciphertext,c.request_nonce,c.wrapped_data_key,c.policy_digest,c.state.value))
+            cur.execute("INSERT INTO restricted_content.turns (tenant_id,conversation_id,conversation_epoch,turn_id,client_request_id,authenticated_caller_principal,schema_version,request_mac,mac_key_resource,mac_key_version,request_ciphertext,request_nonce,wrapped_data_key,policy_digest,state,lease_owner,lease_generation,lease_expires_at) VALUES (%s,%s,%s,%s,%s,%s,'restricted-turn.v1',%s,%s,%s,%s,%s,%s,%s,%s,'handler',0,transaction_timestamp()+interval '90 seconds') ON CONFLICT (tenant_id,client_request_id) DO NOTHING",(c.tenant_id,c.conversation_id,c.conversation_epoch,c.turn_id,c.client_request_id,c.principal,c.request_mac,c.mac_key_resource,c.mac_key_version,c.request_ciphertext,c.request_nonce,c.wrapped_data_key,c.policy_digest,c.state.value))
             if cur.rowcount:return c,True
             cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND client_request_id=%s FOR UPDATE",(c.tenant_id,c.client_request_id)); return self._row(cur.fetchone()),False
     def committed_history(self,t:str,c:str,e:str)->list[TurnRow]:
@@ -123,6 +123,9 @@ class PostgresContentStore:
     def claim_expired_lease(self,t:str,turn:str,owner:str,seconds:int=30)->int|None:
         with self._connect() as conn,conn.cursor() as cur:
             cur.execute("UPDATE restricted_content.turns SET lease_owner=%s,lease_generation=lease_generation+1,lease_expires_at=transaction_timestamp()+(%s || ' seconds')::interval,updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND state NOT IN ('COMMITTED','REJECTED','FAILED','INDETERMINATE') AND lease_expires_at<transaction_timestamp() RETURNING lease_generation",(owner,seconds,t,turn));row=cur.fetchone();return row["lease_generation"] if row else None
+    def renew_lease(self,t:str,turn:str,g:int,seconds:int=90)->bool:
+        with self._connect() as conn,conn.cursor() as cur:
+            cur.execute("UPDATE restricted_content.turns SET lease_expires_at=transaction_timestamp()+(%s || ' seconds')::interval,updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND lease_generation=%s AND state='INFERENCE_PENDING'",(seconds,t,turn,g));return cur.rowcount==1
     def expired_turns(self, limit:int=32)->list[TurnRow]:
         with self._connect() as conn,conn.cursor() as cur:
             cur.execute("SELECT * FROM restricted_content.turns WHERE state NOT IN ('COMMITTED','REJECTED','FAILED','INDETERMINATE') AND lease_expires_at<transaction_timestamp() ORDER BY lease_expires_at LIMIT %s",(limit,));return [self._row(r) for r in cur.fetchall()]
