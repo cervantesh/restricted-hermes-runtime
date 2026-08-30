@@ -60,6 +60,15 @@ def test_kms_algorithms_image_provenance_and_policy_build_context_are_closed():
         assert "policy/generated/policy.json" in recipe and "policy/generated/policy.sig" in recipe
 
 
+def test_cloud_build_source_context_includes_only_public_policy_artifacts():
+    ignore=Path(".gcloudignore").read_text(encoding="utf-8")
+    for excluded in (".git", ".serena/", ".env", "*.pem", "*.key", "*.p8", "*private*", "*.tfstate", "*.tfvars", "policy/generated/*"):
+        assert excluded in ignore
+    assert "!policy/generated/policy.json" in ignore
+    assert "!policy/generated/policy.sig" in ignore
+    assert "!policy/generated/public_key.b64" not in ignore
+
+
 def test_migration_uses_password_admin_socket_while_runtime_sidecars_use_iam_auth():
     source=(ROOT/"runtime.tf").read_text(encoding="utf-8")
     assert len(re.findall(r'args\s*=\s*\["--private-ip",\s*"--auto-iam-authn"',source))==2

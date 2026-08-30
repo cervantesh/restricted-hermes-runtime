@@ -1,0 +1,18 @@
+# Cloud Build source contract: public signed policy only; no private signing
+# material or workstation/runtime state may enter the uploaded source archive.
+.git
+.serena/
+.env
+*.env
+*.pem
+*.key
+*.p8
+*private*
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
+infra/.terraform/
+policy/generated/*
+!policy/generated/policy.json
+!policy/generated/policy.sig
