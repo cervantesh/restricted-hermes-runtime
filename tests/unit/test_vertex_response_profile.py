@@ -28,6 +28,11 @@ def test_observed_response_extensions_remain_closed_to_on_demand_and_bounded_bas
     assert parse_vertex_response(200,raw.replace("ON_DEMAND","BATCH").encode()).state=="INDETERMINATE"
     assert parse_vertex_response(200,raw.replace("c2FuaXRpemVkLXRoaW5raW5nLXNpZ25hdHVyZQ==","not base64!").encode()).state=="INDETERMINATE"
 
+def test_single_candidate_index_is_optional_but_never_nonzero_or_wrong_type():
+    assert parse_vertex_response(200,payload()).state=="SUCCEEDED"
+    assert parse_vertex_response(200,b'{"candidates":[{"content":{"role":"model","parts":[{"text":"x"}]},"finishReason":"STOP","index":1}]}').state=="INDETERMINATE"
+    assert parse_vertex_response(200,b'{"candidates":[{"content":{"role":"model","parts":[{"text":"x"}]},"finishReason":"STOP","index":"0"}]}').state=="INDETERMINATE"
+
 
 AC16_FIXTURES = [
     ("stop_all_optional.json", "SUCCEEDED"),

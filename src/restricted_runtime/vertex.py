@@ -76,7 +76,8 @@ def parse_vertex_response(status_code: int, raw: bytes) -> ProviderResult:
         if "avgLogprobs" in candidate and (not isinstance(candidate["avgLogprobs"],(int,float)) or isinstance(candidate["avgLogprobs"],bool) or not math.isfinite(candidate["avgLogprobs"])): raise ContractError("avgLogprobs")
         reason = candidate.get("finishReason")
         if reason in {"SAFETY", "RECITATION"}: return ProviderResult("FAILED", failure_class=reason)
-        if candidate.get("index") != 0 or not isinstance(reason, str): raise ContractError("candidate identity")
+        if "index" in candidate and (not isinstance(candidate["index"],int) or isinstance(candidate["index"],bool) or candidate["index"] != 0): raise ContractError("candidate identity")
+        if not isinstance(reason, str): raise ContractError("candidate identity")
         content = candidate.get("content")
         if not isinstance(content, dict) or set(content) != {"role", "parts"} or content["role"] != "model": raise ContractError("content")
         parts = content["parts"]

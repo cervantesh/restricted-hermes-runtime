@@ -10,8 +10,7 @@
           }
         ]
       },
-      "finishReason": "STOP",
-      "index": 0
+      "finishReason": "STOP"
     }
   ],
   "usageMetadata": {
