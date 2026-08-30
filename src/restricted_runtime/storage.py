@@ -60,3 +60,8 @@ class PostgresContentStore:
     def commit_response_cas(self, tenant_id: str, turn_id: str, generation: int, ciphertext: bytes, nonce: bytes, decision_id: str) -> bool:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("UPDATE restricted_content.turns SET response_ciphertext=%s,response_nonce=%s,gateway_decision_id=%s,state='COMMITTED',updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND lease_generation=%s AND state='RESPONSE_RECEIVED'", (ciphertext, nonce, decision_id, tenant_id, turn_id, generation)); return cur.rowcount == 1
+    def mark_terminal_cas(self, tenant_id: str, turn_id: str, generation: int, state: TurnState, failure_class: str | None) -> bool:
+        if state not in {TurnState.FAILED, TurnState.INDETERMINATE}:
+            raise ContractError("reconciler may only write failure terminals")
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE restricted_content.turns SET state=%s,failure_class=%s,updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND lease_generation=%s AND state NOT IN ('COMMITTED','REJECTED','FAILED','INDETERMINATE')", (state.value, failure_class, tenant_id, turn_id, generation)); return cur.rowcount == 1
