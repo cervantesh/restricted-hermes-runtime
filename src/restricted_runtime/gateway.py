@@ -28,8 +28,8 @@ class Ledger(Protocol):
     def fence(self, tenant_id: str, turn_id: str, *, client_request_id: str, policy_epoch: str, policy_digest: str) -> AttemptState: ...
 
 class Gateway:
-    def __init__(self, policy: PolicyBundle, mac_key: MacKey, ledger: Ledger, vertex):
-        policy.validate(); self.policy, self.mac_key, self.ledger, self.vertex = policy, mac_key, ledger, vertex
+    def __init__(self, policy: PolicyBundle, mac_key: MacKey, ledger: Ledger, vertex, *, admission_enabled: bool = True):
+        policy.validate(); self.policy, self.mac_key, self.ledger, self.vertex, self.admission_enabled = policy, mac_key, ledger, vertex, admission_enabled
         if getattr(ledger, "mac_key", None) is None:
             ledger.mac_key = mac_key
     def validate(self, envelope: GatewayEnvelope, principal: str) -> bytes:
@@ -46,6 +46,11 @@ class Gateway:
             raise ContractError("content limit mismatch")
         return canonical
     def infer_once(self, envelope: GatewayEnvelope, principal: str) -> ProviderResult:
+        # This is intentionally before validation, MAC, reservation, and the
+        # provider. A kill switch must also stop a durable pre-existing turn
+        # from crossing the only Vertex dispatch boundary.
+        if not self.admission_enabled:
+            raise ContractError("gateway admission is disabled")
         canonical = self.validate(envelope, principal)
         record = self.mac_key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN, canonical))
         state = self.ledger.reserve(envelope, principal, record.mac, record.key_resource, record.key_version)

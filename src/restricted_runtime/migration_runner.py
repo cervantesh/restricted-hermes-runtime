@@ -13,14 +13,23 @@ def migration_sql(directory: Path, conversation_user: str, gateway_user: str) ->
     return [first,rendered]
 
 
+def validate_admin_dsn(dsn: str, expected_socket: str) -> None:
+    from psycopg.conninfo import conninfo_to_dict
+    values=conninfo_to_dict(dsn)
+    if values.get("host") != expected_socket or not values.get("user") or not values.get("password"):
+        raise RuntimeError("migration admin DSN must use the expected private Cloud SQL socket and password authentication")
+
+
 def main() -> None:
     dsn=os.environ.get("MIGRATION_ADMIN_DSN")
     directory=os.environ.get("RESTRICTED_MIGRATIONS_DIR")
     conversation=os.environ.get("CONVERSATION_IAM_DB_USER")
     gateway=os.environ.get("GATEWAY_IAM_DB_USER")
-    if not all((dsn,directory,conversation,gateway)):
+    expected_socket=os.environ.get("RESTRICTED_EXPECTED_MIGRATION_SOCKET")
+    if not all((dsn,directory,conversation,gateway,expected_socket)):
         raise RuntimeError("migration bootstrap input is incomplete")
     import psycopg
+    validate_admin_dsn(dsn,expected_socket)
     with psycopg.connect(dsn) as connection:
         for statement in migration_sql(Path(directory),conversation,gateway):
             connection.execute(statement)

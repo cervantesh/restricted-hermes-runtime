@@ -8,7 +8,8 @@ locals {
     RESTRICTED_POLICY_DIGEST                 = var.policy_digest
     RESTRICTED_GATEWAY_AUDIENCE              = local.gateway_audience
     RESTRICTED_GATEWAY_MAC_KEY_RESOURCE      = google_kms_crypto_key.gateway_mac_active.id
-    RESTRICTED_GATEWAY_MAC_KEY_VERSION       = "${google_kms_crypto_key.gateway_mac_active.id}/cryptoKeyVersions/1"
+    RESTRICTED_GATEWAY_MAC_KEY_VERSION       = google_kms_crypto_key_version.gateway_mac_active.id
+    RESTRICTED_ADMISSION_ENABLED             = var.admission_enabled ? "true" : "false"
     RESTRICTED_GATEWAY_RETIRED_MAC_KEYS_JSON = jsonencode(var.retired_gateway_mac_versions)
     DATABASE_URL                             = "host=${local.sql_socket} dbname=${google_sql_database.runtime.name} user=${google_service_account.gateway.email}"
   }
@@ -25,7 +26,7 @@ locals {
     RESTRICTED_GATEWAY_AUDIENCE              = local.gateway_audience
     RESTRICTED_CONTENT_WRAP_KEY              = google_kms_crypto_key.content_wrap.id
     RESTRICTED_SERVICE_MAC_KEY_RESOURCE      = google_kms_crypto_key.service_mac_active.id
-    RESTRICTED_SERVICE_MAC_KEY_VERSION       = "${google_kms_crypto_key.service_mac_active.id}/cryptoKeyVersions/1"
+    RESTRICTED_SERVICE_MAC_KEY_VERSION       = google_kms_crypto_key_version.service_mac_active.id
     RESTRICTED_SERVICE_RETIRED_MAC_KEYS_JSON = jsonencode(var.retired_service_mac_versions)
     DATABASE_URL                             = "host=${local.sql_socket} dbname=${google_sql_database.runtime.name} user=${google_service_account.conversation.email}"
   }
@@ -35,9 +36,10 @@ locals {
     RESTRICTED_SYNTHETIC_PAYLOAD = "HRH_RESTRICTED_RUNTIME_OK"
   }
   migration_job_env = {
-    RESTRICTED_MIGRATIONS_DIR = "/app/migrations"
-    CONVERSATION_IAM_DB_USER  = google_service_account.conversation.email
-    GATEWAY_IAM_DB_USER       = google_service_account.gateway.email
+    RESTRICTED_MIGRATIONS_DIR            = "/app/migrations"
+    RESTRICTED_EXPECTED_MIGRATION_SOCKET = local.sql_socket
+    CONVERSATION_IAM_DB_USER             = google_service_account.conversation.email
+    GATEWAY_IAM_DB_USER                  = google_service_account.gateway.email
   }
 }
 
@@ -54,7 +56,7 @@ resource "google_cloud_run_v2_service" "gateway" {
       max_instance_count = 1
     }
     vpc_access {
-      connector = google_vpc_access_connector.restricted.id
+      connector = google_vpc_access_connector.gateway.id
       egress    = "ALL_TRAFFIC"
     }
     volumes {
@@ -99,7 +101,7 @@ resource "google_cloud_run_v2_service" "conversation" {
       max_instance_count = 1
     }
     vpc_access {
-      connector = google_vpc_access_connector.restricted.id
+      connector = google_vpc_access_connector.conversation.id
       egress    = "ALL_TRAFFIC"
     }
     volumes {
@@ -154,7 +156,7 @@ resource "google_cloud_run_v2_job" "runner" {
       service_account = google_service_account.runner.email
       max_retries     = 0
       vpc_access {
-        connector = google_vpc_access_connector.restricted.id
+        connector = google_vpc_access_connector.runner.id
         egress    = "ALL_TRAFFIC"
       }
       containers {
@@ -179,7 +181,7 @@ resource "google_cloud_run_v2_job" "migration" {
       service_account = google_service_account.migration.email
       max_retries     = 0
       vpc_access {
-        connector = google_vpc_access_connector.restricted.id
+        connector = google_vpc_access_connector.migration.id
         egress    = "ALL_TRAFFIC"
       }
       volumes {
@@ -212,7 +214,9 @@ resource "google_cloud_run_v2_job" "migration" {
       }
       containers {
         image = var.cloud_sql_proxy_image
-        args  = ["--auto-iam-authn", "--unix-socket=/cloudsql", google_sql_database_instance.restricted.connection_name]
+        # One-shot operator-admin DSN uses PostgreSQL password authentication.
+        # Runtime services alone use --auto-iam-authn.
+        args = ["--unix-socket=/cloudsql", google_sql_database_instance.restricted.connection_name]
         volume_mounts {
           name       = "cloudsql"
           mount_path = "/cloudsql"

@@ -11,6 +11,18 @@ from restricted_runtime.contracts import jcs_bytes
 from restricted_runtime.policy import PolicyBundle
 
 
+REPOSITORY_ROOT=Path(__file__).resolve().parents[1]
+
+
+def require_external_private_key(path: Path) -> Path:
+    resolved=path.resolve(strict=True)
+    try:
+        resolved.relative_to(REPOSITORY_ROOT)
+    except ValueError:
+        return resolved
+    raise ValueError("policy private key must remain outside the repository and Docker build context")
+
+
 def generate(*, template: Path, output_dir: Path, private_key_b64_file: Path, project_id: str, project_number: str, epoch: str, tenant_id: str, runner_principal: str, conversation_principal: str) -> tuple[Path, Path, str]:
     values=json.loads(template.read_text(encoding="utf-8"))
     values.update({
@@ -21,7 +33,8 @@ def generate(*, template: Path, output_dir: Path, private_key_b64_file: Path, pr
         "generate_content_path":f"/v1/projects/{project_number}/locations/us/publishers/google/models/gemini-3.5-flash:generateContent",
     })
     bundle=PolicyBundle(values,"");bundle.validate()
-    private=Ed25519PrivateKey.from_private_bytes(base64.b64decode(private_key_b64_file.read_text(encoding="ascii"),validate=True))
+    external_key=require_external_private_key(private_key_b64_file)
+    private=Ed25519PrivateKey.from_private_bytes(base64.b64decode(external_key.read_text(encoding="ascii"),validate=True))
     output_dir.mkdir(parents=True,exist_ok=True)
     policy_path=output_dir/"policy.json";signature_path=output_dir/"policy.sig"
     canonical=jcs_bytes(values)

@@ -7,8 +7,12 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import base64
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from tools.generate_synthetic_policy import generate
 
 
 ROOT=Path(__file__).resolve().parents[2]
@@ -96,13 +100,33 @@ def test_image_recipe_has_no_dynamic_capabilities():
         source=recipe.read_text(encoding="utf-8")
         assert ".env" not in source and "hermes" not in source.lower() and "USER " in source
         assert "AS builder" in source and "COPY --from=builder /usr/local/lib/python3.11/site-packages" in source
+        assert "COPY policy ./policy" not in source
+        assert "COPY policy/generated/policy.json policy/generated/policy.sig" in source
+
+
+@pytest.fixture
+def generated_public_policy(tmp_path):
+    """Supply only build-safe artifacts; the temporary private key is external."""
+    private=Ed25519PrivateKey.generate()
+    key=tmp_path/"external-policy-private-key.b64"
+    key.write_text(base64.b64encode(private.private_bytes_raw()).decode("ascii"),encoding="ascii")
+    output=ROOT/"policy"/"generated"
+    output.mkdir(exist_ok=True)
+    try:
+        generate(template=ROOT/"policy"/"policy.template.json",output_dir=output,private_key_b64_file=key,project_id="project",project_number="123",epoch="image-proof",tenant_id="tenant",runner_principal="caller",conversation_principal="conversation")
+        yield
+    finally:
+        for name in ("policy.json","policy.sig"):
+            (output/name).unlink(missing_ok=True)
+        try:output.rmdir()
+        except OSError:pass
 
 @pytest.mark.skipif(DOCKER is None, reason="Docker daemon unavailable locally and through Ubuntu-24.04 WSL")
 @pytest.mark.parametrize(("recipe","tag","entry","uid","absent"),[
     ("Dockerfile.conversation","restricted-runtime-conversation-proof","restricted_runtime.services.production_conversation","10001",{"vertex.py","services/production_gateway.py","services/gateway_api.py"}),
     ("Dockerfile.gateway","restricted-runtime-gateway-proof","restricted_runtime.services.production_gateway","10002",{"gateway_client.py","reconciliation.py","reconciliation_driver.py","services/production_conversation.py","services/restricted_api.py"}),
 ])
-def test_built_role_image_is_import_closed_and_has_only_its_role_surface(recipe,tag,entry,uid,absent):
+def test_built_role_image_is_import_closed_and_has_only_its_role_surface(generated_public_policy,recipe,tag,entry,uid,absent):
     built=run_docker("build","-f",recipe,"-t",tag,".")
     assert built.returncode==0,built.stdout[-2000:]+built.stderr[-2000:]
     proof=f"""

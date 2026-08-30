@@ -12,11 +12,12 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
-from restricted_runtime.contracts import ProviderResult, TurnRequest, TurnState, jcs_bytes
+from restricted_runtime.contracts import Classification, ProviderResult, TurnRequest, TurnState, jcs_bytes
+from restricted_runtime.crypto import GATEWAY_MAC_DOMAIN, kms_mac_input
 from restricted_runtime.conversation import ConversationService
 from restricted_runtime.crypto import LocalHmacKey
-from restricted_runtime.gateway import Gateway
-from restricted_runtime.policy import PolicyBundle
+from restricted_runtime.gateway import Gateway, GatewayEnvelope
+from restricted_runtime.policy import PolicyBundle, SYSTEM_INSTRUCTION
 from restricted_runtime.reconciliation import Reconciler
 from restricted_runtime.reconciliation_driver import ReconciliationDriver
 from restricted_runtime.services.restricted_api import create_app
@@ -120,4 +121,19 @@ def test_gateway_policy_rollout_mismatch_creates_no_ledger_reservation_or_provid
     with pytest.raises(Exception,match="indeterminate"):
         service.submit(request,principal="caller",conversation_id="rollout")
     with psycopg.connect(URL) as conn:assert conn.execute("SELECT count(*) FROM inference_ledger.attempts").fetchone()[0]==0
+    assert provider.calls==0
+
+
+def test_gateway_kill_switch_blocks_a_real_previously_reserved_turn_before_vertex():
+    p=policy(); key=LocalHmacKey("gateway","version",b"g"*32); ledger=PostgresLedger(URL,p,key)
+    class Provider:
+        def __init__(self):self.calls=0
+        def generate_content(self,messages):self.calls+=1;return ProviderResult("SUCCEEDED",text="must not happen")
+    provider=Provider(); turn_id=str(uuid.uuid4()); request_id=str(uuid.uuid4())
+    envelope=GatewayEnvelope("tenant","conversation","epoch",turn_id,request_id,p.epoch,p.digest,"restricted-phi-system.v1",SYSTEM_INSTRUCTION,Classification.PHI,[{"role":"user","text":"synthetic"}],p.values["max_canonical_input_utf8_bytes"],authenticated_external_principal="caller")
+    enabled=Gateway(p,key,ledger,provider); canonical=enabled.validate(envelope,"conversation"); record=key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN,canonical))
+    assert ledger.reserve(envelope,"conversation",record.mac,record.key_resource,record.key_version).value=="RESERVED"
+    disabled=Gateway(p,key,ledger,provider,admission_enabled=False)
+    with pytest.raises(Exception,match="gateway admission is disabled"):
+        disabled.infer_once(envelope,"conversation")
     assert provider.calls==0

@@ -80,9 +80,20 @@ provider "google" {
 }
 
 locals {
-  labels           = { restricted_runtime = "synthetic-only", ttl = var.ttl, phi = "forbidden" }
-  runner_audience  = "https://restricted-synthetic-conversation-${var.project_id}.run.app"
-  gateway_audience = "https://restricted-synthetic-gateway-${var.project_id}.run.app"
+  labels                   = { restricted_runtime = "synthetic-only", ttl = var.ttl, phi = "forbidden" }
+  runner_audience          = "https://restricted-synthetic-conversation-${var.project_id}.run.app"
+  gateway_audience         = "https://restricted-synthetic-gateway-${var.project_id}.run.app"
+  artifact_registry_prefix = "${var.region}-docker.pkg.dev/${var.project_id}/restricted-synthetic-runtime/"
+}
+
+check "runtime_images_are_project_owned" {
+  assert {
+    condition = alltrue([
+      for image in [var.conversation_image, var.gateway_image, var.runner_image, var.migration_image] :
+      startswith(image, local.artifact_registry_prefix) && can(regex("@sha256:[0-9a-f]{64}$", image))
+    ]) && startswith(var.cloud_sql_proxy_image, "gcr.io/cloud-sql-connectors/cloud-sql-proxy@sha256:")
+    error_message = "runtime images must be digests from this project's restricted Artifact Registry; only the official digest-pinned Cloud SQL proxy is external."
+  }
 }
 
 resource "google_artifact_registry_repository" "runtime" {
@@ -93,8 +104,9 @@ resource "google_artifact_registry_repository" "runtime" {
 }
 
 resource "google_compute_network" "restricted" {
-  name                    = "restricted-synthetic-vpc"
-  auto_create_subnetworks = false
+  name                            = "restricted-synthetic-vpc"
+  auto_create_subnetworks         = false
+  delete_default_routes_on_create = true
 }
 resource "google_compute_subnetwork" "restricted" {
   name                     = "restricted-synthetic-subnet"
@@ -115,11 +127,106 @@ resource "google_service_networking_connection" "private_services" {
   service                 = "servicenetworking.googleapis.com"
   reserved_peering_ranges = [google_compute_global_address.private_services.name]
 }
-resource "google_vpc_access_connector" "restricted" {
-  name          = "restricted-synthetic-egress"
+resource "google_vpc_access_connector" "conversation" {
+  name          = "restricted-synthetic-conversation-egress"
   region        = var.region
   network       = google_compute_network.restricted.name
   ip_cidr_range = "10.77.1.0/28"
+}
+resource "google_vpc_access_connector" "gateway" {
+  name          = "restricted-synthetic-gateway-egress"
+  region        = var.region
+  network       = google_compute_network.restricted.name
+  ip_cidr_range = "10.77.2.0/28"
+}
+resource "google_vpc_access_connector" "runner" {
+  name          = "restricted-synthetic-runner-egress"
+  region        = var.region
+  network       = google_compute_network.restricted.name
+  ip_cidr_range = "10.77.3.0/28"
+}
+resource "google_vpc_access_connector" "migration" {
+  name          = "restricted-synthetic-migration-egress"
+  region        = var.region
+  network       = google_compute_network.restricted.name
+  ip_cidr_range = "10.77.4.0/28"
+}
+
+locals {
+  connector_tags = [
+    "vpc-connector-${var.region}-${google_vpc_access_connector.conversation.name}",
+    "vpc-connector-${var.region}-${google_vpc_access_connector.gateway.name}",
+    "vpc-connector-${var.region}-${google_vpc_access_connector.runner.name}",
+    "vpc-connector-${var.region}-${google_vpc_access_connector.migration.name}",
+  ]
+}
+
+# The official restricted.googleapis.com baseline permits only the restricted
+# VIP before deny-all. FQDN/SNI verification remains an external HOLD gate.
+resource "google_dns_managed_zone" "googleapis" {
+  name       = "restricted-synthetic-googleapis"
+  dns_name   = "googleapis.com."
+  visibility = "private"
+  private_visibility_config {
+    networks {
+      network_url = google_compute_network.restricted.id
+    }
+  }
+}
+resource "google_dns_record_set" "restricted_googleapis" {
+  managed_zone = google_dns_managed_zone.googleapis.name
+  name         = "restricted.googleapis.com."
+  type         = "A"
+  ttl          = 300
+  rrdatas      = ["199.36.153.4", "199.36.153.5", "199.36.153.6", "199.36.153.7"]
+}
+resource "google_dns_record_set" "all_googleapis" {
+  managed_zone = google_dns_managed_zone.googleapis.name
+  name         = "*.googleapis.com."
+  type         = "CNAME"
+  ttl          = 300
+  rrdatas      = ["restricted.googleapis.com."]
+}
+resource "google_compute_route" "restricted_google_apis" {
+  name             = "restricted-synthetic-google-apis"
+  network          = google_compute_network.restricted.id
+  dest_range       = "199.36.153.4/30"
+  next_hop_gateway = "default-internet-gateway"
+}
+resource "google_compute_firewall" "allow_restricted_google_apis" {
+  name               = "restricted-synthetic-allow-google-apis"
+  network            = google_compute_network.restricted.name
+  direction          = "EGRESS"
+  priority           = 1000
+  target_tags        = local.connector_tags
+  destination_ranges = ["199.36.153.4/30"]
+  allow {
+    protocol = "tcp"
+    ports    = ["443"]
+  }
+}
+resource "google_compute_firewall" "allow_private_sql" {
+  name               = "restricted-synthetic-allow-private-sql"
+  network            = google_compute_network.restricted.name
+  direction          = "EGRESS"
+  priority           = 1010
+  target_tags        = local.connector_tags
+  destination_ranges = ["${google_compute_global_address.private_services.address}/${google_compute_global_address.private_services.prefix_length}"]
+  allow {
+    protocol = "tcp"
+    ports    = ["5432"]
+  }
+}
+resource "google_compute_firewall" "deny_other_egress" {
+  name               = "restricted-synthetic-deny-other-egress"
+  network            = google_compute_network.restricted.name
+  direction          = "EGRESS"
+  priority           = 65534
+  target_tags        = local.connector_tags
+  destination_ranges = ["0.0.0.0/0"]
+  deny {
+    protocol = "all"
+  }
 }
 
 resource "google_service_account" "runner" {
@@ -144,34 +251,64 @@ resource "google_kms_key_ring" "restricted" {
   location = var.region
 }
 resource "google_kms_crypto_key" "content_wrap" {
-  name     = "content-wrap"
-  key_ring = google_kms_key_ring.restricted.id
-  purpose  = "ENCRYPT_DECRYPT"
+  name                          = "content-wrap"
+  key_ring                      = google_kms_key_ring.restricted.id
+  purpose                       = "ENCRYPT_DECRYPT"
+  skip_initial_version_creation = true
+  version_template { algorithm = "GOOGLE_SYMMETRIC_ENCRYPTION" }
 }
 resource "google_kms_crypto_key" "service_mac_active" {
-  name     = "service-idempotency-active"
-  key_ring = google_kms_key_ring.restricted.id
-  purpose  = "MAC"
+  name                          = "service-idempotency-active"
+  key_ring                      = google_kms_key_ring.restricted.id
+  purpose                       = "MAC"
+  skip_initial_version_creation = true
+  version_template { algorithm = "HMAC_SHA256" }
 }
 resource "google_kms_crypto_key" "service_mac_retired" {
-  name     = "service-idempotency-retired"
-  key_ring = google_kms_key_ring.restricted.id
-  purpose  = "MAC"
+  name                          = "service-idempotency-retired"
+  key_ring                      = google_kms_key_ring.restricted.id
+  purpose                       = "MAC"
+  skip_initial_version_creation = true
+  version_template { algorithm = "HMAC_SHA256" }
 }
 resource "google_kms_crypto_key" "gateway_mac_active" {
-  name     = "gateway-envelope-active"
-  key_ring = google_kms_key_ring.restricted.id
-  purpose  = "MAC"
+  name                          = "gateway-envelope-active"
+  key_ring                      = google_kms_key_ring.restricted.id
+  purpose                       = "MAC"
+  skip_initial_version_creation = true
+  version_template { algorithm = "HMAC_SHA256" }
 }
 resource "google_kms_crypto_key" "gateway_mac_retired" {
-  name     = "gateway-envelope-retired"
-  key_ring = google_kms_key_ring.restricted.id
-  purpose  = "MAC"
+  name                          = "gateway-envelope-retired"
+  key_ring                      = google_kms_key_ring.restricted.id
+  purpose                       = "MAC"
+  skip_initial_version_creation = true
+  version_template { algorithm = "HMAC_SHA256" }
 }
 resource "google_kms_crypto_key" "policy_signing" {
-  name     = "policy-ed25519"
-  key_ring = google_kms_key_ring.restricted.id
-  purpose  = "ASYMMETRIC_SIGN"
+  name                          = "policy-ed25519"
+  key_ring                      = google_kms_key_ring.restricted.id
+  purpose                       = "ASYMMETRIC_SIGN"
+  skip_initial_version_creation = true
+  version_template { algorithm = "EC_SIGN_ED25519" }
+}
+resource "google_kms_crypto_key_version" "content_wrap_active" {
+  crypto_key = google_kms_crypto_key.content_wrap.id
+}
+resource "google_kms_crypto_key_version" "service_mac_active" {
+  crypto_key = google_kms_crypto_key.service_mac_active.id
+}
+resource "google_kms_crypto_key_version" "service_mac_retired" {
+  crypto_key = google_kms_crypto_key.service_mac_retired.id
+}
+resource "google_kms_crypto_key_version" "gateway_mac_active" {
+  crypto_key = google_kms_crypto_key.gateway_mac_active.id
+}
+resource "google_kms_crypto_key_version" "gateway_mac_retired" {
+  crypto_key = google_kms_crypto_key.gateway_mac_retired.id
+}
+resource "google_kms_crypto_key_version" "policy_signing_active" {
+  crypto_key = google_kms_crypto_key.policy_signing.id
 }
 resource "google_project_iam_custom_role" "mac_verify_only" {
   role_id     = "restrictedSyntheticMacVerify"

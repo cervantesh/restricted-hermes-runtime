@@ -1,0 +1,16 @@
+.git
+.serena
+.env
+*.pem
+*.key
+*private*
+policy/generated/*
+!policy/generated/policy.json
+!policy/generated/policy.sig
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+tests/
+infra/
+collectors/

@@ -1,8 +1,14 @@
 # Required controlled-egress boundary (apply blocker)
 
-Status for the synthetic diagnostic: **UNDETERMINED**.  The Terraform baseline
-uses Private Google Access and intentionally has no NAT, but it does not claim
-an inspected FQDN/SNI/certificate witness.  This residual result prevents
+Status for the synthetic diagnostic: **UNDETERMINED / HOLD_DEPLOYMENT**. The
+Terraform baseline uses Private Google Access, a private `googleapis.com` DNS
+zone resolving `*.googleapis.com` to `restricted.googleapis.com`
+(`199.36.153.4/30`), an exact TCP/443 allow to that VIP before deny-all, and
+has no NAT or broad default route. Private SQL is separately allowed on 5432
+over the PSA range. Each role receives its own VPC connector; this is a
+network baseline, not a claim that application hostnames were inspected.
+
+It does not claim an inspected FQDN/SNI/certificate witness. This residual result prevents
 `READY`, `CLOSED`, and any PHI authorization claim.
 
 Cloud Run and Terraform alone do not prove host/SNI enforcement. The deployment
@@ -17,5 +23,6 @@ egress proxy/firewall that validates request hostname plus TLS SNI/certificate.
   Deny global/alternate Vertex endpoints, proxying, redirects, literal IPs,
   metadata paths other than identity, and all telemetry/download routes.
 
-An exact-staging test must demonstrate each denied route. This file is a policy
-input, not evidence that a network control exists.
+An exact-staging test must demonstrate each denied route and the internal Run
+reachability path before this HOLD can change. This file is a policy input, not
+evidence that a network control exists.
