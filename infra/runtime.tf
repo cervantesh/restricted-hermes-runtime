@@ -11,7 +11,7 @@ locals {
     RESTRICTED_GATEWAY_MAC_KEY_VERSION       = google_kms_crypto_key_version.gateway_mac_active.id
     RESTRICTED_ADMISSION_ENABLED             = var.admission_enabled ? "true" : "false"
     RESTRICTED_GATEWAY_RETIRED_MAC_KEYS_JSON = jsonencode(var.retired_gateway_mac_versions)
-    DATABASE_URL                             = "host=${local.sql_socket} dbname=${google_sql_database.runtime.name} user=${google_service_account.gateway.email}"
+    DATABASE_URL                             = "host=${local.sql_socket} dbname=${google_sql_database.runtime.name} user=${local.gateway_db_user}"
   }
   conversation_runtime_env = {
     RESTRICTED_POLICY_PATH                   = "/app/policy/generated/policy.json"
@@ -28,7 +28,7 @@ locals {
     RESTRICTED_SERVICE_MAC_KEY_RESOURCE      = google_kms_crypto_key.service_mac_active.id
     RESTRICTED_SERVICE_MAC_KEY_VERSION       = google_kms_crypto_key_version.service_mac_active.id
     RESTRICTED_SERVICE_RETIRED_MAC_KEYS_JSON = jsonencode(var.retired_service_mac_versions)
-    DATABASE_URL                             = "host=${local.sql_socket} dbname=${google_sql_database.runtime.name} user=${google_service_account.conversation.email}"
+    DATABASE_URL                             = "host=${local.sql_socket} dbname=${google_sql_database.runtime.name} user=${local.conversation_db_user}"
   }
   runner_job_env = {
     RESTRICTED_RUNNER_AUDIENCE   = local.runner_audience
@@ -38,8 +38,8 @@ locals {
   migration_job_env = {
     RESTRICTED_MIGRATIONS_DIR            = "/app/migrations"
     RESTRICTED_EXPECTED_MIGRATION_SOCKET = local.sql_socket
-    CONVERSATION_IAM_DB_USER             = google_service_account.conversation.email
-    GATEWAY_IAM_DB_USER                  = google_service_account.gateway.email
+    CONVERSATION_IAM_DB_USER             = local.conversation_db_user
+    GATEWAY_IAM_DB_USER                  = local.gateway_db_user
   }
 }
 
@@ -79,7 +79,7 @@ resource "google_cloud_run_v2_service" "gateway" {
     }
     containers {
       image = var.cloud_sql_proxy_image
-      args  = ["--auto-iam-authn", "--unix-socket=/cloudsql", google_sql_database_instance.restricted.connection_name]
+      args  = ["--private-ip", "--auto-iam-authn", "--unix-socket=/cloudsql", google_sql_database_instance.restricted.connection_name]
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -124,7 +124,7 @@ resource "google_cloud_run_v2_service" "conversation" {
     }
     containers {
       image = var.cloud_sql_proxy_image
-      args  = ["--auto-iam-authn", "--unix-socket=/cloudsql", google_sql_database_instance.restricted.connection_name]
+      args  = ["--private-ip", "--auto-iam-authn", "--unix-socket=/cloudsql", google_sql_database_instance.restricted.connection_name]
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -216,7 +216,7 @@ resource "google_cloud_run_v2_job" "migration" {
         image = var.cloud_sql_proxy_image
         # One-shot operator-admin DSN uses PostgreSQL password authentication.
         # Runtime services alone use --auto-iam-authn.
-        args = ["--unix-socket=/cloudsql", google_sql_database_instance.restricted.connection_name]
+        args = ["--private-ip", "--unix-socket=/cloudsql", google_sql_database_instance.restricted.connection_name]
         volume_mounts {
           name       = "cloudsql"
           mount_path = "/cloudsql"

@@ -19,6 +19,7 @@ def isolated_database():
     with psycopg.connect(DATABASE_URL,autocommit=True) as conn:
         conn.execute("DROP SCHEMA IF EXISTS restricted_content CASCADE; DROP SCHEMA IF EXISTS inference_ledger CASCADE")
         conn.execute(Path("migrations/001_restricted_runtime.sql").read_text(encoding="utf-8"))
+        conn.execute("UPDATE inference_ledger.runtime_controls SET dispatch_enabled=true WHERE control_key=true")
     yield
 def turn(*,key=None,conversation="c",epoch="e",state=TurnState.RECEIVED):
     return TurnRow("tenant",conversation,epoch,str(uuid.uuid4()),key or str(uuid.uuid4()),"caller",b"mac","service-key","1","policy",state,b"cipher",b"123456789012",None,None,b"wrapped",0)

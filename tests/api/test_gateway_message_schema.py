@@ -33,6 +33,7 @@ def migrated():
     with psycopg.connect(URL,autocommit=True) as conn:
         conn.execute("DROP SCHEMA IF EXISTS restricted_content CASCADE; DROP SCHEMA IF EXISTS inference_ledger CASCADE")
         conn.execute(Path("migrations/001_restricted_runtime.sql").read_text(encoding="utf-8"))
+        conn.execute("UPDATE inference_ledger.runtime_controls SET dispatch_enabled=true WHERE control_key=true")
 
 @pytest.mark.parametrize("messages",[[{"role":"system","text":"x"}],[{"role":"user","text":"x","extra":"no"}],[{"role":"user","text":""}]])
 def test_infer_rejects_closed_internal_message_violations_before_ledger_or_provider(messages):

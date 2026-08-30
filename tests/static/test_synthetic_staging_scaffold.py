@@ -27,6 +27,7 @@ def test_staging_has_no_nat_and_keeps_fqdn_sni_residual_undetermined():
     assert "google_compute_router_nat" not in source
     assert 'dest_range       = "199.36.153.4/30"' in source
     assert "restricted.googleapis.com." in source
+    assert 'dns_name   = "run.app."' in source and 'name         = "*.run.app."' in source
     assert "google_compute_firewall" in source and 'protocol = "all"' in source
     assert "UNDETERMINED" in (ROOT / "egress-policy.md").read_text(encoding="utf-8")
 
@@ -61,10 +62,29 @@ def test_kms_algorithms_image_provenance_and_policy_build_context_are_closed():
 
 def test_migration_uses_password_admin_socket_while_runtime_sidecars_use_iam_auth():
     source=(ROOT/"runtime.tf").read_text(encoding="utf-8")
-    assert len(re.findall(r'args\s*=\s*\["--auto-iam-authn"',source))==2
+    assert len(re.findall(r'args\s*=\s*\["--private-ip",\s*"--auto-iam-authn"',source))==2
     assert "RESTRICTED_EXPECTED_MIGRATION_SOCKET" in source
-    assert 'args = ["--unix-socket=/cloudsql"' in source
+    assert 'args = ["--private-ip", "--unix-socket=/cloudsql"' in source
     assert "MIGRATION_ADMIN_DSN" in source
+
+
+def test_connectors_fit_the_official_weighted_name_limit_and_sql_users_are_trimmed():
+    main=(ROOT/"main.tf").read_text(encoding="utf-8")
+    names=re.findall(r'resource "google_vpc_access_connector" "\w+" \{\s+name\s*=\s*"([^"]+)"',main)
+    assert len(names)==4 and all(len(name)+name.count("-") < 21 for name in names)
+    assert "trimsuffix(google_service_account.conversation.email, \".gserviceaccount.com\")" in main
+    assert "trimsuffix(google_service_account.gateway.email, \".gserviceaccount.com\")" in main
+    runtime=(ROOT/"runtime.tf").read_text(encoding="utf-8")
+    assert "local.conversation_db_user" in runtime and "local.gateway_db_user" in runtime
+
+
+def test_durable_dispatch_control_starts_disabled_and_is_not_mutable_by_gateway_role():
+    migration=Path("migrations/001_restricted_runtime.sql").read_text(encoding="utf-8")
+    storage=Path("src/restricted_runtime/storage.py").read_text(encoding="utf-8")
+    assert "CREATE TABLE inference_ledger.runtime_controls" in migration
+    assert "dispatch_enabled boolean NOT NULL DEFAULT false" in migration
+    assert "REVOKE INSERT, UPDATE, DELETE ON inference_ledger.runtime_controls FROM restricted_ledger_runtime" in migration
+    assert "control.dispatch_enabled=true" in storage and "attempt.state='RESERVED'" in storage
 
 
 def test_release_recipe_has_no_fake_digest_or_private_key_and_imports_manual_registry():

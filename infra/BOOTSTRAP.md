@@ -55,9 +55,16 @@ are present. Its Cloud SQL Auth Proxy deliberately does **not** use
 `002_synthetic_iam_role_grants.sql.tmpl`. Runtime identities never receive DDL
 privileges. The conversation IAM database user receives only
 `restricted_content_runtime`; the gateway receives only
-`restricted_ledger_runtime`.
+`restricted_ledger_runtime`. Cloud SQL IAM database usernames are the service
+account emails with the `.gserviceaccount.com` suffix removed; OIDC audiences
+and Cloud IAM bindings retain full service-account emails.
 
 The VPC has Private Google Access and no NAT. It intentionally does not claim
 FQDN/SNI/certificate enforcement; that receipt field is `UNDETERMINED` until a
 separately approved inspected egress control is deployed and tested. The
 synthetic runner payload is fixed and must never be replaced with PHI.
+
+The VPC's private DNS also maps `*.run.app` to the restricted VIP so the two
+internal Cloud Run invocations retain a route after default-route removal. This
+does not prove SNI/certificate enforcement; see `KILL_SWITCH.md` for the
+separate durable dispatch disablement required before rollout or rollback.

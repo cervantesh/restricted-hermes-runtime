@@ -56,6 +56,7 @@ def migrated():
     with psycopg.connect(URL,autocommit=True) as conn:
         conn.execute("DROP SCHEMA IF EXISTS restricted_content CASCADE; DROP SCHEMA IF EXISTS inference_ledger CASCADE")
         conn.execute(Path("migrations/001_restricted_runtime.sql").read_text(encoding="utf-8"))
+        conn.execute("UPDATE inference_ledger.runtime_controls SET dispatch_enabled=true WHERE control_key=true")
 
 def test_reconciliation_driver_scans_expired_rows_without_inference():
     p=policy();store=PostgresContentStore(URL);key=LocalHmacKey("gateway","1",b"g"*32);provider=ExplodingProvider();ledger=PostgresLedger(URL,p,key)
@@ -136,4 +137,21 @@ def test_gateway_kill_switch_blocks_a_real_previously_reserved_turn_before_verte
     disabled=Gateway(p,key,ledger,provider,admission_enabled=False)
     with pytest.raises(Exception,match="gateway admission is disabled"):
         disabled.infer_once(envelope,"conversation")
+    assert provider.calls==0
+
+
+def test_durable_dispatch_control_blocks_pre_reserved_turn_without_vertex_transition():
+    p=policy(); key=LocalHmacKey("gateway","version",b"g"*32); ledger=PostgresLedger(URL,p,key)
+    class Provider:
+        def __init__(self):self.calls=0
+        def generate_content(self,messages):self.calls+=1;return ProviderResult("SUCCEEDED",text="must not happen")
+    provider=Provider(); turn_id=str(uuid.uuid4()); request_id=str(uuid.uuid4())
+    envelope=GatewayEnvelope("tenant","conversation","epoch",turn_id,request_id,p.epoch,p.digest,"restricted-phi-system.v1",SYSTEM_INSTRUCTION,Classification.PHI,[{"role":"user","text":"synthetic"}],p.values["max_canonical_input_utf8_bytes"],authenticated_external_principal="caller")
+    gateway=Gateway(p,key,ledger,provider); canonical=gateway.validate(envelope,"conversation"); record=key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN,canonical))
+    assert ledger.reserve(envelope,"conversation",record.mac,record.key_resource,record.key_version).value=="RESERVED"
+    with psycopg.connect(URL,autocommit=True) as conn:
+        conn.execute("UPDATE inference_ledger.runtime_controls SET dispatch_enabled=false WHERE control_key=true")
+    assert gateway.infer_once(envelope,"conversation").state=="CANCELLED_NO_DISPATCH"
+    with psycopg.connect(URL) as conn:
+        assert conn.execute("SELECT state FROM inference_ledger.attempts WHERE turn_id=%s",(turn_id,)).fetchone()[0]=="RESERVED"
     assert provider.calls==0

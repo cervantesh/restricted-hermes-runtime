@@ -28,6 +28,14 @@ GRANT USAGE ON SCHEMA restricted_content TO restricted_content_runtime;
 GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA restricted_content TO restricted_content_runtime;
 
 CREATE TYPE inference_ledger.attempt_state AS ENUM ('RESERVED','DISPATCH_STARTED','SUCCEEDED','FAILED','INDETERMINATE','CANCELLED_NO_DISPATCH');
+-- One durable, operator-controlled dispatch gate. It starts disabled and is
+-- consulted in the same UPDATE that claims the only provider-dispatch state.
+CREATE TABLE inference_ledger.runtime_controls (
+  control_key boolean PRIMARY KEY DEFAULT true CHECK (control_key),
+  dispatch_enabled boolean NOT NULL DEFAULT false,
+  updated_at timestamptz NOT NULL DEFAULT transaction_timestamp()
+);
+INSERT INTO inference_ledger.runtime_controls (control_key, dispatch_enabled) VALUES (true, false) ON CONFLICT DO NOTHING;
 CREATE TABLE inference_ledger.dispatch_guards (
   tenant_id text NOT NULL, turn_id uuid NOT NULL, client_request_id uuid NOT NULL,
   policy_epoch text NOT NULL, policy_digest text NOT NULL,
@@ -48,3 +56,7 @@ CREATE TABLE inference_ledger.cancellation_tombstones (
 );
 GRANT USAGE ON SCHEMA inference_ledger TO restricted_ledger_runtime;
 GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA inference_ledger TO restricted_ledger_runtime;
+-- Only the operator-admin bootstrap identity can toggle this control. Gateway
+-- code needs SELECT in its atomic transition predicate, never UPDATE.
+REVOKE INSERT, UPDATE, DELETE ON inference_ledger.runtime_controls FROM restricted_ledger_runtime;
+GRANT SELECT ON inference_ledger.runtime_controls TO restricted_ledger_runtime;

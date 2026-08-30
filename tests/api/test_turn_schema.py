@@ -35,7 +35,7 @@ class Provider:
 @pytest.fixture
 def client():
     with psycopg.connect(URL,autocommit=True) as c:
-        c.execute("DROP SCHEMA IF EXISTS restricted_content CASCADE; DROP SCHEMA IF EXISTS inference_ledger CASCADE");c.execute(Path("migrations/001_restricted_runtime.sql").read_text(encoding="utf-8"))
+        c.execute("DROP SCHEMA IF EXISTS restricted_content CASCADE; DROP SCHEMA IF EXISTS inference_ledger CASCADE");c.execute(Path("migrations/001_restricted_runtime.sql").read_text(encoding="utf-8"));c.execute("UPDATE inference_ledger.runtime_controls SET dispatch_enabled=true WHERE control_key=true")
     p=policy();provider=Provider();gkey=LocalHmacKey("gateway","1",b"g"*32);svc=ConversationService(PostgresContentStore(URL),Gateway(p,gkey,PostgresLedger(URL,p,gkey),provider),LocalHmacKey("service","1",b"s"*32),Keys(),p,"tenant")
     return TestClient(create_app(svc,SyntheticAuthenticator("caller"))),provider
 

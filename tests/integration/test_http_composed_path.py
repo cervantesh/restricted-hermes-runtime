@@ -64,6 +64,7 @@ def migrated():
     with psycopg.connect(URL,autocommit=True) as conn:
         conn.execute("DROP SCHEMA IF EXISTS restricted_content CASCADE; DROP SCHEMA IF EXISTS inference_ledger CASCADE")
         conn.execute(Path("migrations/001_restricted_runtime.sql").read_text(encoding="utf-8"))
+        conn.execute("UPDATE inference_ledger.runtime_controls SET dispatch_enabled=true WHERE control_key=true")
 
 def test_real_http_composition_commits_encrypted_readback_and_duplicate_dispatches_once():
     p=policy();provider=CountedProvider();key=LocalHmacKey("gateway","1",b"g"*32)

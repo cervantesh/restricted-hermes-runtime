@@ -128,25 +128,25 @@ resource "google_service_networking_connection" "private_services" {
   reserved_peering_ranges = [google_compute_global_address.private_services.name]
 }
 resource "google_vpc_access_connector" "conversation" {
-  name          = "restricted-synthetic-conversation-egress"
+  name          = "rr-conv-eg"
   region        = var.region
   network       = google_compute_network.restricted.name
   ip_cidr_range = "10.77.1.0/28"
 }
 resource "google_vpc_access_connector" "gateway" {
-  name          = "restricted-synthetic-gateway-egress"
+  name          = "rr-gw-eg"
   region        = var.region
   network       = google_compute_network.restricted.name
   ip_cidr_range = "10.77.2.0/28"
 }
 resource "google_vpc_access_connector" "runner" {
-  name          = "restricted-synthetic-runner-egress"
+  name          = "rr-run-eg"
   region        = var.region
   network       = google_compute_network.restricted.name
   ip_cidr_range = "10.77.3.0/28"
 }
 resource "google_vpc_access_connector" "migration" {
-  name          = "restricted-synthetic-migration-egress"
+  name          = "rr-mig-eg"
   region        = var.region
   network       = google_compute_network.restricted.name
   ip_cidr_range = "10.77.4.0/28"
@@ -186,6 +186,26 @@ resource "google_dns_record_set" "all_googleapis" {
   type         = "CNAME"
   ttl          = 300
   rrdatas      = ["restricted.googleapis.com."]
+}
+# Internal Cloud Run URLs remain on run.app even when default routes are
+# removed. Resolve their wildcard only to the same restricted VIP; the
+# firewall's exact TCP/443 allow remains the sole network path.
+resource "google_dns_managed_zone" "runapp" {
+  name       = "restricted-synthetic-runapp"
+  dns_name   = "run.app."
+  visibility = "private"
+  private_visibility_config {
+    networks {
+      network_url = google_compute_network.restricted.id
+    }
+  }
+}
+resource "google_dns_record_set" "all_runapp" {
+  managed_zone = google_dns_managed_zone.runapp.name
+  name         = "*.run.app."
+  type         = "A"
+  ttl          = 300
+  rrdatas      = ["199.36.153.4", "199.36.153.5", "199.36.153.6", "199.36.153.7"]
 }
 resource "google_compute_route" "restricted_google_apis" {
   name             = "restricted-synthetic-google-apis"
@@ -341,18 +361,25 @@ resource "google_sql_database" "runtime" {
   name     = "restricted_runtime"
   instance = google_sql_database_instance.restricted.name
 }
+locals {
+  # Cloud SQL IAM database usernames omit this service-account domain suffix.
+  # OIDC and Google IAM bindings deliberately retain the full email identity.
+  conversation_db_user = trimsuffix(google_service_account.conversation.email, ".gserviceaccount.com")
+  gateway_db_user      = trimsuffix(google_service_account.gateway.email, ".gserviceaccount.com")
+  migration_db_user    = trimsuffix(google_service_account.migration.email, ".gserviceaccount.com")
+}
 resource "google_sql_user" "conversation" {
-  name     = google_service_account.conversation.email
+  name     = local.conversation_db_user
   instance = google_sql_database_instance.restricted.name
   type     = "CLOUD_IAM_SERVICE_ACCOUNT"
 }
 resource "google_sql_user" "gateway" {
-  name     = google_service_account.gateway.email
+  name     = local.gateway_db_user
   instance = google_sql_database_instance.restricted.name
   type     = "CLOUD_IAM_SERVICE_ACCOUNT"
 }
 resource "google_sql_user" "migration" {
-  name     = google_service_account.migration.email
+  name     = local.migration_db_user
   instance = google_sql_database_instance.restricted.name
   type     = "CLOUD_IAM_SERVICE_ACCOUNT"
 }

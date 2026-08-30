@@ -49,7 +49,10 @@ class PostgresLedger:
             self._same(row,envelope,principal,mac); return AttemptState(row["state"])
     def start_dispatch(self, tenant_id: str, turn_id: str) -> bool:
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("UPDATE inference_ledger.attempts SET state='DISPATCH_STARTED',updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND state='RESERVED'",(tenant_id,turn_id)); return cur.rowcount == 1
+            # The durable control is part of the state-transition predicate;
+            # an environment switch cannot leave an already-reserved row able
+            # to cross the sole provider dispatch boundary after a live rollout.
+            cur.execute("UPDATE inference_ledger.attempts AS attempt SET state='DISPATCH_STARTED',updated_at=transaction_timestamp() FROM inference_ledger.runtime_controls AS control WHERE control.control_key=true AND control.dispatch_enabled=true AND attempt.tenant_id=%s AND attempt.turn_id=%s AND attempt.state='RESERVED'",(tenant_id,turn_id)); return cur.rowcount == 1
     def finish(self, tenant_id: str, turn_id: str, result: ProviderResult) -> None:
         state=result.state if result.state in {"SUCCEEDED","FAILED","INDETERMINATE"} else "INDETERMINATE"
         with self._connect() as conn, conn.cursor() as cur:

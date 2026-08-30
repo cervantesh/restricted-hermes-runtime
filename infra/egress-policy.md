@@ -4,8 +4,11 @@ Status for the synthetic diagnostic: **UNDETERMINED / HOLD_DEPLOYMENT**. The
 Terraform baseline uses Private Google Access, a private `googleapis.com` DNS
 zone resolving `*.googleapis.com` to `restricted.googleapis.com`
 (`199.36.153.4/30`), an exact TCP/443 allow to that VIP before deny-all, and
-has no NAT or broad default route. Private SQL is separately allowed on 5432
-over the PSA range. Each role receives its own VPC connector; this is a
+has no NAT or broad default route. A private `run.app` wildcard resolves to
+the same restricted VIP so internal runner-to-conversation and
+conversation-to-gateway URLs remain reachable. Private SQL is separately
+allowed on 5432 over the PSA range. Each role receives its own VPC connector;
+this is a
 network baseline, not a claim that application hostnames were inspected.
 
 It does not claim an inspected FQDN/SNI/certificate witness. This residual result prevents
