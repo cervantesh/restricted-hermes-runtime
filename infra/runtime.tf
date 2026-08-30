@@ -19,6 +19,7 @@ locals {
     RESTRICTED_POLICY_EPOCH = var.policy_epoch
     RESTRICTED_POLICY_DIGEST = var.policy_digest
     RESTRICTED_TENANT_ID = var.tenant_id
+    RESTRICTED_ADMISSION_ENABLED = var.admission_enabled ? "true" : "false"
     RESTRICTED_RUNNER_AUDIENCE = local.runner_audience
     RESTRICTED_GATEWAY_URL = google_cloud_run_v2_service.gateway.uri
     RESTRICTED_GATEWAY_AUDIENCE = local.gateway_audience

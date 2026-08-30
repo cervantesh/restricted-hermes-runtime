@@ -47,6 +47,7 @@ class ConversationService:
     policy: PolicyBundle
     tenant_id: str
     lease_heartbeat_seconds: float = 20
+    admission_enabled: bool = True
 
     def _aad(self, row: TurnRow, direction: str) -> bytes:
         return content_aad(tenant_id=row.tenant_id, conversation_id=row.conversation_id, conversation_epoch=row.conversation_epoch, turn_id=row.turn_id, client_request_id=row.client_request_id, direction=direction, policy_digest=row.policy_digest)
@@ -76,6 +77,8 @@ class ConversationService:
             # reconciler can fence/claim the still non-terminal row later.
             pass
     def submit(self, request: TurnRequest, *, principal: str, conversation_id: str) -> dict[str, str]:
+        if not self.admission_enabled:
+            raise ContractError("restricted admission is disabled")
         canonical = jcs_bytes(request.identity(principal=principal, tenant_id=self.tenant_id, conversation_id=conversation_id))
         if len(canonical) > self.policy.values["max_canonical_input_utf8_bytes"]:
             raise ContractError("canonical input exceeds policy")

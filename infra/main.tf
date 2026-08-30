@@ -18,6 +18,10 @@ variable "policy_epoch" { type = string }
 variable "policy_digest" { type = string }
 variable "policy_public_key_b64" { type = string }
 variable "ttl" { type = string }
+variable "admission_enabled" {
+  type = bool
+  default = true
+}
 variable "conversation_image" {
   type = string
   validation {

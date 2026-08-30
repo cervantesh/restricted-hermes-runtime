@@ -30,7 +30,9 @@ def build_app():
     active_resource=required("RESTRICTED_SERVICE_MAC_KEY_RESOURCE");active_version=required("RESTRICTED_SERVICE_MAC_KEY_VERSION")
     active=GoogleKmsHmacKey(active_resource,active_version,retired_versions("RESTRICTED_SERVICE_RETIRED_MAC_KEYS_JSON",active_resource,active_version))
     store=PostgresContentStore(required("DATABASE_URL"));gateway=HttpGatewayClient(required("RESTRICTED_GATEWAY_URL"),required("RESTRICTED_GATEWAY_AUDIENCE"))
-    runtime=ConversationService(store,gateway,active,GoogleKmsDataKeyWrapper(required("RESTRICTED_CONTENT_WRAP_KEY")),policy,required("RESTRICTED_TENANT_ID"))
+    admission=required("RESTRICTED_ADMISSION_ENABLED")
+    if admission not in {"true","false"}:raise RuntimeError("RESTRICTED_ADMISSION_ENABLED must be true or false")
+    runtime=ConversationService(store,gateway,active,GoogleKmsDataKeyWrapper(required("RESTRICTED_CONTENT_WRAP_KEY")),policy,required("RESTRICTED_TENANT_ID"),admission_enabled=admission=="true")
     driver=ReconciliationDriver(store,Reconciler(store,gateway),"conversation-reconciler",policy.epoch)
     @asynccontextmanager
     async def lifespan(app):

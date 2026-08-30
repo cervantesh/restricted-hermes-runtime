@@ -56,6 +56,11 @@ def test_same_key_association_mismatch_never_releases_existing_content():
     with pytest.raises(Exception):svc.submit(request(),principal="svc@example.com",conversation_id="other")
     assert gateway.calls==1
 
+def test_kill_switch_rejects_before_admission_or_gateway_dispatch():
+    p=policy();store=Store();gateway=Gateway();svc=ConversationService(store,gateway,LocalHmacKey("k","v",b"x"*32),Keys(),p,"tenant",admission_enabled=False)
+    with pytest.raises(Exception,match="admission is disabled"):svc.submit(request(),principal="svc@example.com",conversation_id="one")
+    assert not store.rows and gateway.calls==0
+
 def test_lost_lease_during_blocking_gateway_call_prevents_commit_or_release():
     class RenewingStore(Store):
         def __init__(self):super().__init__();self.renewals=0
