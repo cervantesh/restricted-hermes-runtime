@@ -1,6 +1,7 @@
 """Offline proof that the diagnostic manifest stays isolated and non-PHI."""
 from pathlib import Path
 import re
+import yaml
 
 
 ROOT=Path("infra")
@@ -112,10 +113,14 @@ def test_vertex_us_sink_uses_its_own_psc_dns_and_not_the_restricted_vip():
 
 
 def test_release_recipe_has_no_fake_digest_or_private_key_and_imports_manual_registry():
-    pipeline=(ROOT/"cloudbuild.images.yaml").read_text(encoding="utf-8")
+    pipeline_path=ROOT/"cloudbuild.images.yaml"
+    pipeline=pipeline_path.read_text(encoding="utf-8")
+    parsed=yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
     bootstrap=(ROOT/"BOOTSTRAP.md").read_text(encoding="utf-8")
     assert "restricted-synthetic-runtime" in pipeline and "$PROJECT_ID" in pipeline
     assert "private-key" not in pipeline.lower()
+    assert len(parsed["steps"]) == 4 and len(parsed["images"]) == 4
+    assert all(isinstance(step["args"],list) and step["args"][-2].startswith("${_REGION}-docker.pkg.dev/$PROJECT_ID/") for step in parsed["steps"])
     assert "gcloud artifacts repositories create" in bootstrap
     assert "terraform -chdir=infra import -var-file=../operator.synthetic.tfvars google_artifact_registry_repository.runtime" in bootstrap
     assert "sha256:000" not in bootstrap.lower()

@@ -5,15 +5,15 @@ substitutions:
   _REV: REQUIRED_RELEASE_REVISION
 steps:
   - name: gcr.io/cloud-builders/docker
-    args: [build, -f, Dockerfile.conversation, -t, ${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/conversation:${_REV}, .]
+    args: ["build", "-f", "Dockerfile.conversation", "-t", "${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/conversation:${_REV}", "."]
   - name: gcr.io/cloud-builders/docker
-    args: [build, -f, Dockerfile.gateway, -t, ${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/gateway:${_REV}, .]
+    args: ["build", "-f", "Dockerfile.gateway", "-t", "${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/gateway:${_REV}", "."]
   - name: gcr.io/cloud-builders/docker
-    args: [build, -f, Dockerfile.runner, -t, ${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/runner:${_REV}, .]
+    args: ["build", "-f", "Dockerfile.runner", "-t", "${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/runner:${_REV}", "."]
   - name: gcr.io/cloud-builders/docker
-    args: [build, -f, Dockerfile.migration, -t, ${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/migration:${_REV}, .]
+    args: ["build", "-f", "Dockerfile.migration", "-t", "${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/migration:${_REV}", "."]
 images:
-  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/conversation:${_REV}
-  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/gateway:${_REV}
-  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/runner:${_REV}
-  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/migration:${_REV}
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/conversation:${_REV}"
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/gateway:${_REV}"
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/runner:${_REV}"
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/restricted-synthetic-runtime/migration:${_REV}"
