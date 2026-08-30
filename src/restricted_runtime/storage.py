@@ -123,6 +123,9 @@ class PostgresContentStore:
     def claim_expired_lease(self,t:str,turn:str,owner:str,seconds:int=30)->int|None:
         with self._connect() as conn,conn.cursor() as cur:
             cur.execute("UPDATE restricted_content.turns SET lease_owner=%s,lease_generation=lease_generation+1,lease_expires_at=transaction_timestamp()+(%s || ' seconds')::interval,updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND state NOT IN ('COMMITTED','REJECTED','FAILED','INDETERMINATE') AND lease_expires_at<transaction_timestamp() RETURNING lease_generation",(owner,seconds,t,turn));row=cur.fetchone();return row["lease_generation"] if row else None
+    def expired_turns(self, limit:int=32)->list[TurnRow]:
+        with self._connect() as conn,conn.cursor() as cur:
+            cur.execute("SELECT * FROM restricted_content.turns WHERE state NOT IN ('COMMITTED','REJECTED','FAILED','INDETERMINATE') AND lease_expires_at<transaction_timestamp() ORDER BY lease_expires_at LIMIT %s",(limit,));return [self._row(r) for r in cur.fetchall()]
     def mark_terminal_cas(self,t:str,turn:str,g:int,state:TurnState,failure_class:str|None)->bool:
         if state not in {TurnState.FAILED,TurnState.INDETERMINATE}:raise ContractError("reconciler terminal restriction")
         with self._connect() as conn,conn.cursor() as cur:
