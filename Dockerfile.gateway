@@ -1,0 +1,10 @@
+FROM python:3.11-slim AS runtime
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+COPY pyproject.toml ./
+COPY src ./src
+COPY policy ./policy
+RUN pip install --no-cache-dir . && useradd --system --uid 10002 gateway
+USER 10002
+EXPOSE 8080
+CMD ["uvicorn", "restricted_runtime.services.gateway_api:app", "--host", "0.0.0.0", "--port", "8080"]

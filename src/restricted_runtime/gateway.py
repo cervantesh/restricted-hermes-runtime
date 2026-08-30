@@ -1,0 +1,55 @@
+"""Gateway envelope validation and one-attempt state transitions."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from .contracts import AttemptState, Classification, ContractError, jcs_bytes
+from .crypto import GATEWAY_MAC_DOMAIN, MacKey, kms_mac_input
+from .policy import PolicyBundle, SYSTEM_INSTRUCTION, SYSTEM_INSTRUCTION_SHA256
+from .vertex import ProviderResult
+
+
+@dataclass(frozen=True)
+class GatewayEnvelope:
+    tenant_id: str; conversation_id: str; conversation_epoch: str; turn_id: str; client_request_id: str
+    policy_epoch: str; policy_digest: str; system_instruction_version: str; system_instruction: str
+    classification: str; messages: list[dict[str, str]]; content_limit: int
+    def canonical(self, principal: str) -> bytes:
+        return jcs_bytes({"authenticated_caller_principal": principal, **self.__dict__})
+
+class Ledger(Protocol):
+    def reserve(self, envelope: GatewayEnvelope, principal: str, mac: bytes, key_resource: str, key_version: str) -> AttemptState: ...
+    def start_dispatch(self, tenant_id: str, turn_id: str) -> bool: ...
+    def finish(self, tenant_id: str, turn_id: str, result: ProviderResult) -> None: ...
+    def status(self, tenant_id: str, turn_id: str) -> AttemptState | None: ...
+    def fence(self, tenant_id: str, turn_id: str) -> AttemptState: ...
+
+class Gateway:
+    def __init__(self, policy: PolicyBundle, mac_key: MacKey, ledger: Ledger, vertex):
+        policy.validate(); self.policy, self.mac_key, self.ledger, self.vertex = policy, mac_key, ledger, vertex
+    def validate(self, envelope: GatewayEnvelope, principal: str) -> bytes:
+        p = self.policy.values
+        if principal != p["caller_principal"] or envelope.tenant_id != p["tenant_id"] or envelope.classification != Classification.PHI:
+            raise ContractError("caller, tenant, or classification rejected")
+        if envelope.policy_epoch != self.policy.epoch or envelope.policy_digest != self.policy.digest:
+            raise ContractError("policy pair mismatch")
+        if envelope.system_instruction_version != p["system_instruction_version"] or envelope.system_instruction != SYSTEM_INSTRUCTION or p["system_instruction_sha256"] != SYSTEM_INSTRUCTION_SHA256:
+            raise ContractError("system instruction mismatch")
+        canonical = envelope.canonical(principal)
+        if envelope.content_limit != len(canonical) or len(canonical) > p["max_canonical_input_utf8_bytes"]:
+            raise ContractError("content limit mismatch")
+        return canonical
+    def infer_once(self, envelope: GatewayEnvelope, principal: str) -> ProviderResult:
+        canonical = self.validate(envelope, principal)
+        record = self.mac_key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN, canonical))
+        state = self.ledger.reserve(envelope, principal, record.mac, record.key_resource, record.key_version)
+        if state != AttemptState.RESERVED:
+            return ProviderResult(state)
+        if not self.ledger.start_dispatch(envelope.tenant_id, envelope.turn_id):
+            return ProviderResult("CANCELLED_NO_DISPATCH")
+        result = self.vertex.generate_content(envelope.messages)
+        self.ledger.finish(envelope.tenant_id, envelope.turn_id, result)
+        return result
+    def status(self, tenant_id: str, turn_id: str) -> AttemptState | None: return self.ledger.status(tenant_id, turn_id)
+    def fence(self, tenant_id: str, turn_id: str) -> AttemptState: return self.ledger.fence(tenant_id, turn_id)

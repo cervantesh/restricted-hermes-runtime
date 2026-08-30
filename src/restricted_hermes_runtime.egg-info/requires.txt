@@ -1,0 +1,10 @@
+cryptography<45,>=42
+fastapi<1,>=0.115
+httpx<1,>=0.27
+psycopg[binary,pool]<4,>=3.2
+PyYAML<7,>=6
+uvicorn[standard]<1,>=0.30
+
+[test]
+pytest<9,>=8
+pytest-asyncio<1,>=0.24
