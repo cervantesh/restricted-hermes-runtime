@@ -1,4 +1,5 @@
 import json
+import base64
 from pathlib import Path
 import pytest
 from restricted_runtime.vertex import parse_vertex_response
@@ -32,6 +33,19 @@ def test_single_candidate_index_is_optional_but_never_nonzero_or_wrong_type():
     assert parse_vertex_response(200,payload()).state=="SUCCEEDED"
     assert parse_vertex_response(200,b'{"candidates":[{"content":{"role":"model","parts":[{"text":"x"}]},"finishReason":"STOP","index":1}]}').state=="INDETERMINATE"
     assert parse_vertex_response(200,b'{"candidates":[{"content":{"role":"model","parts":[{"text":"x"}]},"finishReason":"STOP","index":"0"}]}').state=="INDETERMINATE"
+
+@pytest.mark.parametrize("index",[False,True])
+def test_single_candidate_index_rejects_boolean_values(index):
+    raw=json.loads(Path("tests/fixtures/vertex/sanitized_exact_sink_response.json").read_text())
+    raw["candidates"][0]["index"]=index
+    result=parse_vertex_response(200,json.dumps(raw).encode())
+    assert result.state=="INDETERMINATE" and result.text is None
+
+def test_thought_signature_rejects_more_than_65536_decoded_bytes():
+    raw=json.loads(Path("tests/fixtures/vertex/sanitized_exact_sink_response.json").read_text())
+    raw["candidates"][0]["content"]["parts"][0]["thoughtSignature"]=base64.b64encode(b"x"*65_537).decode()
+    result=parse_vertex_response(200,json.dumps(raw).encode())
+    assert result.state=="INDETERMINATE" and result.text is None
 
 
 AC16_FIXTURES = [
