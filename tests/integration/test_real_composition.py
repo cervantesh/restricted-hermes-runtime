@@ -17,7 +17,7 @@ def migrated():
         c.execute("DROP SCHEMA IF EXISTS restricted_content CASCADE; DROP SCHEMA IF EXISTS inference_ledger CASCADE")
         c.execute(Path("migrations/001_restricted_runtime.sql").read_text())
 def policy():
-    v=json.loads(Path("policy/policy.template.json").read_text());v.update(policy_epoch="1",caller_principal="caller",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
+    v=json.loads(Path("policy/policy.template.json").read_text());v.update(policy_epoch="1",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
     return PolicyBundle(v,hashlib.sha256(jcs_bytes(v)).hexdigest())
 class Keys:
     def wrap(self,k):return k

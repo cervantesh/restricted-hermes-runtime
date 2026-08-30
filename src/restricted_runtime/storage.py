@@ -25,9 +25,9 @@ class PostgresLedger:
     def _same(self, row, envelope, principal, mac):
         sink = {k: self.policy.values[k] for k in ("vertex_project_id","vertex_project_number","model_resource","generate_content_path","location","hostname","method","model")}
         actual = (str(row["turn_id"]),str(row["client_request_id"]),row["authenticated_caller_principal"],row["conversation_epoch"],row["policy_epoch"],row["policy_digest"],bytes(row["request_mac"]),row["sink_tuple"])
-        wanted = (envelope.turn_id,envelope.client_request_id,principal,envelope.conversation_epoch,envelope.policy_epoch,envelope.policy_digest,mac,sink)
+        wanted = (envelope.turn_id,envelope.client_request_id,envelope.authenticated_external_principal,envelope.conversation_epoch,envelope.policy_epoch,envelope.policy_digest,mac,sink)
         if actual != wanted: raise ContractError("ledger replay association conflict")
-        if self.mac_key and not self.mac_key.verify(MacRecord(row["mac_key_resource"],row["mac_key_version"],bytes(row["request_mac"])),kms_mac_input(GATEWAY_MAC_DOMAIN,envelope.canonical(principal))): raise ContractError("stored ledger MAC verification failed")
+        if self.mac_key and not self.mac_key.verify(MacRecord(row["mac_key_resource"],row["mac_key_version"],bytes(row["request_mac"])),kms_mac_input(GATEWAY_MAC_DOMAIN,envelope.canonical())): raise ContractError("stored ledger MAC verification failed")
     def reserve(self, envelope: GatewayEnvelope, principal: str, mac: bytes, key_resource: str, key_version: str) -> AttemptState:
         sink = {k: self.policy.values[k] for k in ("vertex_project_id","vertex_project_number","model_resource","generate_content_path","location","hostname","method","model")}
         with self._connect() as conn, conn.cursor() as cur:
@@ -42,7 +42,7 @@ class PostgresLedger:
             if tomb:
                 if (str(tomb["turn_id"]),str(tomb["client_request_id"]),tomb["policy_epoch"],tomb["policy_digest"]) != (envelope.turn_id,envelope.client_request_id,envelope.policy_epoch,envelope.policy_digest): raise ContractError("tombstone remap conflict")
                 return AttemptState.CANCELLED_NO_DISPATCH
-            cur.execute("INSERT INTO inference_ledger.attempts (tenant_id,turn_id,client_request_id,decision_id,conversation_epoch,authenticated_caller_principal,request_mac,mac_key_resource,mac_key_version,policy_epoch,policy_digest,sink_tuple,state) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'RESERVED') ON CONFLICT DO NOTHING", (envelope.tenant_id,envelope.turn_id,envelope.client_request_id,str(uuid.uuid4()),envelope.conversation_epoch,principal,mac,key_resource,key_version,envelope.policy_epoch,envelope.policy_digest,psycopg.types.json.Jsonb(sink)))
+            cur.execute("INSERT INTO inference_ledger.attempts (tenant_id,turn_id,client_request_id,decision_id,conversation_epoch,authenticated_caller_principal,request_mac,mac_key_resource,mac_key_version,policy_epoch,policy_digest,sink_tuple,state) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'RESERVED') ON CONFLICT DO NOTHING", (envelope.tenant_id,envelope.turn_id,envelope.client_request_id,str(uuid.uuid4()),envelope.conversation_epoch,envelope.authenticated_external_principal,mac,key_resource,key_version,envelope.policy_epoch,envelope.policy_digest,psycopg.types.json.Jsonb(sink)))
             if cur.rowcount == 1: return AttemptState.RESERVED
             cur.execute("SELECT * FROM inference_ledger.attempts WHERE tenant_id=%s AND (turn_id=%s OR client_request_id=%s) FOR UPDATE", (envelope.tenant_id,envelope.turn_id,envelope.client_request_id)); row=cur.fetchone()
             if not row: raise ContractError("concurrent reservation did not converge")

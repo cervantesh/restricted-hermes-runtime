@@ -24,7 +24,7 @@ URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL") or os.environ.get("DA
 pytestmark=pytest.mark.skipif(not URL,reason="requires isolated PostgreSQL")
 
 def policy():
-    v=json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"));v.update(policy_epoch="1",caller_principal="caller",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
+    v=json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"));v.update(policy_epoch="1",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
     return PolicyBundle(v,hashlib.sha256(jcs_bytes(v)).hexdigest())
 class Keys:
     def wrap(self,k):return k

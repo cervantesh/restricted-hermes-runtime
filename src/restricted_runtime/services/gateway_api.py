@@ -11,7 +11,9 @@ def create_app(gateway:Gateway,authenticator:Authenticator)->FastAPI:
     app=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
     def auth(r:Request)->str:return authenticator.authenticate(r.headers.get("authorization"))
     @app.get("/readyz")
-    def readyz(policy_epoch:str,policy_digest:str):
+    def readyz(policy_epoch:str,policy_digest:str,request:Request):
+        try:auth(request)
+        except ContractError as exc:raise HTTPException(401,"gateway readiness authentication rejected") from exc
         if (policy_epoch,policy_digest)!=(gateway.policy.epoch,gateway.policy.digest):raise HTTPException(503,"policy pair mismatch")
         return {"status":"ready","policy_epoch":gateway.policy.epoch,"policy_digest":gateway.policy.digest}
     @app.post("/infer")

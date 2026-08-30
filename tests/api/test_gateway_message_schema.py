@@ -21,7 +21,7 @@ URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL") or os.environ.get("DA
 pytestmark=pytest.mark.skipif(not URL,reason="requires isolated PostgreSQL")
 
 def policy():
-    values=json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"));values.update(policy_epoch="1",caller_principal="caller",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
+    values=json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"));values.update(policy_epoch="1",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
     return PolicyBundle(values,hashlib.sha256(jcs_bytes(values)).hexdigest())
 
 class Provider:
@@ -37,8 +37,8 @@ def migrated():
 @pytest.mark.parametrize("messages",[[{"role":"system","text":"x"}],[{"role":"user","text":"x","extra":"no"}],[{"role":"user","text":""}]])
 def test_infer_rejects_closed_internal_message_violations_before_ledger_or_provider(messages):
     p=policy();provider=Provider();key=LocalHmacKey("gateway","1",b"g"*32)
-    envelope=GatewayEnvelope("tenant","conversation","epoch",str(uuid.uuid4()),str(uuid.uuid4()),p.epoch,p.digest,"restricted-phi-system.v1",SYSTEM_INSTRUCTION,"PHI",messages,p.values["max_canonical_input_utf8_bytes"])
-    response=TestClient(create_app(Gateway(p,key,PostgresLedger(URL,p,key),provider),SyntheticAuthenticator("caller"))).post("/infer",headers={"Authorization":"Synthetic test credential"},json={"schema_version":"restricted-gateway-envelope.v1",**envelope.__dict__})
+    envelope=GatewayEnvelope("tenant","conversation","epoch",str(uuid.uuid4()),str(uuid.uuid4()),p.epoch,p.digest,"restricted-phi-system.v1",SYSTEM_INSTRUCTION,"PHI",messages,p.values["max_canonical_input_utf8_bytes"],authenticated_external_principal="caller")
+    response=TestClient(create_app(Gateway(p,key,PostgresLedger(URL,p,key),provider),SyntheticAuthenticator("conversation"))).post("/infer",headers={"Authorization":"Synthetic test credential"},json={"schema_version":"restricted-gateway-envelope.v1",**envelope.__dict__})
     assert response.status_code==400 and provider.calls==0
     with psycopg.connect(URL) as conn:
         assert conn.execute("SELECT count(*) FROM inference_ledger.dispatch_guards").fetchone()[0]==0

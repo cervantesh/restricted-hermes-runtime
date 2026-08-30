@@ -29,5 +29,5 @@ def build_app():
     key_resource=required("RESTRICTED_GATEWAY_MAC_KEY_RESOURCE");key_version=required("RESTRICTED_GATEWAY_MAC_KEY_VERSION")
     key=GoogleKmsHmacKey(key_resource,key_version,retired_versions("RESTRICTED_GATEWAY_RETIRED_MAC_KEYS_JSON",key_resource,key_version))
     gateway=Gateway(policy,key,PostgresLedger(required("DATABASE_URL"),policy,key),VertexClient(policy,AccessToken()))
-    return create_app(gateway,production_authenticator(audience=required("RESTRICTED_GATEWAY_AUDIENCE"),caller_principal=policy.values["caller_principal"]))
+    return create_app(gateway,production_authenticator(audience=required("RESTRICTED_GATEWAY_AUDIENCE"),caller_principal=policy.values["gateway_invoker_principal"]))
 app=build_app()

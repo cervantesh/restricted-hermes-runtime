@@ -27,7 +27,6 @@ def make_policy() -> PolicyBundle:
     values = json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"))
     values.update(
         policy_epoch="1",
-        caller_principal="caller",
         tenant_id="tenant",
         vertex_project_id="project",
         vertex_project_number="123",

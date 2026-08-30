@@ -3,7 +3,9 @@
   "policy_epoch": "REQUIRED_MONOTONIC_EPOCH",
   "system_instruction_version": "restricted-phi-system.v1",
   "system_instruction_sha256": "afcf847cd029409e53bbcb07e92b9d407876e3190e9cf951844829cb34599c1b",
-  "caller_principal": "REQUIRED_SERVICE_ACCOUNT",
+  "authorization_status": "synthetic-non-phi-only",
+  "external_runner_principal": "caller",
+  "gateway_invoker_principal": "conversation",
   "tenant_id": "REQUIRED_SINGLE_TENANT",
   "classification": "PHI",
   "provider": "vertex-ai",
@@ -15,7 +17,7 @@
   "location": "us", "hostname": "aiplatform.us.rep.googleapis.com", "method": "generateContent",
   "streaming": false, "fallbacks": [], "max_provider_attempts": 1, "allowed_modalities": ["text"], "tools_allowed": false,
   "candidate_count": 1, "max_output_tokens": 4096, "max_canonical_input_utf8_bytes": 131072,
-  "response_profile": "restricted-vertex-text-response.v1", "provider_request_logging": "baa-covered-only",
-  "provider_response_logging": "baa-covered-only", "vertex_data_access_payload_logging": "baa-covered-only",
-  "vertex_in_memory_cache": "disabled", "training_use": "prohibited", "retention_profile": "baa-covered-documented"
+  "response_profile": "restricted-vertex-text-response.v1", "provider_request_logging": "synthetic-unverified-no-phi",
+  "provider_response_logging": "synthetic-unverified-no-phi", "vertex_data_access_payload_logging": "synthetic-unverified-no-phi",
+  "vertex_in_memory_cache": "synthetic-unverified-no-phi", "training_use": "synthetic-unverified-no-phi", "retention_profile": "synthetic-unverified-no-phi"
 }

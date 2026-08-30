@@ -13,7 +13,7 @@ from restricted_runtime.policy import PolicyBundle
 
 def policy():
     data=json.loads(open("policy/policy.template.json",encoding="utf-8").read())
-    data.update(policy_epoch="7",caller_principal="svc@example.com",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
+    data.update(policy_epoch="7",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
     return PolicyBundle(data,hashlib.sha256(jcs_bytes(data)).hexdigest())
 
 class Keys:

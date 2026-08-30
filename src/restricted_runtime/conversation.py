@@ -88,8 +88,8 @@ class ConversationService:
             nonlocal messages_for_turn,envelope_for_turn
             initial = TurnRow(self.tenant_id, conversation_id, request.conversation_epoch, turn_id, request.client_request_id, principal, key_record.mac, key_record.key_resource, key_record.key_version, self.policy.digest, TurnState.REQUEST_COMMITTED, b"", b"", None, None, self.data_keys.wrap(data_key), 0, policy_epoch=self.policy.epoch)
             messages_for_turn = self._decrypt_history(history) + [{"role": "user", "text": request.message}]
-            envelope_for_turn = GatewayEnvelope(self.tenant_id, conversation_id, request.conversation_epoch, initial.turn_id, request.client_request_id, initial.policy_epoch, initial.policy_digest, "restricted-phi-system.v1", SYSTEM_INSTRUCTION, "PHI", messages_for_turn, self.policy.values["max_canonical_input_utf8_bytes"])
-            if len(envelope_for_turn.canonical(principal)) > self.policy.values["max_canonical_input_utf8_bytes"]:
+            envelope_for_turn = GatewayEnvelope(self.tenant_id, conversation_id, request.conversation_epoch, initial.turn_id, request.client_request_id, initial.policy_epoch, initial.policy_digest, "restricted-phi-system.v1", SYSTEM_INSTRUCTION, "PHI", messages_for_turn, self.policy.values["max_canonical_input_utf8_bytes"], authenticated_external_principal=principal)
+            if len(envelope_for_turn.canonical()) > self.policy.values["max_canonical_input_utf8_bytes"]:
                 raise ContractError("gateway envelope exceeds policy")
             request_payload = jcs_bytes({"system_instruction": SYSTEM_INSTRUCTION, "messages": messages_for_turn})
             encrypted = encrypt(data_key, request_payload, self._aad(initial, "request"))
@@ -121,7 +121,10 @@ class ConversationService:
         heartbeat_thread=threading.Thread(target=heartbeat,name="restricted-lease-heartbeat",daemon=True)
         heartbeat_thread.start()
         try:
-            result = self.gateway.infer_once(envelope, principal)
+            # The local adapter receives the configured internal identity; the
+            # production HTTP client obtains its real audience-bound ID token
+            # itself and deliberately does not trust this value.
+            result = self.gateway.infer_once(envelope, self.policy.values["gateway_invoker_principal"])
         except Exception as exc:
             self._mark_indeterminate(row)
             raise ContractError("inference outcome is indeterminate") from exc

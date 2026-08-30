@@ -27,7 +27,7 @@ class Provider:
     def generate_content(self,messages):return ProviderResult("SUCCEEDED",text="unused")
 
 def policy():
-    v=json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"));v.update(policy_epoch="7",caller_principal="caller",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
+    v=json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"));v.update(policy_epoch="7",tenant_id="tenant",vertex_project_id="p",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
     return PolicyBundle(v,hashlib.sha256(jcs_bytes(v)).hexdigest())
 
 @pytest.mark.parametrize("gateway_ready,expected", [(lambda: True,200),(lambda: False,503)])

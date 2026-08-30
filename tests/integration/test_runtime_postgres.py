@@ -23,7 +23,7 @@ def isolated_database():
 def turn(*,key=None,conversation="c",epoch="e",state=TurnState.RECEIVED):
     return TurnRow("tenant",conversation,epoch,str(uuid.uuid4()),key or str(uuid.uuid4()),"caller",b"mac","service-key","1","policy",state,b"cipher",b"123456789012",None,None,b"wrapped",0)
 def policy():
-    values=json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"));values.update(policy_epoch="1",caller_principal="caller",tenant_id="tenant",vertex_project_id="project",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
+    values=json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"));values.update(policy_epoch="1",tenant_id="tenant",vertex_project_id="project",vertex_project_number="123",model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash",generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
     return PolicyBundle(values,hashlib.sha256(jcs_bytes(values)).hexdigest())
 def test_same_key_converges_and_one_attempt_dispatches():
     store=PostgresContentStore(DATABASE_URL);candidate=turn(key=str(uuid.uuid4()));barrier=threading.Barrier(2)
@@ -49,7 +49,7 @@ def test_commit_readback_conflict_replay_and_stale_lease_cas():
 def test_fence_races_and_fault_boundaries_never_redispatch():
     p=policy();key=LocalHmacKey("gateway-key","1",b"m"*32);ledger=PostgresLedger(DATABASE_URL,p,key);turn_id=str(uuid.uuid4());request_id=str(uuid.uuid4())
     envelope=GatewayEnvelope("tenant","c","e",turn_id,request_id,p.epoch,p.digest,"restricted-phi-system.v1",SYSTEM_INSTRUCTION,"PHI",[{"role":"user","text":"synthetic"}],0)
-    record=key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN,envelope.canonical("caller")))
+    record=key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN,envelope.canonical()))
     assert ledger.reserve(envelope,"caller",record.mac,record.key_resource,record.key_version) is AttemptState.RESERVED
     assert ledger.fence("tenant",turn_id) is AttemptState.CANCELLED_NO_DISPATCH and not ledger.start_dispatch("tenant",turn_id)
     tomb_turn=str(uuid.uuid4());tomb_req=str(uuid.uuid4());assert ledger.fence("tenant",tomb_turn,client_request_id=tomb_req,policy_epoch=p.epoch,policy_digest=p.digest) is AttemptState.CANCELLED_NO_DISPATCH
@@ -60,7 +60,7 @@ def test_reserve_and_not_found_fence_interleave_on_one_durable_guard():
     """The reserve/fence race converges on one tombstone, never a late dispatch."""
     p=policy();key=LocalHmacKey("gateway-key","1",b"m"*32);turn_id=str(uuid.uuid4());request_id=str(uuid.uuid4())
     envelope=GatewayEnvelope("tenant","c","e",turn_id,request_id,p.epoch,p.digest,"restricted-phi-system.v1",SYSTEM_INSTRUCTION,"PHI",[],p.values["max_canonical_input_utf8_bytes"])
-    record=key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN,envelope.canonical("caller")))
+    record=key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN,envelope.canonical()))
     barrier=threading.Barrier(2)
     class RacingLedger(PostgresLedger):
         def reserve(self,*args):

@@ -15,8 +15,9 @@ class GatewayEnvelope:
     tenant_id: str; conversation_id: str; conversation_epoch: str; turn_id: str; client_request_id: str
     policy_epoch: str; policy_digest: str; system_instruction_version: str; system_instruction: str
     classification: str; messages: list[dict[str, str]]; content_limit: int
-    def canonical(self, principal: str) -> bytes:
-        return jcs_bytes({"authenticated_caller_principal": principal, **self.__dict__})
+    authenticated_external_principal: str = ""
+    def canonical(self) -> bytes:
+        return jcs_bytes(self.__dict__)
 
 class Ledger(Protocol):
     def reserve(self, envelope: GatewayEnvelope, principal: str, mac: bytes, key_resource: str, key_version: str) -> AttemptState: ...
@@ -33,14 +34,14 @@ class Gateway:
             ledger.mac_key = mac_key
     def validate(self, envelope: GatewayEnvelope, principal: str) -> bytes:
         p = self.policy.values
-        if principal != p["caller_principal"] or envelope.tenant_id != p["tenant_id"] or envelope.classification != Classification.PHI:
-            raise ContractError("caller, tenant, or classification rejected")
+        if principal != p["gateway_invoker_principal"] or envelope.authenticated_external_principal != p["external_runner_principal"] or envelope.tenant_id != p["tenant_id"] or envelope.classification != Classification.PHI:
+            raise ContractError("identity, tenant, or classification rejected")
         if envelope.policy_epoch != self.policy.epoch or envelope.policy_digest != self.policy.digest:
             raise ContractError("policy pair mismatch")
         if envelope.system_instruction_version != p["system_instruction_version"] or envelope.system_instruction != SYSTEM_INSTRUCTION or p["system_instruction_sha256"] != SYSTEM_INSTRUCTION_SHA256:
             raise ContractError("system instruction mismatch")
         validate_internal_messages(envelope.messages)
-        canonical = envelope.canonical(principal)
+        canonical = envelope.canonical()
         if envelope.content_limit != p["max_canonical_input_utf8_bytes"] or len(canonical) > envelope.content_limit:
             raise ContractError("content limit mismatch")
         return canonical

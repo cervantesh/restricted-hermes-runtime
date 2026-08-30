@@ -50,7 +50,7 @@ def build_app():
             try:await task
             except asyncio.CancelledError:pass
     def gateway_ready():return gateway.ready(policy.epoch,policy.digest)
-    app=create_app(runtime,production_authenticator(audience=required("RESTRICTED_EXTERNAL_AUDIENCE"),caller_principal=required("RESTRICTED_CALLER_PRINCIPAL")),gateway_ready)
+    app=create_app(runtime,production_authenticator(audience=required("RESTRICTED_RUNNER_AUDIENCE"),caller_principal=policy.values["external_runner_principal"]),gateway_ready)
     app.router.lifespan_context=lifespan
     return app
 app=build_app()

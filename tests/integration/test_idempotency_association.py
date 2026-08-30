@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(not URL, reason="requires isolated PostgreSQL")
 
 def policy() -> PolicyBundle:
     values = json.loads(Path("policy/policy.template.json").read_text(encoding="utf-8"))
-    values.update(policy_epoch="1", caller_principal="caller", tenant_id="tenant", vertex_project_id="p", vertex_project_number="123", model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash", generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
+    values.update(policy_epoch="1", tenant_id="tenant", vertex_project_id="p", vertex_project_number="123", model_resource="projects/123/locations/us/publishers/google/models/gemini-3.5-flash", generate_content_path="/v1/projects/123/locations/us/publishers/google/models/gemini-3.5-flash:generateContent")
     return PolicyBundle(values, hashlib.sha256(jcs_bytes(values)).hexdigest())
 
 
@@ -69,7 +69,7 @@ def test_identity_dimensions_reject_replay_before_plaintext_read_or_dispatch():
 def test_status_and_fence_identity_mutations_fail_closed():
     p=policy();key=LocalHmacKey("gateway","1",b"g"*32);ledger=PostgresLedger(URL,p,key);turn_id=str(uuid.uuid4());request_id=str(uuid.uuid4())
     envelope=GatewayEnvelope("tenant","c","e",turn_id,request_id,p.epoch,p.digest,"restricted-phi-system.v1",SYSTEM_INSTRUCTION,"PHI",[],p.values["max_canonical_input_utf8_bytes"])
-    record=key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN,envelope.canonical("caller")))
+    record=key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN,envelope.canonical()))
     assert ledger.reserve(envelope,"caller",record.mac,record.key_resource,record.key_version).value == "RESERVED"
     for field, value in (("client_request_id",str(uuid.uuid4())), ("policy_epoch","stale"), ("policy_digest","stale")):
         identity={"client_request_id":request_id,"policy_epoch":p.epoch,"policy_digest":p.digest};identity[field]=value
