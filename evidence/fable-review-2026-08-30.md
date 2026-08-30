@@ -24,7 +24,7 @@ Fable recorded these follow-ups without treating them as release blockers:
 - slightly stricter fail-closed detail schema; and
 - requiring the Docker gate in CI.
 
-Provider smoke remains **PENDING** for user passkey reauthentication. PHI
+Provider smoke completed successfully with synthetic non-PHI input. PHI
 authorization, registry push, deployment, BAA, IAM, and egress remain
 **BLOCKED**. No signed policy, deployed revision, registry digest, or PHI
 readiness is claimed.

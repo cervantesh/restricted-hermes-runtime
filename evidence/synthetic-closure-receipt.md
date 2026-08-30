@@ -35,9 +35,9 @@ it is not PHI deployment authorization.
 - Synthetic no-PHI diagnostics/smoke: six total requests; each product client
   was limited to one dispatch with no retry. Final real-provider smoke is
   recorded in `restricted-vertex-smoke-2026-08-30.md`.
-- Provider smoke status: **PENDING for further reauthentication** — the final
-  synthetic evidence is recorded, but user passkey reauthentication is still
-  required for the next `gcloud` operation.
+- Final real-provider synthetic smoke: **GREEN / COMPLETED** with synthetic
+  non-PHI input. Future `gcloud` authentication state is irrelevant to this
+  receipt.
 
 ## External boundary
 
