@@ -1,0 +1,3 @@
+python -m pytest tests/unit/test_diagnostic_receipt.py -q
+1 passed
+PostgreSQL 18.4

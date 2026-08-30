@@ -31,16 +31,32 @@ class PostgresLedger:
     def reserve(self, envelope: GatewayEnvelope, principal: str, mac: bytes, key_resource: str, key_version: str) -> AttemptState:
         sink = {k: self.policy.values[k] for k in ("vertex_project_id","vertex_project_number","model_resource","generate_content_path","location","hostname","method","model")}
         with self._connect() as conn, conn.cursor() as cur:
+            # Take the durable control lock before any per-attempt lock. A
+            # disabling transaction owns this same row and cancels RESERVED
+            # attempts, so neither an old snapshot nor a later re-enable can
+            # revive a row across the provider boundary.
+            cur.execute("SELECT dispatch_enabled FROM inference_ledger.runtime_controls WHERE control_key=true FOR SHARE")
+            control=cur.fetchone()
+            if control is None: raise ContractError("durable dispatch control missing")
+            dispatch_enabled=bool(control["dispatch_enabled"])
             # Both reserve and NOT_FOUND fence lock this durable identity guard;
             # neither can observe an absent attempt while the other writes a tombstone.
             cur.execute("INSERT INTO inference_ledger.dispatch_guards (tenant_id,turn_id,client_request_id,policy_epoch,policy_digest) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",(envelope.tenant_id,envelope.turn_id,envelope.client_request_id,envelope.policy_epoch,envelope.policy_digest))
             cur.execute("SELECT * FROM inference_ledger.dispatch_guards WHERE tenant_id=%s AND (turn_id=%s OR client_request_id=%s) FOR UPDATE",(envelope.tenant_id,envelope.turn_id,envelope.client_request_id));guard=cur.fetchone()
             if (str(guard["turn_id"]),str(guard["client_request_id"]),guard["policy_epoch"],guard["policy_digest"]) != (envelope.turn_id,envelope.client_request_id,envelope.policy_epoch,envelope.policy_digest): raise ContractError("guard remap conflict")
             cur.execute("SELECT * FROM inference_ledger.attempts WHERE tenant_id=%s AND (turn_id=%s OR client_request_id=%s) FOR UPDATE", (envelope.tenant_id,envelope.turn_id,envelope.client_request_id)); row=cur.fetchone()
-            if row: self._same(row,envelope,principal,mac); return AttemptState(row["state"])
+            if row:
+                self._same(row,envelope,principal,mac)
+                if not dispatch_enabled and row["state"] == "RESERVED":
+                    cur.execute("UPDATE inference_ledger.attempts SET state='CANCELLED_NO_DISPATCH',fence_generation=fence_generation+1,updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND state='RESERVED'",(envelope.tenant_id,envelope.turn_id))
+                    return AttemptState.CANCELLED_NO_DISPATCH
+                return AttemptState(row["state"])
             cur.execute("SELECT * FROM inference_ledger.cancellation_tombstones WHERE tenant_id=%s AND (turn_id=%s OR client_request_id=%s) FOR UPDATE", (envelope.tenant_id,envelope.turn_id,envelope.client_request_id)); tomb=cur.fetchone()
             if tomb:
                 if (str(tomb["turn_id"]),str(tomb["client_request_id"]),tomb["policy_epoch"],tomb["policy_digest"]) != (envelope.turn_id,envelope.client_request_id,envelope.policy_epoch,envelope.policy_digest): raise ContractError("tombstone remap conflict")
+                return AttemptState.CANCELLED_NO_DISPATCH
+            if not dispatch_enabled:
+                cur.execute("INSERT INTO inference_ledger.cancellation_tombstones (tenant_id,turn_id,client_request_id,policy_epoch,policy_digest) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (tenant_id,turn_id) DO NOTHING",(envelope.tenant_id,envelope.turn_id,envelope.client_request_id,envelope.policy_epoch,envelope.policy_digest))
                 return AttemptState.CANCELLED_NO_DISPATCH
             cur.execute("INSERT INTO inference_ledger.attempts (tenant_id,turn_id,client_request_id,decision_id,conversation_epoch,authenticated_caller_principal,request_mac,mac_key_resource,mac_key_version,policy_epoch,policy_digest,sink_tuple,state) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'RESERVED') ON CONFLICT DO NOTHING", (envelope.tenant_id,envelope.turn_id,envelope.client_request_id,str(uuid.uuid4()),envelope.conversation_epoch,envelope.authenticated_external_principal,mac,key_resource,key_version,envelope.policy_epoch,envelope.policy_digest,psycopg.types.json.Jsonb(sink)))
             if cur.rowcount == 1: return AttemptState.RESERVED
@@ -49,10 +65,17 @@ class PostgresLedger:
             self._same(row,envelope,principal,mac); return AttemptState(row["state"])
     def start_dispatch(self, tenant_id: str, turn_id: str) -> bool:
         with self._connect() as conn, conn.cursor() as cur:
-            # The durable control is part of the state-transition predicate;
-            # an environment switch cannot leave an already-reserved row able
-            # to cross the sole provider dispatch boundary after a live rollout.
-            cur.execute("UPDATE inference_ledger.attempts AS attempt SET state='DISPATCH_STARTED',updated_at=transaction_timestamp() FROM inference_ledger.runtime_controls AS control WHERE control.control_key=true AND control.dispatch_enabled=true AND attempt.tenant_id=%s AND attempt.turn_id=%s AND attempt.state='RESERVED'",(tenant_id,turn_id)); return cur.rowcount == 1
+            # Lock order is control then attempt. If disable owns the control,
+            # it cancels RESERVED rows before this transaction can read it; if
+            # this transaction owns it first, disable waits and is ordered after
+            # this durable transition. No stale control snapshot can win.
+            cur.execute("SELECT dispatch_enabled FROM inference_ledger.runtime_controls WHERE control_key=true FOR SHARE")
+            control=cur.fetchone()
+            if control is None or not control["dispatch_enabled"]: return False
+            cur.execute("SELECT state FROM inference_ledger.attempts WHERE tenant_id=%s AND turn_id=%s FOR UPDATE",(tenant_id,turn_id))
+            attempt=cur.fetchone()
+            if attempt is None or attempt["state"] != "RESERVED": return False
+            cur.execute("UPDATE inference_ledger.attempts SET state='DISPATCH_STARTED',updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND state='RESERVED'",(tenant_id,turn_id)); return cur.rowcount == 1
     def finish(self, tenant_id: str, turn_id: str, result: ProviderResult) -> None:
         state=result.state if result.state in {"SUCCEEDED","FAILED","INDETERMINATE"} else "INDETERMINATE"
         with self._connect() as conn, conn.cursor() as cur:

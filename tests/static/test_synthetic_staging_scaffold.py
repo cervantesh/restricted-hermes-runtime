@@ -84,7 +84,16 @@ def test_durable_dispatch_control_starts_disabled_and_is_not_mutable_by_gateway_
     assert "CREATE TABLE inference_ledger.runtime_controls" in migration
     assert "dispatch_enabled boolean NOT NULL DEFAULT false" in migration
     assert "REVOKE INSERT, UPDATE, DELETE ON inference_ledger.runtime_controls FROM restricted_ledger_runtime" in migration
-    assert "control.dispatch_enabled=true" in storage and "attempt.state='RESERVED'" in storage
+    assert "FOR SHARE" in storage and "attempt[\"state\"] != \"RESERVED\"" in storage
+
+
+def test_vertex_sink_uses_the_restricted_vip_supported_global_google_api_host():
+    policy=Path("policy/policy.template.json").read_text(encoding="utf-8")
+    egress=(ROOT/"egress-policy.md").read_text(encoding="utf-8")
+    assert '"hostname": "aiplatform.googleapis.com"' in policy
+    assert '"location": "us"' in policy
+    assert "aiplatform.us.rep.googleapis.com" not in policy
+    assert "aiplatform.googleapis.com" in egress and "restricted VIP" in egress
 
 
 def test_release_recipe_has_no_fake_digest_or_private_key_and_imports_manual_registry():

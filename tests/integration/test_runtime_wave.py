@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -153,5 +154,34 @@ def test_durable_dispatch_control_blocks_pre_reserved_turn_without_vertex_transi
         conn.execute("UPDATE inference_ledger.runtime_controls SET dispatch_enabled=false WHERE control_key=true")
     assert gateway.infer_once(envelope,"conversation").state=="CANCELLED_NO_DISPATCH"
     with psycopg.connect(URL) as conn:
-        assert conn.execute("SELECT state FROM inference_ledger.attempts WHERE turn_id=%s",(turn_id,)).fetchone()[0]=="RESERVED"
+        assert conn.execute("SELECT state FROM inference_ledger.attempts WHERE turn_id=%s",(turn_id,)).fetchone()[0]=="CANCELLED_NO_DISPATCH"
+    assert provider.calls==0
+
+
+def test_concurrent_operator_disable_commits_before_gateway_and_wins_without_vertex_call():
+    p=policy(); key=LocalHmacKey("gateway","version",b"g"*32); ledger=PostgresLedger(URL,p,key)
+    class Provider:
+        def __init__(self):self.calls=0
+        def generate_content(self,messages):self.calls+=1;return ProviderResult("SUCCEEDED",text="must not happen")
+    provider=Provider(); turn_id=str(uuid.uuid4()); request_id=str(uuid.uuid4())
+    envelope=GatewayEnvelope("tenant","conversation","epoch",turn_id,request_id,p.epoch,p.digest,"restricted-phi-system.v1",SYSTEM_INSTRUCTION,Classification.PHI,[{"role":"user","text":"synthetic"}],p.values["max_canonical_input_utf8_bytes"],authenticated_external_principal="caller")
+    gateway=Gateway(p,key,ledger,provider); canonical=gateway.validate(envelope,"conversation"); record=key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN,canonical))
+    assert ledger.reserve(envelope,"conversation",record.mac,record.key_resource,record.key_version).value=="RESERVED"
+    operator=psycopg.connect(URL)
+    try:
+        operator.execute("UPDATE inference_ledger.runtime_controls SET dispatch_enabled=false WHERE control_key=true")
+        result=[]
+        worker=threading.Thread(target=lambda:result.append(gateway.infer_once(envelope,"conversation")))
+        worker.start()
+        try:
+            time.sleep(.05)
+            assert worker.is_alive(),"gateway must wait on the operator's control lock"
+        finally:
+            operator.commit()
+        worker.join(5)
+        assert not worker.is_alive() and result[0].state=="CANCELLED_NO_DISPATCH"
+    finally:
+        operator.close()
+    with psycopg.connect(URL) as conn:
+        assert conn.execute("SELECT state FROM inference_ledger.attempts WHERE turn_id=%s",(turn_id,)).fetchone()[0]=="CANCELLED_NO_DISPATCH"
     assert provider.calls==0

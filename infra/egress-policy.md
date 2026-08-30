@@ -11,6 +11,19 @@ allowed on 5432 over the PSA range. Each role receives its own VPC connector;
 this is a
 network baseline, not a claim that application hostnames were inspected.
 
+The sole Vertex sink is the documented global REST host
+`aiplatform.googleapis.com` with the frozen regional publisher-model path.
+Unlike the former regional `aiplatform.us.rep.googleapis.com` host, the service name
+`aiplatform.googleapis.com` is supported by the restricted VIP. No PSC is
+introduced because the exact restricted-VIP route is the narrower supported
+path for this closed endpoint.
+
+Source basis: [Vertex Gemini REST quickstart](https://cloud.google.com/vertex-ai/generative-ai/docs/start/quickstart)
+uses `aiplatform.googleapis.com` for `generateContent`; [restricted VIP
+services](https://cloud.google.com/vpc-service-controls/docs/restricted-vip-services)
+lists `aiplatform.googleapis.com` as supported. This documentation does not
+replace the required staging FQDN/SNI witness.
+
 It does not claim an inspected FQDN/SNI/certificate witness. This residual result prevents
 `READY`, `CLOSED`, and any PHI authorization claim.
 
@@ -21,7 +34,7 @@ egress proxy/firewall that validates request hostname plus TLS SNI/certificate.
 - Conversation identity: private gateway, private SQL, named KMS key endpoint,
   identity endpoint, controlled DNS only. Deny Vertex, public IPv4/IPv6,
   literal IPs, proxy variables, telemetry, downloads, redirects.
-- Gateway identity: exact `aiplatform.us.rep.googleapis.com` only, private SQL,
+- Gateway identity: exact `aiplatform.googleapis.com` only, private SQL,
   named gateway MAC key endpoint, identity endpoint, controlled DNS only.
   Deny global/alternate Vertex endpoints, proxying, redirects, literal IPs,
   metadata paths other than identity, and all telemetry/download routes.

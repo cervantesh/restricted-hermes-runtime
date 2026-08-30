@@ -50,6 +50,20 @@ CREATE TABLE inference_ledger.attempts (
   failure_class text, provider_request_id text, created_at timestamptz NOT NULL DEFAULT transaction_timestamp(), updated_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
   PRIMARY KEY (tenant_id, turn_id), UNIQUE (tenant_id, client_request_id)
 );
+CREATE OR REPLACE FUNCTION inference_ledger.cancel_reserved_on_dispatch_disable()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.dispatch_enabled AND NOT NEW.dispatch_enabled THEN
+    UPDATE inference_ledger.attempts
+    SET state='CANCELLED_NO_DISPATCH', fence_generation=fence_generation+1, updated_at=transaction_timestamp()
+    WHERE state='RESERVED';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER runtime_controls_disable_cancels_reserved
+BEFORE UPDATE OF dispatch_enabled ON inference_ledger.runtime_controls
+FOR EACH ROW EXECUTE FUNCTION inference_ledger.cancel_reserved_on_dispatch_disable();
 CREATE TABLE inference_ledger.cancellation_tombstones (
   tenant_id text NOT NULL, turn_id uuid NOT NULL, client_request_id uuid NOT NULL, policy_epoch text NOT NULL, policy_digest text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT transaction_timestamp(), PRIMARY KEY (tenant_id, turn_id), UNIQUE (tenant_id, client_request_id)
