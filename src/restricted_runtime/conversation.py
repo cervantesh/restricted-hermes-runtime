@@ -121,6 +121,10 @@ class ConversationService:
             raise ContractError("inference outcome is indeterminate") from exc
         finally:
             lease_stop.set();heartbeat_thread.join(timeout=1)
+        # One final DB-time CAS renewal closes the interval between the last
+        # heartbeat and the provider return before any response transition.
+        if hasattr(self.store,"renew_lease") and not self.store.renew_lease(self.tenant_id,row.turn_id,row.lease_generation):
+            lease_lost.set()
         if lease_lost.is_set():
             self._mark_indeterminate(row)
             raise ContractError("lease lost during provider operation")

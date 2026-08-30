@@ -5,7 +5,7 @@ from ..auth import Authenticator
 from ..contracts import ContractError, TurnRequest, load_closed_json
 from ..conversation import ConversationService
 
-def create_app(runtime: ConversationService, authenticator: Authenticator) -> FastAPI:
+def create_app(runtime: ConversationService, authenticator: Authenticator, gateway_ready=None) -> FastAPI:
     app=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
     @app.post("/v1/restricted/conversations/{conversation_id}")
     async def create_conversation(conversation_id:str,request:Request):
@@ -31,6 +31,11 @@ def create_app(runtime: ConversationService, authenticator: Authenticator) -> Fa
             epoch=runtime.store.reset(runtime.tenant_id,conversation_id,body["conversation_epoch"])
             return {"schema_version":"restricted-conversation-reset.v1","conversation_epoch":epoch}
         except ContractError as exc: raise HTTPException(409 if str(exc)=="ACTIVE_TURN" else 400,"restricted reset rejected") from exc
+    @app.get("/readyz")
+    async def readyz():
+        if gateway_ready is None or not gateway_ready():
+            raise HTTPException(503,"gateway policy pair is not ready")
+        return {"status":"ready"}
     return app
 
 def unconfigured_app()->FastAPI:

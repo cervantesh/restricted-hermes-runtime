@@ -56,13 +56,8 @@ def build_app():
             stop.set();task.cancel()
             try:await task
             except asyncio.CancelledError:pass
-    app=create_app(runtime,production_authenticator(audience=required("RESTRICTED_EXTERNAL_AUDIENCE"),caller_principal=required("RESTRICTED_CALLER_PRINCIPAL")))
+    def gateway_ready():return gateway.ready(policy.epoch,policy.digest)
+    app=create_app(runtime,production_authenticator(audience=required("RESTRICTED_EXTERNAL_AUDIENCE"),caller_principal=required("RESTRICTED_CALLER_PRINCIPAL")),gateway_ready)
     app.router.lifespan_context=lifespan
-    @app.get("/readyz")
-    async def readyz():
-        if not await asyncio.to_thread(gateway.ready,policy.epoch,policy.digest):
-            from fastapi import HTTPException
-            raise HTTPException(503,"gateway policy pair is not ready")
-        return {"status":"ready","policy_epoch":policy.epoch,"policy_digest":policy.digest}
     return app
 app=build_app()
