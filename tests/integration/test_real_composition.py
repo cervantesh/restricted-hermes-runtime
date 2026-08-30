@@ -37,3 +37,16 @@ def test_real_composition_admits_dispatches_commits_reads_once_and_duplicate_is_
         assert c.execute("SELECT state FROM inference_ledger.attempts").fetchone()[0]=="SUCCEEDED"
         row=c.execute("SELECT policy_epoch,policy_digest,gateway_decision_id,gateway_attempt_classification FROM restricted_content.turns").fetchone()
         assert row[0]==p.epoch and row[1]==p.digest and row[2] is not None and row[3]=="SUCCEEDED"
+
+def test_history_expanding_complete_gateway_envelope_rejects_before_second_content_admission():
+    p=policy()
+    mac=LocalHmacKey("gateway","1",b"g"*32);provider=CountedProvider();service=ConversationService(PostgresContentStore(URL),Gateway(p,mac,PostgresLedger(URL,p,mac),provider),LocalHmacKey("service","1",b"s"*32),Keys(),p,"tenant")
+    first=TurnRequest.parse({"schema_version":"restricted-turn.v1","client_request_id":str(uuid.uuid4()),"conversation_epoch":"epoch","message":"x"*70_000})
+    assert service.submit(first,principal="caller",conversation_id="limit")["status"]=="COMMITTED"
+    second=TurnRequest.parse({"schema_version":"restricted-turn.v1","client_request_id":str(uuid.uuid4()),"conversation_epoch":"epoch","message":"y"*70_000})
+    with pytest.raises(Exception,match="gateway envelope exceeds policy"):
+        service.submit(second,principal="caller",conversation_id="limit")
+    with psycopg.connect(URL) as conn:
+        assert conn.execute("SELECT count(*) FROM restricted_content.turns").fetchone()[0]==1
+        assert conn.execute("SELECT count(*) FROM inference_ledger.attempts").fetchone()[0]==1
+    assert provider.calls==1

@@ -9,6 +9,7 @@ from typing import Any, Protocol
 import httpx
 
 from .contracts import ContractError, ProviderResult, load_closed_json
+from .messages import validate_internal_messages
 from .policy import PolicyBundle, SYSTEM_INSTRUCTION
 
 
@@ -112,9 +113,8 @@ class VertexClient:
             return ProviderResult("INDETERMINATE", failure_class="TRANSPORT_AFTER_DISPATCH")
 
 def build_vertex_payload(messages: list[dict[str,str]]) -> dict[str,Any] | None:
-        contents=[]
-        for message in messages:
-            if set(message)!={"role","text"} or message["role"] not in {"user","model"} or not isinstance(message["text"],str) or not message["text"]:
-                return None
-            contents.append({"role":message["role"],"parts":[{"text":message["text"]}]})
-        return {"systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]}, "contents": contents, "generationConfig": {"candidateCount": 1, "maxOutputTokens": 4096}}
+    try:
+        contents=[{"role":message["role"],"parts":[{"text":message["text"]}]} for message in validate_internal_messages(messages)]
+    except ContractError:
+        return None
+    return {"systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]}, "contents": contents, "generationConfig": {"candidateCount": 1, "maxOutputTokens": 4096}}

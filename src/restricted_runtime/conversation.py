@@ -83,22 +83,19 @@ class ConversationService:
         data_key = os.urandom(32)
         turn_id = str(uuid.uuid4())
         messages_for_turn: list[dict[str, str]] = []
+        envelope_for_turn: GatewayEnvelope | None = None
         def build_initial(history: list[TurnRow]) -> TurnRow:
-            nonlocal messages_for_turn
+            nonlocal messages_for_turn,envelope_for_turn
             initial = TurnRow(self.tenant_id, conversation_id, request.conversation_epoch, turn_id, request.client_request_id, principal, key_record.mac, key_record.key_resource, key_record.key_version, self.policy.digest, TurnState.REQUEST_COMMITTED, b"", b"", None, None, self.data_keys.wrap(data_key), 0, policy_epoch=self.policy.epoch)
             messages_for_turn = self._decrypt_history(history) + [{"role": "user", "text": request.message}]
+            envelope_for_turn = GatewayEnvelope(self.tenant_id, conversation_id, request.conversation_epoch, initial.turn_id, request.client_request_id, initial.policy_epoch, initial.policy_digest, "restricted-phi-system.v1", SYSTEM_INSTRUCTION, "PHI", messages_for_turn, self.policy.values["max_canonical_input_utf8_bytes"])
+            if len(envelope_for_turn.canonical(principal)) > self.policy.values["max_canonical_input_utf8_bytes"]:
+                raise ContractError("gateway envelope exceeds policy")
             request_payload = jcs_bytes({"system_instruction": SYSTEM_INSTRUCTION, "messages": messages_for_turn})
             encrypted = encrypt(data_key, request_payload, self._aad(initial, "request"))
             return replace(initial, request_ciphertext=encrypted.ciphertext, request_nonce=encrypted.nonce)
         if hasattr(self.store, "admit_with_history"):
             row, created = self.store.admit_with_history(tenant_id=self.tenant_id, conversation_id=conversation_id, conversation_epoch=request.conversation_epoch, client_request_id=request.client_request_id, build_row=build_initial)
-            if created:
-                # The just-built request carries the authoritative history. It
-                # is needed for the gateway envelope, so decrypt that payload
-                # after admission rather than reading history outside the lock.
-                key = self.data_keys.unwrap(row.wrapped_data_key)
-                import json
-                messages_for_turn = json.loads(decrypt(key, Ciphertext(row.request_nonce, row.request_ciphertext), self._aad(row, "request")))['messages']
         else:
             row, created = self.store.admit(build_initial(self.store.committed_history(self.tenant_id, conversation_id, request.conversation_epoch)))
         self._verify_duplicate(row, request, principal, conversation_id)
@@ -109,7 +106,9 @@ class ConversationService:
         row = self.store.read_turn(self.tenant_id, row.turn_id)
         if hasattr(self.store,"renew_lease") and not self.store.renew_lease(self.tenant_id,row.turn_id,row.lease_generation):
             raise ContractError("lease renewal failed before provider dispatch")
-        envelope = GatewayEnvelope(self.tenant_id, conversation_id, request.conversation_epoch, row.turn_id, request.client_request_id, self.policy.epoch, self.policy.digest, "restricted-phi-system.v1", SYSTEM_INSTRUCTION, "PHI", messages_for_turn, self.policy.values["max_canonical_input_utf8_bytes"])
+        if envelope_for_turn is None:
+            raise ContractError("admitted turn lacks gateway envelope")
+        envelope = envelope_for_turn
         lease_stop=threading.Event();lease_lost=threading.Event()
         def heartbeat():
             while not lease_stop.wait(self.lease_heartbeat_seconds):

@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 from .contracts import AttemptState, Classification, ContractError, ProviderResult, jcs_bytes
 from .crypto import GATEWAY_MAC_DOMAIN, MacKey, kms_mac_input
+from .messages import validate_internal_messages
 from .policy import PolicyBundle, SYSTEM_INSTRUCTION, SYSTEM_INSTRUCTION_SHA256
 
 
@@ -38,6 +39,7 @@ class Gateway:
             raise ContractError("policy pair mismatch")
         if envelope.system_instruction_version != p["system_instruction_version"] or envelope.system_instruction != SYSTEM_INSTRUCTION or p["system_instruction_sha256"] != SYSTEM_INSTRUCTION_SHA256:
             raise ContractError("system instruction mismatch")
+        validate_internal_messages(envelope.messages)
         canonical = envelope.canonical(principal)
         if envelope.content_limit != p["max_canonical_input_utf8_bytes"] or len(canonical) > envelope.content_limit:
             raise ContractError("content limit mismatch")
