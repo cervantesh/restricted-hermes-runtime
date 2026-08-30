@@ -36,6 +36,36 @@ resource "google_kms_crypto_key" "gateway_mac_retired" {
   purpose  = "MAC"
   version_template { algorithm = "HMAC_SHA256" }
 }
+resource "google_project_iam_custom_role" "mac_verify_only" {
+  role_id     = "restrictedMacVerifyOnly"
+  title       = "Restricted KMS MAC verify only"
+  permissions = ["cloudkms.cryptoKeyVersions.useToVerifyMac"]
+}
+resource "google_kms_crypto_key_iam_member" "conversation_wrap" {
+  crypto_key_id = google_kms_crypto_key.content_wrap.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:${google_service_account.conversation.email}"
+}
+resource "google_kms_crypto_key_iam_member" "conversation_mac_active" {
+  crypto_key_id = google_kms_crypto_key.service_mac_active.id
+  role          = "roles/cloudkms.signerVerifier"
+  member        = "serviceAccount:${google_service_account.conversation.email}"
+}
+resource "google_kms_crypto_key_iam_member" "conversation_mac_retired" {
+  crypto_key_id = google_kms_crypto_key.service_mac_retired.id
+  role          = google_project_iam_custom_role.mac_verify_only.name
+  member        = "serviceAccount:${google_service_account.conversation.email}"
+}
+resource "google_kms_crypto_key_iam_member" "gateway_mac_active" {
+  crypto_key_id = google_kms_crypto_key.gateway_mac_active.id
+  role          = "roles/cloudkms.signerVerifier"
+  member        = "serviceAccount:${google_service_account.gateway.email}"
+}
+resource "google_kms_crypto_key_iam_member" "gateway_mac_retired" {
+  crypto_key_id = google_kms_crypto_key.gateway_mac_retired.id
+  role          = google_project_iam_custom_role.mac_verify_only.name
+  member        = "serviceAccount:${google_service_account.gateway.email}"
+}
 resource "google_sql_database_instance" "restricted" {
   name                = "restricted-phi-postgres"
   region              = var.region
