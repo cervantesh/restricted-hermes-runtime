@@ -2,7 +2,7 @@
 
 | Matrix | Executable path | Current class |
 |---|---|---|
-| AC1 | `tests/static/test_forbidden_imports.py`, `tests/static/test_matrix_local.py::test_ac1_closed_import_graph`, `tests/container/test_runtime_image.py` | local/static and Docker recipe scan green; 2 Docker build/runtime tests skipped because daemon unavailable |
+| AC1 | `tests/static/test_forbidden_imports.py`, `tests/static/test_matrix_local.py::test_ac1_closed_import_graph`, `tests/container/test_runtime_image.py` | image isolation **GREEN**: local immutable conversation image (UID 10001) excludes Vertex/opposite roots; gateway image (UID 10002) excludes conversation roots; imported-package and tar-readable OCI lower-layer/site-packages leak mutations are zero |
 | AC2–3 | `tests/unit/test_contracts.py`, `tests/unit/test_conversation_execution.py` | local |
 | AC4–5 | `tests/exact/` deployment receipt | exact-staging blocked |
 | AC6 | `tests/integration/test_real_composition.py::test_real_composition_admits_dispatches_commits_reads_once_and_duplicate_is_read_only`, `tests/integration/test_http_composed_path.py::test_real_http_composition_commits_encrypted_readback_and_duplicate_dispatches_once` | PostgreSQL/real HTTP composition green |
@@ -30,10 +30,28 @@ mocks; an unavailable local database is reported as unavailable infrastructure.
 
 ## Execution snapshot
 
-Exact code/test head: `2282e4a4fcc8a71411e9747111a1d70c13137936`.
+Exact base: `1128fddfc83abd5ecba5989583243693a98e9750`; contract head:
+`5961788e08c9414e78f3dc26dc6d7b53ec56cca2`; code/test head:
+`09cca80a3dd0dda20e5484a67b1693939ef0fb5b`.
 
-`RESTRICTED_RUNTIME_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:57288/restricted_runtime_test python -m pytest tests/unit tests/static tests/integration tests/container tests/api -q` — **118 passed, 2 skipped** (both Docker daemon gates), 3 warnings. The run includes the real HTTP composition test
+Root-independent full run using WSL Docker and real ephemeral PostgreSQL at
+localhost `127.0.0.1:57288` (credentials omitted): **127 passed, 0 skipped, 3
+warnings in 27.45s**. The run includes the real HTTP composition test
 `tests/integration/test_http_composed_path.py::test_real_http_composition_commits_encrypted_readback_and_duplicate_dispatches_once`.
 
-The two skipped tests are the image build/runtime proof only; the Docker recipe
-scan itself ran. PostgreSQL-backed tests ran against the isolated test database.
+Local immutable image IDs (not registry-pushed deployment digests):
+
+- conversation: `sha256:0bf4d5c5b5bf640e45157a1e4d0b66cb2dcc9f11378ea6f17f85479adcd78301`, UID `10001`;
+- gateway: `sha256:62acf9d31fa4716267e67281674cd8a55acd31cc878f679453b6a33890da4361`, UID `10002`.
+
+OCI layer scans inspected imported packages and tar-readable `docker save`
+blobs; forbidden lower-layer/site-packages modules were zero, and the
+conversation/gateway root exclusions held. No registry push or deployed image
+digest is claimed.
+
+Final synthetic non-PHI provider smoke: exact sink
+`projects/350094423396/locations/us/publishers/google/models/gemini-3.5-flash`
+at `aiplatform.us.rep.googleapis.com`, one dispatch, `3219ms`,
+`SUCCEEDED`, sanitized text `HRH_RESTRICTED_RUNTIME_OK`, and provider request
+ID `8G-UasvzJOC00ekPlfiWkA0`; policy digest/epoch were recorded without
+asserting a signed deployment bundle. See `restricted-vertex-smoke-2026-08-30.md`.

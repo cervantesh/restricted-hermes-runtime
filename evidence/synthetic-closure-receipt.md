@@ -4,34 +4,45 @@ This receipt records synthetic-only evidence at one immutable repository head;
 it is not PHI deployment authorization.
 
 - repository base: `1128fddfc83abd5ecba5989583243693a98e9750`
-- code/test head: `2282e4a4fcc8a71411e9747111a1d70c13137936`
-- conversation/gateway image digests: **PENDING** — Docker daemon was unavailable; no image digest is claimed
-- policy digest/epoch: no signed deployment bundle is asserted; `policy/policy.template.json` remains a template and no policy digest is invented
+- contract head: `5961788e08c9414e78f3dc26dc6d7b53ec56cca2`
+- code/test head: `09cca80a3dd0dda20e5484a67b1693939ef0fb5b`
+- successful runtime head range: `759760` through `09cca80` (Dockerfiles, `src/`, `pyproject.toml`, `policy/`, `infra/`, and `migrations`)
+- local immutable conversation image ID (not a registry-pushed deployment digest): `sha256:0bf4d5c5b5bf640e45157a1e4d0b66cb2dcc9f11378ea6f17f85479adcd78301`, UID `10001`
+- local immutable gateway image ID (not a registry-pushed deployment digest): `sha256:62acf9d31fa4716267e67281674cd8a55acd31cc878f679453b6a33890da4361`, UID `10002`
+- policy digest/epoch observed by the final synthetic smoke: `faf98336bfe94b460a903662cb841e991682788ade1ad3a244348f22bb907687` / `synthetic-smoke-2026-08-30-final-r2`; no signed deployment bundle or registry/deployment claim is asserted
 - system instruction digest: `afcf847cd029409e53bbcb07e92b9d407876e3190e9cf951844829cb34599c1b`
 - response profile: `restricted-vertex-text-response.v1`
 - migration: `001_restricted_runtime.sql`
 
 ## Executed gates
 
-- Local/static/integration/API/container command:
-  `RESTRICTED_RUNTIME_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:57288/restricted_runtime_test python -m pytest tests/unit tests/static tests/integration tests/container tests/api -q`
-  — **118 passed, 2 skipped**, 3 warnings. The two skips are the Docker image
-  build/runtime tests; the Docker recipe scan passed. This includes the real
-  HTTP composition test and the AC16 raw response fixture wave.
-- PostgreSQL: **GREEN** against the isolated database at
-  `127.0.0.1:57288/restricted_runtime_test`; migrations applied by the
-  integration fixtures.
+- Root-independent full run (WSL Docker, real ephemeral PostgreSQL at
+  localhost `127.0.0.1:57288`, credentials omitted): **127 passed, 0 skipped,
+  3 warnings in 27.45s**. This includes the real HTTP composition test and the
+  AC16 raw response fixture wave.
+- PostgreSQL: **GREEN** against the real ephemeral localhost instance at
+  `127.0.0.1:57288`; migrations applied by the integration fixtures.
+- Image isolation: **GREEN**. Imported-package and tar-readable `docker save`
+  layer scans found zero forbidden lower-layer/site-packages modules; the
+  conversation image excludes Vertex and opposite-service roots, and the
+  gateway image excludes conversation production roots. Synthetic mutations
+  for a site-packages lower-layer leak and a zero-readable-layer archive were
+  exercised.
+- Container runtime identities: conversation runs as UID `10001`; gateway runs
+  as UID `10002`.
 - Terraform: **GREEN** — `terraform -chdir=infra init -backend=false -input=false`
   followed by `terraform -chdir=infra validate` reported a valid configuration.
-- synthetic real-provider receipt: existing sanitized fixture reference
-  `restricted-vertex-smoke-2026-08-30.md`; no provider dispatch is claimed by
-  this local receipt.
-- provider smoke: **PENDING** — requires `gcloud` reauthentication; no result
-  is inferred from the checked-in fixture.
+- Synthetic no-PHI diagnostics/smoke: six total requests; each product client
+  was limited to one dispatch with no retry. Final real-provider smoke is
+  recorded in `restricted-vertex-smoke-2026-08-30.md`.
+- Provider smoke status: **PENDING for further reauthentication** — the final
+  synthetic evidence is recorded, but user passkey reauthentication is still
+  required for the next `gcloud` operation.
 
 ## External boundary
 
 - PHI authorization: **BLOCKED**; see `PHI_BLOCKERS.md`.
-- The missing image digests and provider smoke are the only receipt items
-  marked **PENDING**. Unsupplied signed policy/deployment values are explicitly
-  not asserted here.
+- Registry push, deployed revision, BAA, IAM, egress, and PHI authorization
+  remain **BLOCKED**. Local image IDs above are not registry-pushed digests.
+- No signed policy artifact, deployment revision, or PHI readiness is asserted
+  by this synthetic receipt.
