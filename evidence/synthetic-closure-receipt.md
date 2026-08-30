@@ -3,7 +3,7 @@
 This receipt records synthetic-only evidence at one immutable repository head;
 it is not PHI deployment authorization.
 
-- repository base: `1128fddfc83abd5ecba5989583243693a98e9756`
+- repository base: `1128fddfc83abd5ecba5989583243693a98e9750`
 - code/test head: `2282e4a4fcc8a71411e9747111a1d70c13137936`
 - conversation/gateway image digests: **PENDING** — Docker daemon was unavailable; no image digest is claimed
 - policy digest/epoch: no signed deployment bundle is asserted; `policy/policy.template.json` remains a template and no policy digest is invented
