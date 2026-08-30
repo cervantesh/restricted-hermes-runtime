@@ -1,5 +1,6 @@
 """Offline proof that the diagnostic manifest stays isolated and non-PHI."""
 from pathlib import Path
+import re
 
 
 ROOT=Path("infra")
@@ -25,3 +26,15 @@ def test_staging_has_no_nat_and_keeps_fqdn_sni_residual_undetermined():
     source="\n".join(path.read_text(encoding="utf-8") for path in ROOT.glob("*.tf"))
     assert "google_compute_router_nat" not in source
     assert "UNDETERMINED" in (ROOT / "egress-policy.md").read_text(encoding="utf-8")
+
+
+def test_staging_uses_iam_database_auth_key_scoped_kms_and_fail_closed_jobs():
+    source="\n".join(path.read_text(encoding="utf-8") for path in ROOT.glob("*.tf"))
+    assert len(re.findall(r'role\s*=\s*"roles/cloudsql\.instanceUser"',source)) == 3
+    assert "google_kms_crypto_key_iam_member" in source
+    assert "roles/cloudkms.cryptoKeyEncrypterDecrypter" in source
+    assert len(re.findall(r'role\s*=\s*"roles/cloudkms\.signerVerifier"',source)) == 2
+    assert "migration_bootstrap_secret_id" in source and "MIGRATION_ADMIN_DSN" in source
+    assert "--auto-iam-authn" in source and "RESTRICTED_SYNTHETIC_PAYLOAD" in source
+    assert 'default = false' in source and "RESTRICTED_ADMISSION_ENABLED" in source
+    assert "jsonencode(var.retired_service_mac_versions)" in source

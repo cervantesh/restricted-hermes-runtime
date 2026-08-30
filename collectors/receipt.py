@@ -18,6 +18,7 @@ def redact(fields: Mapping[str,object]) -> dict[str,str]:
 
 def make_receipt(*, fqdn_sni_witness: str, fields: Mapping[str,object]) -> DiagnosticReceipt:
     if fqdn_sni_witness not in {"PASS","UNDETERMINED","FAIL"}: raise ValueError("closed FQDN/SNI state")
-    # An unknown network witness is intentionally a partial synthetic result.
-    state="PARTIAL" if fqdn_sni_witness=="UNDETERMINED" else ("READY" if fqdn_sni_witness=="PASS" else "FAILED")
+    # A network witness is only one gate.  Deployed proof must be explicitly
+    # complete; a missing collector result never promotes a synthetic receipt.
+    state="FAILED" if fqdn_sni_witness=="FAIL" else ("READY" if fqdn_sni_witness=="PASS" and fields.get("deployed_gates")=="PASS" else "PARTIAL")
     return DiagnosticReceipt(state,fqdn_sni_witness,redact(fields))

@@ -5,3 +5,7 @@ def test_undetermined_fqdn_sni_can_never_be_labeled_ready_and_secrets_are_redact
     receipt=make_receipt(fqdn_sni_witness="UNDETERMINED",fields={"conversation_digest":"sha256:abc","database_url":"postgresql://secret","authorization":"Bearer x"})
     assert receipt.state=="PARTIAL"
     assert receipt.fields["database_url"]=="[REDACTED]" and receipt.fields["authorization"]=="[REDACTED]"
+
+def test_a_passing_network_witness_without_all_deployed_gates_is_still_partial():
+    assert make_receipt(fqdn_sni_witness="PASS",fields={}).state=="PARTIAL"
+    assert make_receipt(fqdn_sni_witness="PASS",fields={"deployed_gates":"PASS"}).state=="READY"

@@ -1,0 +1,6 @@
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir "google-auth>=2.35,<3" "httpx>=0.27,<1" && useradd --system --uid 10004 restricted-runner
+COPY runner/synthetic_runner.py ./synthetic_runner.py
+USER 10004
+CMD ["python", "/app/synthetic_runner.py"]
