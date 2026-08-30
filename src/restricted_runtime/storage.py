@@ -22,6 +22,11 @@ class PostgresLedger:
     def reserve(self, envelope: GatewayEnvelope, principal: str, mac: bytes, key_resource: str, key_version: str) -> AttemptState:
         sink = {k: self.policy.values[k] for k in ("vertex_project_id","vertex_project_number","model_resource","generate_content_path","location","hostname","method","model")}
         with self._connect() as conn, conn.cursor() as cur:
+            # Both reserve and NOT_FOUND fence lock this durable identity guard;
+            # neither can observe an absent attempt while the other writes a tombstone.
+            cur.execute("INSERT INTO inference_ledger.dispatch_guards (tenant_id,turn_id,client_request_id,policy_epoch,policy_digest) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",(envelope.tenant_id,envelope.turn_id,envelope.client_request_id,envelope.policy_epoch,envelope.policy_digest))
+            cur.execute("SELECT * FROM inference_ledger.dispatch_guards WHERE tenant_id=%s AND (turn_id=%s OR client_request_id=%s) FOR UPDATE",(envelope.tenant_id,envelope.turn_id,envelope.client_request_id));guard=cur.fetchone()
+            if (str(guard["turn_id"]),str(guard["client_request_id"]),guard["policy_epoch"],guard["policy_digest"]) != (envelope.turn_id,envelope.client_request_id,envelope.policy_epoch,envelope.policy_digest): raise ContractError("guard remap conflict")
             cur.execute("SELECT * FROM inference_ledger.attempts WHERE tenant_id=%s AND (turn_id=%s OR client_request_id=%s) FOR UPDATE", (envelope.tenant_id,envelope.turn_id,envelope.client_request_id)); row=cur.fetchone()
             if row: self._same(row,envelope,principal,mac); return AttemptState(row["state"])
             cur.execute("SELECT * FROM inference_ledger.cancellation_tombstones WHERE tenant_id=%s AND (turn_id=%s OR client_request_id=%s) FOR UPDATE", (envelope.tenant_id,envelope.turn_id,envelope.client_request_id)); tomb=cur.fetchone()
@@ -46,9 +51,17 @@ class PostgresLedger:
             cur.execute("SELECT state FROM inference_ledger.attempts WHERE tenant_id=%s AND turn_id=%s",(tenant_id,turn_id)); row=cur.fetchone(); return AttemptState(row["state"]) if row else None
     def fence(self, tenant_id: str, turn_id: str, *, client_request_id: str|None=None, policy_epoch: str|None=None, policy_digest: str|None=None) -> AttemptState:
         with self._connect() as conn, conn.cursor() as cur:
+            if not all((client_request_id,policy_epoch,policy_digest)):
+                # Existing attempts may supply identity after their durable guard
+                # is locked; NOT_FOUND has no safe abbreviated form.
+                cur.execute("SELECT client_request_id,policy_epoch,policy_digest FROM inference_ledger.dispatch_guards WHERE tenant_id=%s AND turn_id=%s FOR UPDATE",(tenant_id,turn_id));known=cur.fetchone()
+                if known: client_request_id,policy_epoch,policy_digest=str(known["client_request_id"]),known["policy_epoch"],known["policy_digest"]
+                else: raise ContractError("NOT_FOUND fence requires complete identity")
+            cur.execute("INSERT INTO inference_ledger.dispatch_guards (tenant_id,turn_id,client_request_id,policy_epoch,policy_digest) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",(tenant_id,turn_id,client_request_id,policy_epoch,policy_digest))
+            cur.execute("SELECT * FROM inference_ledger.dispatch_guards WHERE tenant_id=%s AND (turn_id=%s OR client_request_id=%s) FOR UPDATE",(tenant_id,turn_id,client_request_id));guard=cur.fetchone()
+            if (str(guard["turn_id"]),str(guard["client_request_id"]),guard["policy_epoch"],guard["policy_digest"]) != (turn_id,client_request_id,policy_epoch,policy_digest): raise ContractError("guard remap conflict")
             cur.execute("SELECT * FROM inference_ledger.attempts WHERE tenant_id=%s AND turn_id=%s FOR UPDATE",(tenant_id,turn_id)); row=cur.fetchone()
             if row is None:
-                if not all((client_request_id,policy_epoch,policy_digest)): raise ContractError("NOT_FOUND fence requires complete identity")
                 cur.execute("INSERT INTO inference_ledger.cancellation_tombstones (tenant_id,turn_id,client_request_id,policy_epoch,policy_digest) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (tenant_id,turn_id) DO NOTHING",(tenant_id,turn_id,client_request_id,policy_epoch,policy_digest)); return AttemptState.CANCELLED_NO_DISPATCH
             if row["state"] == "RESERVED":
                 cur.execute("UPDATE inference_ledger.attempts SET state='CANCELLED_NO_DISPATCH',fence_generation=fence_generation+1,updated_at=transaction_timestamp() WHERE tenant_id=%s AND turn_id=%s AND state='RESERVED'",(tenant_id,turn_id)); return AttemptState.CANCELLED_NO_DISPATCH
@@ -57,6 +70,12 @@ class PostgresLedger:
 class PostgresContentStore:
     def __init__(self, connection_string: str): self.connection_string=connection_string
     def _connect(self): return psycopg.connect(self.connection_string,row_factory=dict_row)
+    def create_conversation(self, tenant_id: str, conversation_id: str) -> str:
+        epoch=str(uuid.uuid4())
+        with self._connect() as conn,conn.cursor() as cur:
+            cur.execute("INSERT INTO restricted_content.conversations (tenant_id,conversation_id,conversation_epoch) VALUES (%s,%s,%s) ON CONFLICT (tenant_id,conversation_id) DO NOTHING RETURNING conversation_epoch",(tenant_id,conversation_id,epoch));row=cur.fetchone()
+            if row:return row["conversation_epoch"]
+            cur.execute("SELECT conversation_epoch FROM restricted_content.conversations WHERE tenant_id=%s AND conversation_id=%s",(tenant_id,conversation_id));return cur.fetchone()["conversation_epoch"]
     @staticmethod
     def _row(r:dict[str,Any])->TurnRow:
         return TurnRow(r["tenant_id"],r["conversation_id"],r["conversation_epoch"],str(r["turn_id"]),str(r["client_request_id"]),r["authenticated_caller_principal"],bytes(r["request_mac"]),r["mac_key_resource"],r["mac_key_version"],r["policy_digest"],TurnState(r["state"]),bytes(r["request_ciphertext"]),bytes(r["request_nonce"]),bytes(r["response_ciphertext"]) if r["response_ciphertext"] else None,bytes(r["response_nonce"]) if r["response_nonce"] else None,bytes(r["wrapped_data_key"]),r["lease_generation"])
@@ -72,7 +91,7 @@ class PostgresContentStore:
             if old:return self._row(old),False
             cur.execute("SELECT 1 FROM restricted_content.turns WHERE tenant_id=%s AND conversation_id=%s AND conversation_epoch=%s AND state NOT IN ('COMMITTED','REJECTED','FAILED','INDETERMINATE')",(c.tenant_id,c.conversation_id,c.conversation_epoch))
             if cur.fetchone():raise ContractError("ACTIVE_TURN")
-            cur.execute("INSERT INTO restricted_content.turns (tenant_id,conversation_id,conversation_epoch,turn_id,client_request_id,authenticated_caller_principal,schema_version,request_mac,mac_key_resource,mac_key_version,request_ciphertext,request_nonce,wrapped_data_key,policy_digest,state,lease_owner,lease_generation,lease_expires_at) VALUES (%s,%s,%s,%s,%s,%s,'restricted-turn.v1',%s,%s,%s,%s,%s,%s,%s,'RECEIVED','handler',0,transaction_timestamp()+interval '30 seconds') ON CONFLICT (tenant_id,client_request_id) DO NOTHING",(c.tenant_id,c.conversation_id,c.conversation_epoch,c.turn_id,c.client_request_id,c.principal,c.request_mac,c.mac_key_resource,c.mac_key_version,c.request_ciphertext,c.request_nonce,c.wrapped_data_key,c.policy_digest))
+            cur.execute("INSERT INTO restricted_content.turns (tenant_id,conversation_id,conversation_epoch,turn_id,client_request_id,authenticated_caller_principal,schema_version,request_mac,mac_key_resource,mac_key_version,request_ciphertext,request_nonce,wrapped_data_key,policy_digest,state,lease_owner,lease_generation,lease_expires_at) VALUES (%s,%s,%s,%s,%s,%s,'restricted-turn.v1',%s,%s,%s,%s,%s,%s,%s,%s,'handler',0,transaction_timestamp()+interval '30 seconds') ON CONFLICT (tenant_id,client_request_id) DO NOTHING",(c.tenant_id,c.conversation_id,c.conversation_epoch,c.turn_id,c.client_request_id,c.principal,c.request_mac,c.mac_key_resource,c.mac_key_version,c.request_ciphertext,c.request_nonce,c.wrapped_data_key,c.policy_digest,c.state.value))
             if cur.rowcount:return c,True
             cur.execute("SELECT * FROM restricted_content.turns WHERE tenant_id=%s AND client_request_id=%s FOR UPDATE",(c.tenant_id,c.client_request_id)); return self._row(cur.fetchone()),False
     def committed_history(self,t:str,c:str,e:str)->list[TurnRow]:

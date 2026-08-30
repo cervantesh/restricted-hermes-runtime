@@ -39,7 +39,7 @@ resource "google_kms_crypto_key" "gateway_mac_retired" {
 resource "google_project_iam_custom_role" "mac_verify_only" {
   role_id     = "restrictedMacVerifyOnly"
   title       = "Restricted KMS MAC verify only"
-  permissions = ["cloudkms.cryptoKeyVersions.useToVerifyMac"]
+  permissions = ["cloudkms.cryptoKeyVersions.useToVerify"]
 }
 resource "google_kms_crypto_key_iam_member" "conversation_wrap" {
   crypto_key_id = google_kms_crypto_key.content_wrap.id

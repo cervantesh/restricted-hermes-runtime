@@ -38,7 +38,7 @@ class Gateway:
         if envelope.system_instruction_version != p["system_instruction_version"] or envelope.system_instruction != SYSTEM_INSTRUCTION or p["system_instruction_sha256"] != SYSTEM_INSTRUCTION_SHA256:
             raise ContractError("system instruction mismatch")
         canonical = envelope.canonical(principal)
-        if envelope.content_limit != len(canonical) or len(canonical) > p["max_canonical_input_utf8_bytes"]:
+        if envelope.content_limit != p["max_canonical_input_utf8_bytes"] or len(canonical) > envelope.content_limit:
             raise ContractError("content limit mismatch")
         return canonical
     def infer_once(self, envelope: GatewayEnvelope, principal: str) -> ProviderResult:

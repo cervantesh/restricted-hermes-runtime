@@ -90,7 +90,9 @@ class VertexClient:
         self.policy, self._token_supplier = policy, token_supplier
         self.dispatch_count = 0
     def generate_content(self, messages: list[dict[str, str]]) -> ProviderResult:
-        body = {"systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]}, "contents": messages, "generationConfig": {"candidateCount": 1, "maxOutputTokens": 4096}}
+        body = build_vertex_payload(messages)
+        if body is None:
+            return ProviderResult("INDETERMINATE",failure_class="INVALID_INTERNAL_MESSAGE")
         # system instruction never comes from a caller; injected by gateway only.
         url = "https://" + self.policy.values["hostname"] + self.policy.values["generate_content_path"]
         self.dispatch_count += 1
@@ -103,3 +105,11 @@ class VertexClient:
             return parse_vertex_response(response.status_code, response.content)
         except httpx.TransportError:
             return ProviderResult("INDETERMINATE", failure_class="TRANSPORT_AFTER_DISPATCH")
+
+def build_vertex_payload(messages: list[dict[str,str]]) -> dict[str,Any] | None:
+        contents=[]
+        for message in messages:
+            if set(message)!={"role","text"} or message["role"] not in {"user","model"} or not isinstance(message["text"],str) or not message["text"]:
+                return None
+            contents.append({"role":message["role"],"parts":[{"text":message["text"]}]})
+        return {"systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]}, "contents": contents, "generationConfig": {"candidateCount": 1, "maxOutputTokens": 4096}}

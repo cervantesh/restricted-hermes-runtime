@@ -7,6 +7,14 @@ from ..conversation import ConversationService
 
 def create_app(runtime: ConversationService, authenticator: Authenticator) -> FastAPI:
     app=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
+    @app.post("/v1/restricted/conversations/{conversation_id}")
+    async def create_conversation(conversation_id:str,request:Request):
+        try:
+            if await request.body():raise ContractError("conversation creation has no caller body")
+            authenticator.authenticate(request.headers.get("authorization"))
+            epoch=runtime.store.create_conversation(runtime.tenant_id,conversation_id)
+            return {"schema_version":"restricted-conversation.v1","conversation_id":conversation_id,"conversation_epoch":epoch}
+        except ContractError as exc:raise HTTPException(400,"restricted conversation rejected") from exc
     @app.post("/v1/restricted/conversations/{conversation_id}/turns")
     async def create_turn(conversation_id:str,request:Request):
         try:

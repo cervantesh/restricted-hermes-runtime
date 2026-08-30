@@ -22,6 +22,11 @@ CREATE UNIQUE INDEX one_active_turn_per_conversation ON restricted_content.turns
  WHERE state NOT IN ('COMMITTED','REJECTED','FAILED','INDETERMINATE');
 
 CREATE TYPE inference_ledger.attempt_state AS ENUM ('RESERVED','DISPATCH_STARTED','SUCCEEDED','FAILED','INDETERMINATE','CANCELLED_NO_DISPATCH');
+CREATE TABLE inference_ledger.dispatch_guards (
+  tenant_id text NOT NULL, turn_id uuid NOT NULL, client_request_id uuid NOT NULL,
+  policy_epoch text NOT NULL, policy_digest text NOT NULL,
+  PRIMARY KEY (tenant_id, turn_id), UNIQUE (tenant_id, client_request_id)
+);
 CREATE TABLE inference_ledger.attempts (
   tenant_id text NOT NULL, turn_id uuid NOT NULL, client_request_id uuid NOT NULL, decision_id uuid NOT NULL,
   conversation_epoch text NOT NULL, authenticated_caller_principal text NOT NULL,

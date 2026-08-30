@@ -59,7 +59,7 @@ class ConversationService:
         key_record = self.mac_key.sign(kms_mac_input(SERVICE_MAC_DOMAIN, canonical))
         data_key = os.urandom(32)
         turn_id = str(uuid.uuid4())
-        initial = TurnRow(self.tenant_id, conversation_id, request.conversation_epoch, turn_id, request.client_request_id, principal, key_record.mac, key_record.key_resource, key_record.key_version, self.policy.digest, TurnState.RECEIVED, b"", b"", None, None, self.data_keys.wrap(data_key), 0)
+        initial = TurnRow(self.tenant_id, conversation_id, request.conversation_epoch, turn_id, request.client_request_id, principal, key_record.mac, key_record.key_resource, key_record.key_version, self.policy.digest, TurnState.REQUEST_COMMITTED, b"", b"", None, None, self.data_keys.wrap(data_key), 0)
         history = self.store.committed_history(self.tenant_id, conversation_id, request.conversation_epoch)
         messages = self._decrypt_history(history) + [{"role": "user", "text": request.message}]
         request_payload = jcs_bytes({"system_instruction": SYSTEM_INSTRUCTION, "messages": messages})
@@ -69,18 +69,20 @@ class ConversationService:
         self._verify_duplicate(row, request, principal, conversation_id)
         if not created:
             return self._duplicate_result(row)
-        if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.RECEIVED, TurnState.INFERENCE_PENDING):
+        if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.REQUEST_COMMITTED, TurnState.INFERENCE_PENDING):
             raise ContractError("admitted turn lease lost")
         row = self.store.read_turn(self.tenant_id, row.turn_id)
-        envelope = GatewayEnvelope(self.tenant_id, conversation_id, request.conversation_epoch, row.turn_id, request.client_request_id, self.policy.epoch, self.policy.digest, "restricted-phi-system.v1", SYSTEM_INSTRUCTION, "PHI", messages, 0)
-        envelope = GatewayEnvelope(**{**envelope.__dict__, "content_limit": len(envelope.canonical(principal))})
+        envelope = GatewayEnvelope(self.tenant_id, conversation_id, request.conversation_epoch, row.turn_id, request.client_request_id, self.policy.epoch, self.policy.digest, "restricted-phi-system.v1", SYSTEM_INSTRUCTION, "PHI", messages, self.policy.values["max_canonical_input_utf8_bytes"])
         result = self.gateway.infer_once(envelope, principal)
         if result.state != "SUCCEEDED" or result.text is None:
-            target = TurnState.FAILED if result.state == "FAILED" else TurnState.INDETERMINATE
-            self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.INFERENCE_PENDING, target)
+            target = TurnState.FAILED if result.state in {"FAILED","CANCELLED_NO_DISPATCH"} else TurnState.INDETERMINATE
+            if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.INFERENCE_PENDING, target):
+                raise ContractError("terminal transition did not commit")
             return {"schema_version": "restricted-turn-status.v1", "turn_id": row.turn_id, "conversation_epoch": row.conversation_epoch, "status": target.value}
         response_cipher = encrypt(data_key, result.text.encode("utf-8"), self._aad(row, "response"))
-        if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.INFERENCE_PENDING, TurnState.COMMITTED, response_ciphertext=response_cipher.ciphertext, response_nonce=response_cipher.nonce):
+        if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.INFERENCE_PENDING, TurnState.RESPONSE_RECEIVED):
+            raise ContractError("response received transition failed")
+        if not self.store.set_state_cas(self.tenant_id, row.turn_id, row.lease_generation, TurnState.RESPONSE_RECEIVED, TurnState.COMMITTED, response_ciphertext=response_cipher.ciphertext, response_nonce=response_cipher.nonce):
             raise ContractError("response durable commit failed")
         return self._committed_result(self.store.read_turn(self.tenant_id, row.turn_id))
     def _decrypt_history(self, rows: list[TurnRow]) -> list[dict[str, str]]:
