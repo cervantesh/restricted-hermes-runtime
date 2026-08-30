@@ -31,7 +31,13 @@ def test_a_passing_network_witness_without_all_deployed_gates_is_still_partial()
     incomplete={gate:"PASS" for gate in REQUIRED_DEPLOYED_GATES-{"one_dispatch"}}
     assert make_receipt(fqdn_sni_witness="PASS",fields=incomplete).state=="PARTIAL"
     complete=complete_fields()
-    assert make_receipt(fqdn_sni_witness="PASS",fields=complete,provenance=complete).state=="READY"
+    assert make_receipt(fqdn_sni_witness="PASS",fields=complete,provenance=complete).state=="PARTIAL"
+
+
+def test_local_helper_cannot_promote_even_a_structurally_bound_complete_receipt():
+    complete=complete_fields()
+    receipt=make_receipt(fqdn_sni_witness="PASS",fields=complete,provenance=complete)
+    assert receipt.state == "PARTIAL"
 
 
 def test_sensitive_dsn_and_private_key_values_are_redacted_even_with_benign_keys():

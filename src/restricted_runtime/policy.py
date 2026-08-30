@@ -31,7 +31,7 @@ class PolicyBundle:
         if set(self.values) != REQUIRED_FIELDS or self.values.get("schema_version") != POLICY_SCHEMA:
             raise ContractError("policy schema is closed")
         expected = {
-            "classification": "PHI", "provider": "vertex-ai", "model": "gemini-3.5-flash", "location": "us", "hostname": "aiplatform.googleapis.com", "method": "generateContent", "streaming": False, "fallbacks": [], "max_provider_attempts": 1, "allowed_modalities": ["text"], "tools_allowed": False, "candidate_count": 1, "max_output_tokens": 4096, "max_canonical_input_utf8_bytes": 131072, "response_profile": "restricted-vertex-text-response.v1", "system_instruction_version": "restricted-phi-system.v1", "system_instruction_sha256": SYSTEM_INSTRUCTION_SHA256,
+            "classification": "PHI", "provider": "vertex-ai", "model": "gemini-3.5-flash", "location": "us", "hostname": "aiplatform.us.rep.googleapis.com", "method": "generateContent", "streaming": False, "fallbacks": [], "max_provider_attempts": 1, "allowed_modalities": ["text"], "tools_allowed": False, "candidate_count": 1, "max_output_tokens": 4096, "max_canonical_input_utf8_bytes": 131072, "response_profile": "restricted-vertex-text-response.v1", "system_instruction_version": "restricted-phi-system.v1", "system_instruction_sha256": SYSTEM_INSTRUCTION_SHA256,
         }
         for key, expected_value in expected.items():
             if self.values.get(key) != expected_value:

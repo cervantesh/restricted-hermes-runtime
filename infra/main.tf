@@ -159,6 +159,7 @@ locals {
     "vpc-connector-${var.region}-${google_vpc_access_connector.runner.name}",
     "vpc-connector-${var.region}-${google_vpc_access_connector.migration.name}",
   ]
+  gateway_connector_tag = "vpc-connector-${var.region}-${google_vpc_access_connector.gateway.name}"
 }
 
 # The official restricted.googleapis.com baseline permits only the restricted
@@ -186,6 +187,53 @@ resource "google_dns_record_set" "all_googleapis" {
   type         = "CNAME"
   ttl          = 300
   rrdatas      = ["restricted.googleapis.com."]
+}
+
+# `aiplatform.us.rep.googleapis.com` is a multi-regional Vertex endpoint. It
+# is deliberately excluded from the restricted VIP wildcard: regional and
+# multi-regional Google APIs require a regional PSC endpoint and exact DNS.
+resource "google_project_service" "network_connectivity" {
+  service            = "networkconnectivity.googleapis.com"
+  disable_on_destroy = false
+}
+resource "google_compute_subnetwork" "vertex_psc" {
+  name                     = "restricted-vertex-psc"
+  region                   = var.region
+  network                  = google_compute_network.restricted.id
+  ip_cidr_range            = "10.77.5.0/28"
+  private_ip_google_access = true
+}
+resource "google_compute_address" "vertex_psc" {
+  name         = "restricted-vertex-psc"
+  region       = var.region
+  subnetwork   = google_compute_subnetwork.vertex_psc.id
+  address_type = "INTERNAL"
+}
+resource "google_network_connectivity_regional_endpoint" "vertex_us" {
+  name              = "restricted-vertex-us"
+  location          = var.region
+  access_type       = "REGIONAL"
+  target_google_api = "aiplatform.us.rep.googleapis.com"
+  network           = google_compute_network.restricted.id
+  subnetwork        = google_compute_subnetwork.vertex_psc.id
+  address           = google_compute_address.vertex_psc.address
+  depends_on        = [google_project_service.network_connectivity]
+}
+resource "google_dns_managed_zone" "vertex_us_rep" {
+  name       = "restricted-vertex-us-rep"
+  dns_name   = "aiplatform.us.rep.googleapis.com."
+  visibility = "private"
+  private_visibility_config {
+    networks { network_url = google_compute_network.restricted.id }
+  }
+}
+resource "google_dns_record_set" "vertex_us_rep_apex" {
+  managed_zone = google_dns_managed_zone.vertex_us_rep.name
+  name         = "aiplatform.us.rep.googleapis.com."
+  type         = "A"
+  ttl          = 300
+  rrdatas      = [google_compute_address.vertex_psc.address]
+  depends_on   = [google_network_connectivity_regional_endpoint.vertex_us]
 }
 # Internal Cloud Run URLs remain on run.app even when default routes are
 # removed. Resolve their wildcard only to the same restricted VIP; the
@@ -235,6 +283,18 @@ resource "google_compute_firewall" "allow_private_sql" {
   allow {
     protocol = "tcp"
     ports    = ["5432"]
+  }
+}
+resource "google_compute_firewall" "allow_vertex_psc" {
+  name               = "restricted-synthetic-allow-vertex-psc"
+  network            = google_compute_network.restricted.name
+  direction          = "EGRESS"
+  priority           = 1005
+  target_tags        = [local.gateway_connector_tag]
+  destination_ranges = ["${google_compute_address.vertex_psc.address}/32"]
+  allow {
+    protocol = "tcp"
+    ports    = ["443"]
   }
 }
 resource "google_compute_firewall" "deny_other_egress" {

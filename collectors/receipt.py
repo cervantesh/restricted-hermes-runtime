@@ -93,9 +93,13 @@ def collect_provenance(*, runtime_root: Path, contract_root: Path, contract_base
 
 def make_receipt(*, fqdn_sni_witness: str, fields: Mapping[str,object], provenance: Mapping[str,object] | None = None) -> DiagnosticReceipt:
     if fqdn_sni_witness not in {"PASS","UNDETERMINED","FAIL"}: raise ValueError("closed FQDN/SNI state")
-    # A network witness is only one gate.  Deployed proof must be explicitly
-    # complete; a missing collector result never promotes a synthetic receipt.
+    # A network witness is only one gate. This local helper has no independently
+    # deployed collector/verifier, so caller-supplied fields or provenance must
+    # never promote a diagnostic into READY. Keep checking structure to make
+    # fabricated receipts visible, but fail closed until that separate service
+    # exists and writes/verifies the evidence itself.
     immutable_evidence_valid=provenance is not None and all(pattern.fullmatch(str(fields.get(name,""))) and str(fields.get(name))==str(provenance.get(name)) for name,pattern in IMMUTABLE_EVIDENCE_FIELDS.items())
     all_gates_pass=all(fields.get(gate)=="PASS" for gate in REQUIRED_DEPLOYED_GATES) and immutable_evidence_valid
-    state="FAILED" if fqdn_sni_witness=="FAIL" else ("READY" if fqdn_sni_witness=="PASS" and all_gates_pass else "PARTIAL")
+    _ = all_gates_pass  # retained validation; no local caller can certify deployment.
+    state="FAILED" if fqdn_sni_witness=="FAIL" else "PARTIAL"
     return DiagnosticReceipt(state,fqdn_sni_witness,redact(fields))

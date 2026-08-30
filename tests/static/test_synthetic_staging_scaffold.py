@@ -87,13 +87,19 @@ def test_durable_dispatch_control_starts_disabled_and_is_not_mutable_by_gateway_
     assert "FOR SHARE" in storage and "attempt[\"state\"] != \"RESERVED\"" in storage
 
 
-def test_vertex_sink_uses_the_restricted_vip_supported_global_google_api_host():
+def test_vertex_us_sink_uses_its_own_psc_dns_and_not_the_restricted_vip():
     policy=Path("policy/policy.template.json").read_text(encoding="utf-8")
     egress=(ROOT/"egress-policy.md").read_text(encoding="utf-8")
-    assert '"hostname": "aiplatform.googleapis.com"' in policy
+    main=(ROOT/"main.tf").read_text(encoding="utf-8")
+    assert '"hostname": "aiplatform.us.rep.googleapis.com"' in policy
     assert '"location": "us"' in policy
-    assert "aiplatform.us.rep.googleapis.com" not in policy
-    assert "aiplatform.googleapis.com" in egress and "restricted VIP" in egress
+    assert 'resource "google_network_connectivity_regional_endpoint" "vertex_us"' in main
+    assert 'target_google_api = "aiplatform.us.rep.googleapis.com"' in main
+    assert 'dns_name   = "aiplatform.us.rep.googleapis.com."' in main
+    assert 'name         = "aiplatform.us.rep.googleapis.com."' in main
+    assert 'destination_ranges = ["${google_compute_address.vertex_psc.address}/32"]' in main
+    assert 'target_tags        = [local.gateway_connector_tag]' in main
+    assert "It is **not** sent to the restricted VIP" in egress
 
 
 def test_release_recipe_has_no_fake_digest_or_private_key_and_imports_manual_registry():

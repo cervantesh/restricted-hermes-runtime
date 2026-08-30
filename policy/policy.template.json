@@ -14,7 +14,7 @@
   "vertex_project_number": "REQUIRED_PROJECT_NUMBER",
   "model_resource": "projects/REQUIRED_PROJECT_NUMBER/locations/us/publishers/google/models/gemini-3.5-flash",
   "generate_content_path": "/v1/projects/REQUIRED_PROJECT_NUMBER/locations/us/publishers/google/models/gemini-3.5-flash:generateContent",
-  "location": "us", "hostname": "aiplatform.googleapis.com", "method": "generateContent",
+  "location": "us", "hostname": "aiplatform.us.rep.googleapis.com", "method": "generateContent",
   "streaming": false, "fallbacks": [], "max_provider_attempts": 1, "allowed_modalities": ["text"], "tools_allowed": false,
   "candidate_count": 1, "max_output_tokens": 4096, "max_canonical_input_utf8_bytes": 131072,
   "response_profile": "restricted-vertex-text-response.v1", "provider_request_logging": "synthetic-unverified-no-phi",

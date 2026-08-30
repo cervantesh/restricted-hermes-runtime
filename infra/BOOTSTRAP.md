@@ -59,10 +59,19 @@ privileges. The conversation IAM database user receives only
 account emails with the `.gserviceaccount.com` suffix removed; OIDC audiences
 and Cloud IAM bindings retain full service-account emails.
 
-The VPC has Private Google Access and no NAT. It intentionally does not claim
-FQDN/SNI/certificate enforcement; that receipt field is `UNDETERMINED` until a
-separately approved inspected egress control is deployed and tested. The
-synthetic runner payload is fixed and must never be replaced with PHI.
+The VPC has Private Google Access and no NAT. Ordinary Google APIs use the
+restricted VIP, but the frozen Vertex `us` endpoint uses its dedicated regional
+PSC address and exact private DNS record; it must never be substituted with
+`aiplatform.googleapis.com` or routed to the restricted VIP. It intentionally
+does not claim FQDN/SNI/certificate enforcement; that receipt field is
+`UNDETERMINED` until a separately approved inspected egress control is deployed
+and tested. The synthetic runner payload is fixed and must never be replaced
+with PHI.
+
+The receipt helper in this repository is local only and therefore permanently
+returns `PARTIAL` unless an independent deployed collector/verifier is added in
+an approved follow-up. Do not treat caller-provided `PASS` fields, Git SHAs, or
+digests as deployed evidence.
 
 The VPC's private DNS also maps `*.run.app` to the restricted VIP so the two
 internal Cloud Run invocations retain a route after default-route removal. This
