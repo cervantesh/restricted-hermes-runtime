@@ -17,6 +17,11 @@
 | AC21 local | `tests/unit/test_fingerprint_rotation.py` | local green |
 | SQL separation | `tests/integration/test_sql_privileges.py::test_sql_roles_cannot_read_or_write_the_other_schema` | PostgreSQL green |
 | API schema/409 | `tests/api/test_turn_schema.py` | PostgreSQL green |
+| AC15 readiness | `tests/api/test_readiness_wave.py`, `tests/unit/test_gateway_readiness.py` | live pair/down/malformed response checks green; gateway-exception mapping remains red |
+| Reconciliation startup/periodic | `tests/integration/test_runtime_wave.py::test_reconciliation_driver_scans_expired_rows_without_inference`, `tests/static/test_production_wiring_wave.py::test_conversation_root_starts_bounded_reconciliation_without_provider_import` | PostgreSQL/static green |
+| Lease heartbeat/stale generation | `tests/integration/test_runtime_wave.py::test_slow_provider_requires_multiple_lease_heartbeats`, `tests/integration/test_runtime_wave.py::test_lost_lease_generation_cannot_commit_or_release_provider_output` | PostgreSQL green on current working tree |
+| KMS retired-key config | `tests/unit/test_kms_rotation_wave.py` | config parser green; retired signing negative remains red |
+| Two-service production wiring | `tests/static/test_production_wiring_wave.py` | static green; exact Cloud Run wiring remains blocked |
 
 The failure-injection, concurrency, and cryptographic association rows are
 implemented as PostgreSQL-only test targets. They never downgrade to SQLite or
