@@ -1,0 +1,25 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "role": "model",
+        "parts": [
+          {
+            "text": "HRH_RESTRICTED_RUNTIME_OK",
+            "thoughtSignature": "c2FuaXRpemVkLXRoaW5raW5nLXNpZ25hdHVyZQ=="
+          }
+        ]
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 19,
+    "candidatesTokenCount": 7,
+    "totalTokenCount": 26,
+    "trafficType": "ON_DEMAND"
+  },
+  "modelVersion": "gemini-3.5-flash",
+  "responseId": "sanitized-exact-sink-response"
+}

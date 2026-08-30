@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import base64
 from typing import Any, Protocol
 
 import httpx
@@ -35,7 +36,7 @@ def _validate_optional(root: dict[str,Any]) -> None:
         if not isinstance(usage,dict):raise ContractError("usage")
         counts={"promptTokenCount","candidatesTokenCount","totalTokenCount","thoughtsTokenCount","cachedContentTokenCount","toolUsePromptTokenCount"}
         arrays={"promptTokensDetails","candidatesTokensDetails","cacheTokensDetails","toolUsePromptTokensDetails"}
-        _closed_keys(usage,counts|arrays)
+        _closed_keys(usage,counts|arrays|{"trafficType"})
         for key in counts:
             if key in usage and (not isinstance(usage[key],int) or isinstance(usage[key],bool) or usage[key]<0):raise ContractError("token count")
         for key in arrays:
@@ -43,6 +44,7 @@ def _validate_optional(root: dict[str,Any]) -> None:
                 if not isinstance(usage[key],list):raise ContractError("token detail")
                 for item in usage[key]:
                     if not isinstance(item,dict) or set(item)!={"modality","tokenCount"} or not isinstance(item["modality"],str) or not isinstance(item["tokenCount"],int) or isinstance(item["tokenCount"],bool) or item["tokenCount"]<0:raise ContractError("token detail")
+        if "trafficType" in usage and usage["trafficType"] != "ON_DEMAND":raise ContractError("traffic type")
     for key in ("modelVersion","createTime","responseId"):
         if key in root and not isinstance(root[key],str):raise ContractError("root string")
 
@@ -78,8 +80,14 @@ def parse_vertex_response(status_code: int, raw: bytes) -> ProviderResult:
         content = candidate.get("content")
         if not isinstance(content, dict) or set(content) != {"role", "parts"} or content["role"] != "model": raise ContractError("content")
         parts = content["parts"]
-        if not isinstance(parts, list) or len(parts) != 1 or not isinstance(parts[0], dict) or set(parts[0]) != {"text"} or not isinstance(parts[0]["text"], str) or not parts[0]["text"]:
+        if not isinstance(parts, list) or len(parts) != 1 or not isinstance(parts[0], dict) or set(parts[0]) not in ({"text"},{"text","thoughtSignature"}) or not isinstance(parts[0].get("text"), str) or not parts[0]["text"]:
             raise ContractError("text part")
+        if "thoughtSignature" in parts[0]:
+            signature=parts[0]["thoughtSignature"]
+            if not isinstance(signature,str) or not signature:raise ContractError("thought signature")
+            try:decoded=base64.b64decode(signature,validate=True)
+            except (ValueError,base64.binascii.Error) as exc:raise ContractError("thought signature") from exc
+            if not decoded or len(decoded)>65_536:raise ContractError("thought signature")
         if reason != "STOP": return ProviderResult("INDETERMINATE", failure_class="NON_FINAL_FINISH")
         return ProviderResult("SUCCEEDED", text=parts[0]["text"], provider_request_id=root.get("responseId"))
     except ContractError:

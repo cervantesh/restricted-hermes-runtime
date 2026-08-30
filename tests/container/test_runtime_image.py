@@ -4,6 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
+import tempfile
 
 import pytest
 
@@ -33,18 +35,42 @@ def run_docker(*args: str, timeout: int = 180) -> subprocess.CompletedProcess[st
     assert DOCKER is not None
     return subprocess.run([*DOCKER,*args],capture_output=True,text=True,timeout=timeout,cwd=None if DOCKER[0]=="wsl" else ROOT)
 
+def docker_path(path: Path) -> str:
+    value=path.resolve()
+    return _wsl_cwd_for(value) if DOCKER and DOCKER[0]=="wsl" else str(value)
+
+def _wsl_cwd_for(path: Path) -> str:
+    return "/mnt/"+path.drive[0].lower()+path.as_posix()[2:]
+
+def layer_members(archive: Path) -> set[str]:
+    """Read every tar-readable layer from legacy or OCI docker-save layouts."""
+    found:set[str]=set()
+    with tarfile.open(archive) as saved:
+        for member in saved:
+            if not member.isfile():
+                continue
+            stream=saved.extractfile(member)
+            if stream is None:
+                continue
+            try:
+                with tarfile.open(fileobj=stream,mode="r|*") as layer:
+                    found.update(item.name.lstrip("./") for item in layer)
+            except tarfile.ReadError:
+                pass
+    return found
+
 def test_image_recipe_has_no_dynamic_capabilities():
     for recipe in (ROOT/"Dockerfile.conversation",ROOT/"Dockerfile.gateway"):
         source=recipe.read_text(encoding="utf-8")
         assert ".env" not in source and "hermes" not in source.lower() and "USER " in source
-        assert "rm -rf /app/src /app/build" in source
+        assert "AS builder" in source and "COPY --from=builder /usr/local/lib/python3.11/site-packages" in source
 
 @pytest.mark.skipif(DOCKER is None, reason="Docker daemon unavailable locally and through Ubuntu-24.04 WSL")
-@pytest.mark.parametrize(("recipe","tag","entry","absent"),[
-    ("Dockerfile.conversation","restricted-runtime-conversation-proof","restricted_runtime.services.production_conversation",{"vertex.py","services/production_gateway.py","services/gateway_api.py"}),
-    ("Dockerfile.gateway","restricted-runtime-gateway-proof","restricted_runtime.services.production_gateway",{"gateway_client.py","reconciliation.py","reconciliation_driver.py","services/production_conversation.py","services/restricted_api.py"}),
+@pytest.mark.parametrize(("recipe","tag","entry","uid","absent"),[
+    ("Dockerfile.conversation","restricted-runtime-conversation-proof","restricted_runtime.services.production_conversation","10001",{"vertex.py","services/production_gateway.py","services/gateway_api.py"}),
+    ("Dockerfile.gateway","restricted-runtime-gateway-proof","restricted_runtime.services.production_gateway","10002",{"gateway_client.py","reconciliation.py","reconciliation_driver.py","services/production_conversation.py","services/restricted_api.py"}),
 ])
-def test_built_role_image_is_import_closed_and_has_only_its_role_surface(recipe,tag,entry,absent):
+def test_built_role_image_is_import_closed_and_has_only_its_role_surface(recipe,tag,entry,uid,absent):
     built=run_docker("build","-f",recipe,"-t",tag,".")
     assert built.returncode==0,built.stdout[-2000:]+built.stderr[-2000:]
     proof=f"""
@@ -69,6 +95,14 @@ importlib.import_module('{entry}')
     assert checked.returncode != 0
     assert "required restricted runtime configuration missing" in checked.stderr
     assert "ModuleNotFoundError" not in checked.stderr and "ImportError" not in checked.stderr
-    metadata=run_docker("image","inspect",tag,"--format","{{json .Config.Env}}",timeout=20)
+    metadata=run_docker("image","inspect",tag,"--format","{{json .Config}}",timeout=20)
     assert metadata.returncode==0
     assert "HERMES_HOME" not in metadata.stdout and "GOOGLE_APPLICATION_CREDENTIALS" not in metadata.stdout
+    assert f'"User":"{uid}"' in metadata.stdout
+    with tempfile.TemporaryDirectory() as directory:
+        archive=Path(directory)/"image.tar"
+        saved=run_docker("save","-o",docker_path(archive),tag,timeout=60)
+        assert saved.returncode==0,saved.stderr
+        names=layer_members(archive)
+    forbidden={"app/src/restricted_runtime/"+name for name in absent}
+    assert not any(name in names for name in forbidden), sorted(name for name in names if name in forbidden)
