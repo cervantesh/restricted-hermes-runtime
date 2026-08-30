@@ -47,6 +47,13 @@ class AttemptState(StrEnum):
     INDETERMINATE = "INDETERMINATE"
     CANCELLED_NO_DISPATCH = "CANCELLED_NO_DISPATCH"
 
+@dataclass(frozen=True)
+class ProviderResult:
+    state: str
+    text: str | None = None
+    failure_class: str | None = None
+    request_id: str | None = None
+
 
 def _no_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     obj: dict[str, Any] = {}

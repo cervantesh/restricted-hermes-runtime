@@ -1,28 +1,33 @@
-"""Restricted conversation HTTP boundary. It contains no provider client."""
+"""External conversation API composed only with a verified authenticator and runtime."""
 from __future__ import annotations
-
-import os
 from fastapi import FastAPI, HTTPException, Request
-
+from ..auth import Authenticator
 from ..contracts import ContractError, TurnRequest, load_closed_json
+from ..conversation import ConversationService
 
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-TENANT_ID = os.environ.get("RESTRICTED_TENANT_ID", "UNCONFIGURED")
-ALLOWED_PRINCIPAL = os.environ.get("RESTRICTED_CALLER_PRINCIPAL", "UNCONFIGURED")
+def create_app(runtime: ConversationService, authenticator: Authenticator) -> FastAPI:
+    app=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
+    @app.post("/v1/restricted/conversations/{conversation_id}/turns")
+    async def create_turn(conversation_id:str,request:Request):
+        try:
+            turn=TurnRequest.parse(load_closed_json(await request.body()))
+            principal=authenticator.authenticate(request.headers.get("authorization"))
+            return runtime.submit(turn,principal=principal,conversation_id=conversation_id)
+        except ContractError as exc: raise HTTPException(409 if str(exc) in {"ACTIVE_TURN","idempotency association conflict"} else 400,"restricted turn rejected") from exc
+    @app.post("/v1/restricted/conversations/{conversation_id}/reset")
+    async def reset(conversation_id:str,request:Request):
+        try:
+            principal=authenticator.authenticate(request.headers.get("authorization")); body=load_closed_json(await request.body())
+            if set(body)!={"conversation_epoch"} or not isinstance(body["conversation_epoch"],str):raise ContractError("closed reset schema")
+            if not principal:raise ContractError("unauthorized")
+            epoch=runtime.store.reset(runtime.tenant_id,conversation_id,body["conversation_epoch"])
+            return {"schema_version":"restricted-conversation-reset.v1","conversation_epoch":epoch}
+        except ContractError as exc: raise HTTPException(409 if str(exc)=="ACTIVE_TURN" else 400,"restricted reset rejected") from exc
+    return app
 
-def authenticated_principal(request: Request) -> str:
-    # Deployment adapter must validate Google issuer/audience/expiry before this point.
-    principal = request.headers.get("x-restricted-verified-principal")
-    if principal != ALLOWED_PRINCIPAL: raise HTTPException(401, "unauthorized")
-    return principal
-
-@app.post("/v1/restricted/conversations/{conversation_id}/turns")
-async def create_turn(conversation_id: str, request: Request):
-    try:
-        body = TurnRequest.parse(load_closed_json(await request.body()))
-        principal = authenticated_principal(request)
-        # Store/admission integration is intentionally injected by deployment composition;
-        # this boundary only accepts the closed request and trusted server identity.
-        return {"schema_version": "restricted-turn-accepted.v1", "status": "RECEIVED", "classification": "PHI"}
-    except ContractError as exc:
-        raise HTTPException(400, "invalid restricted turn") from exc
+def unconfigured_app()->FastAPI:
+    app=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
+    @app.get("/readyz")
+    def readyz():raise HTTPException(503,"runtime composition is required")
+    return app
+app=unconfigured_app()

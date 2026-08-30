@@ -4,10 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from .contracts import AttemptState, Classification, ContractError, jcs_bytes
+from .contracts import AttemptState, Classification, ContractError, ProviderResult, jcs_bytes
 from .crypto import GATEWAY_MAC_DOMAIN, MacKey, kms_mac_input
 from .policy import PolicyBundle, SYSTEM_INSTRUCTION, SYSTEM_INSTRUCTION_SHA256
-from .vertex import ProviderResult
 
 
 @dataclass(frozen=True)
@@ -28,6 +27,8 @@ class Ledger(Protocol):
 class Gateway:
     def __init__(self, policy: PolicyBundle, mac_key: MacKey, ledger: Ledger, vertex):
         policy.validate(); self.policy, self.mac_key, self.ledger, self.vertex = policy, mac_key, ledger, vertex
+        if getattr(ledger, "mac_key", None) is None:
+            ledger.mac_key = mac_key
     def validate(self, envelope: GatewayEnvelope, principal: str) -> bytes:
         p = self.policy.values
         if principal != p["caller_principal"] or envelope.tenant_id != p["tenant_id"] or envelope.classification != Classification.PHI:
