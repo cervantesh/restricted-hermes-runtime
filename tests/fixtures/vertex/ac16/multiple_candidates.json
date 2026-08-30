@@ -1,0 +1,1 @@
+{"candidates": [{"content": {"role": "model", "parts": [{"text": "first"}]}, "finishReason": "STOP", "index": 0}, {"content": {"role": "model", "parts": [{"text": "second"}]}, "finishReason": "STOP", "index": 1}]}

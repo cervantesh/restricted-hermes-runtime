@@ -1,0 +1,34 @@
+{
+  "candidates": [
+    {
+      "content": {"role": "model", "parts": [{"text": "accepted administrative response"}]},
+      "finishReason": "STOP",
+      "index": 0,
+      "safetyRatings": [{
+        "category": "HARM_CATEGORY_DEROGATORY",
+        "probability": "NEGLIGIBLE",
+        "blocked": false,
+        "severity": "HARM_SEVERITY_NEGLIGIBLE",
+        "probabilityScore": 0.01,
+        "severityScore": 0.02
+      }],
+      "avgLogprobs": -0.25
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 10,
+    "candidatesTokenCount": 4,
+    "totalTokenCount": 14,
+    "thoughtsTokenCount": 1,
+    "cachedContentTokenCount": 2,
+    "toolUsePromptTokenCount": 0,
+    "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 10}],
+    "candidatesTokensDetails": [{"modality": "TEXT", "tokenCount": 4}],
+    "cacheTokensDetails": [{"modality": "TEXT", "tokenCount": 2}],
+    "toolUsePromptTokensDetails": [{"modality": "TEXT", "tokenCount": 0}]
+  },
+  "modelVersion": "gemini-3.5-flash-001",
+  "createTime": "2026-08-30T00:00:00Z",
+  "responseId": "ac16-stop-all-optional",
+  "promptFeedback": {"safetyRatings": []}
+}
