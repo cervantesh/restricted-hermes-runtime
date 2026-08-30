@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import io
 import shutil
 import subprocess
 import tarfile
@@ -42,9 +43,10 @@ def docker_path(path: Path) -> str:
 def _wsl_cwd_for(path: Path) -> str:
     return "/mnt/"+path.drive[0].lower()+path.as_posix()[2:]
 
-def layer_members(archive: Path) -> set[str]:
+def layer_members(archive: Path) -> tuple[set[str],int]:
     """Read every tar-readable layer from legacy or OCI docker-save layouts."""
     found:set[str]=set()
+    inspected=0
     with tarfile.open(archive) as saved:
         for member in saved:
             if not member.isfile():
@@ -55,9 +57,39 @@ def layer_members(archive: Path) -> set[str]:
             try:
                 with tarfile.open(fileobj=stream,mode="r|*") as layer:
                     found.update(item.name.lstrip("./") for item in layer)
+                    inspected+=1
             except tarfile.ReadError:
                 pass
-    return found
+    return found,inspected
+
+def forbidden_layer_paths(names:set[str],absent:set[str])->set[str]:
+    suffixes={"restricted_runtime/"+path for path in absent}
+    return {name for name in names if any(name.rstrip("/").endswith(suffix) for suffix in suffixes)}
+
+def assert_layer_proof(names:set[str],inspected:int,absent:set[str])->None:
+    assert inspected>0,"docker-save archive contained no tar-readable OCI or legacy layer"
+    forbidden=forbidden_layer_paths(names,absent)
+    assert not forbidden,sorted(forbidden)
+
+def _tar_bytes(paths:list[str])->bytes:
+    data=io.BytesIO()
+    with tarfile.open(fileobj=data,mode="w") as layer:
+        for path in paths:
+            info=tarfile.TarInfo(path);info.size=0;layer.addfile(info)
+    return data.getvalue()
+
+def test_layer_proof_catches_site_packages_prefix_and_rejects_zero_readable_layers(tmp_path):
+    archive=tmp_path/"oci-save.tar";payload=_tar_bytes(["usr/local/lib/python3.11/site-packages/restricted_runtime/vertex.py"])
+    with tarfile.open(archive,"w") as saved:
+        info=tarfile.TarInfo("blobs/sha256/layer");info.size=len(payload);saved.addfile(info,io.BytesIO(payload))
+    names,inspected=layer_members(archive)
+    assert inspected==1
+    with pytest.raises(AssertionError):assert_layer_proof(names,inspected,{"vertex.py"})
+    empty=tmp_path/"empty-save.tar"
+    with tarfile.open(empty,"w") as saved:
+        data=b"{}";info=tarfile.TarInfo("manifest.json");info.size=len(data);saved.addfile(info,io.BytesIO(data))
+    names,inspected=layer_members(empty)
+    with pytest.raises(AssertionError):assert_layer_proof(names,inspected,{"vertex.py"})
 
 def test_image_recipe_has_no_dynamic_capabilities():
     for recipe in (ROOT/"Dockerfile.conversation",ROOT/"Dockerfile.gateway"):
@@ -103,6 +135,5 @@ importlib.import_module('{entry}')
         archive=Path(directory)/"image.tar"
         saved=run_docker("save","-o",docker_path(archive),tag,timeout=60)
         assert saved.returncode==0,saved.stderr
-        names=layer_members(archive)
-    forbidden={"app/src/restricted_runtime/"+name for name in absent}
-    assert not any(name in names for name in forbidden), sorted(name for name in names if name in forbidden)
+        names,inspected=layer_members(archive)
+    assert_layer_proof(names,inspected,absent)
