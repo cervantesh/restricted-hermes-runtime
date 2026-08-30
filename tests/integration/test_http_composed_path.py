@@ -44,9 +44,11 @@ class CountedProvider:
         return ProviderResult("SUCCEEDED",text="synthetic HTTP response",provider_request_id="synthetic-provider-request")
 
 class InternalSyntheticAuthenticator:
+    def __init__(self):self.principals=[]
     def authenticate(self, authorization):
         assert authorization=="Bearer synthetic"
-        return "caller"
+        self.principals.append("conversation")
+        return "conversation"
 
 def start(app):
     sock=socket.socket();sock.bind(("127.0.0.1",0));port=sock.getsockname()[1];sock.close()
@@ -65,7 +67,8 @@ def migrated():
 
 def test_real_http_composition_commits_encrypted_readback_and_duplicate_dispatches_once():
     p=policy();provider=CountedProvider();key=LocalHmacKey("gateway","1",b"g"*32)
-    gateway_server,gateway_thread,gateway_url=start(gateway_app(Gateway(p,key,PostgresLedger(URL,p,key),provider),InternalSyntheticAuthenticator()))
+    internal_auth=InternalSyntheticAuthenticator()
+    gateway_server,gateway_thread,gateway_url=start(gateway_app(Gateway(p,key,PostgresLedger(URL,p,key),provider),internal_auth))
     try:
         client=HttpGatewayClient(gateway_url,"synthetic-audience");client.tokens=lambda:"synthetic"
         service=ConversationService(PostgresContentStore(URL),client,LocalHmacKey("service","1",b"s"*32),Keys(),p,"tenant")
@@ -83,9 +86,10 @@ def test_real_http_composition_commits_encrypted_readback_and_duplicate_dispatch
             assert first.json()["message"]==second.json()["message"]=="synthetic HTTP response"
             assert provider.calls==1
             with psycopg.connect(URL) as conn:
-                turn=conn.execute("SELECT state,request_ciphertext,response_ciphertext,gateway_decision_id,gateway_attempt_classification FROM restricted_content.turns").fetchone()
+                turn=conn.execute("SELECT state,request_ciphertext,response_ciphertext,gateway_decision_id,gateway_attempt_classification,authenticated_caller_principal FROM restricted_content.turns").fetchone()
                 assert turn[0]=="COMMITTED" and b"synthetic request" not in bytes(turn[1]) and b"synthetic HTTP response" not in bytes(turn[2])
                 assert turn[3] is not None and turn[4]=="SUCCEEDED"
+                assert turn[5]=="caller" and internal_auth.principals and set(internal_auth.principals)=={"conversation"}
                 assert conn.execute("SELECT count(*) FROM inference_ledger.attempts").fetchone()[0]==1
         finally:
             conversation_server.should_exit=True;conversation_thread.join(5)
