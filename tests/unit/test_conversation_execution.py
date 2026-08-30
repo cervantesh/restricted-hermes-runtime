@@ -4,6 +4,8 @@ import json
 import time
 from dataclasses import replace
 
+import pytest
+
 from restricted_runtime.contracts import ProviderResult, TurnRequest, TurnState, jcs_bytes
 from restricted_runtime.conversation import ConversationService, TurnRow
 from restricted_runtime.crypto import LocalHmacKey
@@ -61,7 +63,42 @@ def test_lost_lease_during_blocking_gateway_call_prevents_commit_or_release():
     class BlockingGateway(Gateway):
         def infer_once(self,*args):time.sleep(.04);return super().infer_once(*args)
     p=policy();store=RenewingStore();gateway=BlockingGateway();svc=ConversationService(store,gateway,LocalHmacKey("k","v",b"x"*32),Keys(),p,"tenant",lease_heartbeat_seconds=.005)
-    import pytest
     with pytest.raises(Exception):svc.submit(request(),principal="svc@example.com",conversation_id="one")
     assert gateway.calls==1
+    assert all(row.state is not TurnState.COMMITTED for row in store.rows.values())
+
+
+@pytest.mark.parametrize("failure", ["false", "raises"])
+def test_heartbeat_renewal_loss_or_exception_during_slow_provider_never_commits(failure):
+    class LeaseStore(Store):
+        def __init__(self):super().__init__();self.renewals=0
+        def renew_lease(self,*_):
+            self.renewals+=1
+            if self.renewals == 1:return True
+            if failure == "raises":raise RuntimeError("DB renewal failed")
+            return False
+    class BlockingGateway(Gateway):
+        def infer_once(self,*args):
+            time.sleep(.04)
+            return super().infer_once(*args)
+    p=policy();store=LeaseStore();gateway=BlockingGateway();svc=ConversationService(store,gateway,LocalHmacKey("k","v",b"x"*32),Keys(),p,"tenant",lease_heartbeat_seconds=.005)
+    with pytest.raises(Exception, match="lease lost"):
+        svc.submit(request(),principal="svc@example.com",conversation_id="one")
+    assert gateway.calls==1
+    assert store.renewals >= 2
+    assert all(row.state is not TurnState.COMMITTED for row in store.rows.values())
+
+
+def test_final_renewal_exception_never_commits_or_returns_provider_output():
+    class LeaseStore(Store):
+        def __init__(self):super().__init__();self.renewals=0
+        def renew_lease(self,*_):
+            self.renewals+=1
+            if self.renewals == 1:return True
+            raise RuntimeError("final DB renewal failed")
+    p=policy();store=LeaseStore();gateway=Gateway();svc=ConversationService(store,gateway,LocalHmacKey("k","v",b"x"*32),Keys(),p,"tenant",lease_heartbeat_seconds=10)
+    with pytest.raises(Exception, match="lease lost"):
+        svc.submit(request(),principal="svc@example.com",conversation_id="one")
+    assert gateway.calls==1
+    assert store.renewals == 2
     assert all(row.state is not TurnState.COMMITTED for row in store.rows.values())

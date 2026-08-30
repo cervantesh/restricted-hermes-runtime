@@ -33,7 +33,11 @@ def create_app(runtime: ConversationService, authenticator: Authenticator, gatew
         except ContractError as exc: raise HTTPException(409 if str(exc)=="ACTIVE_TURN" else 400,"restricted reset rejected") from exc
     @app.get("/readyz")
     async def readyz():
-        if gateway_ready is None or not gateway_ready():
+        try:
+            ready = gateway_ready is not None and gateway_ready()
+        except Exception:
+            ready = False
+        if not ready:
             raise HTTPException(503,"gateway policy pair is not ready")
         return {"status":"ready"}
     return app

@@ -4,7 +4,6 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -35,10 +34,10 @@ def test_active_sign_and_retired_verify_preserve_old_record():
     assert active.verify(old,b"canonical digest")
 
 
-def test_retired_key_cannot_sign_new_records():
-    retired=key("retired","retired-v1")
-    with pytest.raises(PermissionError):
-        retired.sign(b"new canonical digest")
+def test_signing_is_bound_to_the_configured_active_key_not_a_retired_mapping():
+    active=key("active","active-v2",{("retired","retired-v1"):"retired-v1"})
+    record=active.sign(b"new canonical digest")
+    assert (record.key_resource,record.key_version)==("active","active-v2")
 
 
 def test_production_roots_must_not_discard_retired_key_configuration():
@@ -49,8 +48,20 @@ def test_production_roots_must_not_discard_retired_key_configuration():
         assert calls
         assert all(not (isinstance(c.args[2],ast.Dict) and not c.args[2].keys) for c in calls), path
 
-def test_production_retired_key_configuration_is_closed_and_duplicate_free(monkeypatch):
-    valid=json.dumps([{"key_resource":"old","key_version":"v1","verify_version":"old/cryptoKeyVersions/v1"}])
-    assert parse_retired_versions(valid,active_resource="active",active_version="active-v1")=={("old","v1"):"old/cryptoKeyVersions/v1"}
-    for raw in ("{",json.dumps({"key_resource":"old"}),json.dumps([{"key_resource":"old","key_version":"v1","verify_version":"x","extra":1}]),json.dumps([{"key_resource":"old","key_version":"v1","verify_version":"old/cryptoKeyVersions/v1"},{"key_resource":"old","key_version":"v1","verify_version":"old/cryptoKeyVersions/v2"}]),'{"x":1,"x":2}'):
-        with pytest.raises((RuntimeError,ValueError)): parse_retired_versions(raw,active_resource="active",active_version="active-v1")
+def test_production_retired_key_configuration_is_closed_and_rejects_active_or_ambiguous_aliases():
+    active_resource="projects/p/locations/l/keyRings/r/cryptoKeys/service"
+    active_version=active_resource+"/cryptoKeyVersions/7"
+    retired_resource="projects/p/locations/l/keyRings/r/cryptoKeys/retired"
+    good=json.dumps([{"key_resource":retired_resource,"key_version":"retired-id","verify_version":retired_resource+"/cryptoKeyVersions/3"}])
+    assert parse_retired_versions(good,active_resource=active_resource,active_version=active_version)=={(retired_resource,"retired-id"):retired_resource+"/cryptoKeyVersions/3"}
+    bad=(
+        "{",
+        '[{"key_resource":"a","key_resource":"b","key_version":"x","verify_version":"b/cryptoKeyVersions/1"}]',
+        json.dumps([{"key_resource":active_resource,"key_version":active_version,"verify_version":active_version}]),
+        json.dumps([{"key_resource":retired_resource,"key_version":"retired-id","verify_version":active_version}]),
+        json.dumps([{"key_resource":retired_resource,"key_version":"retired-id","verify_version":"other/cryptoKeyVersions/3"}]),
+        json.dumps([{"key_resource":retired_resource,"key_version":"retired-id","verify_version":retired_resource+"/cryptoKeyVersions/3"},{"key_resource":retired_resource,"key_version":"retired-id","verify_version":retired_resource+"/cryptoKeyVersions/4"}]),
+    )
+    for raw in bad:
+        with pytest.raises(RuntimeError):
+            parse_retired_versions(raw,active_resource=active_resource,active_version=active_version)
