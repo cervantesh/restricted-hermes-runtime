@@ -61,7 +61,7 @@ and Cloud IAM bindings retain full service-account emails.
 
 The VPC has Private Google Access and no NAT. Ordinary Google APIs use the
 restricted VIP, but the frozen Vertex `us` endpoint uses its dedicated regional
-PSC subnet, API-managed endpoint address, and exact private DNS record; it must never be substituted with
+PSC subnet, reserved PSC address passed to the endpoint as its resource URI, and exact private DNS record; it must never be substituted with
 `aiplatform.googleapis.com` or routed to the restricted VIP. It intentionally
 does not claim FQDN/SNI/certificate enforcement; that receipt field is
 `UNDETERMINED` until a separately approved inspected egress control is deployed
