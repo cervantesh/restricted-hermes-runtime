@@ -4,7 +4,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 COPY pyproject.toml ./
 COPY src ./src
 COPY policy ./policy
-RUN pip install --no-cache-dir . && useradd --system --uid 10002 gateway
+RUN pip install --no-cache-dir . \
+ && rm -rf /app/src /app/build /app/pyproject.toml \
+ && find /usr/local/lib/python3.11/site-packages/restricted_runtime -type d -name __pycache__ -prune -exec rm -rf {} + \
+ && rm -f /usr/local/lib/python3.11/site-packages/restricted_runtime/gateway_client.py \
+           /usr/local/lib/python3.11/site-packages/restricted_runtime/reconciliation.py \
+           /usr/local/lib/python3.11/site-packages/restricted_runtime/reconciliation_driver.py \
+           /usr/local/lib/python3.11/site-packages/restricted_runtime/services/production_conversation.py \
+           /usr/local/lib/python3.11/site-packages/restricted_runtime/services/restricted_api.py \
+ && useradd --system --uid 10002 gateway
 USER 10002
 EXPOSE 8080
 CMD ["uvicorn", "restricted_runtime.services.production_gateway:app", "--host", "0.0.0.0", "--port", "8080"]
