@@ -59,6 +59,11 @@ privileges. The conversation IAM database user receives only
 account emails with the `.gserviceaccount.com` suffix removed; OIDC audiences
 and Cloud IAM bindings retain full service-account emails.
 
+The zonal PostgreSQL 16 instance explicitly pins `edition = "ENTERPRISE"` with
+`tier = "db-custom-1-3840"`. This compatible pair must remain explicit: relying
+on a provider default can select Enterprise Plus, where that custom tier is
+invalid.
+
 The VPC has Private Google Access and no NAT. Ordinary Google APIs use the
 restricted VIP, but the frozen Vertex `us` endpoint uses its dedicated regional
 PSC subnet, reserved PSC address passed to the endpoint as its resource URI, and exact private DNS record; it must never be substituted with

@@ -421,6 +421,8 @@ resource "google_sql_database_instance" "restricted" {
   deletion_protection = false
   depends_on          = [google_service_networking_connection.private_services]
   settings {
+    # Pin the compatible edition/tier pair; provider defaults may select Enterprise Plus.
+    edition           = "ENTERPRISE"
     tier              = "db-custom-1-3840"
     availability_type = "ZONAL"
     user_labels       = local.labels

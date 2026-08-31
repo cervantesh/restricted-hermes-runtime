@@ -88,6 +88,14 @@ def test_connectors_fit_the_official_weighted_name_limit_and_sql_users_are_trimm
     assert "local.conversation_db_user" in runtime and "local.gateway_db_user" in runtime
 
 
+def test_cloud_sql_pins_the_enterprise_edition_and_compatible_custom_tier():
+    main=(ROOT/"main.tf").read_text(encoding="utf-8")
+    instance=main.split('resource "google_sql_database_instance" "restricted" {',1)[1].split('resource "google_sql_database" "runtime"',1)[0]
+    assert 'edition           = "ENTERPRISE"' in instance
+    assert 'tier              = "db-custom-1-3840"' in instance
+    assert "provider defaults may select Enterprise Plus" in instance
+
+
 def test_connectors_have_explicit_supported_capacity_and_psc_uses_the_reserved_address_uri():
     main=(ROOT/"main.tf").read_text(encoding="utf-8")
     assert main.count("min_instances = 2") == 4
