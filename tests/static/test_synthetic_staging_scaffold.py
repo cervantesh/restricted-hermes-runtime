@@ -70,24 +70,30 @@ def test_cloud_build_source_context_includes_only_public_policy_artifacts():
     assert "!policy/generated/public_key.b64" not in ignore
 
 
-def test_migration_uses_native_cloud_sql_socket_while_runtime_sidecars_use_iam_auth():
+def test_migration_embeds_the_pinned_proxy_and_uses_its_own_socket_while_runtime_sidecars_use_iam_auth():
     source=(ROOT/"runtime.tf").read_text(encoding="utf-8")
     migration=source.split('resource "google_cloud_run_v2_job" "migration" {',1)[1]
+    dockerfile=Path("Dockerfile.migration").read_text(encoding="utf-8")
     assert len(re.findall(r'args\s*=\s*\["--private-ip",\s*"--auto-iam-authn"',source))==2
     assert "RESTRICTED_EXPECTED_MIGRATION_SOCKET" in source
-    assert re.search(r'volumes\s*\{(?:\s|#.*\n)*name\s*=\s*"cloudsql"\s+cloud_sql_instance\s*\{\s+instances\s*=\s*\[google_sql_database_instance\.restricted\.connection_name\]',migration)
-    assert re.search(r'volume_mounts\s*\{\s+name\s*=\s*"cloudsql"\s+mount_path\s*=\s*"/cloudsql"',migration)
+    assert "RESTRICTED_CLOUD_SQL_CONNECTION_NAME" in source
+    assert "volumes" not in migration and "volume_mounts" not in migration
+    assert "cloud_sql_instance" not in migration and "cloud-sql-proxy" not in migration
+    assert re.search(r'^FROM gcr\.io/cloud-sql-connectors/cloud-sql-proxy@sha256:[0-9a-f]{64} AS cloud-sql-proxy$',dockerfile,re.MULTILINE)
+    assert "COPY --from=cloud-sql-proxy /cloud-sql-proxy /cloud-sql-proxy" in dockerfile
+    assert "COPY --from=cloud-sql-proxy / /" not in dockerfile
+    assert "--owner=restricted-migration --group=restricted-migration --mode=0700 /cloudsql" in dockerfile
     assert "MIGRATION_ADMIN_DSN" in source
 
 
-def test_migration_secret_is_pinned_and_migration_has_only_native_cloud_sql_container():
+def test_migration_secret_is_pinned_and_migration_has_one_supervised_container():
     source=(ROOT/"runtime.tf").read_text(encoding="utf-8")
     migration=source.split('resource "google_cloud_run_v2_job" "migration" {',1)[1]
     assert 'version = "1"' in migration
     assert 'version = "latest"' not in migration
     assert re.search(r'depends_on\s*=\s*\[google_secret_manager_secret_iam_member\.migration_bootstrap\]',migration)
     assert len(re.findall(r'containers\s*\{',migration)) == 1
-    for forbidden in ('cloud-sql-proxy', 'depends_on = ["cloud-sql-proxy"]', 'startup_probe', '"--health-check"', '"--quitquitquit"', '"--exit-zero-on-sigterm"', 'empty_dir', 'sql-socket'):
+    for forbidden in ('cloud-sql-proxy', 'depends_on = ["cloud-sql-proxy"]', 'startup_probe', '"--health-check"', '"--quitquitquit"', '"--exit-zero-on-sigterm"', 'empty_dir', 'sql-socket', 'volumes', 'volume_mounts'):
         assert forbidden not in migration
     assert len(re.findall(r'name\s*=\s*"cloud-sql-proxy"',source)) == 2
     assert source.count('"--health-check"') == 2
@@ -108,19 +114,21 @@ def test_empty_dir_socket_volumes_use_a_nonreserved_name_with_consistent_mounts(
     volumes = re.findall(r'volumes\s*\{\s+name\s*=\s*"([^"]+)"\s+empty_dir\s*\{\}', source)
     mounts = re.findall(r'volume_mounts\s*\{\s+name\s*=\s*"([^"]+)"\s+mount_path\s*=\s*"/cloudsql"', source)
     assert volumes == ["sql-socket"] * 2
-    assert mounts == ["sql-socket"] * 4 + ["cloudsql"]
+    assert mounts == ["sql-socket"] * 4
     assert 'name = "cloudsql"\n      empty_dir {}' not in source
 
 
 def test_private_sql_firewall_allows_only_cloud_sql_proxy_connector_port_3307():
     main=(ROOT/"main.tf").read_text(encoding="utf-8")
     firewall=main.split('resource "google_compute_firewall" "allow_private_sql" {',1)[1].split('resource "google_compute_firewall"',1)[0]
-    assert 'target_tags        = local.connector_tags' in firewall
+    assert 'target_tags        = local.sql_connector_tags' in firewall
+    assert 'destination_ranges = ["${google_sql_database_instance.restricted.private_ip_address}/32"]' in firewall
     assert re.search(r'ports\s*=\s*\["3307"\]',firewall)
     assert '5432' not in firewall
-    tags=main.split('connector_tags = [',1)[1].split(']',1)[0]
-    for connector in ("conversation", "gateway", "runner", "migration"):
+    tags=main.split('sql_connector_tags = [',1)[1].split(']',1)[0]
+    for connector in ("conversation", "gateway", "migration"):
         assert f'google_vpc_access_connector.{connector}.name' in tags
+    assert "google_vpc_access_connector.runner.name" not in tags
 
 
 def test_connectors_fit_the_official_weighted_name_limit_and_sql_users_are_trimmed():

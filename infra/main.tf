@@ -167,6 +167,11 @@ locals {
     "vpc-connector-${var.region}-${google_vpc_access_connector.runner.name}",
     "vpc-connector-${var.region}-${google_vpc_access_connector.migration.name}",
   ]
+  sql_connector_tags = [
+    "vpc-connector-${var.region}-${google_vpc_access_connector.conversation.name}",
+    "vpc-connector-${var.region}-${google_vpc_access_connector.gateway.name}",
+    "vpc-connector-${var.region}-${google_vpc_access_connector.migration.name}",
+  ]
   gateway_connector_tag = "vpc-connector-${var.region}-${google_vpc_access_connector.gateway.name}"
 }
 
@@ -296,11 +301,11 @@ resource "google_compute_firewall" "allow_private_sql" {
   network            = google_compute_network.restricted.name
   direction          = "EGRESS"
   priority           = 1010
-  target_tags        = local.connector_tags
-  destination_ranges = ["${google_compute_global_address.private_services.address}/${google_compute_global_address.private_services.prefix_length}"]
+  target_tags        = local.sql_connector_tags
+  destination_ranges = ["${google_sql_database_instance.restricted.private_ip_address}/32"]
   allow {
     protocol = "tcp"
-    # Cloud SQL Auth Proxy and the Cloud Run native Cloud SQL volume connect
+    # Cloud SQL Auth Proxy and the in-image migration proxy connect
     # to the instance-side proxy port, not PostgreSQL's listener port.
     ports = ["3307"]
   }

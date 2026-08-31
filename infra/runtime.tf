@@ -38,6 +38,7 @@ locals {
   migration_job_env = {
     RESTRICTED_MIGRATIONS_DIR            = "/app/migrations"
     RESTRICTED_EXPECTED_MIGRATION_SOCKET = local.sql_socket
+    RESTRICTED_CLOUD_SQL_CONNECTION_NAME = google_sql_database_instance.restricted.connection_name
     CONVERSATION_IAM_DB_USER             = local.conversation_db_user
     GATEWAY_IAM_DB_USER                  = local.gateway_db_user
   }
@@ -214,21 +215,10 @@ resource "google_cloud_run_v2_job" "migration" {
         connector = google_vpc_access_connector.migration.id
         egress    = "ALL_TRAFFIC"
       }
-      volumes {
-        # Cloud Run reserves this logical name for its native Cloud SQL socket.
-        name = "cloudsql"
-        cloud_sql_instance {
-          instances = [google_sql_database_instance.restricted.connection_name]
-        }
-      }
       containers {
         name    = "migration-runner"
         image   = var.migration_image
         command = ["python", "-m", "restricted_runtime.migration_runner"]
-        volume_mounts {
-          name       = "cloudsql"
-          mount_path = "/cloudsql"
-        }
         dynamic "env" {
           for_each = local.migration_job_env
           content {

@@ -2,6 +2,7 @@ from pathlib import Path
 import pytest
 
 import restricted_runtime.migration_runner as migration_runner
+import restricted_runtime.migration_supervisor as migration_supervisor
 from restricted_runtime.migration_runner import migration_sql, validate_admin_dsn
 
 
@@ -22,25 +23,127 @@ def test_migration_admin_dsn_is_password_auth_over_exact_private_socket():
         validate_admin_dsn(f"host={socket} dbname=postgres user=operator",socket)
 
 
-def test_main_runs_only_migration_and_postflight_path(monkeypatch):
+class _Proxy:
+    def __init__(self, *, wait_result=0):
+        self.wait_result=wait_result
+        self.terminated=False
+    def poll(self): return None
+    def terminate(self): self.terminated=True
+    def wait(self, timeout): return self.wait_result
+
+
+def _ready_proxy_supervisor(**overrides):
+    process=overrides.pop("process",_Proxy())
     calls=[]
-    monkeypatch.setattr(migration_runner,"run_from_environment",lambda connect: calls.append(("migration",connect)))
+    defaults={
+        "connection_name":"project:us-central1:restricted-synthetic-postgres",
+        "socket_dir":Path("/cloudsql"),
+        "run_migration":lambda connect: calls.append(("migration",connect)),
+        "connect":"connection-factory",
+        "popen":lambda command, **kwargs: (calls.append(("start",command)) or process),
+        "readiness_probe":lambda: calls.append(("ready",None)),
+        "prepare_socket":lambda path: calls.append(("socket",path)),
+        "cleanup":lambda child: (calls.append(("cleanup",child)), child.terminate()),
+    }
+    defaults.update(overrides)
+    migration_supervisor.run_with_proxy(**defaults)
+    return calls,process
+
+
+def test_supervisor_starts_bounded_proxy_then_runs_migration_and_cleans_up():
+    calls,process=_ready_proxy_supervisor()
+    assert calls[0]==("socket",Path("/cloudsql"))
+    assert calls[1][0]=="start"
+    assert calls[1][1]==[
+        "/cloud-sql-proxy","--private-ip","--unix-socket=/cloudsql",
+        "--health-check","--http-address=127.0.0.1","--http-port=9091",
+        "--exit-zero-on-sigterm","project:us-central1:restricted-synthetic-postgres",
+    ]
+    assert calls[2:]==[("ready",None),("migration","connection-factory"),("cleanup",process)]
+    assert process.terminated is True
+
+
+def test_supervisor_fails_closed_when_proxy_cannot_start():
+    calls=[]
+    with pytest.raises(OSError,match="proxy start"):
+        migration_supervisor.run_with_proxy(
+            connection_name="project:region:instance",socket_dir=Path("/cloudsql"),connect="connection",
+            run_migration=lambda connect: calls.append("migration"),prepare_socket=lambda path: calls.append("socket"),
+            popen=lambda command, **kwargs: (_ for _ in ()).throw(OSError("proxy start")),readiness_probe=lambda: None,
+            cleanup=lambda process: calls.append("cleanup"),
+        )
+    assert calls==["socket"]
+
+
+def test_supervisor_fails_closed_when_local_proxy_readiness_times_out():
+    process=_Proxy()
+    clock=iter((0,0,11))
+    with pytest.raises(RuntimeError,match="readiness timed out"):
+        migration_supervisor.wait_for_proxy_ready(
+            process,
+            readiness_probe=lambda: (_ for _ in ()).throw(OSError("not ready")),
+            timeout_seconds=10,
+            monotonic=lambda: next(clock),
+            sleep=lambda seconds: None,
+        )
+
+
+def test_supervisor_does_not_pass_bootstrap_dsn_to_child_and_reaps_an_exited_child(monkeypatch):
+    monkeypatch.setenv("MIGRATION_ADMIN_DSN","password=not-for-child")
+    process=_Proxy()
+    process.poll=lambda: 9
+    seen={}
+    with pytest.raises(RuntimeError,match="exited before readiness"):
+        _ready_proxy_supervisor(
+            process=process,
+            popen=lambda command, **kwargs: (seen.update(kwargs) or process),
+            cleanup=lambda child: None,
+        )
+    assert "MIGRATION_ADMIN_DSN" not in seen["env"]
+
+
+@pytest.mark.parametrize("failure",[ValueError("migration failed"),RuntimeError("postflight failed")])
+def test_supervisor_preserves_migration_or_postflight_failure_while_cleaning_child(failure):
+    process=_Proxy()
+    calls=[]
+    with pytest.raises(type(failure),match=str(failure)):
+        _ready_proxy_supervisor(
+            process=process,
+            run_migration=lambda connect: (_ for _ in ()).throw(failure),
+            cleanup=lambda child: calls.append(child),
+        )
+    assert calls==[process]
+
+
+def test_supervisor_fails_when_proxy_cleanup_fails_after_successful_migration():
+    with pytest.raises(RuntimeError,match="cleanup failed"):
+        _ready_proxy_supervisor(cleanup=lambda child: (_ for _ in ()).throw(OSError("cleanup failed")))
+
+
+def test_cleanup_terminates_then_kills_and_reaps_a_timed_out_child():
+    import subprocess
+    class TimedOutProxy(_Proxy):
+        def __init__(self):
+            super().__init__()
+            self.killed=False
+            self.waits=0
+        def wait(self, timeout):
+            self.waits+=1
+            if self.waits==1: raise subprocess.TimeoutExpired("proxy",timeout)
+            return 0
+        def kill(self): self.killed=True
+    process=TimedOutProxy()
+    migration_supervisor.cleanup_proxy(process)
+    assert process.terminated is True and process.killed is True and process.waits==2
+
+
+def test_main_uses_supervisor_and_requires_the_exact_connection_name(monkeypatch):
+    seen=[]
+    monkeypatch.setenv("RESTRICTED_CLOUD_SQL_CONNECTION_NAME","project:us-central1:restricted-synthetic-postgres")
+    monkeypatch.setattr(migration_supervisor,"run_with_proxy",lambda **kwargs: seen.append(kwargs))
     migration_runner.main(connect="connection-factory")
-    assert calls==[("migration","connection-factory")]
-
-
-def test_main_propagates_the_migration_or_postflight_error_unchanged(monkeypatch):
-    def primary_failure(connect):
-        raise ValueError("primary migration failure")
-    monkeypatch.setattr(migration_runner,"run_from_environment",primary_failure)
-    with pytest.raises(ValueError,match="primary migration failure"):
-        migration_runner.main(connect="connection-factory")
-
-
-def test_migration_runner_has_no_local_proxy_shutdown_side_channel():
-    source=Path(migration_runner.__file__).read_text(encoding="utf-8")
-    for forbidden in ("shutdown_proxy", "quitquitquit", "urlopen", "urllib"):
-        assert forbidden not in source
+    assert seen[0]["connection_name"]=="project:us-central1:restricted-synthetic-postgres"
+    assert seen[0]["connect"]=="connection-factory"
 
 
 def test_post_migration_verification_queries_public_as_oid_zero_with_parameters():

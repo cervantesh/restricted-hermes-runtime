@@ -7,8 +7,10 @@ zone resolving ordinary `*.googleapis.com` traffic to
 that VIP before deny-all, and has no NAT or broad default route. A private
 `run.app` wildcard resolves to the same restricted VIP so internal
 runner-to-conversation and conversation-to-gateway URLs remain reachable.
-Private SQL is separately allowed on TCP/3307 over the PSA range. Each role has a
-separate VPC connector; this baseline does not inspect application hostnames.
+Private SQL is separately allowed on TCP/3307 to the Cloud SQL private-IP
+`/32` only for the conversation, gateway, and migration connector tags. The
+runner has no database path. Each role has a separate VPC connector; this
+baseline does not inspect application hostnames.
 
 The frozen Vertex sink remains `aiplatform.us.rep.googleapis.com` with
 `location=us`. It is **not** sent to the restricted VIP. Terraform creates a

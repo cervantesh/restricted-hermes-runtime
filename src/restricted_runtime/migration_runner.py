@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from restricted_runtime import migration_supervisor
+
 
 def migration_sql(directory: Path, conversation_user: str, gateway_user: str) -> list[str]:
     first = (directory / "001_restricted_runtime.sql").read_text(encoding="utf-8")
@@ -84,12 +86,20 @@ def run_from_environment(connect: object) -> None:
 
 
 def main(*, connect: object | None = None) -> None:
-    """Run migration and postflight; the process exit is their exact outcome."""
+    """Run migration plus postflight only after the local proxy is ready."""
     if connect is None:
         import psycopg
 
         connect = psycopg.connect
-    run_from_environment(connect)
+    connection_name = os.environ.get("RESTRICTED_CLOUD_SQL_CONNECTION_NAME")
+    if not connection_name:
+        raise RuntimeError("Cloud SQL connection name is required")
+    migration_supervisor.run_with_proxy(
+        connection_name=connection_name,
+        socket_dir=Path("/cloudsql"),
+        run_migration=run_from_environment,
+        connect=connect,
+    )
 
 
 if __name__ == "__main__":

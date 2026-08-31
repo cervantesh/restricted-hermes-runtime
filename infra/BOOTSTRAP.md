@@ -49,10 +49,14 @@ password-authenticated PostgreSQL conninfo string with
 Terraform. Terraform grants only the isolated migration service account access
 to that named secret. The migration job fails closed unless the reference,
 secret version, exact socket host, password auth, and both IAM DB user names
-are present. It uses Cloud Run's native `cloud_sql_instance` volume named
-`cloudsql`, mounted at `/cloudsql`; it has no Cloud SQL Auth Proxy sidecar or
-proxy lifecycle callback. The job depends on its Secret Manager accessor
-binding, so its process exit is exactly the migration and postflight result.
+are present. The one migration image copies the approved digest-pinned Cloud
+SQL Auth Proxy binary and supervises it as a local child. It creates its owned
+`/cloudsql` socket directory, waits for bounded localhost readiness, then runs
+the migration and postflight; it always reaps the child. A migration or
+postflight error remains the process error even if cleanup also fails; a clean
+exit requires both the migration/postflight and proxy cleanup to succeed. The
+job depends on its Secret Manager accessor binding and declares neither a
+Cloud Run proxy sidecar nor a native Cloud SQL volume.
 The two long-lived runtime services alone retain IAM-authenticated Cloud SQL
 Auth Proxy sidecars with health checks and a localhost-only `quitquitquit`
 shutdown endpoint. It runs
@@ -78,9 +82,9 @@ does not claim FQDN/SNI/certificate enforcement; that receipt field is
 and tested. The synthetic runner payload is fixed and must never be replaced
 with PHI.
 
-Private SQL egress is TCP/3307 over the PSA range for all four connector tags.
-That is the Cloud SQL Auth Proxy/native connector port; TCP/5432 is not opened
-by this firewall.
+Private SQL egress is TCP/3307 to the Cloud SQL private-IP `/32` for the
+conversation, gateway, and migration connector tags only. The runner has no
+database path. TCP/5432 is not opened by this firewall.
 
 Provider 6.50 reads the endpoint address back as its literal IP after creation.
 `main.tf` therefore ignores only that normalized `address` field; do not widen

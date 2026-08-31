@@ -1,8 +1,13 @@
+FROM gcr.io/cloud-sql-connectors/cloud-sql-proxy@sha256:b239a84edd20cfcf1fef20a8d297ac578a73e5cb0ba0eaaf5498782de4f9f861 AS cloud-sql-proxy
+
 FROM python:3.11-slim
 WORKDIR /app
 COPY pyproject.toml ./
 COPY src ./src
 COPY migrations ./migrations
-RUN pip install --no-cache-dir . && useradd --system --uid 10003 restricted-migration
+COPY --from=cloud-sql-proxy /cloud-sql-proxy /cloud-sql-proxy
+RUN pip install --no-cache-dir . \
+    && useradd --system --uid 10003 restricted-migration \
+    && install -d --owner=restricted-migration --group=restricted-migration --mode=0700 /cloudsql
 USER 10003
 CMD ["python", "-m", "restricted_runtime.migration_runner"]
