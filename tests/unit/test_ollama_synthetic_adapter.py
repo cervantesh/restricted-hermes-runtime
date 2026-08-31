@@ -289,3 +289,11 @@ def test_warmup_is_one_synthetic_chat_attempt(monkeypatch):
     assert len(chats) == 1
     assert all(call[2] == 123.0 for call in calls)
     assert chats[0][1]["messages"] == [{"role": "system", "content": "SYNTHETIC_NON_PHI_ONLY"}, {"role": "user", "content": "SYNTHETIC_NON_PHI_ONLY: reply with ready."}]
+
+
+def test_departed_readiness_peer_cannot_kill_broker_response_path():
+    class DepartedPeer:
+        def sendall(self, _payload):
+            raise BrokenPipeError("peer closed")
+
+    adapter._reply(DepartedPeer(), 400, {"error": "restricted request rejected"})

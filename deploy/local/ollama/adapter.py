@@ -231,7 +231,12 @@ def _warm(*, deadline: float | None = None) -> None:
 def _reply(connection: socket.socket, status: int, value: dict[str, Any]) -> None:
     body = json.dumps(value, separators=(",", ":")).encode("utf-8")
     reason = b"OK" if status == 200 else b"Bad Request"
-    connection.sendall(b"HTTP/1.1 " + str(status).encode() + b" " + reason + b"\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    try:
+        connection.sendall(b"HTTP/1.1 " + str(status).encode() + b" " + reason + b"\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    except OSError:
+        # Readiness probes may deliberately connect and close without a request.
+        # Their departed peer must not terminate the long-lived broker listener.
+        return
 
 
 def _read_request(connection: socket.socket) -> dict[str, Any]:
