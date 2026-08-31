@@ -95,6 +95,9 @@ def test_connectors_have_explicit_supported_capacity_and_psc_uses_the_reserved_a
     assert 'resource "google_compute_address" "vertex_psc"' in main
     endpoint=main.split('resource "google_network_connectivity_regional_endpoint" "vertex_us" {',1)[1].split("}",1)[0]
     assert "address           = google_compute_address.vertex_psc.id" in endpoint
+    assert "ignore_changes = [address]" in main
+    assert "ignore_changes = all" not in main
+    assert "Provider 6.50 normalizes URI to literal post-create" in main
     assert 'rrdatas      = [google_compute_address.vertex_psc.address]' in main
     assert 'destination_ranges = ["${google_compute_address.vertex_psc.address}/32"]' in main
 

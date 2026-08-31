@@ -22,6 +22,11 @@ multi-regional API endpoints; those endpoints are not reached through Private
 Google Access/restricted VIP. See [Access regional/multi-regional Google APIs
 through private endpoints](https://cloud.google.com/docs/security/compliance/access-regional-google-apis-endpoints).
 
+Provider 6.50 reads the endpoint address back as the literal IP after creation,
+although creation requires the reserved address resource URI. Terraform ignores
+only the endpoint `address` read-back to avoid a spurious replacement; target
+API, network, subnetwork, and access type remain drift-visible.
+
 It does not claim an inspected FQDN/SNI/certificate witness. This residual
 result prevents `READY`, `CLOSED`, and any PHI authorization claim. Cloud Run
 and Terraform alone do not prove host/SNI enforcement. The deployment owner

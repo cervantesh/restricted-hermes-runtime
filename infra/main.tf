@@ -226,6 +226,11 @@ resource "google_network_connectivity_regional_endpoint" "vertex_us" {
   subnetwork        = google_compute_subnetwork.vertex_psc.id
   address           = google_compute_address.vertex_psc.id
   depends_on        = [google_project_service.network_connectivity]
+  lifecycle {
+    # Provider 6.50 normalizes URI to literal post-create; avoid spurious replacement
+    # without hiding target/network/subnetwork/access_type drift.
+    ignore_changes = [address]
+  }
 }
 resource "google_dns_managed_zone" "vertex_us_rep" {
   name       = "restricted-vertex-us-rep"

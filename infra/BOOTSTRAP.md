@@ -68,6 +68,11 @@ does not claim FQDN/SNI/certificate enforcement; that receipt field is
 and tested. The synthetic runner payload is fixed and must never be replaced
 with PHI.
 
+Provider 6.50 reads the endpoint address back as its literal IP after creation.
+`main.tf` therefore ignores only that normalized `address` field; do not widen
+the exception, because target API, network, subnetwork, and access type must
+remain drift-visible.
+
 The receipt helper in this repository is local only and therefore permanently
 returns `PARTIAL` unless an independent deployed collector/verifier is added in
 an approved follow-up. Do not treat caller-provided `PASS` fields, Git SHAs, or
