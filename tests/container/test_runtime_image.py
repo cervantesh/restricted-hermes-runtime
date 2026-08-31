@@ -103,8 +103,8 @@ def test_image_recipe_has_no_dynamic_capabilities():
         assert "COPY policy ./policy" not in source
         assert "COPY policy/generated/policy.json policy/generated/policy.sig" in source
     for recipe, user, uid, primary_gid, supplementary in (
-        (ROOT / "Dockerfile.local-conversation", "restricted-local-conversation", 10006, 20001, (20000, 20002)),
-        (ROOT / "Dockerfile.local-gateway", "restricted-local-gateway", 10005, 20002, (20000, 20003)),
+        (ROOT / "Dockerfile.local-conversation", "restricted-local-conversation", 10006, 20001, (20000, 20002, 20004)),
+        (ROOT / "Dockerfile.local-gateway", "restricted-local-gateway", 10005, 20002, (20000, 20003, 20004)),
     ):
         source = recipe.read_text(encoding="utf-8")
         assert f"useradd --system --uid {uid} --gid {primary_gid} --groups {','.join(map(str, supplementary))} {user}" in source
@@ -190,8 +190,8 @@ importlib.import_module('{entry}')
     assert metadata.returncode==0
     assert "HERMES_HOME" not in metadata.stdout and "GOOGLE_APPLICATION_CREDENTIALS" not in metadata.stdout
     role_identities = {
-        "Dockerfile.local-conversation": ("restricted-local-conversation", 10006, 20001, {20000, 20001, 20002}),
-        "Dockerfile.local-gateway": ("restricted-local-gateway", 10005, 20002, {20000, 20002, 20003}),
+            "Dockerfile.local-conversation": ("restricted-local-conversation", 10006, 20001, {20000, 20001, 20002, 20004}),
+            "Dockerfile.local-gateway": ("restricted-local-gateway", 10005, 20002, {20000, 20002, 20003, 20004}),
     }
     expected_config_user = role_identities.get(recipe, (uid,))[0]
     assert f'"User":"{expected_config_user}"' in metadata.stdout
