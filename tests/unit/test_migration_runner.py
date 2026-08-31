@@ -129,6 +129,17 @@ def test_supervisor_keeps_signal_handlers_until_cleanup_finishes():
     assert events==["cleanup","restore"]
 
 
+def test_shutdown_handler_raises_once_then_ignores_repeated_term_until_restore(monkeypatch):
+    handlers={}
+    previous=object()
+    monkeypatch.setattr(migration_supervisor.signal,"signal",lambda number, handler: handlers.setdefault(number,handler) and previous)
+    restore=migration_supervisor.install_shutdown_handlers()
+    with pytest.raises(RuntimeError,match="interrupted by signal"):
+        handlers[migration_supervisor.signal.SIGTERM](migration_supervisor.signal.SIGTERM,None)
+    assert handlers[migration_supervisor.signal.SIGTERM](migration_supervisor.signal.SIGTERM,None) is None
+    restore()
+
+
 def test_cleanup_rejects_a_child_that_exited_before_supervised_shutdown_even_with_zero_status():
     process=_Proxy()
     process.poll=lambda: 0

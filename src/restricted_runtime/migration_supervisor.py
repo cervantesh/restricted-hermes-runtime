@@ -80,7 +80,13 @@ def cleanup_proxy(process: object, *, timeout_seconds: float = 5) -> None:
 
 def install_shutdown_handlers() -> Callable[[], None]:
     """Make PID 1 enter the supervised cleanup path for TERM and INT."""
+    interrupted = False
+
     def interrupt(signum: int, frame: object) -> None:
+        nonlocal interrupted
+        if interrupted:
+            return
+        interrupted = True
         raise RuntimeError(f"migration supervisor interrupted by signal {signum}")
 
     previous = [(signal_number, signal.signal(signal_number, interrupt)) for signal_number in (signal.SIGTERM, signal.SIGINT)]

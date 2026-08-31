@@ -6,7 +6,7 @@ import pytest
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX signals; execute this proof under WSL")
-def test_sigterm_supervisor_reaps_real_proxy_child(tmp_path: Path):
+def test_two_sigterms_during_cleanup_reap_a_resistant_real_proxy_child(tmp_path: Path):
     import signal
     import subprocess
     import sys
@@ -18,7 +18,7 @@ import os, subprocess, sys, time
 from pathlib import Path
 from restricted_runtime import migration_supervisor
 pid_file = Path({str(child_pid)!r})
-migration_supervisor.proxy_command = lambda connection_name, socket_dir: [sys.executable, '-c', 'import time; time.sleep(60)']
+migration_supervisor.proxy_command = lambda connection_name, socket_dir: [sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)']
 def start(command, **kwargs):
     child = subprocess.Popen(command, **kwargs)
     pid_file.write_text(str(child.pid), encoding='ascii')
@@ -37,6 +37,8 @@ migration_supervisor.run_with_proxy(
     assert child_pid.exists(), "supervisor never started its child"
     pid = int(child_pid.read_text(encoding="ascii"))
     supervisor.send_signal(signal.SIGTERM)
-    assert supervisor.wait(timeout=10) != 0
+    time.sleep(0.2)
+    supervisor.send_signal(signal.SIGTERM)
+    assert supervisor.wait(timeout=12) != 0
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
