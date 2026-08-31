@@ -62,3 +62,25 @@ def test_proxy_shutdown_rejects_a_failed_quitquitquit_response(monkeypatch):
     monkeypatch.setattr(migration_runner,"urlopen",lambda request,timeout: Response())
     with pytest.raises(RuntimeError,match="rejected shutdown"):
         migration_runner.shutdown_proxy()
+
+
+def test_post_migration_verification_queries_public_as_oid_zero_with_parameters():
+    class Cursor:
+        def __init__(self, one=None, many=None): self.one=one; self.many=many or []
+        def fetchone(self): return self.one
+        def fetchall(self): return self.many
+    class Connection:
+        def __init__(self): self.calls=[]
+        def execute(self, sql, params=None):
+            self.calls.append((sql,params))
+            if "pg_namespace" in sql: return Cursor(many=[("restricted_content",),("inference_ledger",)])
+            if "pg_auth_members" in sql: return Cursor(many=[("conversation", "restricted_content_runtime"),("gateway", "restricted_ledger_runtime")])
+            if "pg_roles" in sql: return Cursor(many=[("restricted_content_runtime",),("restricted_ledger_runtime",)])
+            if "has_table_privilege" in sql: return Cursor(one=(False,))
+            if "runtime_controls" in sql: return Cursor(one=(1,True))
+            if "has_schema_privilege" in sql and "PUBLIC" not in sql: return Cursor(one=(False,))
+            raise AssertionError("PUBLIC must be represented only by the OID parameter")
+    connection=Connection()
+    migration_runner.verify_post_migration(connection,"conversation","gateway")
+    public_calls=[params for sql,params in connection.calls if "has_schema_privilege(%s::oid" in sql]
+    assert public_calls==[(0,0)]

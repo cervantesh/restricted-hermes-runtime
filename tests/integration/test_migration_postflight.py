@@ -44,7 +44,7 @@ def test_migration_commits_then_verifies_exclusive_roles_on_a_second_connection(
             assert not connection.execute("SELECT has_schema_privilege(%s, 'inference_ledger', 'USAGE')", (conversation,)).fetchone()[0]
             assert not connection.execute("SELECT has_schema_privilege(%s, 'restricted_content', 'USAGE')", (gateway,)).fetchone()[0]
             assert not connection.execute("SELECT has_table_privilege(%s, 'inference_ledger.runtime_controls', 'UPDATE')", (gateway,)).fetchone()[0]
-            assert not connection.execute("SELECT has_schema_privilege('PUBLIC', 'restricted_content', 'USAGE') OR has_schema_privilege('PUBLIC', 'inference_ledger', 'USAGE')").fetchone()[0]
+            assert not connection.execute("SELECT has_schema_privilege(%s::oid, 'restricted_content', 'USAGE') OR has_schema_privilege(%s::oid, 'inference_ledger', 'USAGE')", (0,0)).fetchone()[0]
             assert connection.execute("SELECT count(*), bool_and(dispatch_enabled = false) FROM inference_ledger.runtime_controls").fetchone() == (1, True)
     finally:
         with psycopg.connect(URL, autocommit=True) as connection:

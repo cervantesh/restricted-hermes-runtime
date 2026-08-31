@@ -51,7 +51,8 @@ def verify_post_migration(connection: object, conversation_user: str, gateway_us
     if cross_scope:
         raise RuntimeError("runtime IAM users must not retain cross-schema usage")
     public_usage = connection.execute(
-        "SELECT has_schema_privilege('PUBLIC', 'restricted_content', 'USAGE') OR has_schema_privilege('PUBLIC', 'inference_ledger', 'USAGE')"
+        "SELECT has_schema_privilege(%s::oid, 'restricted_content', 'USAGE') OR has_schema_privilege(%s::oid, 'inference_ledger', 'USAGE')",
+        (0, 0),
     ).fetchone()[0]
     if public_usage:
         raise RuntimeError("PUBLIC must not retain schema usage")
