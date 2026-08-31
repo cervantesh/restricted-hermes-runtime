@@ -49,6 +49,16 @@ class SyntheticAuthenticator:
         return self.principal
 
 
+@dataclass(frozen=True)
+class LocalSocketAuthenticator:
+    """Local roots rely on operator-controlled UDS permissions, never cloud tokens."""
+    principal: str
+    def authenticate(self, authorization: str | None) -> str:
+        if authorization is not None:
+            raise ContractError("local socket authentication has no bearer channel")
+        return self.principal
+
+
 def production_authenticator(*, audience: str, caller_principal: str) -> GoogleOidcAuthenticator:
     if os.environ.get("RESTRICTED_RUNTIME_MODE", "production") != "production":
         raise RuntimeError("production authenticator requires production runtime mode")

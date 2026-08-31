@@ -5,6 +5,7 @@ COPY src ./src
 RUN pip install --no-cache-dir . \
  && find /usr/local/lib/python3.11/site-packages/restricted_runtime -type d -name __pycache__ -prune -exec rm -rf {} + \
  && rm -f /usr/local/lib/python3.11/site-packages/restricted_runtime/vertex.py \
+           /usr/local/lib/python3.11/site-packages/restricted_runtime/google_kms.py \
            /usr/local/lib/python3.11/site-packages/restricted_runtime/gateway_client.py \
            /usr/local/lib/python3.11/site-packages/restricted_runtime/reconciliation.py \
            /usr/local/lib/python3.11/site-packages/restricted_runtime/reconciliation_driver.py \
@@ -20,5 +21,4 @@ COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
 COPY policy/generated/policy.json policy/generated/policy.sig ./policy/generated/
 RUN useradd --system --uid 10005 restricted-local-gateway
 USER 10005
-EXPOSE 8080
-CMD ["uvicorn", "restricted_runtime.services.production_local_gateway:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "restricted_runtime.services.production_local_gateway:app", "--uds", "/run/restricted-inference/gateway.sock"]

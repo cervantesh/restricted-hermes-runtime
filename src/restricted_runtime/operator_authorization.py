@@ -76,3 +76,22 @@ def load_operator_authorization_files(path: Path, signature_path: Path, public_k
     except Exception as exc:
         raise ContractError("operator authorization artifact is unavailable") from exc
     return load_operator_authorization(values, signature, public_key_b64, policy)
+
+
+@dataclass(frozen=True)
+class OperatorAuthorizationGate:
+    path: Path
+    signature_path: Path
+    public_key_b64: str
+    policy: PolicyBundle
+    clock: callable = lambda: datetime.now(UTC)
+    def __call__(self) -> None:
+        load_operator_authorization_files_at(self.path, self.signature_path, self.public_key_b64, self.policy, self.clock())
+
+
+def load_operator_authorization_files_at(path: Path, signature_path: Path, public_key_b64: str, policy: PolicyBundle, now: datetime) -> OperatorAuthorization:
+    try:
+        values = load_closed_json(path.read_bytes()); signature = signature_path.read_text(encoding="ascii")
+    except Exception as exc:
+        raise ContractError("operator authorization artifact is unavailable") from exc
+    return load_operator_authorization(values, signature, public_key_b64, policy, now=now)

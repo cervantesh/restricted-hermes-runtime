@@ -6,10 +6,9 @@ from pathlib import Path
 
 from ..auth import production_authenticator
 from ..gateway import Gateway
-from ..google_kms import GoogleKmsHmacKey
-from ..kms_config import parse_retired_versions
 from ..local_uds import LocalUdsClient
-from ..operator_authorization import load_operator_authorization_files
+from ..local_crypto import LocalFileHmacKey, LocalKeyRef, load_retired_key_refs
+from ..operator_authorization import OperatorAuthorizationGate
 from ..policy import LOCAL_POLICY_SCHEMA, load_signed_policy
 from ..policy_binding import require_policy_pair
 from ..storage import PostgresLedger
@@ -23,8 +22,8 @@ def required(name: str) -> str:
     return value
 
 
-def retired_versions(name: str, active_resource: str, active_version: str) -> dict[tuple[str, str], str]:
-    return parse_retired_versions(required(name), active_resource=active_resource, active_version=active_version)
+def local_ref(prefix: str) -> LocalKeyRef:
+    return LocalKeyRef(required(prefix + "_RESOURCE"), required(prefix + "_VERSION"), required(prefix + "_PATH"))
 
 
 def build_app():
@@ -34,14 +33,13 @@ def build_app():
     if policy.values["schema_version"] != LOCAL_POLICY_SCHEMA:
         raise RuntimeError("local production root requires local-uds policy")
     require_policy_pair(policy, epoch=required("RESTRICTED_POLICY_EPOCH"), digest=required("RESTRICTED_POLICY_DIGEST"))
-    load_operator_authorization_files(Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_PATH")), Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_PATH")), required("RESTRICTED_OPERATOR_AUTHORIZATION_PUBLIC_KEY_B64"), policy)
+    authorization = OperatorAuthorizationGate(Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_PATH")), Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_PATH")), required("RESTRICTED_OPERATOR_AUTHORIZATION_PUBLIC_KEY_B64"), policy)
+    authorization()
     admission = required("RESTRICTED_ADMISSION_ENABLED")
     if admission not in {"true", "false"}:
         raise RuntimeError("RESTRICTED_ADMISSION_ENABLED must be true or false")
-    key_resource = required("RESTRICTED_GATEWAY_MAC_KEY_RESOURCE")
-    key_version = required("RESTRICTED_GATEWAY_MAC_KEY_VERSION")
-    key = GoogleKmsHmacKey(key_resource, key_version, retired_versions("RESTRICTED_GATEWAY_RETIRED_MAC_KEYS_JSON", key_resource, key_version))
-    gateway = Gateway(policy, key, PostgresLedger(required("DATABASE_URL"), policy, key), LocalUdsClient(policy), admission_enabled=admission == "true")
+    key = LocalFileHmacKey(local_ref("RESTRICTED_LOCAL_GATEWAY_MAC_KEY"), load_retired_key_refs(required("RESTRICTED_LOCAL_GATEWAY_RETIRED_MAC_KEYS_PATH")))
+    gateway = Gateway(policy, key, PostgresLedger(required("DATABASE_URL"), policy, key), LocalUdsClient(policy), admission_enabled=admission == "true", authorization_gate=authorization)
     return create_app(gateway, production_authenticator(audience=required("RESTRICTED_GATEWAY_AUDIENCE"), caller_principal=policy.values["gateway_invoker_principal"]))
 
 

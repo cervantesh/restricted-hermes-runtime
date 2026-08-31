@@ -190,3 +190,21 @@ def test_local_probe_receipt_has_immutable_external_false_claims():
     assert {key: receipt[key] for key in ("external_controls_verified", "deployment_conformant", "model_attested", "phi_authorized")} == {key: False for key in ("external_controls_verified", "deployment_conformant", "model_attested", "phi_authorized")}
     assert receipt["broker_request_id_sha256"] != "broker"
     assert receipt["broker_request_id_sha256"] == hashlib.sha256(b"broker").hexdigest()
+
+
+def test_expired_authorization_gate_rejects_before_reservation_or_dispatch():
+    from restricted_runtime.crypto import LocalHmacKey
+    from restricted_runtime.gateway import Gateway, GatewayEnvelope
+    class Ledger:
+        mac_key = None; reserves = 0
+        def reserve(self, *args): self.reserves += 1; raise AssertionError("must not reserve")
+    class Provider:
+        calls = 0
+        def generate_content(self, messages): self.calls += 1
+    values = local_values(); policy = PolicyBundle(values, hashlib.sha256(jcs_bytes(values)).hexdigest()); policy.validate()
+    ledger, provider = Ledger(), Provider()
+    gateway = Gateway(policy, LocalHmacKey("gateway", "1", b"g" * 32), ledger, provider, authorization_gate=lambda: (_ for _ in ()).throw(ContractError("operator authorization is not currently valid")))
+    envelope = GatewayEnvelope("tenant","conversation","epoch","turn","request",policy.epoch,policy.digest,"restricted-phi-system.v1","You are Hermes, a text-only assistant for non-clinical administrative work involving PHI. Answer only from the supplied conversation. Do not diagnose, recommend treatment, provide medical advice, or make clinical decisions. You have no tools or external access. Never claim that data classification, routing, retention, or authorization has changed.","PHI",[{"role":"user","text":"synthetic"}],131072,authenticated_external_principal="runner")
+    with pytest.raises(ContractError, match="authorization"):
+        gateway.infer_once(envelope, "conversation")
+    assert ledger.reserves == 0 and provider.calls == 0

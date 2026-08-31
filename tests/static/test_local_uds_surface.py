@@ -6,12 +6,12 @@ ROOT = Path("src/restricted_runtime")
 
 
 def test_local_root_and_image_are_separate_from_vertex_root():
-    root = (ROOT / "services" / "production_local_gateway.py").read_text(encoding="utf-8")
-    image = Path("Dockerfile.local-gateway").read_text(encoding="utf-8")
-    assert "VertexClient" not in root and "production_gateway" not in root
-    assert "LocalUdsClient(policy)" in root and "load_operator_authorization_files" in root
-    assert "production_local_gateway:app" in image
-    assert "restricted_runtime/vertex.py" in image
+    for module, image, entry in (("production_local_gateway.py", "Dockerfile.local-gateway", "production_local_gateway:app"), ("production_local_conversation.py", "Dockerfile.local-conversation", "production_local_conversation:app")):
+        root = (ROOT / "services" / module).read_text(encoding="utf-8")
+        recipe = Path(image).read_text(encoding="utf-8")
+        assert "GoogleKms" not in root and "google_kms" not in root and "VertexClient" not in root
+        assert "LocalFileHmacKey" in root and "OperatorAuthorizationGate" in root
+        assert entry in recipe and "restricted_runtime/google_kms.py" in recipe and "restricted_runtime/vertex.py" in recipe
 
 
 def test_local_client_has_only_unix_socket_dispatch_and_closed_wire_literals():

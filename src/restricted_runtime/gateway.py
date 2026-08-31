@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .contracts import AttemptState, Classification, ContractError, ProviderResult, jcs_bytes
 from .crypto import GATEWAY_MAC_DOMAIN, MacKey, kms_mac_input
@@ -28,8 +28,8 @@ class Ledger(Protocol):
     def fence(self, tenant_id: str, turn_id: str, *, client_request_id: str, policy_epoch: str, policy_digest: str) -> AttemptState: ...
 
 class Gateway:
-    def __init__(self, policy: PolicyBundle, mac_key: MacKey, ledger: Ledger, vertex, *, admission_enabled: bool = True):
-        policy.validate(); self.policy, self.mac_key, self.ledger, self.vertex, self.admission_enabled = policy, mac_key, ledger, vertex, admission_enabled
+    def __init__(self, policy: PolicyBundle, mac_key: MacKey, ledger: Ledger, vertex, *, admission_enabled: bool = True, authorization_gate: Callable[[], None] | None = None):
+        policy.validate(); self.policy, self.mac_key, self.ledger, self.vertex, self.admission_enabled, self.authorization_gate = policy, mac_key, ledger, vertex, admission_enabled, authorization_gate
         if getattr(ledger, "mac_key", None) is None:
             ledger.mac_key = mac_key
     def validate(self, envelope: GatewayEnvelope, principal: str) -> bytes:
@@ -51,6 +51,8 @@ class Gateway:
         # from crossing the only Vertex dispatch boundary.
         if not self.admission_enabled:
             raise ContractError("gateway admission is disabled")
+        if self.authorization_gate is not None:
+            self.authorization_gate()
         canonical = self.validate(envelope, principal)
         record = self.mac_key.sign(kms_mac_input(GATEWAY_MAC_DOMAIN, canonical))
         state = self.ledger.reserve(envelope, principal, record.mac, record.key_resource, record.key_version)
