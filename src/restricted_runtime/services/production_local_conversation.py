@@ -10,6 +10,8 @@ from ..operator_authorization import OperatorAuthorizationGate
 from ..policy import LOCAL_POLICY_SCHEMA, load_signed_policy
 from ..policy_binding import require_policy_pair
 from ..storage import PostgresContentStore
+from ..reconciliation import Reconciler
+from ..reconciliation_driver import ReconciliationDriver
 from .restricted_api import create_app
 
 def required(name: str) -> str:
@@ -30,6 +32,8 @@ def build_app():
     admission=required("RESTRICTED_ADMISSION_ENABLED")
     if admission not in {"true","false"}: raise RuntimeError("RESTRICTED_ADMISSION_ENABLED must be true or false")
     service=LocalFileHmacKey(service_ref,service_old); wrapper=LocalAesDataKeyWrapper(wrap_ref,wrap_old)
-    runtime=ConversationService(PostgresContentStore(required("DATABASE_URL")),LocalGatewayClient("/run/restricted-inference/gateway.sock"),service,wrapper,policy,required("RESTRICTED_TENANT_ID"),admission_enabled=admission=="true",authorization_gate=authority)
-    return create_app(runtime,LocalSocketAuthenticator(policy.values["external_runner_principal"]),lambda: LocalGatewayClient("/run/restricted-inference/gateway.sock").ready(policy.epoch,policy.digest))
+    store=PostgresContentStore(required("DATABASE_URL")); client=LocalGatewayClient("/run/restricted-inference/gateway.sock")
+    runtime=ConversationService(store,client,service,wrapper,policy,required("RESTRICTED_TENANT_ID"),admission_enabled=admission=="true",authorization_gate=authority)
+    driver=ReconciliationDriver(store,Reconciler(store,client),"local-conversation-reconciler",policy.epoch)
+    return create_app(runtime,LocalSocketAuthenticator(policy.values["external_runner_principal"]),lambda: (driver.run_once(32) >= 0 and client.ready(policy.epoch,policy.digest)))
 app=build_app()
