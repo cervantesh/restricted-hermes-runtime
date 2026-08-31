@@ -35,7 +35,7 @@ echo "Target inventory before create:"
 "${compose[@]}" up -d --wait postgres
 
 timeout 600 "${compose[@]}" run --rm tests sh -ec \
-  "cp -a /workspace /tmp/workspace && cd /tmp/workspace && pip install --no-cache-dir '.[test]' >/tmp/pip.log && python -m pytest -p no:cacheprovider \
+  "cp -a /workspace /tmp/workspace && cd /tmp/workspace && pip install --no-cache-dir '.[test,google]' >/tmp/pip.log && python -m pytest -p no:cacheprovider \
     tests/api \
     tests/integration --ignore=tests/integration/test_local_three_socket_composition.py \
     tests/unit/test_local_crypto_posix.py \
@@ -45,7 +45,7 @@ timeout 600 "${compose[@]}" run --rm tests sh -ec \
     tests/unit/test_local_deployment_preflight_posix.py -q"
 
 timeout 300 "${compose[@]}" run --rm tests sh -ec \
-  "cp -a /workspace /tmp/workspace && cd /tmp/workspace && pip install --no-cache-dir '.[test]' >/tmp/pip.log && python -m pytest -p no:cacheprovider \
+  "cp -a /workspace /tmp/workspace && cd /tmp/workspace && pip install --no-cache-dir '.[test,google]' >/tmp/pip.log && python -m pytest -p no:cacheprovider \
     tests/integration/test_local_three_socket_composition.py -q"
 
 echo "AC10 Linux/PostgreSQL/POSIX suites passed."
