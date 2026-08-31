@@ -6,6 +6,12 @@ and the public verification key. The Ed25519 private key stays outside this
 repository and Docker context; use `tools/generate_synthetic_policy.py` to
 write ignored files below `policy/generated/` before image construction.
 
+`policy_digest` is the policy bundle's bare lowercase 64-hex JCS SHA-256
+digest (for example `4ce0...e7e54`), not `sha256:<hex>`. Runtime configuration,
+database rows, and gateway envelopes use that bare form. Image references and
+receipt/provenance digests stay prefixed as `image@sha256:<hex>` and
+`sha256:<hex>`, respectively.
+
 ## Two-stage image inputs (operator run; no fake digest)
 
 This repository does not create an Artifact Registry and then invent a digest

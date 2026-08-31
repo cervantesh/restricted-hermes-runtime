@@ -23,6 +23,21 @@ def test_staging_manifest_pins_images_and_carries_all_closed_runtime_inputs():
     assert "RESTRICTED_CALLER_PRINCIPAL" not in source
 
 
+def test_policy_digest_input_is_exactly_the_runtime_bare_jcs_sha256_hex():
+    main = (ROOT / "main.tf").read_text(encoding="utf-8")
+    policy_digest = re.search(
+        r'variable "policy_digest" \{(?P<body>.*?)\n\}\nvariable ', main, re.DOTALL
+    ).group("body")
+    pattern = re.search(r'regex\("([^"]+)", var\.policy_digest\)', policy_digest).group(1)
+    assert re.fullmatch(pattern, "4ce0eda6d2f65426625c3ca20a5019909f1a36e1c58043234ce9809b0f0e7e54")
+    for invalid in (
+        "sha256:4ce0eda6d2f65426625c3ca20a5019909f1a36e1c58043234ce9809b0f0e7e54",
+        "4CE0EDA6D2F65426625C3CA20A5019909F1A36E1C58043234CE9809B0F0E7E54",
+        "4ce0eda6d2f65426625c3ca20a5019909f1a36e1c58043234ce9809b0f0e7e5",
+    ):
+        assert not re.fullmatch(pattern, invalid)
+
+
 def test_staging_has_no_nat_and_keeps_fqdn_sni_residual_undetermined():
     source="\n".join(path.read_text(encoding="utf-8") for path in ROOT.glob("*.tf"))
     assert "google_compute_router_nat" not in source

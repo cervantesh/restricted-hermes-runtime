@@ -15,7 +15,14 @@ variable "region" {
 }
 variable "tenant_id" { type = string }
 variable "policy_epoch" { type = string }
-variable "policy_digest" { type = string }
+variable "policy_digest" {
+  type        = string
+  description = "Bare lowercase 64-hex JCS SHA-256 policy digest; image references remain sha256:-prefixed."
+  validation {
+    condition     = can(regex("^[0-9a-f]{64}$", var.policy_digest))
+    error_message = "policy_digest must be the bare lowercase 64-hex JCS SHA-256 digest, without sha256:."
+  }
+}
 variable "policy_public_key_b64" { type = string }
 variable "ttl" { type = string }
 variable "admission_enabled" {
