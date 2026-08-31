@@ -148,6 +148,7 @@ class LocalAesDataKeyWrapper:
         try:
             if not isinstance(wrapped, bytes) or len(wrapped) > 4096: raise ValueError
             value = load_closed_json(wrapped)
+            if wrapped != jcs_bytes(value): raise ValueError
             if not isinstance(value, dict) or set(value) != {"schema_version","key_resource","key_version","nonce","ciphertext"} or value["schema_version"] != _ENVELOPE:
                 raise ValueError
             if not all(isinstance(value[k],str) and 0 < len(value[k]) <= 128 for k in ("key_resource","key_version")) or not all(isinstance(value[k],str) and 0 < len(value[k]) <= 256 for k in ("nonce","ciphertext")): raise ValueError

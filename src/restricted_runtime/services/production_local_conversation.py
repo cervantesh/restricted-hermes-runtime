@@ -9,9 +9,9 @@ from ..local_gateway_client import LocalGatewayClient
 from ..operator_authorization import OperatorAuthorizationGate
 from ..policy import LOCAL_POLICY_SCHEMA, load_signed_policy
 from ..policy_binding import require_policy_pair
-from ..storage import PostgresContentStore
+from ..conversation_storage import PostgresContentStore
 from ..reconciliation import Reconciler
-from ..reconciliation_driver import ReconciliationDriver
+from ..reconciliation_driver import ReconciliationDriver, reconciliation_lifespan
 from .restricted_api import create_app
 
 def required(name: str) -> str:
@@ -37,6 +37,9 @@ def build_app():
     runtime=ConversationService(store,client,service,wrapper,policy,required("RESTRICTED_TENANT_ID"),admission_enabled=admission=="true",authorization_gate=authority)
     driver=ReconciliationDriver(store,Reconciler(store,client),"local-conversation-reconciler",policy.epoch,authorization_gate=authority)
     def gateway_ready():
-        return driver.run_once(32) >= 0 and client.ready(policy.epoch,policy.digest)
-    return create_app(runtime,LocalSocketAuthenticator(policy.values["external_runner_principal"]),gateway_ready)
+        authority()
+        return client.ready(policy.epoch,policy.digest)
+    app=create_app(runtime,LocalSocketAuthenticator(policy.values["external_runner_principal"]),gateway_ready)
+    app.router.lifespan_context=reconciliation_lifespan(driver)
+    return app
 app=build_app()

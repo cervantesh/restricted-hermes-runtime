@@ -24,6 +24,7 @@ def test_local_keys_rotate_verify_unwrap_and_reject_tamper_or_duplicates():
         wrapper = LocalAesDataKeyWrapper(active, (retired,)); wrapped = wrapper.wrap(b"d" * 32)
         assert wrapper.unwrap(wrapped) == b"d" * 32
         with pytest.raises(ContractError): wrapper.unwrap(wrapped[:-1] + b"x")
+        with pytest.raises(ContractError): wrapper.unwrap(b" " + wrapped)
         with pytest.raises(ContractError): LocalFileHmacKey(active, (active,))
         (root / "bad.bin").write_bytes(b"x"); (root / "bad.bin").chmod(0o600)
         with pytest.raises(ContractError): LocalFileHmacKey(LocalKeyRef("bad", "v1", str(root / "bad.bin"), "0" * 64))

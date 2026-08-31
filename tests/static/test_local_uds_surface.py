@@ -25,3 +25,11 @@ def test_local_client_has_only_unix_socket_dispatch_and_closed_wire_literals():
             assert literal in source
     for forbidden in ("AF_INET", "AF_INET6", "httpx", "requests", "retry", "redirect", "stream"):
         assert forbidden not in source
+
+
+def test_local_conversation_image_excludes_gateway_and_local_provider_modules():
+    root = (ROOT / "services" / "production_local_conversation.py").read_text(encoding="utf-8")
+    recipe = Path("Dockerfile.local-conversation").read_text(encoding="utf-8")
+    assert "conversation_storage" in root and "from ..storage" not in root
+    for module in ("gateway.py", "local_uds.py", "storage.py"):
+        assert f"restricted_runtime/{module}" in recipe

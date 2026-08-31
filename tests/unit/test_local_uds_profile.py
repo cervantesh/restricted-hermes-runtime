@@ -225,6 +225,26 @@ def test_reconciliation_rejects_expired_authority_before_claim_or_gateway_call()
     assert store.expired_calls == 0 and reconciler.calls == 0
 
 
+def test_local_reconciliation_lifespan_runs_bounded_startup_scan():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from restricted_runtime.reconciliation_driver import reconciliation_lifespan
+
+    class Driver:
+        calls = 0
+
+        def run_once(self, _limit):
+            self.calls += 1
+            return 0
+
+    driver = Driver()
+    app = FastAPI()
+    app.router.lifespan_context = reconciliation_lifespan(driver)
+    with TestClient(app):
+        pass
+    assert driver.calls >= 1
+
+
 def test_local_response_parser_is_closed_and_never_surfaces_mismatched_text():
     from restricted_runtime.local_uds import parse_local_response
 
@@ -329,6 +349,50 @@ def test_expired_authorization_gate_rejects_before_reservation_or_dispatch():
     with pytest.raises(ContractError, match="authorization"):
         gateway.infer_once(envelope, "conversation")
     assert ledger.reserves == 0 and provider.calls == 0
+
+
+def test_authorization_is_rechecked_before_gateway_dispatch():
+    from restricted_runtime.crypto import LocalHmacKey
+    from restricted_runtime.gateway import Gateway, GatewayEnvelope
+    from restricted_runtime.contracts import AttemptState
+    from restricted_runtime.policy import SYSTEM_INSTRUCTION
+
+    class Ledger:
+        mac_key = None
+        reserves = 0
+        starts = 0
+
+        def reserve(self, *_args):
+            self.reserves += 1
+            return AttemptState.RESERVED
+
+        def lookup(self, *_args, **_kwargs):
+            return None
+
+        def start_dispatch(self, *_args):
+            self.starts += 1
+            raise AssertionError("dispatch must be gated")
+
+    class Provider:
+        calls = 0
+
+        def generate_content(self, _messages):
+            self.calls += 1
+            raise AssertionError("provider must be gated")
+
+    values = local_values(); policy = PolicyBundle(values, hashlib.sha256(jcs_bytes(values)).hexdigest()); policy.validate()
+    ledger, provider, checks = Ledger(), Provider(), []
+
+    def authority():
+        checks.append(True)
+        if len(checks) == 2:
+            raise ContractError("operator authorization is not currently valid")
+
+    gateway = Gateway(policy, LocalHmacKey("gateway", "1", b"g" * 32), ledger, provider, authorization_gate=authority)
+    envelope = GatewayEnvelope("tenant", "conversation", "epoch", "turn", "request", policy.epoch, policy.digest, "restricted-phi-system.v1", SYSTEM_INSTRUCTION, "PHI", [{"role": "user", "text": "synthetic"}], 131072, authenticated_external_principal="runner")
+    with pytest.raises(ContractError, match="currently valid"):
+        gateway.infer_once(envelope, "conversation")
+    assert len(checks) == 2 and ledger.reserves == 1 and ledger.starts == provider.calls == 0
 
 
 def test_operator_authorization_gate_rechecks_an_injected_clock(tmp_path):

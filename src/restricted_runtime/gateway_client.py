@@ -5,7 +5,7 @@ import httpx
 from google.auth.transport.requests import Request
 from google.oauth2.id_token import fetch_id_token
 from .contracts import ContractError, ProviderResult
-from .gateway import GatewayEnvelope
+from .gateway_contracts import GatewayEnvelope
 
 class GoogleIdTokenSupplier:
     def __init__(self,audience:str): self.audience=audience

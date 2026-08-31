@@ -9,7 +9,7 @@ from typing import Callable, Protocol
 
 from .contracts import ContractError, ProviderResult, TurnRequest, TurnState, content_aad, jcs_bytes
 from .crypto import Ciphertext, MacKey, MacRecord, SERVICE_MAC_DOMAIN, decrypt, encrypt, kms_mac_input
-from .gateway import GatewayEnvelope
+from .gateway_contracts import GatewayEnvelope
 from .policy import PolicyBundle, SYSTEM_INSTRUCTION
 
 

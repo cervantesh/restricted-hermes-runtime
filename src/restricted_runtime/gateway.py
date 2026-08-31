@@ -1,23 +1,15 @@
 """Gateway envelope validation and one-attempt state transitions."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any, Callable, Protocol
 
-from .contracts import AttemptState, Classification, ContractError, ProviderResult, jcs_bytes
+from .contracts import AttemptState, Classification, ContractError, ProviderResult
 from .crypto import GATEWAY_MAC_DOMAIN, MacKey, kms_mac_input
+from .gateway_contracts import GatewayEnvelope
 from .messages import validate_internal_messages
 from .policy import PolicyBundle, SYSTEM_INSTRUCTION, SYSTEM_INSTRUCTION_SHA256
 
-
-@dataclass(frozen=True)
-class GatewayEnvelope:
-    tenant_id: str; conversation_id: str; conversation_epoch: str; turn_id: str; client_request_id: str
-    policy_epoch: str; policy_digest: str; system_instruction_version: str; system_instruction: str
-    classification: str; messages: list[dict[str, str]]; content_limit: int
-    authenticated_external_principal: str = ""
-    def canonical(self) -> bytes:
-        return jcs_bytes(self.__dict__)
 
 class Ledger(Protocol):
     def reserve(self, envelope: GatewayEnvelope, principal: str, mac: bytes, key_resource: str, key_version: str) -> AttemptState: ...
@@ -59,6 +51,8 @@ class Gateway:
         attempt = self.ledger.lookup(envelope.tenant_id,envelope.turn_id,client_request_id=envelope.client_request_id,policy_epoch=envelope.policy_epoch,policy_digest=envelope.policy_digest)
         if state != AttemptState.RESERVED:
             return ProviderResult(str(state),decision_id=attempt.decision_id if attempt else None,provider_request_id=attempt.provider_request_id if attempt else None,policy_epoch=envelope.policy_epoch,policy_digest=envelope.policy_digest)
+        if self.authorization_gate is not None:
+            self.authorization_gate()
         if not self.ledger.start_dispatch(envelope.tenant_id, envelope.turn_id):
             return ProviderResult("CANCELLED_NO_DISPATCH",decision_id=attempt.decision_id if attempt else None,policy_epoch=envelope.policy_epoch,policy_digest=envelope.policy_digest)
         result = self.vertex.generate_content(envelope.messages)

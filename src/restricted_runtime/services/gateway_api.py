@@ -3,7 +3,8 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException, Request
 from ..auth import Authenticator
 from ..contracts import ContractError, load_closed_json
-from ..gateway import Gateway, GatewayEnvelope
+from ..gateway import Gateway
+from ..gateway_contracts import GatewayEnvelope
 
 _ENVELOPE=set(GatewayEnvelope.__annotations__)
 _IDENTITY={"tenant_id","turn_id","client_request_id","policy_epoch","policy_digest"}

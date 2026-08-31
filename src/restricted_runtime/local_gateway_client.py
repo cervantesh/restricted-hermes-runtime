@@ -3,7 +3,7 @@ from __future__ import annotations
 import socket,time
 from pathlib import Path
 from .contracts import AttemptState, ContractError, ProviderResult, jcs_bytes, load_closed_json
-from .gateway import GatewayEnvelope
+from .gateway_contracts import GatewayEnvelope
 
 class LocalGatewayClient:
     def __init__(self, path: str):

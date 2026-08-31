@@ -9,7 +9,7 @@ from psycopg.rows import dict_row
 from .contracts import AttemptState, ContractError, ProviderResult, TurnState
 from .crypto import GATEWAY_MAC_DOMAIN, MacRecord, kms_mac_input
 from .conversation import TurnRow
-from .gateway import GatewayEnvelope
+from .gateway_contracts import GatewayEnvelope
 
 @dataclass(frozen=True)
 class LedgerAttempt:
