@@ -78,6 +78,20 @@ def test_migration_uses_password_admin_socket_while_runtime_sidecars_use_iam_aut
     assert "MIGRATION_ADMIN_DSN" in source
 
 
+def test_migration_secret_is_pinned_and_all_database_clients_wait_for_a_named_healthy_proxy():
+    source=(ROOT/"runtime.tf").read_text(encoding="utf-8")
+    migration=source.split('resource "google_cloud_run_v2_job" "migration" {',1)[1]
+    assert 'version = "1"' in migration
+    assert 'version = "latest"' not in migration
+    assert re.search(r'depends_on\s*=\s*\[google_secret_manager_secret_iam_member\.migration_bootstrap\]',migration)
+    assert len(re.findall(r'name\s*=\s*"cloud-sql-proxy"',source)) == 3
+    assert source.count('"--health-check"') == 3
+    assert source.count('"--quitquitquit"') == 3
+    assert source.count('path = "/readiness"') == 3
+    assert source.count('"--exit-zero-on-sigterm"') == 3
+    assert source.count('depends_on = ["cloud-sql-proxy"]') == 3
+
+
 def test_connectors_fit_the_official_weighted_name_limit_and_sql_users_are_trimmed():
     main=(ROOT/"main.tf").read_text(encoding="utf-8")
     names=re.findall(r'resource "google_vpc_access_connector" "\w+" \{\s+name\s*=\s*"([^"]+)"',main)

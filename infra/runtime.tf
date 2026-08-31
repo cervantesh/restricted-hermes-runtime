@@ -64,7 +64,9 @@ resource "google_cloud_run_v2_service" "gateway" {
       empty_dir {}
     }
     containers {
-      image = var.gateway_image
+      name       = "gateway"
+      depends_on = ["cloud-sql-proxy"]
+      image      = var.gateway_image
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -78,8 +80,20 @@ resource "google_cloud_run_v2_service" "gateway" {
       }
     }
     containers {
+      name  = "cloud-sql-proxy"
       image = var.cloud_sql_proxy_image
-      args  = ["--private-ip", "--auto-iam-authn", "--unix-socket=/cloudsql", google_sql_database_instance.restricted.connection_name]
+      args  = ["--private-ip", "--auto-iam-authn", "--unix-socket=/cloudsql", "--health-check", "--http-address=0.0.0.0", "--http-port=9090", "--quitquitquit", "--exit-zero-on-sigterm", google_sql_database_instance.restricted.connection_name]
+      ports { container_port = 9090 }
+      startup_probe {
+        http_get {
+          path = "/readiness"
+          port = 9090
+        }
+        initial_delay_seconds = 0
+        period_seconds        = 5
+        timeout_seconds       = 3
+        failure_threshold     = 12
+      }
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -109,7 +123,9 @@ resource "google_cloud_run_v2_service" "conversation" {
       empty_dir {}
     }
     containers {
-      image = var.conversation_image
+      name       = "conversation"
+      depends_on = ["cloud-sql-proxy"]
+      image      = var.conversation_image
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -123,8 +139,20 @@ resource "google_cloud_run_v2_service" "conversation" {
       }
     }
     containers {
+      name  = "cloud-sql-proxy"
       image = var.cloud_sql_proxy_image
-      args  = ["--private-ip", "--auto-iam-authn", "--unix-socket=/cloudsql", google_sql_database_instance.restricted.connection_name]
+      args  = ["--private-ip", "--auto-iam-authn", "--unix-socket=/cloudsql", "--health-check", "--http-address=0.0.0.0", "--http-port=9090", "--quitquitquit", "--exit-zero-on-sigterm", google_sql_database_instance.restricted.connection_name]
+      ports { container_port = 9090 }
+      startup_probe {
+        http_get {
+          path = "/readiness"
+          port = 9090
+        }
+        initial_delay_seconds = 0
+        period_seconds        = 5
+        timeout_seconds       = 3
+        failure_threshold     = 12
+      }
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -160,6 +188,7 @@ resource "google_cloud_run_v2_job" "runner" {
         egress    = "ALL_TRAFFIC"
       }
       containers {
+        name  = "synthetic-runner"
         image = var.runner_image
         dynamic "env" {
           for_each = local.runner_job_env
@@ -176,6 +205,7 @@ resource "google_cloud_run_v2_job" "migration" {
   name                = "restricted-synthetic-migration"
   location            = var.region
   deletion_protection = false
+  depends_on          = [google_secret_manager_secret_iam_member.migration_bootstrap]
   template {
     template {
       service_account = google_service_account.migration.email
@@ -189,8 +219,10 @@ resource "google_cloud_run_v2_job" "migration" {
         empty_dir {}
       }
       containers {
-        image   = var.migration_image
-        command = ["python", "-m", "restricted_runtime.migration_runner"]
+        name       = "migration-runner"
+        depends_on = ["cloud-sql-proxy"]
+        image      = var.migration_image
+        command    = ["python", "-m", "restricted_runtime.migration_runner"]
         volume_mounts {
           name       = "cloudsql"
           mount_path = "/cloudsql"
@@ -207,16 +239,28 @@ resource "google_cloud_run_v2_job" "migration" {
           value_source {
             secret_key_ref {
               secret  = var.migration_bootstrap_secret_id
-              version = "latest"
+              version = "1"
             }
           }
         }
       }
       containers {
+        name  = "cloud-sql-proxy"
         image = var.cloud_sql_proxy_image
         # One-shot operator-admin DSN uses PostgreSQL password authentication.
         # Runtime services alone use --auto-iam-authn.
-        args = ["--private-ip", "--unix-socket=/cloudsql", google_sql_database_instance.restricted.connection_name]
+        args = ["--private-ip", "--unix-socket=/cloudsql", "--health-check", "--http-address=0.0.0.0", "--http-port=9090", "--quitquitquit", "--exit-zero-on-sigterm", google_sql_database_instance.restricted.connection_name]
+        ports { container_port = 9090 }
+        startup_probe {
+          http_get {
+            path = "/readiness"
+            port = 9090
+          }
+          initial_delay_seconds = 0
+          period_seconds        = 5
+          timeout_seconds       = 3
+          failure_threshold     = 12
+        }
         volume_mounts {
           name       = "cloudsql"
           mount_path = "/cloudsql"

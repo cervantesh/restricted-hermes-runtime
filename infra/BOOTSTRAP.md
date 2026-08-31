@@ -42,7 +42,7 @@ accepts no placeholder digest.
 
 Before either service receives traffic, an approved database operator creates
 the **external** Secret Manager secret named by `migration_bootstrap_secret_id`.
-Its single version is the one-time `MIGRATION_ADMIN_DSN`, exactly a
+Its exact version `1` is the one-time `MIGRATION_ADMIN_DSN`, exactly a
 password-authenticated PostgreSQL conninfo string with
 `host=/cloudsql/PROJECT:us-central1:restricted-synthetic-postgres`, `dbname`,
 `user`, and `password`. Its value is never created, read, or stored by
@@ -50,7 +50,12 @@ Terraform. Terraform grants only the isolated migration service account access
 to that named secret. The migration job fails closed unless the reference,
 secret version, exact socket host, password auth, and both IAM DB user names
 are present. Its Cloud SQL Auth Proxy deliberately does **not** use
-`--auto-iam-authn`; that option is reserved for the two runtime sidecars. It runs
+`--auto-iam-authn`; that option is reserved for the two runtime sidecars. The
+migration job depends on its Secret Manager accessor binding and its named
+runner waits for the named Cloud SQL proxy startup probe. All proxy sidecars
+enable health checks and the localhost-only `quitquitquit` shutdown endpoint;
+the migration runner requests that shutdown in `finally` without replacing a
+primary migration error. It runs
 `001_restricted_runtime.sql` followed by a rendered
 `002_synthetic_iam_role_grants.sql.tmpl`. Runtime identities never receive DDL
 privileges. The conversation IAM database user receives only
