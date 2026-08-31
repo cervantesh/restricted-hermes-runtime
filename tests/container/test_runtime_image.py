@@ -104,6 +104,30 @@ def test_image_recipe_has_no_dynamic_capabilities():
         assert "COPY policy/generated/policy.json policy/generated/policy.sig" in source
 
 
+@pytest.mark.skipif(DOCKER is None, reason="Docker daemon unavailable locally and through Ubuntu-24.04 WSL")
+def test_built_runner_image_imports_google_request_transport_without_runtime_surface():
+    tag = "restricted-runtime-runner-proof"
+    built = run_docker("build", "-f", "Dockerfile.runner", "-t", tag, ".")
+    assert built.returncode == 0, built.stdout[-2000:] + built.stderr[-2000:]
+    proof = """
+import importlib.util
+import os
+from pathlib import Path
+
+from google.auth.transport.requests import Request
+
+assert Request is not None
+assert os.getuid() == 10004
+script = Path('/app/synthetic_runner.py')
+assert script.is_file()
+compile(script.read_text(encoding='utf-8'), str(script), 'exec')
+assert importlib.util.find_spec('restricted_runtime') is None
+assert 'HRH_RESTRICTED_RUNTIME_OK' in script.read_text(encoding='utf-8')
+"""
+    checked = run_docker("run", "--rm", "--entrypoint", "python", tag, "-c", proof, timeout=30)
+    assert checked.returncode == 0, checked.stdout[-2000:] + checked.stderr[-2000:]
+
+
 @pytest.fixture
 def generated_public_policy(tmp_path):
     """Supply only build-safe artifacts; the temporary private key is external."""
