@@ -67,6 +67,7 @@ resource "google_cloud_run_v2_service" "gateway" {
       name       = "gateway"
       depends_on = ["cloud-sql-proxy"]
       image      = var.gateway_image
+      ports { container_port = 8080 }
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -83,7 +84,6 @@ resource "google_cloud_run_v2_service" "gateway" {
       name  = "cloud-sql-proxy"
       image = var.cloud_sql_proxy_image
       args  = ["--private-ip", "--auto-iam-authn", "--unix-socket=/cloudsql", "--health-check", "--http-address=0.0.0.0", "--http-port=9090", "--quitquitquit", "--exit-zero-on-sigterm", google_sql_database_instance.restricted.connection_name]
-      ports { container_port = 9090 }
       startup_probe {
         http_get {
           path = "/readiness"
@@ -126,6 +126,7 @@ resource "google_cloud_run_v2_service" "conversation" {
       name       = "conversation"
       depends_on = ["cloud-sql-proxy"]
       image      = var.conversation_image
+      ports { container_port = 8080 }
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -142,7 +143,6 @@ resource "google_cloud_run_v2_service" "conversation" {
       name  = "cloud-sql-proxy"
       image = var.cloud_sql_proxy_image
       args  = ["--private-ip", "--auto-iam-authn", "--unix-socket=/cloudsql", "--health-check", "--http-address=0.0.0.0", "--http-port=9090", "--quitquitquit", "--exit-zero-on-sigterm", google_sql_database_instance.restricted.connection_name]
-      ports { container_port = 9090 }
       startup_probe {
         http_get {
           path = "/readiness"
@@ -250,7 +250,6 @@ resource "google_cloud_run_v2_job" "migration" {
         # One-shot operator-admin DSN uses PostgreSQL password authentication.
         # Runtime services alone use --auto-iam-authn.
         args = ["--private-ip", "--unix-socket=/cloudsql", "--health-check", "--http-address=0.0.0.0", "--http-port=9090", "--quitquitquit", "--exit-zero-on-sigterm", google_sql_database_instance.restricted.connection_name]
-        ports { container_port = 9090 }
         startup_probe {
           http_get {
             path = "/readiness"

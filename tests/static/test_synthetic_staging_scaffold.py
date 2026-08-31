@@ -92,6 +92,12 @@ def test_migration_secret_is_pinned_and_all_database_clients_wait_for_a_named_he
     assert source.count('depends_on = ["cloud-sql-proxy"]') == 3
 
 
+def test_only_cloud_run_ingress_containers_declare_the_application_port():
+    source = (ROOT / "runtime.tf").read_text(encoding="utf-8")
+    assert source.count("ports { container_port = 8080 }") == 2
+    assert "ports { container_port = 9090 }" not in source
+
+
 def test_connectors_fit_the_official_weighted_name_limit_and_sql_users_are_trimmed():
     main=(ROOT/"main.tf").read_text(encoding="utf-8")
     names=re.findall(r'resource "google_vpc_access_connector" "\w+" \{\s+name\s*=\s*"([^"]+)"',main)
