@@ -1,12 +1,11 @@
 """External conversation API composed only with a verified authenticator and runtime."""
 from __future__ import annotations
-import logging
+import sys
 from fastapi import FastAPI, HTTPException, Request
 from ..auth import Authenticator
 from ..contracts import ContractError, TurnRequest, load_closed_json
 from ..conversation import ConversationService
 
-_LOG = logging.getLogger(__name__)
 _TURN_REJECTION_CODES = {
     "inference outcome is indeterminate": "inference_outcome_indeterminate",
     "gateway result association mismatch": "gateway_result_association_mismatch",
@@ -37,7 +36,7 @@ def create_app(runtime: ConversationService, authenticator: Authenticator, gatew
             principal=authenticator.authenticate(request.headers.get("authorization"))
             return runtime.submit(turn,principal=principal,conversation_id=conversation_id)
         except ContractError as exc:
-            _LOG.info("turn_rejected_reason=%s", _turn_rejection_code(exc))
+            print(f"turn_rejected_reason={_turn_rejection_code(exc)}", file=sys.stderr, flush=True)
             raise HTTPException(409 if str(exc) in {"ACTIVE_TURN","idempotency association conflict","idempotency MAC verification failed","stale conversation epoch"} else 400,"restricted turn rejected") from exc
     @app.post("/v1/restricted/conversations/{conversation_id}/reset")
     async def reset(conversation_id:str,request:Request):

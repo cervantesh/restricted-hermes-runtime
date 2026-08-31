@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 import uuid
 
 
@@ -26,12 +27,14 @@ def main() -> None:
     conversation = "synthetic-non-phi-only-ollama"
     status, created = request("POST", f"/v1/restricted/conversations/{conversation}")
     assert status == 200, (status, created)
+    started = time.monotonic()
     status, result = request("POST", f"/v1/restricted/conversations/{conversation}/turns", {
         "schema_version": "restricted-turn.v1", "client_request_id": str(uuid.uuid4()),
         "conversation_epoch": created["conversation_epoch"],
         "message": "SYNTHETIC_NON_PHI_ONLY: reply with one short greeting.",
     })
-    assert status == 200 and result.get("status") == "COMMITTED" and isinstance(result.get("message"), str) and result["message"], (status, result)
+    elapsed = time.monotonic() - started
+    assert status == 200 and result.get("status") == "COMMITTED" and isinstance(result.get("message"), str) and result["message"], (round(elapsed, 3), status, result)
     print(json.dumps({"result": result, "model_attested": False, "deployment_conformant": False, "phi_authorized": False}, separators=(",", ":")))
 
 
