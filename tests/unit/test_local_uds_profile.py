@@ -208,3 +208,15 @@ def test_expired_authorization_gate_rejects_before_reservation_or_dispatch():
     with pytest.raises(ContractError, match="authorization"):
         gateway.infer_once(envelope, "conversation")
     assert ledger.reserves == 0 and provider.calls == 0
+
+
+def test_operator_authorization_gate_rechecks_an_injected_clock(tmp_path):
+    from restricted_runtime.operator_authorization import OperatorAuthorizationGate
+    values = local_values(); policy = PolicyBundle(values, hashlib.sha256(jcs_bytes(values)).hexdigest()); policy.validate()
+    private = Ed25519PrivateKey.generate(); now = datetime.now(UTC)
+    artifact = {"schema_version":"restricted-operator-authorization.v1","policy_epoch":policy.epoch,"policy_digest":policy.digest,"tenant_id":"tenant","provider":"local-uds","model_sha256":"a"*64,"permitted_use_id":"probe","issued_at":now.isoformat().replace("+00:00","Z"),"expires_at":(now+timedelta(seconds=1)).isoformat().replace("+00:00","Z")}
+    path, signature = tmp_path/"auth.json", tmp_path/"auth.sig"; path.write_bytes(jcs_bytes(artifact)); signature.write_text(base64.b64encode(private.sign(jcs_bytes(artifact))).decode("ascii"))
+    clock = [now]
+    gate = OperatorAuthorizationGate(path, signature, base64.b64encode(private.public_key().public_bytes_raw()).decode("ascii"), policy, clock=lambda: clock[0])
+    gate(); clock[0] = now + timedelta(seconds=2)
+    with pytest.raises(ContractError, match="currently valid"): gate()
