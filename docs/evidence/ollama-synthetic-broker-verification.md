@@ -85,6 +85,32 @@ Thus AC7--AC10's success-only witnesses remain RED/unproven. This follow-up
 does not relabel the earlier result as a pass and does not change any deadline
 to accommodate the host.
 
+## Latest fresh witness: `olle2e6` remains RED
+
+The later `olle2e6` run did reach the stricter preconditions that the earlier
+attempts did not: the staged bundle was accepted, the adapter bound
+`broker.sock` after its one synthetic warm-up, the GPU-backed Ollama service
+was live, and the normal PostgreSQL/gateway/conversation services became
+healthy. Its first external synthetic call through the conversation UDS then
+returned `400 {"detail":"restricted turn rejected"}`. This is a failed real
+three-UDS witness, not a successful inference result.
+
+The harness preserved the bounded Compose diagnostics outside the deleted
+runtime directory at `C:\\Temp\\olle2e6.ollama-failure-logs`. They show the
+conversation create was accepted, `/infer` reached the gateway, and the turn
+was rejected; the closed adapter intentionally does not emit a reason that
+could expose request content. Consequently these facts remain **unproven**:
+
+- a semantically successful three-UDS Qwen response within 40 seconds;
+- post-ready response-path attribution (including whether the two required
+  serving-time bundle verifications fit the caller's 40-second deadline);
+- the requested post-success `dispatch_enabled=false` readback; and
+- equality of the source-store inventory after a successful full witness.
+
+No timeout was enlarged and no verification step was removed to convert this
+RED result into a pass. The exact test project had no remaining Compose
+containers or named volumes after its cleanup.
+
 ## Nonclaims
 
 `model_attested=false`; `deployment_conformant=false`; `phi_authorized=false`.
