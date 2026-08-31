@@ -98,6 +98,15 @@ def test_only_cloud_run_ingress_containers_declare_the_application_port():
     assert "ports { container_port = 9090 }" not in source
 
 
+def test_empty_dir_socket_volumes_use_a_nonreserved_name_with_consistent_mounts():
+    source = (ROOT / "runtime.tf").read_text(encoding="utf-8")
+    volumes = re.findall(r'volumes\s*\{\s+name\s*=\s*"([^"]+)"\s+empty_dir\s*\{\}', source)
+    mounts = re.findall(r'volume_mounts\s*\{\s+name\s*=\s*"([^"]+)"\s+mount_path\s*=\s*"/cloudsql"', source)
+    assert volumes == ["sql-socket"] * 3
+    assert mounts == ["sql-socket"] * 6
+    assert 'name = "cloudsql"\n      empty_dir {}' not in source
+
+
 def test_connectors_fit_the_official_weighted_name_limit_and_sql_users_are_trimmed():
     main=(ROOT/"main.tf").read_text(encoding="utf-8")
     names=re.findall(r'resource "google_vpc_access_connector" "\w+" \{\s+name\s*=\s*"([^"]+)"',main)

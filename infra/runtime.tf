@@ -60,7 +60,7 @@ resource "google_cloud_run_v2_service" "gateway" {
       egress    = "ALL_TRAFFIC"
     }
     volumes {
-      name = "cloudsql"
+      name = "sql-socket"
       empty_dir {}
     }
     containers {
@@ -69,7 +69,7 @@ resource "google_cloud_run_v2_service" "gateway" {
       image      = var.gateway_image
       ports { container_port = 8080 }
       volume_mounts {
-        name       = "cloudsql"
+        name       = "sql-socket"
         mount_path = "/cloudsql"
       }
       dynamic "env" {
@@ -95,7 +95,7 @@ resource "google_cloud_run_v2_service" "gateway" {
         failure_threshold     = 12
       }
       volume_mounts {
-        name       = "cloudsql"
+        name       = "sql-socket"
         mount_path = "/cloudsql"
       }
     }
@@ -119,7 +119,7 @@ resource "google_cloud_run_v2_service" "conversation" {
       egress    = "ALL_TRAFFIC"
     }
     volumes {
-      name = "cloudsql"
+      name = "sql-socket"
       empty_dir {}
     }
     containers {
@@ -128,7 +128,7 @@ resource "google_cloud_run_v2_service" "conversation" {
       image      = var.conversation_image
       ports { container_port = 8080 }
       volume_mounts {
-        name       = "cloudsql"
+        name       = "sql-socket"
         mount_path = "/cloudsql"
       }
       dynamic "env" {
@@ -154,7 +154,7 @@ resource "google_cloud_run_v2_service" "conversation" {
         failure_threshold     = 12
       }
       volume_mounts {
-        name       = "cloudsql"
+        name       = "sql-socket"
         mount_path = "/cloudsql"
       }
     }
@@ -215,7 +215,7 @@ resource "google_cloud_run_v2_job" "migration" {
         egress    = "ALL_TRAFFIC"
       }
       volumes {
-        name = "cloudsql"
+        name = "sql-socket"
         empty_dir {}
       }
       containers {
@@ -224,7 +224,7 @@ resource "google_cloud_run_v2_job" "migration" {
         image      = var.migration_image
         command    = ["python", "-m", "restricted_runtime.migration_runner"]
         volume_mounts {
-          name       = "cloudsql"
+          name       = "sql-socket"
           mount_path = "/cloudsql"
         }
         dynamic "env" {
@@ -261,7 +261,7 @@ resource "google_cloud_run_v2_job" "migration" {
           failure_threshold     = 12
         }
         volume_mounts {
-          name       = "cloudsql"
+          name       = "sql-socket"
           mount_path = "/cloudsql"
         }
       }
