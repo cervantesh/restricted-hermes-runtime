@@ -42,6 +42,30 @@ Consequently the required GPU-backed three-UDS success witness, its <=40-second
 post-ready request measurement, durable enable/disable proof, and unchanged
 store inventory remain **unproven** on this host.
 
+## Follow-up adjudication
+
+The startup lifecycle now has one absolute 180-second budget, beginning before
+the first bundle verification and covering `VERIFY_1`, local readiness, the
+single synthetic warm-up, and `VERIFY_2`. Blob hashing checks that same budget
+between blocks, and binding checks it again immediately before socket creation.
+This budget is intentionally separate from the fixed one-second TCP connect
+and 35-second individual Ollama request limits; it does not make a serving
+request eligible for 180 seconds.
+
+The RED result above remains historical evidence, not a passing claim. The
+fresh real-path witness must still prove the broker appears within the startup
+budget and that the subsequent complete three-UDS request is at most 40
+seconds. If its two serving-time bundle hashes plus inference do not fit that
+40-second bound, the profile remains non-conformant rather than extending or
+omitting the check.
+
+A fresh uniquely named real E2E was run after this change. It again saw the
+pinned GPU-capable service but the adapter exited before verified warm-up;
+cleanup removed the exact project containers and volumes. Thus AC7--AC10's
+success-only witnesses remain RED/unproven. This follow-up does not relabel
+the earlier result as a pass and does not change any deadline to accommodate
+the host.
+
 ## Nonclaims
 
 `model_attested=false`; `deployment_conformant=false`; `phi_authorized=false`.

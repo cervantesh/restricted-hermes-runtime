@@ -20,6 +20,7 @@ from typing import Any
 
 MAX_HTTP = 1_048_576
 OLLAMA_DEADLINE = 35.0
+STARTUP_DEADLINE = 180.0
 MODEL_TAG = "qwen2.5:7b"
 MANIFEST_SHA256 = "845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e"
 MAIN_BLOB_SHA256 = "2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730"
@@ -48,7 +49,16 @@ def _json(raw: bytes) -> Any:
         raise ClosedError("invalid JSON") from exc
 
 
-def _read_regular(path: Path, *, maximum: int | None = None) -> tuple[bytes, str, tuple[int, int, int, int]]:
+def _remaining(deadline: float | None, phase: str) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ClosedError(f"{phase} exceeded deadline")
+    return remaining
+
+
+def _read_regular(path: Path, *, maximum: int | None = None, deadline: float | None = None) -> tuple[bytes, str, tuple[int, int, int, int]]:
     """Read one non-symlink regular file while proving its identity stayed fixed."""
     before = path.lstat()
     if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
@@ -60,7 +70,16 @@ def _read_regular(path: Path, *, maximum: int | None = None) -> tuple[bytes, str
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != identity:
             raise ClosedError("bundle file changed during open")
         with os.fdopen(os.dup(descriptor), "rb") as source:
-            raw = source.read(-1 if maximum is None else maximum + 1)
+            chunks: list[bytes] = []
+            while True:
+                _remaining(deadline, "bundle metadata read")
+                chunk = source.read(65_536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if maximum is not None and sum(map(len, chunks)) > maximum:
+                    raise ClosedError("bundle metadata exceeds limit")
+            raw = b"".join(chunks)
         if maximum is not None and len(raw) > maximum:
             raise ClosedError("bundle metadata exceeds limit")
     finally:
@@ -71,7 +90,7 @@ def _read_regular(path: Path, *, maximum: int | None = None) -> tuple[bytes, str
     return raw, hashlib.sha256(raw).hexdigest(), identity
 
 
-def _sha256_regular(path: Path) -> tuple[str, int, tuple[int, int, int, int]]:
+def _sha256_regular(path: Path, *, deadline: float | None = None) -> tuple[str, int, tuple[int, int, int, int]]:
     """Stream-hash a regular nofollow file and recheck its identity."""
     before = path.lstat()
     if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
@@ -83,7 +102,11 @@ def _sha256_regular(path: Path) -> tuple[str, int, tuple[int, int, int, int]]:
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != identity:
             raise ClosedError("bundle file changed during open")
         with os.fdopen(os.dup(descriptor), "rb") as source:
-            digest = hashlib.file_digest(source, "sha256").hexdigest()
+            hasher = hashlib.sha256()
+            while chunk := source.read(1_048_576):
+                _remaining(deadline, "bundle blob hash")
+                hasher.update(chunk)
+            digest = hasher.hexdigest()
     finally:
         os.close(descriptor)
     after = path.lstat()
@@ -115,10 +138,10 @@ def _descriptor(value: Any) -> tuple[str, int]:
     return digest[7:], size
 
 
-def verify_bundle() -> str:
+def verify_bundle(*, deadline: float | None = None) -> str:
     """Verify the exact raw manifest and each referenced immutable blob."""
     manifest = _under_store(MANIFEST_RELATIVE)
-    raw_manifest, manifest_digest, manifest_identity = _read_regular(manifest, maximum=MAX_HTTP)
+    raw_manifest, manifest_digest, manifest_identity = _read_regular(manifest, maximum=MAX_HTTP, deadline=deadline)
     if manifest_digest != MANIFEST_SHA256:
         raise ClosedError("manifest digest mismatch")
     value = _json(raw_manifest)
@@ -131,10 +154,10 @@ def verify_bundle() -> str:
     if MAIN_BLOB_SHA256 not in {digest for digest, _ in declared}:
         raise ClosedError("required model blob is absent")
     for digest, expected_size in declared:
-        actual_digest, actual_size, _ = _sha256_regular(_under_store(Path("blobs") / f"sha256-{digest}"))
+        actual_digest, actual_size, _ = _sha256_regular(_under_store(Path("blobs") / f"sha256-{digest}"), deadline=deadline)
         if actual_digest != digest or actual_size != expected_size:
             raise ClosedError("bundle blob verification failed")
-    _, final_digest, final_identity = _read_regular(manifest, maximum=MAX_HTTP)
+    _, final_digest, final_identity = _read_regular(manifest, maximum=MAX_HTTP, deadline=deadline)
     if final_digest != MANIFEST_SHA256 or final_identity != manifest_identity:
         raise ClosedError("manifest changed during bundle verification")
     return final_digest
@@ -156,13 +179,16 @@ def _closed_request(value: Any) -> dict[str, Any]:
     return {"model": MODEL_TAG, "messages": messages, "stream": False, "options": {"num_predict": 4096}}
 
 
-def _ollama(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def _ollama(path: str, payload: dict[str, Any] | None = None, *, startup_deadline: float | None = None) -> dict[str, Any]:
     body = b"" if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
     connection = http.client.HTTPConnection("127.0.0.1", 11434, timeout=1)
     started = time.monotonic()
     try:
         connection.request("GET" if payload is None else "POST", path, body=body if payload is not None else None, headers={"Content-Type": "application/json"} if payload is not None else {})
         remaining = OLLAMA_DEADLINE - (time.monotonic() - started)
+        startup_remaining = _remaining(startup_deadline, "startup Ollama request")
+        if startup_remaining is not None:
+            remaining = min(remaining, startup_remaining)
         if remaining <= 0 or connection.sock is None:
             raise ClosedError("Ollama deadline exceeded")
         # The constructor's one-second timeout applies only while connecting;
@@ -170,6 +196,9 @@ def _ollama(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         connection.sock.settimeout(remaining)
         response = connection.getresponse()
         remaining = OLLAMA_DEADLINE - (time.monotonic() - started)
+        startup_remaining = _remaining(startup_deadline, "startup Ollama request")
+        if startup_remaining is not None:
+            remaining = min(remaining, startup_remaining)
         if remaining <= 0 or connection.sock is None:
             raise ClosedError("Ollama deadline exceeded")
         connection.sock.settimeout(remaining)
@@ -195,11 +224,11 @@ def _validated_response(value: Any) -> tuple[str, str]:
     return message["content"], value["created_at"]
 
 
-def _warm() -> None:
-    tags = _ollama("/api/tags")
+def _warm(*, deadline: float | None = None) -> None:
+    tags = _ollama("/api/tags", startup_deadline=deadline)
     if not isinstance(tags, dict) or set(tags) != {"models"} or not isinstance(tags["models"], list):
         raise ClosedError("Ollama readiness rejected")
-    warm = _ollama("/api/chat", {"model": MODEL_TAG, "messages": [{"role": "system", "content": "SYNTHETIC_NON_PHI_ONLY warmup"}, {"role": "user", "content": "Reply with ready."}], "stream": False, "options": {"num_predict": 4096}})
+    warm = _ollama("/api/chat", {"model": MODEL_TAG, "messages": [{"role": "system", "content": "SYNTHETIC_NON_PHI_ONLY"}, {"role": "user", "content": "SYNTHETIC_NON_PHI_ONLY: reply with ready."}], "stream": False, "options": {"num_predict": 4096}}, startup_deadline=deadline)
     _validated_response(warm)
 
 
@@ -232,7 +261,8 @@ def _read_request(connection: socket.socket) -> dict[str, Any]:
     return _json(body)
 
 
-def _bind() -> socket.socket:
+def _bind(*, deadline: float | None = None) -> socket.socket:
+    _remaining(deadline, "broker bind")
     if SOCKET.exists() or SOCKET.is_symlink():
         metadata = SOCKET.lstat()
         if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.geteuid():
@@ -248,9 +278,19 @@ def _bind() -> socket.socket:
     return server
 
 
+def _startup() -> socket.socket:
+    deadline = time.monotonic() + STARTUP_DEADLINE
+    verify_bundle(deadline=deadline)
+    _remaining(deadline, "VERIFY_1")
+    _warm(deadline=deadline)
+    _remaining(deadline, "WARMUP_ONCE")
+    verify_bundle(deadline=deadline)
+    _remaining(deadline, "VERIFY_2")
+    return _bind(deadline=deadline)
+
+
 def main() -> None:
-    verify_bundle(); _warm(); verify_bundle()
-    with _bind() as server:
+    with _startup() as server:
         while True:
             connection, _ = server.accept()
             with connection:
