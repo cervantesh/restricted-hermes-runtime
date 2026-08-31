@@ -200,6 +200,36 @@ def test_local_api_rejects_missing_or_expired_authority_before_create_or_reset_m
     assert runtime.store.create_calls == runtime.store.reset_calls == 0
 
 
+def test_turn_rejection_logs_only_closed_reason_code(caplog):
+    from fastapi.testclient import TestClient
+    from restricted_runtime.auth import SyntheticAuthenticator
+    from restricted_runtime.services.restricted_api import create_app
+
+    class Runtime:
+        tenant_id = "tenant"
+        authorization_gate = None
+
+        def submit(self, *_args, **_kwargs):
+            raise ContractError("inference outcome is indeterminate")
+
+    client = TestClient(create_app(Runtime(), SyntheticAuthenticator("caller")))
+    with caplog.at_level("INFO"):
+        response = client.post(
+            "/v1/restricted/conversations/conversation/turns",
+            headers={"Authorization": "Synthetic test credential"},
+            json={
+                "schema_version": "restricted-turn.v1",
+                "client_request_id": "00000000-0000-0000-0000-000000000001",
+                "conversation_epoch": "epoch",
+                "message": "SYNTHETIC_NON_PHI_ONLY",
+            },
+        )
+    assert response.status_code == 400
+    assert response.json() == {"detail": "restricted turn rejected"}
+    assert "turn_rejected_reason=inference_outcome_indeterminate" in caplog.text
+    assert "SYNTHETIC_NON_PHI_ONLY" not in caplog.text
+
+
 def test_reconciliation_rejects_expired_authority_before_claim_or_gateway_call():
     from restricted_runtime.reconciliation_driver import ReconciliationDriver
 

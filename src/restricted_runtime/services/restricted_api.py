@@ -1,9 +1,23 @@
 """External conversation API composed only with a verified authenticator and runtime."""
 from __future__ import annotations
+import logging
 from fastapi import FastAPI, HTTPException, Request
 from ..auth import Authenticator
 from ..contracts import ContractError, TurnRequest, load_closed_json
 from ..conversation import ConversationService
+
+_LOG = logging.getLogger(__name__)
+_TURN_REJECTION_CODES = {
+    "inference outcome is indeterminate": "inference_outcome_indeterminate",
+    "gateway result association mismatch": "gateway_result_association_mismatch",
+    "response is not durably committed": "response_not_durably_committed",
+    "lease lost during provider operation": "lease_lost_during_provider_operation",
+}
+
+
+def _turn_rejection_code(error: ContractError) -> str:
+    """Return a closed diagnostic label; never log request content or exception text."""
+    return _TURN_REJECTION_CODES.get(str(error), "closed_contract_rejection")
 
 def create_app(runtime: ConversationService, authenticator: Authenticator, gateway_ready=None) -> FastAPI:
     app=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
@@ -22,7 +36,9 @@ def create_app(runtime: ConversationService, authenticator: Authenticator, gatew
             turn=TurnRequest.parse(load_closed_json(await request.body()))
             principal=authenticator.authenticate(request.headers.get("authorization"))
             return runtime.submit(turn,principal=principal,conversation_id=conversation_id)
-        except ContractError as exc: raise HTTPException(409 if str(exc) in {"ACTIVE_TURN","idempotency association conflict","idempotency MAC verification failed","stale conversation epoch"} else 400,"restricted turn rejected") from exc
+        except ContractError as exc:
+            _LOG.info("turn_rejected_reason=%s", _turn_rejection_code(exc))
+            raise HTTPException(409 if str(exc) in {"ACTIVE_TURN","idempotency association conflict","idempotency MAC verification failed","stale conversation epoch"} else 400,"restricted turn rejected") from exc
     @app.post("/v1/restricted/conversations/{conversation_id}/reset")
     async def reset(conversation_id:str,request:Request):
         try:
