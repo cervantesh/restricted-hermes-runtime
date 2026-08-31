@@ -48,9 +48,10 @@ The startup lifecycle now has one absolute 180-second budget, beginning before
 the first bundle verification and covering `VERIFY_1`, local readiness, the
 single synthetic warm-up, and `VERIFY_2`. Blob hashing checks that same budget
 between blocks, and binding checks it again immediately before socket creation.
-This budget is intentionally separate from the fixed one-second TCP connect
-and 35-second individual Ollama request limits; it does not make a serving
-request eligible for 180 seconds.
+The pre-bind readiness and one warm-up request consume the remaining startup
+budget while retaining a one-second TCP connect. Only requests after `READY`
+use the separate 35-second serving deadline; a serving request never receives
+the 180-second startup budget.
 
 The RED result above remains historical evidence, not a passing claim. The
 fresh real-path witness must still prove the broker appears within the startup
@@ -59,12 +60,14 @@ seconds. If its two serving-time bundle hashes plus inference do not fit that
 40-second bound, the profile remains non-conformant rather than extending or
 omitting the check.
 
-A fresh uniquely named real E2E was run after this change. It again saw the
-pinned GPU-capable service but the adapter exited before verified warm-up;
-cleanup removed the exact project containers and volumes. Thus AC7--AC10's
-success-only witnesses remain RED/unproven. This follow-up does not relabel
-the earlier result as a pass and does not change any deadline to accommodate
-the host.
+A fresh uniquely named real E2E was run after this change. The pinned
+GPU-capable service started, and the pre-bind warm request consumed the
+remaining absolute startup budget rather than the serving budget, but it still
+did not emit headers before the 180-second startup deadline. The adapter exited
+before `broker.sock`; cleanup removed the exact project containers and volumes.
+Thus AC7--AC10's success-only witnesses remain RED/unproven. This follow-up
+does not relabel the earlier result as a pass and does not change any deadline
+to accommodate the host.
 
 ## Nonclaims
 

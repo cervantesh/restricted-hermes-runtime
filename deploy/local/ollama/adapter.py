@@ -179,31 +179,27 @@ def _closed_request(value: Any) -> dict[str, Any]:
     return {"model": MODEL_TAG, "messages": messages, "stream": False, "options": {"num_predict": 4096}}
 
 
-def _ollama(path: str, payload: dict[str, Any] | None = None, *, startup_deadline: float | None = None) -> dict[str, Any]:
+def _ollama(path: str, payload: dict[str, Any] | None = None, *, deadline: float | None = None) -> dict[str, Any]:
+    """Make one request; a pre-bind caller supplies its absolute startup deadline."""
     body = b"" if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
     connection = http.client.HTTPConnection("127.0.0.1", 11434, timeout=1)
     started = time.monotonic()
+    request_deadline = deadline if deadline is not None else started + OLLAMA_DEADLINE
     try:
         connection.request("GET" if payload is None else "POST", path, body=body if payload is not None else None, headers={"Content-Type": "application/json"} if payload is not None else {})
-        remaining = OLLAMA_DEADLINE - (time.monotonic() - started)
-        startup_remaining = _remaining(startup_deadline, "startup Ollama request")
-        if startup_remaining is not None:
-            remaining = min(remaining, startup_remaining)
+        remaining = _remaining(request_deadline, "Ollama request")
         if remaining <= 0 or connection.sock is None:
             raise ClosedError("Ollama deadline exceeded")
         # The constructor's one-second timeout applies only while connecting;
         # once connected, the single request receives the closed total budget.
         connection.sock.settimeout(remaining)
         response = connection.getresponse()
-        remaining = OLLAMA_DEADLINE - (time.monotonic() - started)
-        startup_remaining = _remaining(startup_deadline, "startup Ollama request")
-        if startup_remaining is not None:
-            remaining = min(remaining, startup_remaining)
+        remaining = _remaining(request_deadline, "Ollama request")
         if remaining <= 0 or connection.sock is None:
             raise ClosedError("Ollama deadline exceeded")
         connection.sock.settimeout(remaining)
         raw = response.read(MAX_HTTP + 1)
-        if response.status < 200 or response.status >= 300 or len(raw) > MAX_HTTP or time.monotonic() - started > OLLAMA_DEADLINE:
+        if response.status < 200 or response.status >= 300 or len(raw) > MAX_HTTP or time.monotonic() > request_deadline:
             raise ClosedError("Ollama response rejected")
         return _json(raw)
     except (OSError, http.client.HTTPException) as exc:
@@ -225,10 +221,10 @@ def _validated_response(value: Any) -> tuple[str, str]:
 
 
 def _warm(*, deadline: float | None = None) -> None:
-    tags = _ollama("/api/tags", startup_deadline=deadline)
+    tags = _ollama("/api/tags", deadline=deadline)
     if not isinstance(tags, dict) or set(tags) != {"models"} or not isinstance(tags["models"], list):
         raise ClosedError("Ollama readiness rejected")
-    warm = _ollama("/api/chat", {"model": MODEL_TAG, "messages": [{"role": "system", "content": "SYNTHETIC_NON_PHI_ONLY"}, {"role": "user", "content": "SYNTHETIC_NON_PHI_ONLY: reply with ready."}], "stream": False, "options": {"num_predict": 4096}}, startup_deadline=deadline)
+    warm = _ollama("/api/chat", {"model": MODEL_TAG, "messages": [{"role": "system", "content": "SYNTHETIC_NON_PHI_ONLY"}, {"role": "user", "content": "SYNTHETIC_NON_PHI_ONLY: reply with ready."}], "stream": False, "options": {"num_predict": 4096}}, deadline=deadline)
     _validated_response(warm)
 
 

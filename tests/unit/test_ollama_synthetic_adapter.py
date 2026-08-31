@@ -174,6 +174,25 @@ def test_serving_keeps_connect_one_second_and_never_uses_startup_budget(monkeypa
     assert adapter.STARTUP_DEADLINE not in connection.sock.timeouts
 
 
+def test_prebind_warmup_can_use_remaining_absolute_startup_budget(monkeypatch):
+    connection = _Connection(_Response(200, b'{"models":[]}'))
+    ticks = iter((0.0, 0.0, 36.0, 36.0))
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(adapter.http.client, "HTTPConnection", lambda *_args, **_kwargs: connection)
+    assert adapter._ollama("/api/tags", deadline=179.0) == {"models": []}
+    assert connection.sock.timeouts == [179.0, 143.0]
+
+
+def test_serving_over_35_seconds_fails_closed(monkeypatch):
+    connection = _Connection(_Response(200, b'{"models":[]}'))
+    ticks = iter((0.0, 0.0, 36.0))
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(adapter.http.client, "HTTPConnection", lambda *_args, **_kwargs: connection)
+    with pytest.raises(adapter.ClosedError):
+        adapter._ollama("/api/tags")
+    assert connection.sock.timeouts == [adapter.OLLAMA_DEADLINE]
+
+
 @pytest.mark.parametrize("expired_phase", ["verify_1", "warmup", "verify_2"])
 def test_startup_phase_timeout_never_calls_bind(monkeypatch, expired_phase):
     now = [0.0]
@@ -212,6 +231,24 @@ def test_startup_keeps_socket_absent_while_warmup_is_pending(monkeypatch, tmp_pa
     assert bound == [True]
 
 
+def test_expired_prebind_request_has_no_retry_and_never_binds(monkeypatch):
+    attempts = []
+    bound = []
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(adapter, "verify_bundle", lambda **_kwargs: adapter.MANIFEST_SHA256)
+
+    def expired(path, payload=None, *, deadline=None):
+        attempts.append((path, payload, deadline))
+        raise adapter.ClosedError("Ollama request exceeded deadline")
+
+    monkeypatch.setattr(adapter, "_ollama", expired)
+    monkeypatch.setattr(adapter, "_bind", lambda **_kwargs: bound.append(True))
+    with pytest.raises(adapter.ClosedError):
+        adapter._startup()
+    assert attempts == [("/api/tags", None, adapter.STARTUP_DEADLINE)]
+    assert bound == []
+
+
 @pytest.mark.parametrize("durations,allowed", [((50, 50, 50), True), ((60, 60, 61), False)])
 def test_startup_uses_one_absolute_budget_across_all_phases(monkeypatch, durations, allowed):
     now = [0.0]
@@ -242,12 +279,13 @@ def test_warmup_is_one_synthetic_chat_attempt(monkeypatch):
     calls = []
     valid = {"model": "qwen2.5:7b", "created_at": "2026-01-01T00:00:00Z", "message": {"role": "assistant", "content": "ready"}, "done": True, "done_reason": "stop", "total_duration": 1, "load_duration": 0, "prompt_eval_count": 1, "prompt_eval_duration": 1, "eval_count": 1, "eval_duration": 1}
 
-    def ollama(path, payload=None, *, startup_deadline=None):
-        calls.append((path, payload, startup_deadline))
+    def ollama(path, payload=None, *, deadline=None):
+        calls.append((path, payload, deadline))
         return {"models": []} if path == "/api/tags" else valid
 
     monkeypatch.setattr(adapter, "_ollama", ollama)
     adapter._warm(deadline=123.0)
     chats = [call for call in calls if call[0] == "/api/chat"]
     assert len(chats) == 1
+    assert all(call[2] == 123.0 for call in calls)
     assert chats[0][1]["messages"] == [{"role": "system", "content": "SYNTHETIC_NON_PHI_ONLY"}, {"role": "user", "content": "SYNTHETIC_NON_PHI_ONLY: reply with ready."}]
