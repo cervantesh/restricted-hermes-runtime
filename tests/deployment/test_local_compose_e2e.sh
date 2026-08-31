@@ -99,6 +99,37 @@ preflight_must_fail() {
   test "$(broker_count)" = 0
 }
 
+# These controls execute inside the still-running production role containers.
+# A broken conversation-owned artifact must be detected without causing the
+# unaffected gateway to lose readiness. The expected text distinguishes a
+# protected-artifact rejection from an incidental Compose/dependency failure.
+conversation_preflight_must_pass() {
+  "${compose[@]}" exec -T conversation \
+    python -m restricted_runtime.local_deployment_preflight check conversation
+}
+
+gateway_must_remain_reachable() {
+  "${compose[@]}" exec -T gateway \
+    python -m restricted_runtime.local_deployment_preflight ready gateway
+}
+
+conversation_preflight_must_fail() {
+  local control="$1" expected_diagnostic="$2" output
+  echo "Fail-closed control: $control"
+  if output="$("${compose[@]}" exec -T conversation \
+      python -m restricted_runtime.local_deployment_preflight check conversation 2>&1)"; then
+    echo "conversation preflight unexpectedly passed: $control" >&2
+    exit 1
+  fi
+  printf '%s\n' "$output"
+  if ! grep -Fq -- "$expected_diagnostic" <<<"$output"; then
+    echo "conversation preflight failed without expected diagnostic: $expected_diagnostic" >&2
+    exit 1
+  fi
+  gateway_must_remain_reachable
+  test "$(broker_count)" = 0
+}
+
 "${compose[@]}" --profile synthetic-non-phi-only config >/dev/null
 "${compose[@]}" --profile synthetic-non-phi-only build
 "${compose[@]}" --profile synthetic-non-phi-only up -d synthetic-non-phi-only-broker
@@ -137,25 +168,40 @@ acl_probe 10008:20004 broker.sock deny
 "${compose[@]}" exec -T gateway test ! -e /run/restricted-keys/service-mac.key
 "${compose[@]}" exec -T gateway test ! -e /run/restricted-keys/content-wrap.key
 
-# Exact-image artifact and dependency mutations. Runtime services are stopped,
-# dispatch is still durably disabled, and every control must leave broker count 0.
+# Conversation-owned protected artifacts are mutated while both runtime roles
+# stay live. The positive check immediately precedes each mutation; the
+# negative check must emit the protected-artifact diagnostic; restoration must
+# return the running conversation image to a positive preflight.
+conversation_preflight_must_pass
+gateway_must_remain_reachable
+volume_exec "${project}_conversation_authorization" "mv /data/authorization.json /data/authorization.saved"
+conversation_preflight_must_fail "missing conversation authorization" "protected deployment artifact is unavailable"
+volume_exec "${project}_conversation_authorization" "mv /data/authorization.saved /data/authorization.json"
+conversation_preflight_must_pass
+gateway_must_remain_reachable
+test "$(broker_count)" = 0
+
+conversation_preflight_must_pass
+gateway_must_remain_reachable
+volume_exec "${project}_conversation_keys" "mv /data/service-mac.key /data/service-mac.saved"
+conversation_preflight_must_fail "missing conversation key" "protected deployment artifact is unavailable"
+volume_exec "${project}_conversation_keys" "mv /data/service-mac.saved /data/service-mac.key"
+conversation_preflight_must_pass
+gateway_must_remain_reachable
+test "$(broker_count)" = 0
+
+# The remaining mutations do not require an unaffected peer to stay live.
+# Runtime services are stopped, dispatch is still durably disabled, and every
+# control must leave broker count 0.
 "${compose[@]}" stop conversation gateway
 
 volume_exec "${project}_gateway_authorization" "mv /data/authorization.json /data/authorization.saved"
 preflight_must_fail gateway-preflight gateway "missing gateway authorization"
 volume_exec "${project}_gateway_authorization" "mv /data/authorization.saved /data/authorization.json"
 
-volume_exec "${project}_conversation_authorization" "mv /data/authorization.json /data/authorization.saved"
-preflight_must_fail conversation conversation "missing conversation authorization"
-volume_exec "${project}_conversation_authorization" "mv /data/authorization.saved /data/authorization.json"
-
 volume_exec "${project}_gateway_keys" "mv /data/gateway-mac.key /data/gateway-mac.saved"
 preflight_must_fail gateway-preflight gateway "missing gateway key"
 volume_exec "${project}_gateway_keys" "mv /data/gateway-mac.saved /data/gateway-mac.key"
-
-volume_exec "${project}_conversation_keys" "mv /data/service-mac.key /data/service-mac.saved"
-preflight_must_fail conversation conversation "missing conversation key"
-volume_exec "${project}_conversation_keys" "mv /data/service-mac.saved /data/service-mac.key"
 
 volume_exec "${project}_gateway_authorization" "mv /data/authorization.json /data/authorization.saved; ln -s authorization.saved /data/authorization.json"
 preflight_must_fail gateway-preflight gateway "symlinked authorization"

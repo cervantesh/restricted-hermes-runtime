@@ -66,6 +66,15 @@ and broker count remains zero for:
 - missing/unreachable broker socket; and
 - missing PostgreSQL socket.
 
+The two conversation-owned missing-artifact controls run without stopping the
+conversation or gateway. Each first proves a positive conversation preflight,
+then mutates the exact mounted authorization or service-MAC-key artifact. The
+same live production conversation image must fail with the expected
+`protected deployment artifact is unavailable` diagnostic; gateway readiness
+stays positive, broker count stays zero, and restoring the artifact returns
+conversation preflight to positive. This distinguishes an artifact rejection
+from an unrelated nonzero Compose exit.
+
 The root-POSIX unit matrix independently covers valid, missing, symlinked,
 wrong-owner, group-writable, world-writable, and digest-mismatched protected
 files against `local_deployment_preflight._protected_file`.
