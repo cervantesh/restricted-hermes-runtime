@@ -34,7 +34,7 @@ def build_app():
         raise RuntimeError("local production root requires local-uds policy")
     require_policy_pair(policy, epoch=required("RESTRICTED_POLICY_EPOCH"), digest=required("RESTRICTED_POLICY_DIGEST"))
     active = local_ref("RESTRICTED_LOCAL_GATEWAY_MAC_KEY"); retired = load_retired_key_refs(required("RESTRICTED_LOCAL_GATEWAY_RETIRED_MAC_KEYS_PATH"))
-    authorization = OperatorAuthorizationGate(Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_PATH")), Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_PATH")), required("RESTRICTED_OPERATOR_AUTHORIZATION_PUBLIC_KEY_B64"), policy, gateway_keyset_sha256=keyset_digest("gateway",(active,*retired)), conversation_keyset_sha256=required("RESTRICTED_LOCAL_CONVERSATION_KEYSET_SHA256"))
+    authorization = OperatorAuthorizationGate(Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_PATH")), Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_PATH")), required("RESTRICTED_OPERATOR_AUTHORIZATION_PUBLIC_KEY_B64"), policy, gateway_keyset_sha256=keyset_digest("gateway-mac",(active,*retired)), conversation_keyset_sha256=required("RESTRICTED_LOCAL_CONVERSATION_KEYSET_SHA256"))
     authorization()
     admission = required("RESTRICTED_ADMISSION_ENABLED")
     if admission not in {"true", "false"}:

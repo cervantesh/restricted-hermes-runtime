@@ -66,7 +66,7 @@ def _refs(active: LocalKeyRef, retired: tuple[LocalKeyRef, ...]) -> dict[tuple[s
     return indexed
 
 def keyset_digest(purpose: str, refs: tuple[LocalKeyRef, ...]) -> str:
-    if purpose not in {"gateway", "conversation"}: raise ContractError("local keyset purpose rejected")
+    if purpose not in {"gateway-mac", "service-mac", "content-wrap"}: raise ContractError("local keyset purpose rejected")
     return hashlib.sha256(jcs_bytes({"purpose":purpose,"keys":[{"key_resource":r.key_resource,"key_version":r.key_version,"key_sha256":r.key_sha256} for r in sorted(refs,key=lambda r:(r.key_resource,r.key_version))]})).hexdigest()
 
 
@@ -122,10 +122,10 @@ class LocalAesDataKeyWrapper:
             value = load_closed_json(wrapped)
             if not isinstance(value, dict) or set(value) != {"schema_version","key_resource","key_version","nonce","ciphertext"} or value["schema_version"] != _ENVELOPE:
                 raise ValueError
-            if not all(isinstance(value[k],str) and 0 < len(value[k]) <= 256 for k in ("key_resource","key_version","nonce","ciphertext")): raise ValueError
+            if not all(isinstance(value[k],str) and 0 < len(value[k]) <= 128 for k in ("key_resource","key_version")) or not all(isinstance(value[k],str) and 0 < len(value[k]) <= 256 for k in ("nonce","ciphertext")): raise ValueError
             ref = self._refs[(value["key_resource"], value["key_version"])]
             nonce = base64.b64decode(value["nonce"], validate=True); cipher = base64.b64decode(value["ciphertext"], validate=True)
-            if len(nonce) != 12: raise ValueError
+            if len(nonce) != 12 or len(cipher) != 48: raise ValueError
             plain = AESGCM(self._material[(ref.key_resource,ref.key_version)]).decrypt(nonce, cipher, self._aad(ref))
             if len(plain) != 32: raise ValueError
             return plain

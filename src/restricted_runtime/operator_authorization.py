@@ -62,7 +62,7 @@ def load_operator_authorization(values: Any, signature_b64: str, public_key_b64:
         raise ContractError("operator authorization binding mismatch")
     for key, expected in (("gateway_keyset_sha256", gateway_keyset_sha256), ("conversation_keyset_sha256", conversation_keyset_sha256)):
         if not isinstance(values.get(key),str) or len(values[key]) != 64 or any(c not in "0123456789abcdef" for c in values[key]) or (expected is not None and values[key] != expected): raise ContractError("operator authorization keyset binding mismatch")
-    if not isinstance(values["permitted_use_id"], str) or not values["permitted_use_id"]:
+    if not isinstance(values["permitted_use_id"], str) or not values["permitted_use_id"] or len(values["permitted_use_id"]) > 128:
         raise ContractError("operator authorization permitted use is required")
     issued_at, expires_at = _instant(values["issued_at"]), _instant(values["expires_at"])
     current = (now or datetime.now(UTC)).astimezone(UTC)

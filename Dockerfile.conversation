@@ -2,7 +2,7 @@ FROM python:3.11-slim AS builder
 WORKDIR /build
 COPY pyproject.toml ./
 COPY src ./src
-RUN pip install --no-cache-dir . \
+RUN pip install --no-cache-dir ".[google]" \
  && find /usr/local/lib/python3.11/site-packages/restricted_runtime -type d -name __pycache__ -prune -exec rm -rf {} + \
  && rm -f /usr/local/lib/python3.11/site-packages/restricted_runtime/vertex.py \
            /usr/local/lib/python3.11/site-packages/restricted_runtime/services/production_gateway.py \
