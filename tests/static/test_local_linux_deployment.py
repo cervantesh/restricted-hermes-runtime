@@ -73,6 +73,7 @@ def test_synthetic_overlay_is_explicitly_non_phi_and_opt_in():
         assert "synthetic-non-phi-only" in name
         assert service["profiles"] == ["synthetic-non-phi-only"]
         assert service["network_mode"] == "none"
+    assert "synthetic-non-phi-only-disable" in services
 
 
 def test_local_database_bootstrap_is_separate_from_cloud_sql_runner():
@@ -92,3 +93,5 @@ def test_operator_runbook_and_evidence_template_state_nonclaims():
     ).lower()
     for phrase in ("not hipaa", "not phi authorization", "model_attested=false", "deployment_conformant=false", "phi_authorized=false"):
         assert phrase in combined
+    assert "never combine the synthetic overlay" in combined
+    assert "synthetic-non-phi-only-disable" in combined

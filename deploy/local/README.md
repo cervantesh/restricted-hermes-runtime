@@ -85,3 +85,9 @@ It creates uniquely named disposable artifacts and a deterministic broker
 containing only `SYNTHETIC_NON_PHI_ONLY` text. Its receipt/nonclaim contract is
 always `model_attested=false`, `deployment_conformant=false`, and
 `phi_authorized=false`. It is not a template for production authority.
+
+**Never combine the synthetic overlay or harness with production volume names,
+operator artifacts, databases, or Compose projects.** The harness requires a
+fresh unique project and refuses every pre-existing target volume. If a
+synthetic database is intentionally preserved instead of destructively removed,
+run `synthetic-non-phi-only-disable` first and verify durable dispatch is false.

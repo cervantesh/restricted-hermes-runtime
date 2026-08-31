@@ -79,6 +79,26 @@ copy_volume "${project}_conversation_keys" "$runtime/conversation-keys" 10006 20
 copy_volume "${project}_gateway_keys" "$runtime/gateway-keys" 10005 20002
 copy_volume "${project}_postgres_admin_secret" "$runtime/postgres-admin-secret" 999 999
 
+volume_exec() {
+  local volume="$1" command="$2"
+  "${docker_cli[@]}" run --rm --network none --user 0:0 -v "$volume:/data" alpine:3.20.3 sh -ec "$command"
+}
+
+broker_count() {
+  "${docker_cli[@]}" run --rm --network none -v "${project}_synthetic_non_phi_only_state:/state:ro" alpine:3.20.3 cat /state/broker-count
+}
+
+preflight_must_fail() {
+  local service="$1" role="$2" control="$3"
+  echo "Fail-closed control: $control"
+  if "${compose[@]}" run --rm --no-deps "$service" \
+      python -m restricted_runtime.local_deployment_preflight check "$role"; then
+    echo "preflight unexpectedly passed: $control" >&2
+    exit 1
+  fi
+  test "$(broker_count)" = 0
+}
+
 "${compose[@]}" --profile synthetic-non-phi-only config >/dev/null
 "${compose[@]}" --profile synthetic-non-phi-only build
 "${compose[@]}" --profile synthetic-non-phi-only up -d synthetic-non-phi-only-broker
@@ -117,19 +137,64 @@ acl_probe 10008:20004 broker.sock deny
 "${compose[@]}" exec -T gateway test ! -e /run/restricted-keys/service-mac.key
 "${compose[@]}" exec -T gateway test ! -e /run/restricted-keys/content-wrap.key
 
+# Exact-image artifact and dependency mutations. Runtime services are stopped,
+# dispatch is still durably disabled, and every control must leave broker count 0.
+"${compose[@]}" stop conversation gateway
+
+volume_exec "${project}_gateway_authorization" "mv /data/authorization.json /data/authorization.saved"
+preflight_must_fail gateway-preflight gateway "missing gateway authorization"
+volume_exec "${project}_gateway_authorization" "mv /data/authorization.saved /data/authorization.json"
+
+volume_exec "${project}_conversation_authorization" "mv /data/authorization.json /data/authorization.saved"
+preflight_must_fail conversation conversation "missing conversation authorization"
+volume_exec "${project}_conversation_authorization" "mv /data/authorization.saved /data/authorization.json"
+
+volume_exec "${project}_gateway_keys" "mv /data/gateway-mac.key /data/gateway-mac.saved"
+preflight_must_fail gateway-preflight gateway "missing gateway key"
+volume_exec "${project}_gateway_keys" "mv /data/gateway-mac.saved /data/gateway-mac.key"
+
+volume_exec "${project}_conversation_keys" "mv /data/service-mac.key /data/service-mac.saved"
+preflight_must_fail conversation conversation "missing conversation key"
+volume_exec "${project}_conversation_keys" "mv /data/service-mac.saved /data/service-mac.key"
+
+volume_exec "${project}_gateway_authorization" "mv /data/authorization.json /data/authorization.saved; ln -s authorization.saved /data/authorization.json"
+preflight_must_fail gateway-preflight gateway "symlinked authorization"
+volume_exec "${project}_gateway_authorization" "rm /data/authorization.json; mv /data/authorization.saved /data/authorization.json"
+
+volume_exec "${project}_gateway_authorization" "chown 10006:20001 /data/authorization.json"
+preflight_must_fail gateway-preflight gateway "wrong-owner authorization"
+volume_exec "${project}_gateway_authorization" "chown 10005:20002 /data/authorization.json"
+
+volume_exec "${project}_gateway_authorization" "chmod 0660 /data/authorization.json"
+preflight_must_fail gateway-preflight gateway "group-writable authorization"
+volume_exec "${project}_gateway_authorization" "chmod 0600 /data/authorization.json"
+
+volume_exec "${project}_gateway_authorization" "cp -a /data/authorization.json /data/authorization.saved; printf x >> /data/authorization.json"
+preflight_must_fail gateway-preflight gateway "digest-mismatched authorization"
+volume_exec "${project}_gateway_authorization" "mv -f /data/authorization.saved /data/authorization.json"
+
+"${compose[@]}" stop synthetic-non-phi-only-broker
+preflight_must_fail gateway-preflight gateway "missing broker socket"
+"${compose[@]}" --profile synthetic-non-phi-only up -d synthetic-non-phi-only-broker
+
+"${compose[@]}" stop postgres
+preflight_must_fail gateway-preflight gateway "missing PostgreSQL socket"
+"${compose[@]}" up -d --wait postgres gateway conversation
+test "$(broker_count)" = 0
+
 "${compose[@]}" --profile synthetic-non-phi-only run --rm -e SYNTHETIC_NON_PHI_ONLY_MODE=disabled synthetic-non-phi-only-probe
-count="$("${docker_cli[@]}" run --rm --network none -v "${project}_synthetic_non_phi_only_state:/state:ro" alpine:3.20.3 cat /state/broker-count)"
+count="$(broker_count)"
 test "$count" = 0
 
 "${compose[@]}" --profile synthetic-non-phi-only run --rm synthetic-non-phi-only-enable
 "${compose[@]}" --profile synthetic-non-phi-only run --rm -e SYNTHETIC_NON_PHI_ONLY_MODE=create synthetic-non-phi-only-probe
 "${compose[@]}" --profile synthetic-non-phi-only run --rm -e SYNTHETIC_NON_PHI_ONLY_MODE=replay synthetic-non-phi-only-probe
-count="$("${docker_cli[@]}" run --rm --network none -v "${project}_synthetic_non_phi_only_state:/state:ro" alpine:3.20.3 cat /state/broker-count)"
+count="$(broker_count)"
 test "$count" = 1
 
 "${compose[@]}" up -d --force-recreate --wait gateway conversation
 "${compose[@]}" --profile synthetic-non-phi-only run --rm -e SYNTHETIC_NON_PHI_ONLY_MODE=replay synthetic-non-phi-only-probe
-count="$("${docker_cli[@]}" run --rm --network none -v "${project}_synthetic_non_phi_only_state:/state:ro" alpine:3.20.3 cat /state/broker-count)"
+count="$(broker_count)"
 test "$count" = 1
 
 # Peer roles and privilege negatives.
@@ -151,6 +216,11 @@ for service in conversation gateway; do
   ! "${compose[@]}" exec -T "$service" python -c 'import socket; socket.getaddrinfo("example.com",443)' >/dev/null 2>&1
   "${compose[@]}" exec -T "$service" python -c 'import os; assert not any(k.upper() in {"HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY"} for k in os.environ)'
 done
+
+# Return durable dispatch to its fail-closed state before normal exit.
+"${compose[@]}" --profile synthetic-non-phi-only run --rm synthetic-non-phi-only-disable
+dispatch="$("${compose[@]}" exec -T -u 999:20004 postgres psql -h /run/restricted-postgres -U postgres -d restricted_runtime -Atqc 'SELECT dispatch_enabled FROM inference_ledger.runtime_controls WHERE control_key=true')"
+test "$dispatch" = f
 
 echo 'SYNTHETIC_NON_PHI_ONLY Compose E2E passed.'
 echo 'model_attested=false deployment_conformant=false phi_authorized=false'

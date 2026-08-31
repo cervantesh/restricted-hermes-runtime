@@ -53,6 +53,25 @@ services:
     security_opt: ["no-new-privileges:true"]
     restart: "no"
 
+  synthetic-non-phi-only-disable:
+    profiles: ["synthetic-non-phi-only"]
+    build:
+      context: ../..
+      dockerfile: deploy/local/postgres/Dockerfile
+    network_mode: none
+    user: "999:999"
+    group_add: ["20004"]
+    entrypoint: ["psql"]
+    command: ["-h", "/run/restricted-postgres", "-U", "postgres", "-d", "restricted_runtime", "-v", "ON_ERROR_STOP=1", "-c", "UPDATE inference_ledger.runtime_controls SET dispatch_enabled=false WHERE control_key=true"]
+    volumes:
+      - postgres_socket:/run/restricted-postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
   synthetic-non-phi-only-probe:
     profiles: ["synthetic-non-phi-only"]
     build:
