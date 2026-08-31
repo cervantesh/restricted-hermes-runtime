@@ -229,7 +229,12 @@ resource "google_network_connectivity_regional_endpoint" "vertex_us" {
   lifecycle {
     # Provider 6.50 normalizes URI to literal post-create; avoid spurious replacement
     # without hiding target/network/subnetwork/access_type drift.
-    ignore_changes = [address]
+    ignore_changes       = [address]
+    replace_triggered_by = [google_compute_address.vertex_psc]
+    postcondition {
+      condition     = self.address == google_compute_address.vertex_psc.address
+      error_message = "Vertex regional endpoint address must match the reserved PSC address."
+    }
   }
 }
 resource "google_dns_managed_zone" "vertex_us_rep" {

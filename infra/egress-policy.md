@@ -26,6 +26,9 @@ Provider 6.50 reads the endpoint address back as the literal IP after creation,
 although creation requires the reserved address resource URI. Terraform ignores
 only the endpoint `address` read-back to avoid a spurious replacement; target
 API, network, subnetwork, and access type remain drift-visible.
+The lifecycle also replaces the endpoint if its reserved address resource is
+replaced, and a postcondition rejects a returned address other than the
+reserved PSC IP.
 
 It does not claim an inspected FQDN/SNI/certificate witness. This residual
 result prevents `READY`, `CLOSED`, and any PHI authorization claim. Cloud Run

@@ -71,7 +71,9 @@ with PHI.
 Provider 6.50 reads the endpoint address back as its literal IP after creation.
 `main.tf` therefore ignores only that normalized `address` field; do not widen
 the exception, because target API, network, subnetwork, and access type must
-remain drift-visible.
+remain drift-visible. A replacement of the reserved address triggers endpoint
+replacement, and a postcondition requires the endpoint's returned address to
+match the reserved PSC IP.
 
 The receipt helper in this repository is local only and therefore permanently
 returns `PARTIAL` unless an independent deployed collector/verifier is added in
