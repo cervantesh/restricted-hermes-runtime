@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from restricted_runtime.contracts import ContractError, jcs_bytes
+from restricted_runtime.contracts import ContractError, ProviderResult, jcs_bytes
 from restricted_runtime.policy import LOCAL_POLICY_SCHEMA, PolicyBundle
 
 
@@ -327,10 +327,35 @@ def test_local_probe_receipt_has_immutable_external_false_claims():
     from restricted_runtime.local_probe_receipt import protocol_probe_receipt
 
     values = local_values(); policy = PolicyBundle(values, hashlib.sha256(jcs_bytes(values)).hexdigest()); policy.validate()
-    receipt = protocol_probe_receipt(policy, ProviderResult("SUCCEEDED", provider_request_id="broker", broker_declared_model_sha256="a" * 64), source_revision_claim="unverified-build")
+    receipt = protocol_probe_receipt(policy, ProviderResult("SUCCEEDED", provider_request_id="broker", broker_declared_model_sha256="a" * 64), source_revision_claim="a" * 40)
     assert {key: receipt[key] for key in ("external_controls_verified", "deployment_conformant", "model_attested", "phi_authorized")} == {key: False for key in ("external_controls_verified", "deployment_conformant", "model_attested", "phi_authorized")}
     assert receipt["broker_request_id_sha256"] != "broker"
     assert receipt["broker_request_id_sha256"] == hashlib.sha256(b"broker").hexdigest()
+
+
+@pytest.mark.parametrize("source_revision_claim", ["unverified-build", "A" * 40, "a" * 39, "a" * 65])
+def test_local_probe_receipt_rejects_unverifiable_revision_claim(source_revision_claim):
+    from restricted_runtime.contracts import ProviderResult
+    from restricted_runtime.local_probe_receipt import protocol_probe_receipt
+
+    values = local_values(); policy = PolicyBundle(values, hashlib.sha256(jcs_bytes(values)).hexdigest()); policy.validate()
+    result = ProviderResult("SUCCEEDED", provider_request_id="broker", broker_declared_model_sha256="a" * 64)
+    with pytest.raises(ValueError):
+        protocol_probe_receipt(policy, result, source_revision_claim=source_revision_claim)
+
+
+@pytest.mark.parametrize("result", [
+    ProviderResult("UNKNOWN", provider_request_id="broker"),
+    ProviderResult("FAILED", provider_request_id=None),
+    ProviderResult("SUCCEEDED", provider_request_id="broker", broker_declared_model_sha256="b" * 64),
+    ProviderResult("FAILED", provider_request_id="broker", broker_declared_model_sha256="a" * 64),
+])
+def test_local_probe_receipt_rejects_structurally_invalid_terminal_or_model_fields(result):
+    from restricted_runtime.local_probe_receipt import protocol_probe_receipt
+
+    values = local_values(); policy = PolicyBundle(values, hashlib.sha256(jcs_bytes(values)).hexdigest()); policy.validate()
+    with pytest.raises(ValueError):
+        protocol_probe_receipt(policy, result, source_revision_claim="a" * 40)
 
 
 def test_expired_authorization_gate_rejects_before_reservation_or_dispatch():
