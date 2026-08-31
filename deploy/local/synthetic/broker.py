@@ -47,6 +47,10 @@ def main() -> None:
                     if not part:
                         break
                     raw += part
+                # Readiness and ACL probes intentionally open and close the UDS
+                # without issuing inference. They must not count or kill the broker.
+                if not raw:
+                    continue
                 head, _, body = raw.partition(b"\r\n\r\n")
                 length = 0
                 for line in head.split(b"\r\n")[1:]:

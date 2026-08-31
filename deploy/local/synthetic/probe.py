@@ -52,10 +52,12 @@ def main() -> None:
     if mode == "disabled":
         assert status == 200 and result["status"] != "COMMITTED", (status, result)
     else:
-        assert status == 200 and result == {
-            "status": "COMMITTED",
-            "message": "SYNTHETIC_NON_PHI_ONLY response",
-        }, (status, result)
+        assert status == 200, (status, result)
+        assert result.get("schema_version") == "restricted-turn-result.v1", result
+        assert result.get("status") == "COMMITTED", result
+        assert result.get("message") == "SYNTHETIC_NON_PHI_ONLY response", result
+        assert result.get("turn_id"), result
+        assert result.get("conversation_epoch") == request["conversation_epoch"], result
     print(json.dumps({"mode": mode, "result": result}, separators=(",", ":")))
 
 

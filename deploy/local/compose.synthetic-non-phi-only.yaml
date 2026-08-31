@@ -1,4 +1,17 @@
 services:
+  synthetic-non-phi-only-state-init:
+    profiles: ["synthetic-non-phi-only"]
+    image: alpine:3.20.3
+    network_mode: none
+    user: "0:0"
+    command: ["/bin/sh", "-ec", "chown 0:20000 /var/lib/restricted-synthetic && chmod 1770 /var/lib/restricted-synthetic"]
+    volumes:
+      - synthetic_non_phi_only_state:/var/lib/restricted-synthetic
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "FOWNER"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
   synthetic-non-phi-only-broker:
     profiles: ["synthetic-non-phi-only"]
     build:
@@ -14,6 +27,8 @@ services:
       - synthetic_non_phi_only_state:/var/lib/restricted-synthetic
     depends_on:
       socket-init:
+        condition: service_completed_successfully
+      synthetic-non-phi-only-state-init:
         condition: service_completed_successfully
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
