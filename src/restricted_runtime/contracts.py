@@ -56,6 +56,7 @@ class ProviderResult:
     decision_id: str | None = None
     policy_epoch: str | None = None
     policy_digest: str | None = None
+    broker_declared_model_sha256: str | None = None
 
 
 def _no_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

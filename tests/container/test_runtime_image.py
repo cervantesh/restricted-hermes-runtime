@@ -96,7 +96,7 @@ def test_layer_proof_catches_site_packages_prefix_and_rejects_zero_readable_laye
     with pytest.raises(AssertionError):assert_layer_proof(names,inspected,{"vertex.py"})
 
 def test_image_recipe_has_no_dynamic_capabilities():
-    for recipe in (ROOT/"Dockerfile.conversation",ROOT/"Dockerfile.gateway"):
+    for recipe in (ROOT/"Dockerfile.conversation",ROOT/"Dockerfile.gateway",ROOT/"Dockerfile.local-gateway"):
         source=recipe.read_text(encoding="utf-8")
         assert ".env" not in source and "hermes" not in source.lower() and "USER " in source
         assert "AS builder" in source and "COPY --from=builder /usr/local/lib/python3.11/site-packages" in source
@@ -149,6 +149,7 @@ def generated_public_policy(tmp_path):
 @pytest.mark.parametrize(("recipe","tag","entry","uid","absent"),[
     ("Dockerfile.conversation","restricted-runtime-conversation-proof","restricted_runtime.services.production_conversation","10001",{"vertex.py","services/production_gateway.py","services/gateway_api.py"}),
     ("Dockerfile.gateway","restricted-runtime-gateway-proof","restricted_runtime.services.production_gateway","10002",{"gateway_client.py","reconciliation.py","reconciliation_driver.py","services/production_conversation.py","services/restricted_api.py"}),
+    ("Dockerfile.local-gateway","restricted-runtime-local-gateway-proof","restricted_runtime.services.production_local_gateway","10005",{"vertex.py","gateway_client.py","reconciliation.py","reconciliation_driver.py","services/production_gateway.py","services/production_conversation.py","services/restricted_api.py"}),
 ])
 def test_built_role_image_is_import_closed_and_has_only_its_role_surface(generated_public_policy,recipe,tag,entry,uid,absent):
     built=run_docker("build","-f",recipe,"-t",tag,".")

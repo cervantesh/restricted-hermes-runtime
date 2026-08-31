@@ -23,13 +23,13 @@ class PostgresLedger:
     def __init__(self, connection_string: str, policy, mac_key=None): self.connection_string, self.policy, self.mac_key = connection_string, policy, mac_key
     def _connect(self): return psycopg.connect(self.connection_string, row_factory=dict_row)
     def _same(self, row, envelope, principal, mac):
-        sink = {k: self.policy.values[k] for k in ("vertex_project_id","vertex_project_number","model_resource","generate_content_path","location","hostname","method","model")}
+        sink = self.policy.sink_tuple()
         actual = (str(row["turn_id"]),str(row["client_request_id"]),row["authenticated_caller_principal"],row["conversation_epoch"],row["policy_epoch"],row["policy_digest"],bytes(row["request_mac"]),row["sink_tuple"])
         wanted = (envelope.turn_id,envelope.client_request_id,envelope.authenticated_external_principal,envelope.conversation_epoch,envelope.policy_epoch,envelope.policy_digest,mac,sink)
         if actual != wanted: raise ContractError("ledger replay association conflict")
         if self.mac_key and not self.mac_key.verify(MacRecord(row["mac_key_resource"],row["mac_key_version"],bytes(row["request_mac"])),kms_mac_input(GATEWAY_MAC_DOMAIN,envelope.canonical())): raise ContractError("stored ledger MAC verification failed")
     def reserve(self, envelope: GatewayEnvelope, principal: str, mac: bytes, key_resource: str, key_version: str) -> AttemptState:
-        sink = {k: self.policy.values[k] for k in ("vertex_project_id","vertex_project_number","model_resource","generate_content_path","location","hostname","method","model")}
+        sink = self.policy.sink_tuple()
         with self._connect() as conn, conn.cursor() as cur:
             # Take the durable control lock before any per-attempt lock. A
             # disabling transaction owns this same row and cancels RESERVED
