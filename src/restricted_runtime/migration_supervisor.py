@@ -66,8 +66,9 @@ def wait_for_proxy_ready(process: object, readiness_probe: Callable[[], None], *
 
 
 def cleanup_proxy(process: object, *, timeout_seconds: float = 5) -> None:
-    if process.poll() is None:
-        process.terminate()
+    if process.poll() is not None:
+        raise RuntimeError("Cloud SQL proxy exited before supervised shutdown")
+    process.terminate()
     try:
         exit_code = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
@@ -96,6 +97,7 @@ def run_with_proxy(*, connection_name: str, socket_dir: Path, run_migration: Cal
     process: object | None = None
     primary_error: BaseException | None = None
     restore_signals = install_signals()
+    cleanup_error: BaseException | None = None
     try:
         prepare_socket(socket_dir)
         process = (start_proxy if popen is None else popen)(proxy_command(connection_name, socket_dir), env=proxy_environment())
@@ -104,14 +106,14 @@ def run_with_proxy(*, connection_name: str, socket_dir: Path, run_migration: Cal
     except BaseException as error:
         primary_error = error
     finally:
-        restore_signals()
-
-    cleanup_error: BaseException | None = None
-    if process is not None:
         try:
-            cleanup(process)
-        except BaseException as error:
-            cleanup_error = error
+            if process is not None:
+                try:
+                    cleanup(process)
+                except BaseException as error:
+                    cleanup_error = error
+        finally:
+            restore_signals()
 
     if primary_error is not None:
         raise primary_error

@@ -120,6 +120,23 @@ def test_supervisor_fails_when_proxy_cleanup_fails_after_successful_migration():
         _ready_proxy_supervisor(cleanup=lambda child: (_ for _ in ()).throw(OSError("cleanup failed")))
 
 
+def test_supervisor_keeps_signal_handlers_until_cleanup_finishes():
+    events=[]
+    _ready_proxy_supervisor(
+        cleanup=lambda child: events.append("cleanup"),
+        install_signals=lambda: lambda: events.append("restore"),
+    )
+    assert events==["cleanup","restore"]
+
+
+def test_cleanup_rejects_a_child_that_exited_before_supervised_shutdown_even_with_zero_status():
+    process=_Proxy()
+    process.poll=lambda: 0
+    with pytest.raises(RuntimeError,match="before supervised shutdown"):
+        migration_supervisor.cleanup_proxy(process)
+    assert process.terminated is False
+
+
 def test_cleanup_terminates_then_kills_and_reaps_a_timed_out_child():
     import subprocess
     class TimedOutProxy(_Proxy):
