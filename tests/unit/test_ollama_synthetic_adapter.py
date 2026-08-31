@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,30 @@ def _bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_bundle_verifier_accepts_exact_regular_manifest_and_blobs(tmp_path, monkeypatch):
     _bundle(tmp_path, monkeypatch)
     assert adapter.verify_bundle() == adapter.MANIFEST_SHA256
+
+
+def test_post_ready_guard_accepts_retained_exact_namespace_and_rejects_drift(tmp_path, monkeypatch):
+    _bundle(tmp_path, monkeypatch)
+    baseline = adapter.capture_baseline()
+    try:
+        adapter.guard(baseline)
+        extra = tmp_path / "models" / "unexpected"; extra.write_bytes(b"x")
+        with pytest.raises(adapter.GuardDrift):
+            adapter.guard(baseline)
+    finally:
+        baseline.close()
+
+
+def test_post_ready_guard_rejects_replaced_referenced_blob(tmp_path, monkeypatch):
+    _bundle(tmp_path, monkeypatch)
+    baseline = adapter.capture_baseline()
+    try:
+        target = next((tmp_path / "models" / "blobs").glob("sha256-*"))
+        os.utime(target, None)
+        with pytest.raises(adapter.GuardDrift):
+            adapter.guard(baseline)
+    finally:
+        baseline.close()
 
 
 @pytest.mark.parametrize("mutation", ["manifest", "blob", "size", "main"])
@@ -226,8 +251,10 @@ def test_startup_keeps_socket_absent_while_warmup_is_pending(monkeypatch, tmp_pa
         assert not adapter.SOCKET.exists()
 
     monkeypatch.setattr(adapter, "_warm", warm)
+    baseline = type("Baseline", (), {"close": lambda self: None})()
+    monkeypatch.setattr(adapter, "capture_baseline", lambda: baseline)
     monkeypatch.setattr(adapter, "_bind", lambda **_kwargs: bound.append(True) or "server")
-    assert adapter._startup() == "server"
+    assert adapter._startup() == ("server", baseline)
     assert bound == [True]
 
 
@@ -265,9 +292,11 @@ def test_startup_uses_one_absolute_budget_across_all_phases(monkeypatch, duratio
 
     monkeypatch.setattr(adapter, "verify_bundle", verify)
     monkeypatch.setattr(adapter, "_warm", warm)
+    baseline = type("Baseline", (), {"close": lambda self: None})()
+    monkeypatch.setattr(adapter, "capture_baseline", lambda: baseline)
     monkeypatch.setattr(adapter, "_bind", lambda **_kwargs: bound.append(True) or "server")
     if allowed:
-        assert adapter._startup() == "server"
+        assert adapter._startup() == ("server", baseline)
         assert bound == [True]
     else:
         with pytest.raises(adapter.ClosedError):

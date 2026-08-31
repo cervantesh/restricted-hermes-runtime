@@ -126,3 +126,19 @@ the request deadline, omit serving-time verification, or claim a partial pass.
 ## Nonclaims
 
 `model_attested=false`; `deployment_conformant=false`; `phi_authorized=false`.
+
+## Narrowed post-ready contract
+
+This is a declared contract correction, not an equivalent optimization. Full
+cryptographic manifest/blob verification remains source-and-destination staging
+and adapter `VERIFY_1 -> warm -> VERIFY_2`, all before `broker.sock` exists.
+After readiness the adapter retains nofollow file descriptors and compares the
+canonical allowlist plus file/directory device, inode, mode, owner, link count,
+size, mtime, and ctime before and after each request. It does not continuously
+hash the model bytes after READY. Namespace or retained-FD drift closes and
+unlinks the broker without releasing text or continuing to serve.
+
+This narrower guarantee trusts the host and Docker administrator and is not
+continuous model-byte attestation. It is intended to preserve the 35-second
+internal and 40-second three-UDS request contracts while retaining a fail-stop
+identity guard over the staged read-only namespace.

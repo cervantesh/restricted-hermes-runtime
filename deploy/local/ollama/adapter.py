@@ -33,6 +33,19 @@ class ClosedError(ValueError):
     pass
 
 
+class GuardDrift(ClosedError):
+    pass
+
+
+class Baseline:
+    def __init__(self, files: dict[str, tuple[int, tuple[int, ...]]], directories: dict[str, tuple[int, ...]]):
+        self.files, self.directories = files, directories
+
+    def close(self) -> None:
+        for descriptor in self.files.values():
+            os.close(descriptor[0])
+
+
 def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -136,6 +149,59 @@ def _descriptor(value: Any) -> tuple[str, int]:
     if not digest.startswith("sha256:") or len(digest) != 71 or any(ch not in "0123456789abcdef" for ch in digest[7:]):
         raise ClosedError("descriptor digest rejected")
     return digest[7:], size
+
+
+def _identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode), stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid, metadata.st_nlink, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def _allowlist() -> set[str]:
+    raw, digest, _ = _read_regular(_under_store(MANIFEST_RELATIVE), maximum=MAX_HTTP)
+    if digest != MANIFEST_SHA256:
+        raise GuardDrift("manifest guard mismatch")
+    value = _json(raw)
+    if not isinstance(value, dict) or set(value) != {"schemaVersion", "mediaType", "config", "layers"}:
+        raise GuardDrift("manifest guard shape")
+    return {str(MANIFEST_RELATIVE), *(str(Path("blobs") / f"sha256-{digest}") for digest, _ in [_descriptor(item) for item in [value["config"], *value["layers"]]])}
+
+
+def _namespace() -> tuple[dict[str, os.stat_result], dict[str, os.stat_result]]:
+    root = STORE.resolve(strict=True); directories: dict[str, os.stat_result] = {".": root.lstat()}; files: dict[str, os.stat_result] = {}
+    for current, names, entries in os.walk(root, followlinks=False):
+        base = Path(current)
+        for name in names:
+            path = base / name; metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode): raise GuardDrift("namespace directory rejected")
+            directories[str(path.relative_to(root))] = metadata
+        for name in entries:
+            path = base / name; metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode): raise GuardDrift("namespace file rejected")
+            files[str(path.relative_to(root))] = metadata
+    return files, directories
+
+
+def capture_baseline() -> Baseline:
+    allow = _allowlist(); files, directories = _namespace()
+    if set(files) != allow: raise GuardDrift("namespace allowlist mismatch")
+    retained: dict[str, tuple[int, tuple[int, int, int, int, int, int, int, int]]] = {}
+    try:
+        for relative, before in files.items():
+            descriptor = os.open(_under_store(Path(relative)), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)); opened = os.fstat(descriptor)
+            if _identity(before) != _identity(opened): os.close(descriptor); raise GuardDrift("file changed during baseline")
+            retained[relative] = (descriptor, _identity(opened))
+        return Baseline(retained, {relative: _identity(value) for relative, value in directories.items()})
+    except Exception:
+        for descriptor, _ in retained.values(): os.close(descriptor)
+        raise
+
+
+def guard(baseline: Baseline) -> None:
+    files, directories = _namespace()
+    if set(files) != set(baseline.files) or set(directories) != set(baseline.directories): raise GuardDrift("namespace changed")
+    if any(_identity(value) != baseline.directories[key] for key, value in directories.items()): raise GuardDrift("directory identity changed")
+    for relative, metadata in files.items():
+        descriptor, expected = baseline.files[relative]
+        if _identity(metadata) != expected or _identity(os.fstat(descriptor)) != expected: raise GuardDrift("file identity changed")
 
 
 def verify_bundle(*, deadline: float | None = None) -> str:
@@ -279,7 +345,7 @@ def _bind(*, deadline: float | None = None) -> socket.socket:
     return server
 
 
-def _startup() -> socket.socket:
+def _startup() -> tuple[socket.socket, Baseline]:
     deadline = time.monotonic() + STARTUP_DEADLINE
     verify_bundle(deadline=deadline)
     _remaining(deadline, "VERIFY_1")
@@ -287,25 +353,37 @@ def _startup() -> socket.socket:
     _remaining(deadline, "WARMUP_ONCE")
     verify_bundle(deadline=deadline)
     _remaining(deadline, "VERIFY_2")
-    return _bind(deadline=deadline)
+    baseline = capture_baseline()
+    try:
+        return _bind(deadline=deadline), baseline
+    except Exception:
+        baseline.close()
+        raise
 
 
 def main() -> None:
-    with _startup() as server:
-        while True:
-            connection, _ = server.accept()
-            with connection:
-                try:
-                    payload = _closed_request(_read_request(connection))
-                    verify_bundle()
-                    response = _ollama("/api/chat", payload)
-                    verify_bundle()
-                    text, created_at = _validated_response(response)
-                    _reply(connection, 200, {"schema_version": "restricted-local-inference-response.v1", "state": "SUCCEEDED", "finish_reason": "STOP", "text": text, "model_sha256": MANIFEST_SHA256, "request_id": created_at + ":" + str(uuid.uuid4())})
-                except Exception:
-                    # A rejected request is intentionally not a local-inference result:
-                    # no generated text or success-shaped payload is released on failure.
-                    _reply(connection, 400, {"error": "restricted request rejected", "request_id": str(uuid.uuid4())})
+    server, baseline = _startup()
+    try:
+        with server:
+            while True:
+                connection, _ = server.accept()
+                with connection:
+                    try:
+                        guard(baseline)  # also covers empty readiness connections.
+                        payload = _closed_request(_read_request(connection))
+                        response = _ollama("/api/chat", payload)
+                        guard(baseline)
+                        text, created_at = _validated_response(response)
+                        _reply(connection, 200, {"schema_version": "restricted-local-inference-response.v1", "state": "SUCCEEDED", "finish_reason": "STOP", "text": text, "model_sha256": MANIFEST_SHA256, "request_id": created_at + ":" + str(uuid.uuid4())})
+                    except GuardDrift:
+                        # A changed staged namespace is fatal: withhold text, remove
+                        # the endpoint, and never continue serving a new identity.
+                        if SOCKET.exists() and not SOCKET.is_symlink(): SOCKET.unlink()
+                        return
+                    except Exception:
+                        _reply(connection, 400, {"error": "restricted request rejected", "request_id": str(uuid.uuid4())})
+    finally:
+        baseline.close()
 
 
 if __name__ == "__main__":
