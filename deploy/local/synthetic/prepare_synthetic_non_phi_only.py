@@ -45,6 +45,8 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--project-name", required=True)
     parser.add_argument("--policy-output", type=Path, default=ROOT / "policy" / "generated")
+    parser.add_argument("--model-display-name", default="SYNTHETIC_NON_PHI_ONLY_BROKER")
+    parser.add_argument("--model-sha256", default=None)
     args = parser.parse_args()
     if re.fullmatch(r"[a-z0-9][a-z0-9_-]{2,48}", args.project_name) is None:
         raise SystemExit("synthetic project name rejected")
@@ -52,7 +54,9 @@ def main() -> None:
     if ROOT == output or ROOT in output.parents:
         raise SystemExit("synthetic private artifacts must remain outside the repository")
 
-    model_digest = hashlib.sha256(b"SYNTHETIC_NON_PHI_ONLY_BROKER").hexdigest()
+    model_digest = args.model_sha256 or hashlib.sha256(b"SYNTHETIC_NON_PHI_ONLY_BROKER").hexdigest()
+    if re.fullmatch(r"[0-9a-f]{64}", model_digest) is None or not args.model_display_name:
+        raise SystemExit("synthetic model identity rejected")
     policy_private = Ed25519PrivateKey.generate()
     auth_private = Ed25519PrivateKey.generate()
     values = json.loads((ROOT / "policy" / "local.policy.template.json").read_text(encoding="utf-8"))
@@ -61,7 +65,7 @@ def main() -> None:
         "tenant_id": "synthetic-non-phi-only-tenant",
         "external_runner_principal": "synthetic-non-phi-only-runner",
         "gateway_invoker_principal": "synthetic-non-phi-only-gateway",
-        "model": "SYNTHETIC_NON_PHI_ONLY_BROKER",
+        "model": args.model_display_name,
         "model_sha256": model_digest,
     })
     canonical_policy = jcs_bytes(values)

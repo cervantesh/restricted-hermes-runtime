@@ -1,0 +1,45 @@
+services:
+  ollama-synthetic-non-phi-only:
+    profiles: ["ollama-synthetic-non-phi-only"]
+    image: ollama/ollama@sha256:9e7d782e99880c70f9563c51633da875ca605518a8f8d95c2532bda70a027b7a
+    network_mode: none
+    gpus: all
+    read_only: true
+    tmpfs: ["/tmp:mode=0700", "/root:mode=0700"]
+    environment:
+      OLLAMA_HOST: 127.0.0.1:11434
+      OLLAMA_MODELS: /models
+      OLLAMA_NO_CLOUD: "true"
+    volumes:
+      - type: bind
+        source: ${RESTRICTED_OLLAMA_MODEL_STORE:?required}
+        target: /models
+        read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  ollama-synthetic-non-phi-only-adapter:
+    profiles: ["ollama-synthetic-non-phi-only"]
+    build:
+      context: ../..
+      dockerfile: deploy/local/ollama/Dockerfile.adapter
+    network_mode: service:ollama-synthetic-non-phi-only
+    user: "10003:20003"
+    group_add: ["20000"]
+    read_only: true
+    tmpfs: ["/tmp:mode=0700,uid=10003,gid=20003"]
+    volumes:
+      - inference_sockets:/run/restricted-inference
+      - type: bind
+        source: ${RESTRICTED_OLLAMA_MODEL_STORE:?required}
+        target: /models
+        read_only: true
+    depends_on:
+      socket-init:
+        condition: service_completed_successfully
+      ollama-synthetic-non-phi-only:
+        condition: service_started
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"

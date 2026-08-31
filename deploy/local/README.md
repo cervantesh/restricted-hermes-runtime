@@ -91,3 +91,18 @@ operator artifacts, databases, or Compose projects.** The harness requires a
 fresh unique project and refuses every pre-existing target volume. If a
 synthetic database is intentionally preserved instead of destructively removed,
 run `synthetic-non-phi-only-disable` first and verify durable dispatch is false.
+
+## Optional real Ollama synthetic witness
+
+`compose.ollama-synthetic-non-phi-only.yaml` is an opt-in **synthetic-only**
+smoke profile for the already present Windows `qwen2.5:7b` store. It pins the
+Ollama image, mounts that store read-only, verifies its raw manifest and every
+referenced blob before binding `broker.sock`, and makes one bounded local
+inference through all three Unix sockets. It never pulls a model at runtime.
+
+Run only with a fresh project and `RESTRICTED_OLLAMA_MODEL_STORE` set to the
+existing model-store path. The harness is
+`tests/deployment/test_ollama_synthetic_compose_e2e.sh`; it inventories the
+store before and after and returns dispatch to false. It remains **not HIPAA**,
+**not PHI authorization**, and always emits
+`model_attested=false deployment_conformant=false phi_authorized=false`.
