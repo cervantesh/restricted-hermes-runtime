@@ -15,18 +15,26 @@ else
   echo "Docker Compose is required" >&2; exit 1
 fi
 runtime="$(mktemp -d "$runtime_root/${project}.SYNTHETIC_NON_PHI_ONLY.XXXXXX")"
-env_file="$runtime/.env.generated"; model_store_for_compose="$model_store"; build_root="$root"
-if [[ "$windows_cli" == true ]]; then env_file="$(wslpath -w "$env_file")"; model_store_for_compose="$(wslpath -w "$model_store")"; build_root="$(wslpath -w "$root")"; fi
+failure_logs="$runtime_root/${project}.ollama-failure-logs"
+env_file="$runtime/.env.generated"; model_store_for_stage="$model_store"; build_root="$root"
+if [[ "$windows_cli" == true ]]; then env_file="$(wslpath -w "$env_file")"; model_store_for_stage="$(wslpath -w "$model_store")"; build_root="$(wslpath -w "$root")"; fi
 compose=("${compose_cli[@]}" --project-name "$project" --env-file "$env_file" -f deploy/local/compose.yaml -f deploy/local/compose.ollama-synthetic-non-phi-only.yaml)
 external=("${project}_inference_sockets" "${project}_conversation_authorization" "${project}_gateway_authorization" "${project}_conversation_keys" "${project}_gateway_keys" "${project}_postgres_admin_secret")
-cleanup() { local status=$?; set +e; if (( status != 0 )); then "${compose[@]}" ps -a; "${compose[@]}" logs --no-color --tail 100; fi; "${compose[@]}" --profile ollama-synthetic-non-phi-only down --volumes --remove-orphans; for volume in "${external[@]}"; do "${docker_cli[@]}" volume inspect "$volume" >/dev/null 2>&1 && "${docker_cli[@]}" volume rm "$volume"; done; "${docker_cli[@]}" image inspect "${project}-ollama-probe:latest" >/dev/null 2>&1 && "${docker_cli[@]}" image rm "${project}-ollama-probe:latest"; rm -rf -- "$runtime"; return "$status"; }
+bundle="${project}_ollama_bundle_845dbda0ea48"; stager_image="${project}-ollama-bundle-stager:latest"
+label_value() { "${docker_cli[@]}" volume inspect --format "{{ index .Labels \"$2\" }}" "$1"; }
+validate_bundle() { test "$1" = "$bundle" && test "$(label_value "$bundle" restricted-runtime.synthetic-only)" = true && test "$(label_value "$bundle" restricted-runtime.project)" = "$project" && test "$(label_value "$bundle" restricted-runtime.manifest-sha256)" = 845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e && test "$(label_value "$bundle" restricted-runtime.managed-bundle)" = true; }
+cleanup() { local status=$?; set +e; if (( status != 0 )); then mkdir -p "$failure_logs"; "${compose[@]}" ps -a >"$failure_logs/compose-ps.txt" 2>&1; "${compose[@]}" logs --no-color --tail 200 >"$failure_logs/compose-services.log" 2>&1; echo "failure logs: $failure_logs" >&2; fi; "${compose[@]}" --profile ollama-synthetic-non-phi-only down --volumes --remove-orphans; for volume in "${external[@]}"; do "${docker_cli[@]}" volume inspect "$volume" >/dev/null 2>&1 && "${docker_cli[@]}" volume rm "$volume"; done; if "${docker_cli[@]}" volume inspect "$bundle" >/dev/null 2>&1; then validate_bundle "$bundle" && "${docker_cli[@]}" volume rm "$bundle" || echo "refusing unlabelled bundle cleanup: $bundle" >&2; fi; for image in "${project}-ollama-probe:latest" "$stager_image"; do "${docker_cli[@]}" image inspect "$image" >/dev/null 2>&1 && "${docker_cli[@]}" image rm "$image"; done; rm -rf -- "$runtime"; return "$status"; }
 trap cleanup EXIT
 echo "Target inventory before create:"; "${docker_cli[@]}" ps -a --filter "label=com.docker.compose.project=$project" --format '{{.ID}} {{.Names}} {{.Status}}'
-for volume in "${external[@]}"; do if "${docker_cli[@]}" volume inspect "$volume" >/dev/null 2>&1; then echo "refusing pre-existing target volume: $volume" >&2; exit 1; fi; done
+for volume in "${external[@]}" "$bundle"; do if "${docker_cli[@]}" volume inspect "$volume" >/dev/null 2>&1; then echo "refusing pre-existing target volume: $volume" >&2; exit 1; fi; done
 before_inventory="$(find "$model_store" -type f -printf '%s %p\n' | sort | sha256sum | awk '{print $1}')"
 PYTHONPATH="$root/src" python3 "$root/deploy/local/synthetic/prepare_synthetic_non_phi_only.py" --output-root "$runtime" --project-name "$project" --policy-output "$root/policy/generated" --model-display-name qwen2.5:7b --model-sha256 845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e
-printf 'RESTRICTED_OLLAMA_MODEL_STORE=%s\n' "$model_store_for_compose" >> "$runtime/.env.generated"
+printf 'RESTRICTED_OLLAMA_BUNDLE_VOLUME=%s\n' "$bundle" >> "$runtime/.env.generated"
 for volume in "${external[@]}"; do "${docker_cli[@]}" volume create "$volume" >/dev/null; done
+"${docker_cli[@]}" volume create --label restricted-runtime.synthetic-only=true --label "restricted-runtime.project=$project" --label restricted-runtime.manifest-sha256=845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e --label restricted-runtime.managed-bundle=true "$bundle" >/dev/null
+validate_bundle "$bundle"
+"${docker_cli[@]}" build -f deploy/local/ollama/Dockerfile.stager -t "$stager_image" "$build_root" >/dev/null
+"${docker_cli[@]}" run --rm --network none --read-only --tmpfs /tmp:mode=0700 --cap-drop ALL --security-opt no-new-privileges:true -v "$model_store_for_stage:/source:ro" -v "$bundle:/bundle" "$stager_image"
 copy() { local volume="$1" source="$2" uid="$3" gid="$4"; [[ "$windows_cli" == true ]] && source="$(wslpath -w "$source")"; "${docker_cli[@]}" run --rm --network none -v "$volume:/dest" -v "$source:/src:ro" alpine:3.20.3 sh -ec "cp -a /src/. /dest/; chown -R $uid:$gid /dest; find /dest -type f -exec chmod 0600 {} +"; }
 copy "${project}_conversation_authorization" "$runtime/conversation-authorization" 10006 20001; copy "${project}_gateway_authorization" "$runtime/gateway-authorization" 10005 20002; copy "${project}_conversation_keys" "$runtime/conversation-keys" 10006 20001; copy "${project}_gateway_keys" "$runtime/gateway-keys" 10005 20002; copy "${project}_postgres_admin_secret" "$runtime/postgres-admin-secret" 999 999
 "${compose[@]}" --profile ollama-synthetic-non-phi-only config >/dev/null

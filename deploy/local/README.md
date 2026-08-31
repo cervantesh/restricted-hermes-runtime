@@ -96,8 +96,10 @@ run `synthetic-non-phi-only-disable` first and verify durable dispatch is false.
 
 `compose.ollama-synthetic-non-phi-only.yaml` is an opt-in **synthetic-only**
 smoke profile for the already present Windows `qwen2.5:7b` store. It pins the
-Ollama image, mounts that store read-only, verifies its raw manifest and every
-referenced blob before binding `broker.sock`, and makes one bounded local
+Ollama image, first stages only the raw-manifest-referenced bundle into a fresh
+labeled external volume offline, and mounts only that staged volume read-only
+at runtime. Both the stager and adapter verify its raw manifest and every
+referenced blob before binding `broker.sock`; it then makes one bounded local
 inference through all three Unix sockets. It never pulls a model at runtime.
 
 Run only with a fresh project and `RESTRICTED_OLLAMA_MODEL_STORE` set to the

@@ -15,6 +15,22 @@ that the host is suitable for sensitive data.
 - Pinned amd64 runtime image:
   `ollama/ollama@sha256:9e7d782e99880c70f9563c51633da875ca605518a8f8d95c2532bda70a027b7a`.
 
+## Offline staging boundary
+
+Before Compose exists, the harness creates exactly
+`<project>_ollama_bundle_845dbda0ea48` with these exact labels:
+`restricted-runtime.synthetic-only=true`,
+`restricted-runtime.project=<project>`,
+`restricted-runtime.manifest-sha256=845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e`,
+and `restricted-runtime.managed-bundle=true`.
+
+The pinned, networkless staging helper sees only the Windows source read-only
+and this fresh destination volume read-write. It copies only the exact raw
+manifest and its referenced blobs, re-verifies source and destination, and
+then Compose mounts only the staged volume read-only. The Windows source is
+never a runtime mount and cleanup validates the exact name and labels before
+removing only the staging volume.
+
 ## Local checks on 2026-08-31
 
 - A complete SHA-256 pass over the 4,683,073,952-byte required blob took

@@ -9,10 +9,10 @@ services:
     environment:
       OLLAMA_HOST: 127.0.0.1:11434
       OLLAMA_MODELS: /models
-      OLLAMA_NO_CLOUD: "true"
+      OLLAMA_NO_CLOUD: "1"
     volumes:
-      - type: bind
-        source: ${RESTRICTED_OLLAMA_MODEL_STORE:?required}
+      - type: volume
+        source: ollama_bundle
         target: /models
         read_only: true
     cap_drop: ["ALL"]
@@ -31,8 +31,8 @@ services:
     tmpfs: ["/tmp:mode=0700,uid=10003,gid=20003"]
     volumes:
       - inference_sockets:/run/restricted-inference
-      - type: bind
-        source: ${RESTRICTED_OLLAMA_MODEL_STORE:?required}
+      - type: volume
+        source: ollama_bundle
         target: /models
         read_only: true
     depends_on:
@@ -43,3 +43,8 @@ services:
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     restart: "no"
+
+volumes:
+  ollama_bundle:
+    external: true
+    name: ${RESTRICTED_OLLAMA_BUNDLE_VOLUME:?required}

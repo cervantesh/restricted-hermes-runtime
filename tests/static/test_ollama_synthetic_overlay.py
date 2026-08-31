@@ -19,9 +19,12 @@ def test_overlay_is_opt_in_pinned_networkless_and_read_only_model_store():
     assert "@sha256:9e7d782e99880c70f9563c51633da875ca605518a8f8d95c2532bda70a027b7a" in ollama["image"]
     assert ollama["network_mode"] == "none" and adapter["network_mode"] == "service:ollama-synthetic-non-phi-only"
     assert ollama["gpus"] == "all" and ollama["read_only"] is True and adapter["read_only"] is True
-    assert ollama["environment"]["OLLAMA_NO_CLOUD"] == "true"
+    assert ollama["environment"]["OLLAMA_NO_CLOUD"] == "1"
     assert adapter["user"] == "10003:20003" and adapter["group_add"] == ["20000"]
     for service in (ollama, adapter):
         assert service["profiles"] == ["ollama-synthetic-non-phi-only"]
         assert all(mount.get("read_only") is True for mount in service["volumes"] if isinstance(mount, dict) and mount.get("target") == "/models")
         assert "ports" not in service and "docker.sock" not in str(service)
+    assert "RESTRICTED_OLLAMA_MODEL_STORE" not in str(value)
+    assert value["volumes"]["ollama_bundle"]["external"] is True
+    assert value["volumes"]["ollama_bundle"]["name"] == "${RESTRICTED_OLLAMA_BUNDLE_VOLUME:?required}"
