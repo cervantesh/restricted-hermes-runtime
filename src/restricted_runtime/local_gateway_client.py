@@ -1,9 +1,20 @@
 """Closed single-request AF_UNIX client for the local gateway API."""
 from __future__ import annotations
-import socket,time
+import socket,sys,time
 from pathlib import Path
 from .contracts import AttemptState, ContractError, ProviderResult, jcs_bytes, load_closed_json
 from .gateway_contracts import GatewayEnvelope
+
+
+def _closed_failure_code(error: Exception) -> str:
+    """A non-content diagnostic category for a local gateway failure."""
+    # `socket.timeout` is a `TimeoutError` on supported runtimes. The boundary
+    # intentionally emits one closed timeout category rather than inferring a
+    # phase from exception text.
+    if isinstance(error, TimeoutError): return "timeout"
+    if isinstance(error, OSError): return "transport"
+    if isinstance(error, (ValueError, KeyError)): return "closed_response"
+    return "unexpected"
 
 class LocalGatewayClient:
     def __init__(self, path: str):
@@ -34,7 +45,9 @@ class LocalGatewayClient:
             if not isinstance(value,dict):raise ValueError
             return value
         except ContractError: raise
-        except Exception as exc: raise ContractError("local gateway unavailable") from exc
+        except Exception as exc:
+            print(f"local_gateway_failure={_closed_failure_code(exc)}", file=sys.stderr, flush=True)
+            raise ContractError("local gateway unavailable") from exc
     def infer_once(self,envelope:GatewayEnvelope,principal:str)->ProviderResult:
         reply=self._request("POST","/infer",{"schema_version":"restricted-gateway-envelope.v1",**envelope.__dict__})
         if reply.get("status")!="SUCCEEDED":return ProviderResult(reply["status"])

@@ -230,6 +230,16 @@ def test_turn_rejection_logs_only_closed_reason_code(capsys):
     assert "SYNTHETIC_NON_PHI_ONLY" not in captured
 
 
+def test_local_gateway_failure_diagnostics_are_closed_categories():
+    from restricted_runtime.local_gateway_client import _closed_failure_code
+
+    assert _closed_failure_code(TimeoutError()) == "timeout"
+    assert _closed_failure_code(socket.timeout()) == "timeout"
+    assert _closed_failure_code(OSError()) == "transport"
+    assert _closed_failure_code(ValueError()) == "closed_response"
+    assert _closed_failure_code(RuntimeError()) == "unexpected"
+
+
 def test_reconciliation_rejects_expired_authority_before_claim_or_gateway_call():
     from restricted_runtime.reconciliation_driver import ReconciliationDriver
 
