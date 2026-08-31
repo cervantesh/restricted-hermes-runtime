@@ -28,7 +28,8 @@ from restricted_runtime.local_uds import LocalUdsClient
 from restricted_runtime.policy import LOCAL_POLICY_SCHEMA, PolicyBundle
 from restricted_runtime.services.gateway_api import create_app as gateway_app
 from restricted_runtime.services.restricted_api import create_app as conversation_app
-from restricted_runtime.storage import PostgresContentStore, PostgresLedger
+from restricted_runtime.conversation_storage import PostgresContentStore
+from restricted_runtime.storage import PostgresLedger
 
 
 DATABASE_URL = os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL")
@@ -79,7 +80,7 @@ class _Keys:
     def unwrap(self, key: bytes) -> bytes: return key
 
 
-def _start_uds(app, path: Path):
+def _start_uds(app, path: Path, *, server_header: bool = False, date_header: bool = False):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         existing = path.lstat()
@@ -92,7 +93,7 @@ def _start_uds(app, path: Path):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(path))
     os.chmod(path, 0o660)
-    config = uvicorn.Config(app, fd=sock.fileno(), lifespan="off", log_level="error", access_log=False)
+    config = uvicorn.Config(app, fd=sock.fileno(), lifespan="off", log_level="error", access_log=False, server_header=server_header, date_header=date_header)
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -118,6 +119,7 @@ def _assert_unrelated_uid_denied(path: Path) -> None:
         [sys.executable, "-c", "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/restricted-inference/conversation.sock')"],
         user=65534,
         group=65534,
+        extra_groups=[],
         capture_output=True,
         text=True,
     )
@@ -203,3 +205,33 @@ def test_real_three_socket_composition_commits_and_reads_back_once():
         if gateway_server is not None:
             _stop_uds(gateway_server, gateway_thread, gateway_sock, _GATEWAY_SOCKET)
         _stop_uds(broker_server, broker_thread, broker_sock, _BROKER_SOCKET)
+
+
+def test_real_uvicorn_closed_headers_are_required_by_local_broker_parser():
+    policy = _policy()
+    broker = FastAPI()
+
+    @broker.post("/v1/restricted/generate")
+    async def generate():
+        return {
+            "schema_version": "restricted-local-inference-response.v1",
+            "state": "SUCCEEDED",
+            "finish_reason": "STOP",
+            "text": "synthetic header probe",
+            "model_sha256": policy.values["model_sha256"],
+            "request_id": "broker-header-probe",
+        }
+
+    server, thread, sock = _start_uds(broker, _BROKER_SOCKET, server_header=True, date_header=True)
+    try:
+        result = LocalUdsClient(policy).generate_content([{"role": "user", "text": "synthetic"}])
+        assert result.state == "INDETERMINATE"
+    finally:
+        _stop_uds(server, thread, sock, _BROKER_SOCKET)
+
+    server, thread, sock = _start_uds(broker, _BROKER_SOCKET)
+    try:
+        result = LocalUdsClient(policy).generate_content([{"role": "user", "text": "synthetic"}])
+        assert result.state == "SUCCEEDED"
+    finally:
+        _stop_uds(server, thread, sock, _BROKER_SOCKET)

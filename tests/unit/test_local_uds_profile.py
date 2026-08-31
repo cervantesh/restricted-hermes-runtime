@@ -315,7 +315,7 @@ def test_local_client_uses_one_closed_unix_socket_request(tmp_path):
         thread.join(timeout=2)
         assert result.state == "SUCCEEDED" and result.provider_request_id == "broker-1"
         assert len(captured) == 1
-        assert captured[0].startswith(b"POST /v1/restricted/generate HTTP/1.1\r\n")
+        assert captured[0].startswith(b"POST /v1/restricted/generate HTTP/1.0\r\n")
         assert b"declared_model_sha256" in captured[0]
     finally:
         server.close()

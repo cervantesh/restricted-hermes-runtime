@@ -16,7 +16,7 @@ def test_local_root_and_image_are_separate_from_vertex_root():
 
 def test_local_client_has_only_unix_socket_dispatch_and_closed_wire_literals():
     source = (ROOT / "local_uds.py").read_text(encoding="utf-8")
-    for literal in ("socket.AF_UNIX", "socket.SOCK_STREAM", "POST /v1/restricted/generate HTTP/1.1", "trust_env"):
+    for literal in ("socket.AF_UNIX", "socket.SOCK_STREAM", "POST /v1/restricted/generate HTTP/1.0", "trust_env"):
         # The client has no HTTP library/proxy path; the latter marker is not
         # applicable to raw sockets and is intentionally absent.
         if literal == "trust_env":

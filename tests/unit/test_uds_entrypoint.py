@@ -18,7 +18,8 @@ def test_launcher_prebinds_restrictive_socket_and_uvicorn_fd_path_preserves_mode
     path.unlink(missing_ok=True)
     observed: dict[str, int] = {}
 
-    def fake_run(app, *, fd):
+    def fake_run(app, *, fd, **kwargs):
+        assert kwargs == {"server_header": False, "date_header": False}
         observed["mode"] = stat.S_IMODE(path.stat().st_mode)
         # This is Uvicorn's real existing-fd code path. Its bind_socket()
         # branch must not chmod the already-bound socket.

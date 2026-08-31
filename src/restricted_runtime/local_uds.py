@@ -105,7 +105,7 @@ class LocalUdsClient:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(phase_timeout())
                 client.connect(path)
-                wire = b"POST /v1/restricted/generate HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " + str(len(payload)).encode("ascii") + b"\r\nConnection: close\r\n\r\n" + payload
+                wire = b"POST /v1/restricted/generate HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
                 client.settimeout(phase_timeout())
                 client.sendall(wire)
                 chunks: list[bytes] = []

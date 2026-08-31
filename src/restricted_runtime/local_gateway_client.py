@@ -15,7 +15,7 @@ class LocalGatewayClient:
         started=time.monotonic()
         try:
             with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
-                client.settimeout(5);client.connect(self.path);client.sendall(method.encode()+b" "+path.encode()+b" HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: "+str(len(raw)).encode()+b"\r\nConnection: close\r\n\r\n"+raw); reply=b""
+                client.settimeout(5);client.connect(self.path);client.sendall(method.encode()+b" "+path.encode()+b" HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: "+str(len(raw)).encode()+b"\r\n\r\n"+raw); reply=b""
                 while True:
                     if time.monotonic()-started>40: raise TimeoutError
                     client.settimeout(5);part=client.recv(65536)

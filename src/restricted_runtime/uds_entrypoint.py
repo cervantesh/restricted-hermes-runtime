@@ -61,7 +61,7 @@ def main() -> None:
     sock = _bind_socket(path)
     identity = (Path(path).lstat().st_dev, Path(path).lstat().st_ino)
     try:
-        uvicorn.run(app, fd=sock.fileno())
+        uvicorn.run(app, fd=sock.fileno(), server_header=False, date_header=False)
     finally:
         _close_socket(sock, path, identity)
 if __name__=="__main__": main()
