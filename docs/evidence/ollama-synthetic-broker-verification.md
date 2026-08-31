@@ -111,6 +111,18 @@ No timeout was enlarged and no verification step was removed to convert this
 RED result into a pass. The exact test project had no remaining Compose
 containers or named volumes after its cleanup.
 
+`olle2e9` then closed the remaining attribution gap without changing the
+deadline: `local_gateway_failure=timeout` was emitted before the conversation
+boundary recorded `turn_rejected_reason=inference_outcome_indeterminate`.
+The gateway completed its `/infer` after that caller had already timed out.
+The local gateway client has a closed 40-second total deadline, so this is a
+real proof that the post-ready path did not fit the required request budget on
+this host. The saved diagnostic is
+`C:\\Temp\\olle2e9.ollama-failure-logs`; it contains only closed reason labels
+and no prompt text. This profile is therefore non-conformant for the demanded
+success witness. The proper disposition is to keep it RED rather than enlarge
+the request deadline, omit serving-time verification, or claim a partial pass.
+
 ## Nonclaims
 
 `model_attested=false`; `deployment_conformant=false`; `phi_authorized=false`.
