@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from urllib.request import Request, urlopen
 
 
 def migration_sql(directory: Path, conversation_user: str, gateway_user: str) -> list[str]:
@@ -73,13 +72,6 @@ def execute_migration(dsn: str, directory: Path, conversation_user: str, gateway
         verify_post_migration(verification_connection, conversation_user, gateway_user)
 
 
-def shutdown_proxy(timeout_seconds: float = 3) -> None:
-    request = Request("http://127.0.0.1:9091/quitquitquit", method="POST")
-    with urlopen(request, timeout=timeout_seconds) as response:
-        if response.status not in (200, 204):
-            raise RuntimeError("Cloud SQL proxy quitquitquit endpoint rejected shutdown")
-
-
 def run_from_environment(connect: object) -> None:
     dsn = os.environ.get("MIGRATION_ADMIN_DSN")
     directory = os.environ.get("RESTRICTED_MIGRATIONS_DIR")
@@ -91,23 +83,13 @@ def run_from_environment(connect: object) -> None:
     execute_migration(dsn, Path(directory), conversation, gateway, expected_socket, connect)
 
 
-def main(*, connect: object | None = None, proxy_shutdown: object = shutdown_proxy) -> None:
-    primary_error: BaseException | None = None
-    try:
-        if connect is None:
-            import psycopg
+def main(*, connect: object | None = None) -> None:
+    """Run migration and postflight; the process exit is their exact outcome."""
+    if connect is None:
+        import psycopg
 
-            connect = psycopg.connect
-        run_from_environment(connect)
-    except BaseException as exc:
-        primary_error = exc
-        raise
-    finally:
-        try:
-            proxy_shutdown()
-        except Exception as shutdown_error:
-            if primary_error is None:
-                raise RuntimeError("Cloud SQL proxy shutdown failed") from shutdown_error
+        connect = psycopg.connect
+    run_from_environment(connect)
 
 
 if __name__ == "__main__":

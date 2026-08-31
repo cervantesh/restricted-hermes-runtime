@@ -215,16 +215,18 @@ resource "google_cloud_run_v2_job" "migration" {
         egress    = "ALL_TRAFFIC"
       }
       volumes {
-        name = "sql-socket"
-        empty_dir {}
+        # Cloud Run reserves this logical name for its native Cloud SQL socket.
+        name = "cloudsql"
+        cloud_sql_instance {
+          instances = [google_sql_database_instance.restricted.connection_name]
+        }
       }
       containers {
-        name       = "migration-runner"
-        depends_on = ["cloud-sql-proxy"]
-        image      = var.migration_image
-        command    = ["python", "-m", "restricted_runtime.migration_runner"]
+        name    = "migration-runner"
+        image   = var.migration_image
+        command = ["python", "-m", "restricted_runtime.migration_runner"]
         volume_mounts {
-          name       = "sql-socket"
+          name       = "cloudsql"
           mount_path = "/cloudsql"
         }
         dynamic "env" {
@@ -242,27 +244,6 @@ resource "google_cloud_run_v2_job" "migration" {
               version = "1"
             }
           }
-        }
-      }
-      containers {
-        name  = "cloud-sql-proxy"
-        image = var.cloud_sql_proxy_image
-        # One-shot operator-admin DSN uses PostgreSQL password authentication.
-        # Runtime services alone use --auto-iam-authn.
-        args = ["--private-ip", "--unix-socket=/cloudsql", "--health-check", "--http-address=0.0.0.0", "--http-port=9090", "--quitquitquit", "--exit-zero-on-sigterm", google_sql_database_instance.restricted.connection_name]
-        startup_probe {
-          http_get {
-            path = "/readiness"
-            port = 9090
-          }
-          initial_delay_seconds = 0
-          period_seconds        = 5
-          timeout_seconds       = 3
-          failure_threshold     = 12
-        }
-        volume_mounts {
-          name       = "sql-socket"
-          mount_path = "/cloudsql"
         }
       }
     }

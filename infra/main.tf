@@ -300,7 +300,9 @@ resource "google_compute_firewall" "allow_private_sql" {
   destination_ranges = ["${google_compute_global_address.private_services.address}/${google_compute_global_address.private_services.prefix_length}"]
   allow {
     protocol = "tcp"
-    ports    = ["5432"]
+    # Cloud SQL Auth Proxy and the Cloud Run native Cloud SQL volume connect
+    # to the instance-side proxy port, not PostgreSQL's listener port.
+    ports = ["3307"]
   }
 }
 resource "google_compute_firewall" "allow_vertex_psc" {
