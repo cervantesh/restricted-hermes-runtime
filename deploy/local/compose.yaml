@@ -1,0 +1,225 @@
+name: restricted-hermes-local
+
+x-gateway-environment: &gateway-environment
+  RESTRICTED_RUNTIME_MODE: production
+  RESTRICTED_POLICY_PATH: /app/policy/generated/policy.json
+  RESTRICTED_POLICY_SIGNATURE_PATH: /app/policy/generated/policy.sig
+  RESTRICTED_POLICY_PUBLIC_KEY_B64: ${RESTRICTED_POLICY_PUBLIC_KEY_B64:?required}
+  RESTRICTED_POLICY_EPOCH: ${RESTRICTED_POLICY_EPOCH:?required}
+  RESTRICTED_POLICY_DIGEST: ${RESTRICTED_POLICY_DIGEST:?required}
+  RESTRICTED_OPERATOR_AUTHORIZATION_PATH: /run/restricted-operator/authorization.json
+  RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_PATH: /run/restricted-operator/authorization.sig
+  RESTRICTED_OPERATOR_AUTHORIZATION_PUBLIC_KEY_B64: ${RESTRICTED_OPERATOR_AUTHORIZATION_PUBLIC_KEY_B64:?required}
+  RESTRICTED_OPERATOR_AUTHORIZATION_SHA256: ${RESTRICTED_OPERATOR_AUTHORIZATION_SHA256:?required}
+  RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_SHA256: ${RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_SHA256:?required}
+  RESTRICTED_LOCAL_GATEWAY_MAC_KEY_RESOURCE: ${RESTRICTED_LOCAL_GATEWAY_MAC_KEY_RESOURCE:?required}
+  RESTRICTED_LOCAL_GATEWAY_MAC_KEY_VERSION: ${RESTRICTED_LOCAL_GATEWAY_MAC_KEY_VERSION:?required}
+  RESTRICTED_LOCAL_GATEWAY_MAC_KEY_PATH: /run/restricted-keys/gateway-mac.key
+  RESTRICTED_LOCAL_GATEWAY_MAC_KEY_SHA256: ${RESTRICTED_LOCAL_GATEWAY_MAC_KEY_SHA256:?required}
+  RESTRICTED_LOCAL_GATEWAY_RETIRED_MAC_KEYS_PATH: /run/restricted-keys/gateway-retired.json
+  RESTRICTED_LOCAL_GATEWAY_RETIRED_MAC_KEYS_SHA256: ${RESTRICTED_LOCAL_GATEWAY_RETIRED_MAC_KEYS_SHA256:?required}
+  RESTRICTED_LOCAL_CONVERSATION_KEYSET_SHA256: ${RESTRICTED_LOCAL_CONVERSATION_KEYSET_SHA256:?required}
+  RESTRICTED_ADMISSION_ENABLED: ${RESTRICTED_ADMISSION_ENABLED:-false}
+  RESTRICTED_TENANT_ID: ${RESTRICTED_TENANT_ID:?required}
+  DATABASE_URL: postgresql:///restricted_runtime?host=/run/restricted-postgres&user=restricted_local_gateway
+
+x-conversation-environment: &conversation-environment
+  RESTRICTED_RUNTIME_MODE: production
+  RESTRICTED_POLICY_PATH: /app/policy/generated/policy.json
+  RESTRICTED_POLICY_SIGNATURE_PATH: /app/policy/generated/policy.sig
+  RESTRICTED_POLICY_PUBLIC_KEY_B64: ${RESTRICTED_POLICY_PUBLIC_KEY_B64:?required}
+  RESTRICTED_POLICY_EPOCH: ${RESTRICTED_POLICY_EPOCH:?required}
+  RESTRICTED_POLICY_DIGEST: ${RESTRICTED_POLICY_DIGEST:?required}
+  RESTRICTED_OPERATOR_AUTHORIZATION_PATH: /run/restricted-operator/authorization.json
+  RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_PATH: /run/restricted-operator/authorization.sig
+  RESTRICTED_OPERATOR_AUTHORIZATION_PUBLIC_KEY_B64: ${RESTRICTED_OPERATOR_AUTHORIZATION_PUBLIC_KEY_B64:?required}
+  RESTRICTED_OPERATOR_AUTHORIZATION_SHA256: ${RESTRICTED_OPERATOR_AUTHORIZATION_SHA256:?required}
+  RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_SHA256: ${RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_SHA256:?required}
+  RESTRICTED_LOCAL_SERVICE_MAC_KEY_RESOURCE: ${RESTRICTED_LOCAL_SERVICE_MAC_KEY_RESOURCE:?required}
+  RESTRICTED_LOCAL_SERVICE_MAC_KEY_VERSION: ${RESTRICTED_LOCAL_SERVICE_MAC_KEY_VERSION:?required}
+  RESTRICTED_LOCAL_SERVICE_MAC_KEY_PATH: /run/restricted-keys/service-mac.key
+  RESTRICTED_LOCAL_SERVICE_MAC_KEY_SHA256: ${RESTRICTED_LOCAL_SERVICE_MAC_KEY_SHA256:?required}
+  RESTRICTED_LOCAL_SERVICE_MAC_KEY_RETIRED_KEYS_PATH: /run/restricted-keys/service-retired.json
+  RESTRICTED_LOCAL_SERVICE_MAC_KEY_RETIRED_KEYS_SHA256: ${RESTRICTED_LOCAL_SERVICE_MAC_KEY_RETIRED_KEYS_SHA256:?required}
+  RESTRICTED_LOCAL_CONTENT_WRAP_KEY_RESOURCE: ${RESTRICTED_LOCAL_CONTENT_WRAP_KEY_RESOURCE:?required}
+  RESTRICTED_LOCAL_CONTENT_WRAP_KEY_VERSION: ${RESTRICTED_LOCAL_CONTENT_WRAP_KEY_VERSION:?required}
+  RESTRICTED_LOCAL_CONTENT_WRAP_KEY_PATH: /run/restricted-keys/content-wrap.key
+  RESTRICTED_LOCAL_CONTENT_WRAP_KEY_SHA256: ${RESTRICTED_LOCAL_CONTENT_WRAP_KEY_SHA256:?required}
+  RESTRICTED_LOCAL_CONTENT_WRAP_KEY_RETIRED_KEYS_PATH: /run/restricted-keys/content-retired.json
+  RESTRICTED_LOCAL_CONTENT_WRAP_KEY_RETIRED_KEYS_SHA256: ${RESTRICTED_LOCAL_CONTENT_WRAP_KEY_RETIRED_KEYS_SHA256:?required}
+  RESTRICTED_LOCAL_GATEWAY_KEYSET_SHA256: ${RESTRICTED_LOCAL_GATEWAY_KEYSET_SHA256:?required}
+  RESTRICTED_ADMISSION_ENABLED: ${RESTRICTED_ADMISSION_ENABLED:-false}
+  RESTRICTED_TENANT_ID: ${RESTRICTED_TENANT_ID:?required}
+  DATABASE_URL: postgresql:///restricted_runtime?host=/run/restricted-postgres&user=restricted_local_conversation
+
+x-gateway-volumes: &gateway-volumes
+  - type: volume
+    source: inference_sockets
+    target: /run/restricted-inference
+  - type: volume
+    source: postgres_socket
+    target: /run/restricted-postgres
+  - type: volume
+    source: gateway_authorization
+    target: /run/restricted-operator
+    read_only: true
+  - type: volume
+    source: gateway_keys
+    target: /run/restricted-keys
+    read_only: true
+
+services:
+  socket-init:
+    image: alpine:3.20.3
+    network_mode: none
+    user: "0:0"
+    command: ["/bin/sh", "/opt/restricted/socket-init.sh"]
+    volumes:
+      - ./socket-init.sh:/opt/restricted/socket-init.sh:ro
+      - inference_sockets:/run/restricted-inference
+      - postgres_socket:/run/restricted-postgres
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "DAC_OVERRIDE", "FOWNER"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  postgres:
+    build:
+      context: ../..
+      dockerfile: deploy/local/postgres/Dockerfile
+    network_mode: none
+    user: "999:999"
+    group_add: ["20004"]
+    environment:
+      POSTGRES_DB: restricted_runtime
+      POSTGRES_PASSWORD_FILE: /run/restricted-postgres-admin/password
+      POSTGRES_INITDB_ARGS: --auth-local=peer --auth-host=scram-sha-256
+    command:
+      - postgres
+      - -c
+      - listen_addresses=
+      - -c
+      - unix_socket_directories=/run/restricted-postgres
+      - -c
+      - unix_socket_group=restricted-postgres-socket
+      - -c
+      - unix_socket_permissions=0770
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - postgres_socket:/run/restricted-postgres
+      - postgres_admin_secret:/run/restricted-postgres-admin:ro
+    depends_on:
+      socket-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h /run/restricted-postgres -U postgres -d restricted_runtime"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  gateway-preflight:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.local-gateway
+    network_mode: none
+    user: "10005:20002"
+    group_add: ["20000", "20003", "20004"]
+    read_only: true
+    tmpfs: ["/tmp:mode=0700,uid=10005,gid=20002"]
+    environment: *gateway-environment
+    command: ["python", "-m", "restricted_runtime.local_deployment_preflight", "check", "gateway"]
+    volumes: *gateway-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      socket-init:
+        condition: service_completed_successfully
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.local-gateway
+    network_mode: none
+    user: "10005:20002"
+    group_add: ["20000", "20003", "20004"]
+    read_only: true
+    tmpfs: ["/tmp:mode=0700,uid=10005,gid=20002"]
+    environment: *gateway-environment
+    volumes: *gateway-volumes
+    depends_on:
+      gateway-preflight:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "restricted_runtime.local_deployment_preflight", "ready", "gateway"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  conversation:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.local-conversation
+    network_mode: none
+    user: "10006:20001"
+    group_add: ["20000", "20002", "20004"]
+    read_only: true
+    tmpfs: ["/tmp:mode=0700,uid=10006,gid=20001"]
+    environment: *conversation-environment
+    volumes:
+      - type: volume
+        source: inference_sockets
+        target: /run/restricted-inference
+      - type: volume
+        source: postgres_socket
+        target: /run/restricted-postgres
+      - type: volume
+        source: conversation_authorization
+        target: /run/restricted-operator
+        read_only: true
+      - type: volume
+        source: conversation_keys
+        target: /run/restricted-keys
+        read_only: true
+    depends_on:
+      gateway:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "restricted_runtime.local_deployment_preflight", "ready", "conversation"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+volumes:
+  inference_sockets:
+    external: true
+    name: ${RESTRICTED_INFERENCE_VOLUME:?required}
+  conversation_authorization:
+    external: true
+    name: ${RESTRICTED_CONVERSATION_AUTHORIZATION_VOLUME:?required}
+  gateway_authorization:
+    external: true
+    name: ${RESTRICTED_GATEWAY_AUTHORIZATION_VOLUME:?required}
+  conversation_keys:
+    external: true
+    name: ${RESTRICTED_CONVERSATION_KEYS_VOLUME:?required}
+  gateway_keys:
+    external: true
+    name: ${RESTRICTED_GATEWAY_KEYS_VOLUME:?required}
+  postgres_admin_secret:
+    external: true
+    name: ${RESTRICTED_POSTGRES_ADMIN_SECRET_VOLUME:?required}
+  postgres_data:
+  postgres_socket:

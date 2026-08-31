@@ -1,0 +1,63 @@
+services:
+  synthetic-non-phi-only-broker:
+    profiles: ["synthetic-non-phi-only"]
+    build:
+      context: ../..
+      dockerfile: deploy/local/synthetic/Dockerfile.broker
+    network_mode: none
+    user: "10003:20003"
+    group_add: ["20000"]
+    read_only: true
+    tmpfs: ["/tmp:mode=0700,uid=10003,gid=20003"]
+    volumes:
+      - inference_sockets:/run/restricted-inference
+      - synthetic_non_phi_only_state:/var/lib/restricted-synthetic
+    depends_on:
+      socket-init:
+        condition: service_completed_successfully
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  synthetic-non-phi-only-enable:
+    profiles: ["synthetic-non-phi-only"]
+    build:
+      context: ../..
+      dockerfile: deploy/local/postgres/Dockerfile
+    network_mode: none
+    user: "999:999"
+    group_add: ["20004"]
+    entrypoint: ["psql"]
+    command: ["-h", "/run/restricted-postgres", "-U", "postgres", "-d", "restricted_runtime", "-v", "ON_ERROR_STOP=1", "-c", "UPDATE inference_ledger.runtime_controls SET dispatch_enabled=true WHERE control_key=true"]
+    volumes:
+      - postgres_socket:/run/restricted-postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  synthetic-non-phi-only-probe:
+    profiles: ["synthetic-non-phi-only"]
+    build:
+      context: ../..
+      dockerfile: deploy/local/synthetic/Dockerfile.probe
+    network_mode: none
+    user: "10007:20001"
+    group_add: ["20000"]
+    read_only: true
+    environment:
+      SYNTHETIC_NON_PHI_ONLY_MODE: ${SYNTHETIC_NON_PHI_ONLY_MODE:-create}
+    volumes:
+      - inference_sockets:/run/restricted-inference
+      - synthetic_non_phi_only_state:/var/lib/restricted-synthetic
+    depends_on:
+      conversation:
+        condition: service_healthy
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+volumes:
+  synthetic_non_phi_only_state:

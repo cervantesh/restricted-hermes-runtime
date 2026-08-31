@@ -15,9 +15,10 @@ RUN groupadd --system --gid 20000 restricted-socket-dir \
  && groupadd --system --gid 20001 restricted-conversation \
  && groupadd --system --gid 20002 restricted-gateway \
  && groupadd --system --gid 20003 restricted-broker \
- && useradd --system --uid 10006 --gid 20001 --groups 20000,20002 restricted-local-conversation \
+ && groupadd --system --gid 20004 restricted-postgres-socket \
+ && useradd --system --uid 10006 --gid 20001 --groups 20000,20002,20004 restricted-local-conversation \
  && mkdir -p /run/restricted-inference \
  && chown root:20000 /run/restricted-inference \
  && chmod 1770 /run/restricted-inference
 USER restricted-local-conversation
-CMD ["python", "-m", "restricted_runtime.uds_entrypoint"]
+CMD ["python", "-m", "restricted_runtime.local_deployment_preflight", "run", "conversation"]

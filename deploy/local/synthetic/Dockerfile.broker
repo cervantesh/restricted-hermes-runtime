@@ -1,0 +1,8 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY deploy/local/synthetic/broker.py /app/broker.py
+RUN groupadd --system --gid 20000 restricted-socket-dir \
+ && groupadd --system --gid 20003 restricted-broker \
+ && useradd --system --uid 10003 --gid 20003 --groups 20000 restricted-synthetic-broker
+USER 10003:20003
+CMD ["python", "/app/broker.py"]

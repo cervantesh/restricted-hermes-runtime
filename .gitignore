@@ -8,3 +8,4 @@ __pycache__/
 policy/generated/
 *.tfplan
 coverage.xml
+deploy/local/.synthetic-runtime/

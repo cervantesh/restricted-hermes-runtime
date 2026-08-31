@@ -1,0 +1,8 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY deploy/local/synthetic/probe.py /app/probe.py
+RUN groupadd --system --gid 20000 restricted-socket-dir \
+ && groupadd --system --gid 20001 restricted-conversation \
+ && useradd --system --uid 10007 --gid 20001 --groups 20000 restricted-synthetic-probe
+USER 10007:20001
+CMD ["python", "/app/probe.py"]
