@@ -19,8 +19,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 RESTRICTED_UDS_APP=restricted_r
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
 COPY policy/generated/policy.json policy/generated/policy.sig ./policy/generated/
-RUN useradd --system --uid 10005 restricted-local-gateway \
+# The operator-provided shared volume must preserve root:20000 and mode 1770;
+# the external broker endpoint must run with access to GID 20003.
+RUN groupadd --system --gid 20000 restricted-socket-dir \
+ && groupadd --system --gid 20001 restricted-conversation \
+ && groupadd --system --gid 20002 restricted-gateway \
+ && groupadd --system --gid 20003 restricted-broker \
+ && useradd --system --uid 10005 --gid 20002 --groups 20000,20003 restricted-local-gateway \
  && mkdir -p /run/restricted-inference \
- && chown 10005:10005 /run/restricted-inference
-USER 10005
+ && chown root:20000 /run/restricted-inference \
+ && chmod 1770 /run/restricted-inference
+USER restricted-local-gateway
 CMD ["python", "-m", "restricted_runtime.uds_entrypoint"]

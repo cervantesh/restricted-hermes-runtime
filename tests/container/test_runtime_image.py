@@ -38,7 +38,7 @@ DOCKER=_docker_prefix()
 
 def run_docker(*args: str, timeout: int = 180) -> subprocess.CompletedProcess[str]:
     assert DOCKER is not None
-    return subprocess.run([*DOCKER,*args],capture_output=True,text=True,timeout=timeout,cwd=None if DOCKER[0]=="wsl" else ROOT)
+    return subprocess.run([*DOCKER,*args],capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=timeout,cwd=None if DOCKER[0]=="wsl" else ROOT)
 
 def docker_path(path: Path) -> str:
     value=path.resolve()
@@ -102,6 +102,15 @@ def test_image_recipe_has_no_dynamic_capabilities():
         assert "AS builder" in source and "COPY --from=builder /usr/local/lib/python3.11/site-packages" in source
         assert "COPY policy ./policy" not in source
         assert "COPY policy/generated/policy.json policy/generated/policy.sig" in source
+    for recipe, user, uid, primary_gid, supplementary in (
+        (ROOT / "Dockerfile.local-conversation", "restricted-local-conversation", 10006, 20001, (20000, 20002)),
+        (ROOT / "Dockerfile.local-gateway", "restricted-local-gateway", 10005, 20002, (20000, 20003)),
+    ):
+        source = recipe.read_text(encoding="utf-8")
+        assert f"useradd --system --uid {uid} --gid {primary_gid} --groups {','.join(map(str, supplementary))} {user}" in source
+        assert f"USER {user}" in source
+        assert "chown root:20000 /run/restricted-inference" in source
+        assert "chmod 1770 /run/restricted-inference" in source
 
 
 @pytest.mark.skipif(DOCKER is None, reason="Docker daemon unavailable locally and through Ubuntu-24.04 WSL")
@@ -180,7 +189,22 @@ importlib.import_module('{entry}')
     metadata=run_docker("image","inspect",tag,"--format","{{json .Config}}",timeout=20)
     assert metadata.returncode==0
     assert "HERMES_HOME" not in metadata.stdout and "GOOGLE_APPLICATION_CREDENTIALS" not in metadata.stdout
-    assert f'"User":"{uid}"' in metadata.stdout
+    role_identities = {
+        "Dockerfile.local-conversation": ("restricted-local-conversation", 10006, 20001, {20000, 20001, 20002}),
+        "Dockerfile.local-gateway": ("restricted-local-gateway", 10005, 20002, {20000, 20002, 20003}),
+    }
+    expected_config_user = role_identities.get(recipe, (uid,))[0]
+    assert f'"User":"{expected_config_user}"' in metadata.stdout
+    if recipe in role_identities:
+        user, expected_uid, expected_gid, expected_groups = role_identities[recipe]
+        assert f'"User":"{user}"' in metadata.stdout
+        identity = run_docker(
+            "run", "--rm", "--entrypoint", "python", tag, "-c",
+            "import os; assert os.getuid() == %d; assert os.getgid() == %d; assert set(os.getgroups()) == %r"
+            % (expected_uid, expected_gid, expected_groups),
+            timeout=20,
+        )
+        assert identity.returncode == 0, identity.stdout[-2000:] + identity.stderr[-2000:]
     with tempfile.TemporaryDirectory() as directory:
         archive=Path(directory)/"image.tar"
         saved=run_docker("save","-o",docker_path(archive),tag,timeout=60)

@@ -42,6 +42,13 @@ _RUN_DIR = Path("/run/restricted-inference")
 _CONVERSATION_SOCKET = _RUN_DIR / "conversation.sock"
 _GATEWAY_SOCKET = _RUN_DIR / "gateway.sock"
 _BROKER_SOCKET = _RUN_DIR / "broker.sock"
+_SOCKET_DIR_GID = 20000
+_CONVERSATION_GID = 20001
+_GATEWAY_GID = 20002
+_BROKER_GID = 20003
+_CONVERSATION_UID = 10006
+_GATEWAY_UID = 10005
+_BROKER_UID = 10003
 
 
 def _policy() -> PolicyBundle:
@@ -80,18 +87,35 @@ class _Keys:
     def unwrap(self, key: bytes) -> bytes: return key
 
 
-def _start_uds(app, path: Path, *, server_header: bool = False, date_header: bool = False):
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _remove_test_socket(path: Path) -> None:
+    """Remove only an exact, runtime-owned socket path."""
     try:
         existing = path.lstat()
-        if stat.S_ISSOCK(existing.st_mode) and existing.st_uid == os.geteuid():
-            path.unlink()
-        else:
-            raise RuntimeError(f"unsafe test socket path: {path}")
     except FileNotFoundError:
-        pass
+        return
+    if not stat.S_ISSOCK(existing.st_mode):
+        raise RuntimeError(f"unsafe test socket path: {path}")
+    allowed_owners = {os.geteuid(), _BROKER_UID, _GATEWAY_UID, _CONVERSATION_UID}
+    if existing.st_uid not in allowed_owners:
+        raise RuntimeError(f"unsafe test socket owner: {path}")
+    path.unlink()
+
+
+def _start_uds(
+    app,
+    path: Path,
+    *,
+    owner_uid: int | None = None,
+    socket_gid: int | None = None,
+    server_header: bool = False,
+    date_header: bool = False,
+):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _remove_test_socket(path)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(path))
+    if owner_uid is not None and socket_gid is not None:
+        os.chown(path, owner_uid, socket_gid)
     os.chmod(path, 0o660)
     config = uvicorn.Config(app, fd=sock.fileno(), lifespan="off", log_level="error", access_log=False, server_header=server_header, date_header=date_header)
     server = uvicorn.Server(config)
@@ -108,36 +132,76 @@ def _stop_uds(server, thread, sock, path: Path):
     server.should_exit = True
     thread.join(5)
     sock.close()
-    path.unlink(missing_ok=True)
+    _remove_test_socket(path)
     assert not thread.is_alive()
 
 
-def _assert_unrelated_uid_denied(path: Path) -> None:
-    if os.geteuid() != 0:
-        pytest.skip("unrelated-UID UDS ACL proof requires a root POSIX test runner")
+def _connect_as(path: Path, uid: int, gid: int, supplementary_groups: tuple[int, ...]) -> bool:
     probe = subprocess.run(
-        [sys.executable, "-c", "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/restricted-inference/conversation.sock')"],
-        user=65534,
-        group=65534,
-        extra_groups=[],
+        [
+            sys.executable,
+            "-c",
+            "import socket, sys; s=socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect(sys.argv[1])",
+            str(path),
+        ],
+        user=uid,
+        group=gid,
+        extra_groups=list(supplementary_groups),
         capture_output=True,
         text=True,
+        timeout=5,
     )
-    assert probe.returncode != 0
-    assert not path.exists() or stat.S_IMODE(path.stat().st_mode) == 0o660
+    return probe.returncode == 0
+
+
+def _assert_acl_matrix() -> None:
+    if os.geteuid() != 0:
+        pytest.skip("UDS ACL matrix requires a root POSIX test runner")
+    paths = {
+        "conversation": (_CONVERSATION_SOCKET, _CONVERSATION_GID),
+        "gateway": (_GATEWAY_SOCKET, _GATEWAY_GID),
+        "broker": (_BROKER_SOCKET, _BROKER_GID),
+    }
+    for path, expected_gid in paths.values():
+        metadata = path.stat()
+        assert stat.S_IMODE(metadata.st_mode) == 0o660
+        assert metadata.st_gid == expected_gid
+
+    # Image identities: conversation -> gateway and gateway -> broker.
+    assert _connect_as(_GATEWAY_SOCKET, _CONVERSATION_UID, _CONVERSATION_GID, (_SOCKET_DIR_GID, _GATEWAY_GID))
+    assert _connect_as(_BROKER_SOCKET, _GATEWAY_UID, _GATEWAY_GID, (_SOCKET_DIR_GID, _BROKER_GID))
+    # An external conversation role reaches only the conversation endpoint.
+    assert _connect_as(_CONVERSATION_SOCKET, 10007, _CONVERSATION_GID, (_SOCKET_DIR_GID,))
+    assert not _connect_as(_GATEWAY_SOCKET, 10007, _CONVERSATION_GID, (_SOCKET_DIR_GID,))
+    assert not _connect_as(_BROKER_SOCKET, 10007, _CONVERSATION_GID, (_SOCKET_DIR_GID,))
+    # An unrelated role has traversal but no socket-group membership.
+    for path, _ in paths.values():
+        assert not _connect_as(path, 10008, 20004, (_SOCKET_DIR_GID,))
 
 
 @pytest.fixture(autouse=True)
 def isolated_database():
-    with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
-        conn.execute("DROP SCHEMA IF EXISTS restricted_content CASCADE; DROP SCHEMA IF EXISTS inference_ledger CASCADE")
-        conn.execute(Path("migrations/001_restricted_runtime.sql").read_text(encoding="utf-8"))
-        conn.execute("UPDATE inference_ledger.runtime_controls SET dispatch_enabled=true WHERE control_key=true")
-    for path in (_CONVERSATION_SOCKET, _GATEWAY_SOCKET, _BROKER_SOCKET):
-        path.unlink(missing_ok=True)
-    yield
-    for path in (_CONVERSATION_SOCKET, _GATEWAY_SOCKET, _BROKER_SOCKET):
-        path.unlink(missing_ok=True)
+    if os.geteuid() != 0:
+        pytest.skip("three-socket ACL proof requires a root POSIX test runner")
+    _RUN_DIR.mkdir(parents=True, exist_ok=True)
+    directory_metadata = _RUN_DIR.stat()
+    if not stat.S_ISDIR(directory_metadata.st_mode):
+        raise RuntimeError(f"unsafe socket directory: {_RUN_DIR}")
+    os.chown(_RUN_DIR, 0, _SOCKET_DIR_GID)
+    os.chmod(_RUN_DIR, 0o1770)
+    try:
+        with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+            conn.execute("DROP SCHEMA IF EXISTS restricted_content CASCADE; DROP SCHEMA IF EXISTS inference_ledger CASCADE")
+            conn.execute(Path("migrations/001_restricted_runtime.sql").read_text(encoding="utf-8"))
+            conn.execute("UPDATE inference_ledger.runtime_controls SET dispatch_enabled=true WHERE control_key=true")
+        for path in (_CONVERSATION_SOCKET, _GATEWAY_SOCKET, _BROKER_SOCKET):
+            _remove_test_socket(path)
+        yield
+    finally:
+        for path in (_CONVERSATION_SOCKET, _GATEWAY_SOCKET, _BROKER_SOCKET):
+            _remove_test_socket(path)
+        os.chown(_RUN_DIR, directory_metadata.st_uid, directory_metadata.st_gid)
+        os.chmod(_RUN_DIR, stat.S_IMODE(directory_metadata.st_mode))
 
 
 def test_real_three_socket_composition_commits_and_reads_back_once():
@@ -157,14 +221,19 @@ def test_real_three_socket_composition_commits_and_reads_back_once():
             "request_id": "broker-request-1",
         }
 
-    broker_server, broker_thread, broker_sock = _start_uds(broker, _BROKER_SOCKET)
+    broker_server, broker_thread, broker_sock = _start_uds(
+        broker, _BROKER_SOCKET, owner_uid=_BROKER_UID, socket_gid=_BROKER_GID
+    )
     gateway_server = gateway_thread = gateway_sock = None
     conversation_server = conversation_thread = conversation_sock = None
     try:
         provider = LocalUdsClient(policy)
         gateway = Gateway(policy, LocalHmacKey("gateway", "v1", b"g" * 32), PostgresLedger(DATABASE_URL, policy), provider)
         gateway_server, gateway_thread, gateway_sock = _start_uds(
-            gateway_app(gateway, LocalSocketAuthenticator("gateway")), _GATEWAY_SOCKET
+            gateway_app(gateway, LocalSocketAuthenticator("gateway")),
+            _GATEWAY_SOCKET,
+            owner_uid=_GATEWAY_UID,
+            socket_gid=_GATEWAY_GID,
         )
         service = ConversationService(
             PostgresContentStore(DATABASE_URL),
@@ -175,7 +244,10 @@ def test_real_three_socket_composition_commits_and_reads_back_once():
             "tenant",
         )
         conversation_server, conversation_thread, conversation_sock = _start_uds(
-            conversation_app(service, LocalSocketAuthenticator("runner")), _CONVERSATION_SOCKET
+            conversation_app(service, LocalSocketAuthenticator("runner")),
+            _CONVERSATION_SOCKET,
+            owner_uid=_CONVERSATION_UID,
+            socket_gid=_CONVERSATION_GID,
         )
         transport = httpx.HTTPTransport(uds=str(_CONVERSATION_SOCKET), retries=0)
         with httpx.Client(transport=transport, base_url="http://localhost", timeout=10, trust_env=False) as operator:
@@ -198,7 +270,7 @@ def test_real_three_socket_composition_commits_and_reads_back_once():
             row = conn.execute("SELECT state, response_ciphertext, gateway_decision_id FROM restricted_content.turns").fetchone()
             assert row[0] == "COMMITTED" and row[1] and row[2] is not None
             assert b"synthetic" not in bytes(row[1])
-        _assert_unrelated_uid_denied(_CONVERSATION_SOCKET)
+        _assert_acl_matrix()
     finally:
         if conversation_server is not None:
             _stop_uds(conversation_server, conversation_thread, conversation_sock, _CONVERSATION_SOCKET)
