@@ -17,7 +17,7 @@ from .contracts import ContractError, jcs_bytes, load_closed_json
 from .policy import LOCAL_POLICY_SCHEMA, PolicyBundle
 
 
-_FIELDS = {"schema_version", "policy_epoch", "policy_digest", "tenant_id", "provider", "model_sha256", "permitted_use_id", "issued_at", "expires_at"}
+_FIELDS = {"schema_version", "policy_epoch", "policy_digest", "tenant_id", "provider", "model_sha256", "gateway_keyset_sha256", "conversation_keyset_sha256", "permitted_use_id", "issued_at", "expires_at"}
 
 
 @dataclass(frozen=True)
@@ -39,7 +39,7 @@ def _instant(value: object) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def load_operator_authorization(values: Any, signature_b64: str, public_key_b64: str, policy: PolicyBundle, *, now: datetime | None = None) -> OperatorAuthorization:
+def load_operator_authorization(values: Any, signature_b64: str, public_key_b64: str, policy: PolicyBundle, *, now: datetime | None = None, gateway_keyset_sha256: str | None = None, conversation_keyset_sha256: str | None = None) -> OperatorAuthorization:
     policy.validate()
     if policy.values["schema_version"] != LOCAL_POLICY_SCHEMA:
         raise ContractError("operator authorization is local-profile only")
@@ -60,6 +60,8 @@ def load_operator_authorization(values: Any, signature_b64: str, public_key_b64:
     }
     if any(values.get(key) != value for key, value in bindings.items()):
         raise ContractError("operator authorization binding mismatch")
+    for key, expected in (("gateway_keyset_sha256", gateway_keyset_sha256), ("conversation_keyset_sha256", conversation_keyset_sha256)):
+        if not isinstance(values.get(key),str) or len(values[key]) != 64 or any(c not in "0123456789abcdef" for c in values[key]) or (expected is not None and values[key] != expected): raise ContractError("operator authorization keyset binding mismatch")
     if not isinstance(values["permitted_use_id"], str) or not values["permitted_use_id"]:
         raise ContractError("operator authorization permitted use is required")
     issued_at, expires_at = _instant(values["issued_at"]), _instant(values["expires_at"])
@@ -84,14 +86,16 @@ class OperatorAuthorizationGate:
     signature_path: Path
     public_key_b64: str
     policy: PolicyBundle
+    gateway_keyset_sha256: str | None = None
+    conversation_keyset_sha256: str | None = None
     clock: callable = lambda: datetime.now(UTC)
     def __call__(self) -> None:
-        load_operator_authorization_files_at(self.path, self.signature_path, self.public_key_b64, self.policy, self.clock())
+        load_operator_authorization_files_at(self.path, self.signature_path, self.public_key_b64, self.policy, self.clock(), self.gateway_keyset_sha256, self.conversation_keyset_sha256)
 
 
-def load_operator_authorization_files_at(path: Path, signature_path: Path, public_key_b64: str, policy: PolicyBundle, now: datetime) -> OperatorAuthorization:
+def load_operator_authorization_files_at(path: Path, signature_path: Path, public_key_b64: str, policy: PolicyBundle, now: datetime, gateway_keyset_sha256: str | None = None, conversation_keyset_sha256: str | None = None) -> OperatorAuthorization:
     try:
         values = load_closed_json(path.read_bytes()); signature = signature_path.read_text(encoding="ascii")
     except Exception as exc:
         raise ContractError("operator authorization artifact is unavailable") from exc
-    return load_operator_authorization(values, signature, public_key_b64, policy, now=now)
+    return load_operator_authorization(values, signature, public_key_b64, policy, now=now, gateway_keyset_sha256=gateway_keyset_sha256, conversation_keyset_sha256=conversation_keyset_sha256)

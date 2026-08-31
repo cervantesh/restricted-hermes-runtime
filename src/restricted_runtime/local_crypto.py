@@ -23,10 +23,11 @@ class LocalKeyRef:
     key_resource: str
     key_version: str
     path: str
+    key_sha256: str
 
     def __post_init__(self) -> None:
         value = PurePosixPath(self.path)
-        if not self.key_resource or not self.key_version or str(value) != self.path or not value.is_absolute() or value.parent != _ROOT:
+        if not self.key_resource or not self.key_version or str(value) != self.path or not value.is_absolute() or value.parent != _ROOT or len(self.key_sha256) != 64 or any(c not in "0123456789abcdef" for c in self.key_sha256):
             raise ContractError("local key reference is outside the closed key directory")
 
 
@@ -47,6 +48,7 @@ def _read(ref: LocalKeyRef) -> bytes:
             data = os.read(descriptor, 33)
             if len(data) != 32 or os.read(descriptor, 1):
                 raise ContractError("local key must be exactly 32 bytes")
+            if hashlib.sha256(data).hexdigest() != ref.key_sha256: raise ContractError("local key fingerprint rejected")
             return data
         finally:
             os.close(descriptor)
@@ -63,10 +65,14 @@ def _refs(active: LocalKeyRef, retired: tuple[LocalKeyRef, ...]) -> dict[tuple[s
         raise ContractError("duplicate local key identifier")
     return indexed
 
+def keyset_digest(purpose: str, refs: tuple[LocalKeyRef, ...]) -> str:
+    if purpose not in {"gateway", "conversation"}: raise ContractError("local keyset purpose rejected")
+    return hashlib.sha256(jcs_bytes({"purpose":purpose,"keys":[{"key_resource":r.key_resource,"key_version":r.key_version,"key_sha256":r.key_sha256} for r in sorted(refs,key=lambda r:(r.key_resource,r.key_version))]})).hexdigest()
+
 
 def load_retired_key_refs(path: str) -> tuple[LocalKeyRef, ...]:
     """Read only key metadata from a protected local file; never key bytes."""
-    metadata = LocalKeyRef("retired-manifest", "v1", path)
+    metadata = LocalKeyRef("retired-manifest", "v1", path, "0" * 64)
     try:
         target = Path(metadata.path); before = target.lstat()
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode) or before.st_uid not in {0, os.geteuid()} or before.st_mode & 0o077:
@@ -80,7 +86,7 @@ def load_retired_key_refs(path: str) -> tuple[LocalKeyRef, ...]:
         if len(raw) > 8192: raise ValueError
         value = load_closed_json(raw)
         if not isinstance(value, list): raise ValueError
-        refs = tuple(LocalKeyRef(item["key_resource"], item["key_version"], item["path"]) for item in value if isinstance(item, dict) and set(item) == {"key_resource", "key_version", "path"})
+        refs = tuple(LocalKeyRef(item["key_resource"], item["key_version"], item["path"], item["key_sha256"]) for item in value if isinstance(item, dict) and set(item) == {"key_resource", "key_version", "path", "key_sha256"})
         if len(refs) != len(value): raise ValueError
         return refs
     except Exception as exc:
@@ -91,37 +97,36 @@ class LocalFileHmacKey:
     def __init__(self, active: LocalKeyRef, retired: tuple[LocalKeyRef, ...] = ()):
         self.active, self._refs = active, _refs(active, retired)
         self.key_resource, self.key_version = active.key_resource, active.key_version
-        _read(active)
-        for ref in retired: _read(ref)
+        self._material = {key: _read(ref) for key, ref in self._refs.items()}
     def sign(self, data: bytes) -> MacRecord:
-        return MacRecord(self.key_resource, self.key_version, hmac.digest(_read(self.active), data, "sha256"))
+        return MacRecord(self.key_resource, self.key_version, hmac.digest(self._material[(self.key_resource,self.key_version)], data, "sha256"))
     def verify(self, record: MacRecord, data: bytes) -> bool:
         ref = self._refs.get((record.key_resource, record.key_version))
-        return bool(ref) and hmac.compare_digest(record.mac, hmac.digest(_read(ref), data, "sha256"))
+        return bool(ref) and hmac.compare_digest(record.mac, hmac.digest(self._material[(record.key_resource,record.key_version)], data, "sha256"))
 
 
 class LocalAesDataKeyWrapper:
     def __init__(self, active: LocalKeyRef, retired: tuple[LocalKeyRef, ...] = ()):
-        self.active, self._refs = active, _refs(active, retired)
-        _read(active)
-        for ref in retired: _read(ref)
+        self.active, self._refs = active, _refs(active, retired); self._material = {key: _read(ref) for key, ref in self._refs.items()}
     @staticmethod
     def _aad(ref: LocalKeyRef) -> bytes:
         return jcs_bytes({"schema_version": _ENVELOPE, "key_resource": ref.key_resource, "key_version": ref.key_version})
     def wrap(self, data_key: bytes) -> bytes:
         if len(data_key) != 32: raise ContractError("local data key must be 32 bytes")
         nonce = os.urandom(12); ref = self.active
-        cipher = AESGCM(_read(ref)).encrypt(nonce, data_key, self._aad(ref))
+        cipher = AESGCM(self._material[(ref.key_resource,ref.key_version)]).encrypt(nonce, data_key, self._aad(ref))
         return jcs_bytes({"schema_version":_ENVELOPE,"key_resource":ref.key_resource,"key_version":ref.key_version,"nonce":base64.b64encode(nonce).decode("ascii"),"ciphertext":base64.b64encode(cipher).decode("ascii")})
     def unwrap(self, wrapped: bytes) -> bytes:
         try:
+            if not isinstance(wrapped, bytes) or len(wrapped) > 4096: raise ValueError
             value = load_closed_json(wrapped)
             if not isinstance(value, dict) or set(value) != {"schema_version","key_resource","key_version","nonce","ciphertext"} or value["schema_version"] != _ENVELOPE:
                 raise ValueError
+            if not all(isinstance(value[k],str) and 0 < len(value[k]) <= 256 for k in ("key_resource","key_version","nonce","ciphertext")): raise ValueError
             ref = self._refs[(value["key_resource"], value["key_version"])]
             nonce = base64.b64decode(value["nonce"], validate=True); cipher = base64.b64decode(value["ciphertext"], validate=True)
             if len(nonce) != 12: raise ValueError
-            plain = AESGCM(_read(ref)).decrypt(nonce, cipher, self._aad(ref))
+            plain = AESGCM(self._material[(ref.key_resource,ref.key_version)]).decrypt(nonce, cipher, self._aad(ref))
             if len(plain) != 32: raise ValueError
             return plain
         except Exception as exc:

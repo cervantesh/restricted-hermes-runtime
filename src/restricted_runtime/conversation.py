@@ -5,7 +5,7 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .contracts import ContractError, ProviderResult, TurnRequest, TurnState, content_aad, jcs_bytes
 from .crypto import Ciphertext, MacKey, MacRecord, SERVICE_MAC_DOMAIN, decrypt, encrypt, kms_mac_input
@@ -48,6 +48,7 @@ class ConversationService:
     tenant_id: str
     lease_heartbeat_seconds: float = 20
     admission_enabled: bool = True
+    authorization_gate: Callable[[], None] | None = None
 
     def _aad(self, row: TurnRow, direction: str) -> bytes:
         return content_aad(tenant_id=row.tenant_id, conversation_id=row.conversation_id, conversation_epoch=row.conversation_epoch, turn_id=row.turn_id, client_request_id=row.client_request_id, direction=direction, policy_digest=row.policy_digest)
@@ -79,6 +80,8 @@ class ConversationService:
     def submit(self, request: TurnRequest, *, principal: str, conversation_id: str) -> dict[str, str]:
         if not self.admission_enabled:
             raise ContractError("restricted admission is disabled")
+        if self.authorization_gate is not None:
+            self.authorization_gate()
         canonical = jcs_bytes(request.identity(principal=principal, tenant_id=self.tenant_id, conversation_id=conversation_id))
         if len(canonical) > self.policy.values["max_canonical_input_utf8_bytes"]:
             raise ContractError("canonical input exceeds policy")

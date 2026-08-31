@@ -1,5 +1,6 @@
 """POSIX-only local key-file rotation and tamper matrix."""
 import os
+import hashlib
 from pathlib import Path
 import pytest
 
@@ -11,7 +12,7 @@ pytestmark = pytest.mark.skipif(os.name != "posix", reason="requires POSIX prote
 
 def _key(path: str, resource: str, version: str) -> LocalKeyRef:
     target = Path(path); target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(bytes(range(32))); target.chmod(0o600)
-    return LocalKeyRef(resource, version, path)
+    return LocalKeyRef(resource, version, path, hashlib.sha256(bytes(range(32))).hexdigest())
 
 
 def test_local_keys_rotate_verify_unwrap_and_reject_tamper_or_duplicates():
@@ -25,8 +26,8 @@ def test_local_keys_rotate_verify_unwrap_and_reject_tamper_or_duplicates():
         with pytest.raises(ContractError): wrapper.unwrap(wrapped[:-1] + b"x")
         with pytest.raises(ContractError): LocalFileHmacKey(active, (active,))
         (root / "bad.bin").write_bytes(b"x"); (root / "bad.bin").chmod(0o600)
-        with pytest.raises(ContractError): LocalFileHmacKey(LocalKeyRef("bad", "v1", str(root / "bad.bin")))
+        with pytest.raises(ContractError): LocalFileHmacKey(LocalKeyRef("bad", "v1", str(root / "bad.bin"), "0" * 64))
         (root / "link.bin").symlink_to(root / "active.bin")
-        with pytest.raises(ContractError): LocalFileHmacKey(LocalKeyRef("link", "v1", str(root / "link.bin")))
+        with pytest.raises(ContractError): LocalFileHmacKey(LocalKeyRef("link", "v1", str(root / "link.bin"), hashlib.sha256(bytes(range(32))).hexdigest()))
     finally:
         for item in root.glob("*.bin"): item.unlink(missing_ok=True)

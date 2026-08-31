@@ -4,10 +4,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from ..auth import production_authenticator
+from ..auth import LocalSocketAuthenticator
 from ..gateway import Gateway
 from ..local_uds import LocalUdsClient
-from ..local_crypto import LocalFileHmacKey, LocalKeyRef, load_retired_key_refs
+from ..local_crypto import LocalFileHmacKey, LocalKeyRef, keyset_digest, load_retired_key_refs
 from ..operator_authorization import OperatorAuthorizationGate
 from ..policy import LOCAL_POLICY_SCHEMA, load_signed_policy
 from ..policy_binding import require_policy_pair
@@ -23,7 +23,7 @@ def required(name: str) -> str:
 
 
 def local_ref(prefix: str) -> LocalKeyRef:
-    return LocalKeyRef(required(prefix + "_RESOURCE"), required(prefix + "_VERSION"), required(prefix + "_PATH"))
+    return LocalKeyRef(required(prefix + "_RESOURCE"), required(prefix + "_VERSION"), required(prefix + "_PATH"), required(prefix + "_SHA256"))
 
 
 def build_app():
@@ -33,14 +33,15 @@ def build_app():
     if policy.values["schema_version"] != LOCAL_POLICY_SCHEMA:
         raise RuntimeError("local production root requires local-uds policy")
     require_policy_pair(policy, epoch=required("RESTRICTED_POLICY_EPOCH"), digest=required("RESTRICTED_POLICY_DIGEST"))
-    authorization = OperatorAuthorizationGate(Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_PATH")), Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_PATH")), required("RESTRICTED_OPERATOR_AUTHORIZATION_PUBLIC_KEY_B64"), policy)
+    active = local_ref("RESTRICTED_LOCAL_GATEWAY_MAC_KEY"); retired = load_retired_key_refs(required("RESTRICTED_LOCAL_GATEWAY_RETIRED_MAC_KEYS_PATH"))
+    authorization = OperatorAuthorizationGate(Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_PATH")), Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_PATH")), required("RESTRICTED_OPERATOR_AUTHORIZATION_PUBLIC_KEY_B64"), policy, gateway_keyset_sha256=keyset_digest("gateway",(active,*retired)), conversation_keyset_sha256=required("RESTRICTED_LOCAL_CONVERSATION_KEYSET_SHA256"))
     authorization()
     admission = required("RESTRICTED_ADMISSION_ENABLED")
     if admission not in {"true", "false"}:
         raise RuntimeError("RESTRICTED_ADMISSION_ENABLED must be true or false")
-    key = LocalFileHmacKey(local_ref("RESTRICTED_LOCAL_GATEWAY_MAC_KEY"), load_retired_key_refs(required("RESTRICTED_LOCAL_GATEWAY_RETIRED_MAC_KEYS_PATH")))
+    key = LocalFileHmacKey(active, retired)
     gateway = Gateway(policy, key, PostgresLedger(required("DATABASE_URL"), policy, key), LocalUdsClient(policy), admission_enabled=admission == "true", authorization_gate=authorization)
-    return create_app(gateway, production_authenticator(audience=required("RESTRICTED_GATEWAY_AUDIENCE"), caller_principal=policy.values["gateway_invoker_principal"]))
+    return create_app(gateway, LocalSocketAuthenticator(policy.values["gateway_invoker_principal"]))
 
 
 app = build_app()
