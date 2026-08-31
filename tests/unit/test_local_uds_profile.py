@@ -106,6 +106,125 @@ def test_operator_authorization_binds_policy_and_expiry():
         load_operator_authorization(authorization, base64.b64encode(private.sign(jcs_bytes(authorization))).decode("ascii"), public, policy, now=now)
 
 
+def test_local_keyset_digests_bind_purpose_and_active_retired_roles():
+    from restricted_runtime.local_crypto import LocalKeyRef, conversation_keyset_digest, keyset_digest
+
+    service_active = LocalKeyRef("service-mac", "v2", "/run/restricted-keys/service-v2", "a" * 64)
+    service_retired = LocalKeyRef("service-mac", "v1", "/run/restricted-keys/service-v1", "b" * 64)
+    content_active = LocalKeyRef("content-wrap", "v2", "/run/restricted-keys/content-v2", "c" * 64)
+    content_retired = LocalKeyRef("content-wrap", "v1", "/run/restricted-keys/content-v1", "d" * 64)
+
+    service_digest = keyset_digest("service-mac", service_active, (service_retired,))
+    assert service_digest != keyset_digest("service-mac", service_retired, (service_active,))
+    assert service_digest != keyset_digest("content-wrap", service_active, (service_retired,))
+
+    content_digest = keyset_digest("content-wrap", content_active, (content_retired,))
+    digest = conversation_keyset_digest(service_digest, content_digest)
+    assert len(digest) == 64 and all(char in "0123456789abcdef" for char in digest)
+    assert digest != conversation_keyset_digest(content_digest, service_digest)
+
+
+def test_produced_local_conversation_digest_is_accepted_by_operator_authorization():
+    from restricted_runtime.local_crypto import LocalKeyRef, conversation_keyset_digest, keyset_digest
+    from restricted_runtime.operator_authorization import load_operator_authorization
+
+    values = local_values()
+    policy = PolicyBundle(values, hashlib.sha256(jcs_bytes(values)).hexdigest())
+    policy.validate()
+    service_active = LocalKeyRef("service-mac", "v2", "/run/restricted-keys/service-v2", "a" * 64)
+    content_active = LocalKeyRef("content-wrap", "v2", "/run/restricted-keys/content-v2", "b" * 64)
+    conversation_digest = conversation_keyset_digest(
+        keyset_digest("service-mac", service_active),
+        keyset_digest("content-wrap", content_active),
+    )
+    now = datetime.now(UTC)
+    authorization = {
+        "schema_version": "restricted-operator-authorization.v1",
+        "policy_epoch": policy.epoch,
+        "policy_digest": policy.digest,
+        "tenant_id": "tenant",
+        "provider": "local-uds",
+        "model_sha256": "a" * 64,
+        "gateway_keyset_sha256": "c" * 64,
+        "conversation_keyset_sha256": conversation_digest,
+        "permitted_use_id": "approved-synthetic-probe",
+        "issued_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+        "expires_at": (now + timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+    }
+    private = Ed25519PrivateKey.generate()
+    loaded = load_operator_authorization(
+        authorization,
+        base64.b64encode(private.sign(jcs_bytes(authorization))).decode("ascii"),
+        base64.b64encode(private.public_key().public_bytes_raw()).decode("ascii"),
+        policy,
+        now=now,
+        conversation_keyset_sha256=conversation_digest,
+    )
+    assert loaded.permitted_use_id == "approved-synthetic-probe"
+
+
+@pytest.mark.parametrize("reason", ["operator authorization is not currently valid", "operator authorization artifact is unavailable"])
+def test_local_api_rejects_missing_or_expired_authority_before_create_or_reset_mutation(reason):
+    from fastapi.testclient import TestClient
+    from restricted_runtime.auth import SyntheticAuthenticator
+    from restricted_runtime.services.restricted_api import create_app
+
+    class Store:
+        create_calls = 0
+        reset_calls = 0
+
+        def create_conversation(self, *_args):
+            self.create_calls += 1
+            raise AssertionError("conversation creation must be gated")
+
+        def reset(self, *_args):
+            self.reset_calls += 1
+            raise AssertionError("conversation reset must be gated")
+
+    class Runtime:
+        tenant_id = "tenant"
+
+        def __init__(self):
+            self.store = Store()
+            self.authorization_gate = lambda: (_ for _ in ()).throw(ContractError(reason))
+
+    runtime = Runtime()
+    client = TestClient(create_app(runtime, SyntheticAuthenticator("caller")))
+    created = client.post("/v1/restricted/conversations/conversation", headers={"Authorization": "Synthetic test credential"})
+    reset = client.post(
+        "/v1/restricted/conversations/conversation/reset",
+        headers={"Authorization": "Synthetic test credential"},
+        json={"conversation_epoch": "epoch"},
+    )
+    assert created.status_code == reset.status_code == 400
+    assert runtime.store.create_calls == runtime.store.reset_calls == 0
+
+
+def test_reconciliation_rejects_expired_authority_before_claim_or_gateway_call():
+    from restricted_runtime.reconciliation_driver import ReconciliationDriver
+
+    class Store:
+        expired_calls = 0
+
+        def expired_turns(self, _limit):
+            self.expired_calls += 1
+            raise AssertionError("reconciliation must be gated")
+
+    class Reconciler:
+        calls = 0
+
+    store, reconciler = Store(), Reconciler()
+    driver = ReconciliationDriver(
+        store,
+        reconciler,
+        "local-conversation-reconciler",
+        authorization_gate=lambda: (_ for _ in ()).throw(ContractError("operator authorization is not currently valid")),
+    )
+    with pytest.raises(ContractError, match="operator authorization"):
+        driver.run_once()
+    assert store.expired_calls == 0 and reconciler.calls == 0
+
+
 def test_local_response_parser_is_closed_and_never_surfaces_mismatched_text():
     from restricted_runtime.local_uds import parse_local_response
 

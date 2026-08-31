@@ -12,6 +12,7 @@ def create_app(runtime: ConversationService, authenticator: Authenticator, gatew
         try:
             if await request.body():raise ContractError("conversation creation has no caller body")
             authenticator.authenticate(request.headers.get("authorization"))
+            if runtime.authorization_gate is not None: runtime.authorization_gate()
             epoch=runtime.store.create_conversation(runtime.tenant_id,conversation_id)
             return {"schema_version":"restricted-conversation.v1","conversation_id":conversation_id,"conversation_epoch":epoch}
         except ContractError as exc:raise HTTPException(400,"restricted conversation rejected") from exc
@@ -28,6 +29,7 @@ def create_app(runtime: ConversationService, authenticator: Authenticator, gatew
             principal=authenticator.authenticate(request.headers.get("authorization")); body=load_closed_json(await request.body())
             if set(body)!={"conversation_epoch"} or not isinstance(body["conversation_epoch"],str):raise ContractError("closed reset schema")
             if not principal:raise ContractError("unauthorized")
+            if runtime.authorization_gate is not None: runtime.authorization_gate()
             epoch=runtime.store.reset(runtime.tenant_id,conversation_id,body["conversation_epoch"])
             return {"schema_version":"restricted-conversation-reset.v1","conversation_epoch":epoch}
         except ContractError as exc: raise HTTPException(409 if str(exc)=="ACTIVE_TURN" else 400,"restricted reset rejected") from exc

@@ -65,9 +65,37 @@ def _refs(active: LocalKeyRef, retired: tuple[LocalKeyRef, ...]) -> dict[tuple[s
         raise ContractError("duplicate local key identifier")
     return indexed
 
-def keyset_digest(purpose: str, refs: tuple[LocalKeyRef, ...]) -> str:
-    if purpose not in {"gateway-mac", "service-mac", "content-wrap"}: raise ContractError("local keyset purpose rejected")
-    return hashlib.sha256(jcs_bytes({"purpose":purpose,"keys":[{"key_resource":r.key_resource,"key_version":r.key_version,"key_sha256":r.key_sha256} for r in sorted(refs,key=lambda r:(r.key_resource,r.key_version))]})).hexdigest()
+def _keyset_entry(ref: LocalKeyRef) -> dict[str, str]:
+    return {"key_resource": ref.key_resource, "key_version": ref.key_version, "key_sha256": ref.key_sha256}
+
+
+def keyset_digest(purpose: str, active: LocalKeyRef, retired: tuple[LocalKeyRef, ...] = ()) -> str:
+    """Digest a keyset while preserving its purpose and active-key role."""
+    if purpose not in {"gateway-mac", "service-mac", "content-wrap"}:
+        raise ContractError("local keyset purpose rejected")
+    refs = (active, *retired)
+    identifiers = {(ref.key_resource, ref.key_version) for ref in refs}
+    if len(identifiers) != len(refs):
+        raise ContractError("duplicate local key identifier")
+    value = {
+        "purpose": purpose,
+        "active": _keyset_entry(active),
+        "retired": [_keyset_entry(ref) for ref in sorted(retired, key=lambda ref: (ref.key_resource, ref.key_version))],
+    }
+    return hashlib.sha256(jcs_bytes(value)).hexdigest()
+
+
+def conversation_keyset_digest(service_mac_digest: str, content_wrap_digest: str) -> str:
+    """Aggregate the distinct conversation keyset purposes into one binding."""
+    digests = (service_mac_digest, content_wrap_digest)
+    if any(not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value) for value in digests):
+        raise ContractError("conversation keyset digest rejected")
+    value = {
+        "schema_version": "restricted-conversation-keyset.v1",
+        "service_mac_sha256": service_mac_digest,
+        "content_wrap_sha256": content_wrap_digest,
+    }
+    return hashlib.sha256(jcs_bytes(value)).hexdigest()
 
 
 def load_retired_key_refs(path: str) -> tuple[LocalKeyRef, ...]:

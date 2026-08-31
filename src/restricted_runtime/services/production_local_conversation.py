@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from ..auth import LocalSocketAuthenticator
 from ..conversation import ConversationService
-from ..local_crypto import LocalAesDataKeyWrapper, LocalFileHmacKey, LocalKeyRef, keyset_digest, load_retired_key_refs
+from ..local_crypto import LocalAesDataKeyWrapper, LocalFileHmacKey, LocalKeyRef, conversation_keyset_digest, keyset_digest, load_retired_key_refs
 from ..local_gateway_client import LocalGatewayClient
 from ..operator_authorization import OperatorAuthorizationGate
 from ..policy import LOCAL_POLICY_SCHEMA, load_signed_policy
@@ -28,13 +28,15 @@ def build_app():
     require_policy_pair(policy,epoch=required("RESTRICTED_POLICY_EPOCH"),digest=required("RESTRICTED_POLICY_DIGEST"))
     service_ref, service_old = ref("RESTRICTED_LOCAL_SERVICE_MAC_KEY"), retired("RESTRICTED_LOCAL_SERVICE_MAC_KEY")
     wrap_ref, wrap_old = ref("RESTRICTED_LOCAL_CONTENT_WRAP_KEY"), retired("RESTRICTED_LOCAL_CONTENT_WRAP_KEY")
-    conversation_digest=keyset_digest("service-mac",(service_ref,*service_old))+":"+keyset_digest("content-wrap",(wrap_ref,*wrap_old))
+    conversation_digest=conversation_keyset_digest(keyset_digest("service-mac",service_ref,service_old),keyset_digest("content-wrap",wrap_ref,wrap_old))
     authority=OperatorAuthorizationGate(Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_PATH")),Path(required("RESTRICTED_OPERATOR_AUTHORIZATION_SIGNATURE_PATH")),required("RESTRICTED_OPERATOR_AUTHORIZATION_PUBLIC_KEY_B64"),policy,gateway_keyset_sha256=required("RESTRICTED_LOCAL_GATEWAY_KEYSET_SHA256"),conversation_keyset_sha256=conversation_digest); authority()
     admission=required("RESTRICTED_ADMISSION_ENABLED")
     if admission not in {"true","false"}: raise RuntimeError("RESTRICTED_ADMISSION_ENABLED must be true or false")
     service=LocalFileHmacKey(service_ref,service_old); wrapper=LocalAesDataKeyWrapper(wrap_ref,wrap_old)
     store=PostgresContentStore(required("DATABASE_URL")); client=LocalGatewayClient("/run/restricted-inference/gateway.sock")
     runtime=ConversationService(store,client,service,wrapper,policy,required("RESTRICTED_TENANT_ID"),admission_enabled=admission=="true",authorization_gate=authority)
-    driver=ReconciliationDriver(store,Reconciler(store,client),"local-conversation-reconciler",policy.epoch)
-    return create_app(runtime,LocalSocketAuthenticator(policy.values["external_runner_principal"]),lambda: (driver.run_once(32) >= 0 and client.ready(policy.epoch,policy.digest)))
+    driver=ReconciliationDriver(store,Reconciler(store,client),"local-conversation-reconciler",policy.epoch,authorization_gate=authority)
+    def gateway_ready():
+        return driver.run_once(32) >= 0 and client.ready(policy.epoch,policy.digest)
+    return create_app(runtime,LocalSocketAuthenticator(policy.values["external_runner_principal"]),gateway_ready)
 app=build_app()
