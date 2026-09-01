@@ -1,5 +1,7 @@
 # Restricted Hermes Runtime (synthetic-only v0)
 
+[![CI](https://github.com/cervantesh/restricted-hermes-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/cervantesh/restricted-hermes-runtime/actions/workflows/ci.yml)
+
 This repository deliberately contains a small, standalone two-service runtime
 for the frozen restricted-sensitive-inference contract. It is **not approved
 for PHI deployment**. The exact-staging gates under `evidence/` remain blockers
