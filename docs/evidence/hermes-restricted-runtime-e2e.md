@@ -118,3 +118,23 @@ four fail-closed controls, and completed exact cleanup. Its privacy-safe
 record is `C:\\Temp\\hrrte2e17.hermes-restricted-success-evidence.txt`.
 The earlier `hrrte2e15` and `hrrte2e16` GREEN results remain valid runtime
 lineage, but this final record is the provenance-complete witness.
+
+## Restacked Hermes GREEN
+
+`hrrte2e18` repeated the provenance-complete witness with Hermes restack head
+`fe13b904d0c99c18991e3f281e91edf7ca1d84e3` on validated ancestor base
+`95d42656021a22f20201c618a67da07a618d16f3`. The exact Hermes tree was
+`5f60fa31086d35dd218296ab81ef6139f4470a55`; its staged archive SHA-256 was
+`bc612ee334e9665d906539c3a69833e8598dd603424fb48363dc47bddb830b33`.
+The runtime remained production head
+`4f457a55e84be6d40394f86ad45988fba50a5b07`, tree
+`59fde4fb52e425ff9413f0eac4fb751f5e66934b`, with staged archive SHA-256
+`f12d9d67e25cce2767d218b8072df0e03d52f116697277cb459619afb638bd2e`.
+
+The three-UDS turn reached `COMMITTED` in two seconds. Policy mismatch,
+missing socket, denied ACL, and altered readiness all failed closed; the
+normal Hermes surface and plaintext marker remained absent, all nonclaims
+remained false, and exact cleanup completed. The privacy-safe source record is
+`C:\\Temp\\hrrte2e18.hermes-restricted-success-evidence.txt`.
+Range-diff equivalence was verified externally and is not a claim made by the
+harness or this runtime witness.
