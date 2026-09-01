@@ -8,8 +8,8 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_harness_keeps_the_hermes_client_on_the_closed_uds_surface():
     source = (ROOT / "tests/deployment/test_hermes_restricted_runtime_e2e.sh").read_text(encoding="utf-8")
     for required in (
-        "7ce40dad644521c658f2985958be6cfc745d06be",
-        "f04d9162a98902926f36e94034821be8f0027bff",
+        "4f457a55e84be6d40394f86ad45988fba50a5b07",
+        "9032d66ac674ccac3b6f49d76dc454d2483c5247",
         "--network none",
         "--group-add 20000",
         ":/run/restricted-inference:ro",
@@ -26,6 +26,9 @@ def test_harness_keeps_the_hermes_client_on_the_closed_uds_surface():
         "-c core.autocrlf=false archive --format=tar \"$runtime_head\"",
         "runtime_stage=exact_git_head_lf_blob_export",
         "runtime_stage_archive_sha256",
+        "runtime_images=(",
+        "refusing pre-existing target image",
+        'image rm "$image"',
     ):
         assert required in source
 

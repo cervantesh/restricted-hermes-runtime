@@ -5,8 +5,8 @@ set -euo pipefail
 
 runtime_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 project="${1:-}"
-readonly RUNTIME_HEAD="7ce40dad644521c658f2985958be6cfc745d06be"
-readonly HERMES_HEAD="f04d9162a98902926f36e94034821be8f0027bff"
+readonly RUNTIME_HEAD="4f457a55e84be6d40394f86ad45988fba50a5b07"
+readonly HERMES_HEAD="9032d66ac674ccac3b6f49d76dc454d2483c5247"
 hermes_source="${HERMES_RESTRICTED_SOURCE:-/mnt/c/dev/hermes-restricted-config}"
 if [[ ! "$project" =~ ^[a-z0-9][a-z0-9_-]{2,48}$ ]]; then
   echo "usage: $0 unique-lowercase-project-name" >&2
@@ -77,6 +77,16 @@ socket_volume="${project}_inference_sockets"
 home_volume="${project}_hermes_home"
 client_image="${project}-hermes-restricted-client:latest"
 fake_container="${project}-altered-readiness"
+runtime_images=(
+  "${project}-postgres:latest"
+  "${project}-gateway-preflight:latest"
+  "${project}-gateway:latest"
+  "${project}-conversation:latest"
+  "${project}-synthetic-non-phi-only-broker:latest"
+  "${project}-synthetic-non-phi-only-probe:latest"
+  "${project}-synthetic-non-phi-only-enable:latest"
+  "${project}-synthetic-non-phi-only-disable:latest"
+)
 
 cleanup() {
   local status=$? cleanup_ok=true
@@ -95,6 +105,10 @@ cleanup() {
   done
   "${docker_cli[@]}" image inspect "$client_image" >/dev/null 2>&1 && "${docker_cli[@]}" image rm "$client_image" >/dev/null || true
   "${docker_cli[@]}" image inspect "$client_image" >/dev/null 2>&1 && cleanup_ok=false
+  for image in "${runtime_images[@]}"; do
+    "${docker_cli[@]}" image inspect "$image" >/dev/null 2>&1 && "${docker_cli[@]}" image rm "$image" >/dev/null || true
+    "${docker_cli[@]}" image inspect "$image" >/dev/null 2>&1 && cleanup_ok=false
+  done
   "${docker_cli[@]}" ps -a --filter "label=com.docker.compose.project=$project" --format '{{.ID}}' | grep -q . && cleanup_ok=false
   rm -rf -- "$runtime"
   if (( status == 0 )) && [[ "$cleanup_ok" == true ]]; then
@@ -112,6 +126,12 @@ echo "Target inventory before create:"
 for volume in "${external[@]}"; do
   if "${docker_cli[@]}" volume inspect "$volume" >/dev/null 2>&1; then
     echo "refusing pre-existing target volume: $volume" >&2
+    exit 1
+  fi
+done
+for image in "${runtime_images[@]}" "$client_image"; do
+  if "${docker_cli[@]}" image inspect "$image" >/dev/null 2>&1; then
+    echo "refusing pre-existing target image: $image" >&2
     exit 1
   fi
 done
@@ -221,18 +241,29 @@ test "$(broker_count)" = 1
 
 # The three controls below mutate only this fresh project and prove fail-closed
 # handling through the same Hermes client, never a mock client.
+printf 'e2e_step=socket-absent-control\n'
 "${compose[@]}" stop conversation
 expect_client_failure 74 RESTRICTED_RUNTIME_UNAVAILABLE restricted doctor
 "${compose[@]}" up -d --wait conversation
+printf 'e2e_step=acl-denied-control\n'
 "${docker_cli[@]}" run --rm --network none --user 0:0 -v "$socket_volume:/run/restricted-inference" alpine:3.20.3 chmod 0600 /run/restricted-inference/conversation.sock
 expect_client_failure 74 RESTRICTED_RUNTIME_UNAVAILABLE restricted doctor
 "${docker_cli[@]}" run --rm --network none --user 0:0 -v "$socket_volume:/run/restricted-inference" alpine:3.20.3 chmod 0660 /run/restricted-inference/conversation.sock
 run_client restricted doctor >/dev/null
 
+printf 'e2e_step=readiness-altered-control\n'
 "${compose[@]}" stop conversation
-fake_code='import json,os,socket; p="/run/restricted-inference/conversation.sock"; os.unlink(p); s=socket.socket(socket.AF_UNIX); s.bind(p); os.chmod(p,0o660); s.listen(1); c,_=s.accept(); c.recv(65536); body=json.dumps({"schema_version":"restricted-conversation-readiness.v1","status":"ready","policy_epoch":"altered","policy_digest":"'"$digest"'","classification":"PHI","system_instruction_version":"restricted-phi-system.v1","allowed_modalities":["text"],"tools_allowed":False,"fallbacks":[],"max_provider_attempts":1,"streaming":False,"max_output_tokens":4096,"max_canonical_input_utf8_bytes":131072,"response_profile":"restricted-local-text-response.v1"},separators=(",",":")).encode(); c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "+str(len(body)).encode()+b"\r\n\r\n"+body); c.close(); s.close()'
+fake_code='import json,os,socket; p="/run/restricted-inference/conversation.sock"; os.path.lexists(p) and os.unlink(p); s=socket.socket(socket.AF_UNIX); s.bind(p); os.chmod(p,0o660); s.listen(1); c,_=s.accept(); c.recv(65536); body=json.dumps({"schema_version":"restricted-conversation-readiness.v1","status":"ready","policy_epoch":"altered","policy_digest":"'"$digest"'","classification":"PHI","system_instruction_version":"restricted-phi-system.v1","allowed_modalities":["text"],"tools_allowed":False,"fallbacks":[],"max_provider_attempts":1,"streaming":False,"max_output_tokens":4096,"max_canonical_input_utf8_bytes":131072,"response_profile":"restricted-local-text-response.v1"},separators=(",",":")).encode(); c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "+str(len(body)).encode()+b"\r\n\r\n"+body); c.close(); s.close()'
 "${docker_cli[@]}" run -d --name "$fake_container" --network none --user 10006:20001 --group-add 20000 -v "$socket_volume:/run/restricted-inference" --entrypoint python "${project}-conversation" -c "$fake_code" >/dev/null
-for _ in $(seq 1 20); do "${docker_cli[@]}" run --rm --network none --user 0:0 -v "$socket_volume:/run/restricted-inference:ro" alpine:3.20.3 test -S /run/restricted-inference/conversation.sock && break; sleep 1; done
+fake_ready=false
+for _ in $(seq 1 20); do
+  if "${docker_cli[@]}" run --rm --network none --user 0:0 -v "$socket_volume:/run/restricted-inference:ro" alpine:3.20.3 test -S /run/restricted-inference/conversation.sock; then
+    fake_ready=true
+    break
+  fi
+  sleep 1
+done
+test "$fake_ready" = true
 expect_client_failure 76 RESTRICTED_POLICY_MISMATCH restricted doctor
 "${docker_cli[@]}" wait "$fake_container" >/dev/null
 "${docker_cli[@]}" rm "$fake_container" >/dev/null
