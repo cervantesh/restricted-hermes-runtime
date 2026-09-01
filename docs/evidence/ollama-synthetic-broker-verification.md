@@ -142,3 +142,14 @@ This narrower guarantee trusts the host and Docker administrator and is not
 continuous model-byte attestation. It is intended to preserve the 35-second
 internal and 40-second three-UDS request contracts while retaining a fail-stop
 identity guard over the staged read-only namespace.
+
+## Fresh narrowed-contract witness: `olle2e10` GREEN
+
+The fresh unique-project witness completed with no failure-log directory. Its
+assertions covered the pinned GPU-backed Ollama process, adapter startup,
+semantic synthetic response through all three UDS boundaries within the
+closed request limits, durable dispatch disable readback, unchanged source
+inventory, and exact project cleanup. The probe and staging images, Compose
+containers, and uniquely named volumes were absent after completion. This is
+evidence only for the narrowed identity-guard contract above; the nonclaims
+remain unchanged.
