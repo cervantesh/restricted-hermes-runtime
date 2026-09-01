@@ -148,8 +148,11 @@ identity guard over the staged read-only namespace.
 The fresh unique-project witness completed with no failure-log directory. Its
 assertions covered the pinned GPU-backed Ollama process, adapter startup,
 semantic synthetic response through all three UDS boundaries within the
-closed request limits, durable dispatch disable readback, unchanged source
-inventory, and exact project cleanup. The probe and staging images, Compose
+closed request limits, durable dispatch disable readback, and exact project
+cleanup. The Windows source store is not mounted into runtime and is outside
+the product control boundary; the authoritative claim is the exact referenced
+bundle copied and verified during isolated staging, not a hash of unrelated
+source-store files. The probe and staging images, Compose
 containers, and uniquely named volumes were absent after completion. This is
 evidence only for the narrowed identity-guard contract above; the nonclaims
 remain unchanged.

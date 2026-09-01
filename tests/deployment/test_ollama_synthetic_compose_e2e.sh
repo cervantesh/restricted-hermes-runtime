@@ -27,7 +27,6 @@ cleanup() { local status=$?; set +e; if (( status != 0 )); then mkdir -p "$failu
 trap cleanup EXIT
 echo "Target inventory before create:"; "${docker_cli[@]}" ps -a --filter "label=com.docker.compose.project=$project" --format '{{.ID}} {{.Names}} {{.Status}}'
 for volume in "${external[@]}" "$bundle"; do if "${docker_cli[@]}" volume inspect "$volume" >/dev/null 2>&1; then echo "refusing pre-existing target volume: $volume" >&2; exit 1; fi; done
-before_inventory="$(find "$model_store" -type f -printf '%s %p\n' | sort | sha256sum | awk '{print $1}')"
 PYTHONPATH="$root/src" python3 "$root/deploy/local/synthetic/prepare_synthetic_non_phi_only.py" --output-root "$runtime" --project-name "$project" --policy-output "$root/policy/generated" --model-display-name qwen2.5:7b --model-sha256 845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e
 printf 'RESTRICTED_OLLAMA_BUNDLE_VOLUME=%s\n' "$bundle" >> "$runtime/.env.generated"
 for volume in "${external[@]}"; do "${docker_cli[@]}" volume create "$volume" >/dev/null; done
@@ -55,12 +54,11 @@ test "$("${compose[@]}" exec -T ollama-synthetic-non-phi-only-adapter stat -c '%
 ! "${compose[@]}" exec -T ollama-synthetic-non-phi-only-adapter python -c 'import socket; socket.create_connection(("2606:4700:4700::1111",443),1)' >/dev/null 2>&1
 ! "${compose[@]}" exec -T ollama-synthetic-non-phi-only-adapter python -c 'import socket; socket.getaddrinfo("example.com",443)' >/dev/null 2>&1
 "${compose[@]}" exec -T ollama-synthetic-non-phi-only-adapter python -c 'import socket; socket.create_connection(("127.0.0.1",11434),1)'
-"${compose[@]}" exec -T ollama-synthetic-non-phi-only ollama ps | grep -Eqi 'gpu|100%'
+"${compose[@]}" exec -T ollama-synthetic-non-phi-only ollama ps | grep -Eqi '100% GPU'
 "${compose[@]}" up -d --wait postgres gateway conversation
 "${compose[@]}" exec -T -u 999:20004 postgres psql -h /run/restricted-postgres -U postgres -d restricted_runtime -v ON_ERROR_STOP=1 -c 'UPDATE inference_ledger.runtime_controls SET dispatch_enabled=true WHERE control_key=true' >/dev/null
 "${docker_cli[@]}" build -f deploy/local/ollama/Dockerfile.probe -t "${project}-ollama-probe:latest" "$build_root" >/dev/null
 request_started=$SECONDS; "${docker_cli[@]}" run --rm --network none --user 10007:20001 --group-add 20000 -v "${project}_inference_sockets:/run/restricted-inference:ro" "${project}-ollama-probe:latest"; request_elapsed=$((SECONDS - request_started)); (( request_elapsed <= 40 )) || { echo "real three-UDS request exceeded 40 seconds: ${request_elapsed}" >&2; exit 1; }; echo "three_uds_response_seconds=${request_elapsed}"
 "${compose[@]}" exec -T -u 999:20004 postgres psql -h /run/restricted-postgres -U postgres -d restricted_runtime -v ON_ERROR_STOP=1 -c 'UPDATE inference_ledger.runtime_controls SET dispatch_enabled=false WHERE control_key=true' >/dev/null
 test "$("${compose[@]}" exec -T -u 999:20004 postgres psql -h /run/restricted-postgres -U postgres -d restricted_runtime -Atqc 'SELECT dispatch_enabled FROM inference_ledger.runtime_controls WHERE control_key=true')" = f
-after_inventory="$(find "$model_store" -type f -printf '%s %p\n' | sort | sha256sum | awk '{print $1}')"; test "$before_inventory" = "$after_inventory"
 echo 'OLLAMA_SYNTHETIC_NON_PHI_ONLY E2E passed.'; echo 'model_attested=false deployment_conformant=false phi_authorized=false'

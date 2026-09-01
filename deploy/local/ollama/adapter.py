@@ -196,7 +196,8 @@ def capture_baseline() -> Baseline:
 
 
 def guard(baseline: Baseline) -> None:
-    files, directories = _namespace()
+    try: files, directories = _namespace()
+    except OSError as exc: raise GuardDrift("namespace unavailable") from exc
     if set(files) != set(baseline.files) or set(directories) != set(baseline.directories): raise GuardDrift("namespace changed")
     if any(_identity(value) != baseline.directories[key] for key, value in directories.items()): raise GuardDrift("directory identity changed")
     for relative, metadata in files.items():
@@ -306,13 +307,17 @@ def _reply(connection: socket.socket, status: int, value: dict[str, Any]) -> Non
 
 
 def _read_request(connection: socket.socket) -> dict[str, Any]:
-    connection.settimeout(5)
+    deadline = time.monotonic() + 5
+    def receive(limit: int) -> bytes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0: raise ClosedError("request read exceeded deadline")
+        connection.settimeout(remaining)
+        part = connection.recv(limit)
+        if not part: raise ClosedError("truncated request")
+        return part
     raw = b""
     while b"\r\n\r\n" not in raw and len(raw) <= MAX_HTTP:
-        part = connection.recv(65536)
-        if not part:
-            raise ClosedError("empty request")
-        raw += part
+        raw += receive(65536)
     head, body = raw.split(b"\r\n\r\n", 1)
     lines = head.split(b"\r\n")
     if not lines or lines[0] != b"POST /v1/restricted/generate HTTP/1.0":
@@ -322,7 +327,7 @@ def _read_request(connection: socket.socket) -> dict[str, Any]:
         raise ClosedError("content length rejected")
     length = int(lengths[0])
     while len(body) < length and len(body) <= MAX_HTTP:
-        body += connection.recv(min(65536, length - len(body)))
+        body += receive(min(65536, length - len(body)))
     if len(body) != length or length > MAX_HTTP:
         raise ClosedError("request body rejected")
     return _json(body)

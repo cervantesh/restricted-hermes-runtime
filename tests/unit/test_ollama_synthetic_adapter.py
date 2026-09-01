@@ -326,3 +326,22 @@ def test_departed_readiness_peer_cannot_kill_broker_response_path():
             raise BrokenPipeError("peer closed")
 
     adapter._reply(DepartedPeer(), 400, {"error": "restricted request rejected"})
+
+
+def test_request_reader_rejects_half_closed_body_and_uses_one_deadline(monkeypatch):
+    class HalfClosed:
+        def __init__(self): self.calls = 0; self.timeouts = []
+        def settimeout(self, value): self.timeouts.append(value)
+        def recv(self, _limit):
+            self.calls += 1
+            return b"POST /v1/restricted/generate HTTP/1.0\r\nContent-Length: 2\r\n\r\n" if self.calls == 1 else b""
+    peer = HalfClosed()
+    with pytest.raises(adapter.ClosedError, match="truncated"):
+        adapter._read_request(peer)
+    assert peer.timeouts and max(peer.timeouts) <= 5
+
+
+def test_guard_oserror_is_fatal_drift(monkeypatch):
+    baseline = type("Baseline", (), {"files": {}, "directories": {}})()
+    monkeypatch.setattr(adapter, "_namespace", lambda: (_ for _ in ()).throw(OSError("race")))
+    with pytest.raises(adapter.GuardDrift): adapter.guard(baseline)
