@@ -156,3 +156,27 @@ source-store files. The probe and staging images, Compose
 containers, and uniquely named volumes were absent after completion. This is
 evidence only for the narrowed identity-guard contract above; the nonclaims
 remain unchanged.
+
+## Fresh hardened-witness rerun: `olle2e11` GREEN
+
+The fresh uniquely named rerun exercised the final startup, staging, and
+post-ready contracts. Its durable success record is retained outside the
+ephemeral run directory at
+`C:\Temp\olle2e11.ollama-success-evidence.txt`; it records:
+
+- `verified_warmup_seconds=160`, within the closed 180-second pre-bind budget;
+- `three_uds_response_seconds=3`, within the closed 40-second external bound;
+- `gpu_witness=100% GPU` (the harness no longer accepts a CPU-only string);
+- a semantically successful synthetic response through conversation, gateway,
+  and broker UDS; and
+- `dispatch_readback=false` and `exact_cleanup=completed`.
+
+The staged authoritative bundle was verified against the exact source manifest
+and referenced blobs before runtime, then independently verified before and
+after warm-up. Runtime services never mount the Windows source store. This is
+not a claim that arbitrary unrelated files in that external store were
+cryptographically inventoried; the protected artifact is the exact referenced
+bundle. No `olle2e11` failure-log directory remains, and inspection after the
+run found no project containers, labeled bundle volume, probe image, or stager
+image. The historic RED witnesses above remain historical evidence of the
+earlier contracts and do not become passing claims.
