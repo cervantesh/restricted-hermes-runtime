@@ -14,7 +14,7 @@ from restricted_runtime.conversation import ConversationService
 from restricted_runtime.crypto import LocalHmacKey
 from restricted_runtime.gateway import Gateway
 from restricted_runtime.policy import PolicyBundle
-from restricted_runtime.services.restricted_api import create_app
+from restricted_runtime.services.restricted_api import create_app, readiness_document
 from restricted_runtime.storage import PostgresContentStore, PostgresLedger
 
 URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
@@ -35,6 +35,8 @@ def test_conversation_readyz_is_live_and_rejects_gateway_down_or_malformed_pair(
     p=policy();key=LocalHmacKey("gateway","1",b"g"*32);service=ConversationService(PostgresContentStore(URL),Gateway(p,key,PostgresLedger(URL,p,key),Provider()),LocalHmacKey("service","1",b"s"*32),Keys(),p,"tenant")
     response=TestClient(create_app(service,SyntheticAuthenticator("caller"),gateway_ready)).get("/readyz")
     assert response.status_code==expected
+    if expected == 200:
+        assert response.json() == readiness_document(p)
 
 def test_conversation_readyz_maps_gateway_exception_to_unready():
     p=policy();key=LocalHmacKey("gateway","1",b"g"*32);service=ConversationService(PostgresContentStore(URL),Gateway(p,key,PostgresLedger(URL,p,key),Provider()),LocalHmacKey("service","1",b"s"*32),Keys(),p,"tenant")
