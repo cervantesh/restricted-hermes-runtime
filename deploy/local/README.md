@@ -17,9 +17,11 @@ socket. Kernel peer identity maps UID 10006 to
 `restricted_local_gateway`. The LOGIN roles inherit only their respective
 content or ledger group role.
 
-`/readyz` remains a component endpoint. It is not whole-stack health. The
-deployment is usable only after the operator separately proves the policy,
-authorization, database, gateway, and broker paths.
+`/readyz` remains a component endpoint. Its closed response binds the signed
+policy epoch/digest and text-only capability values; it is not whole-stack
+health and does not emit deployment, model-attestation, or PHI-authorization
+claims. The deployment is usable only after the operator separately proves the
+policy, authorization, database, gateway, and broker paths.
 
 ## Operator preparation
 

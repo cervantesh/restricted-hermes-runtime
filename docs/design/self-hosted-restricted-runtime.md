@@ -184,6 +184,12 @@ boundary instead of Google OIDC or bearer tokens. This does not claim that the
 PostgreSQL client is unable to use TCP; the operator owns and must authorize the
 configured database endpoint.
 
+Conversation `/readyz` returns one closed, policy-derived document: the exact
+policy epoch/digest and the approved text-only capability fields. Unknown or
+missing fields are a contract failure for local preflight. It is not a
+deployment, model-attestation, or PHI-authorization assertion; those claims
+remain local constant `false` values in protocol receipts.
+
 The shared socket namespace has an explicit numeric ACL contract. Its directory
 is `root:20000` with mode `1770`. `conversation.sock` is group `20001`,
 `gateway.sock` is group `20002`, and the operator-managed `broker.sock` is group
