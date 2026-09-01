@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import stat
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -140,10 +141,25 @@ def verify(root: Path) -> tuple[bytes, list[tuple[str, int]]]:
     return raw, descriptors
 
 
+def _fsync_parent(path: Path) -> None:
+    """Persist a rename on Linux; directory descriptors are not portable to NT."""
+    try:
+        descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except PermissionError:
+        if os.name == "nt":
+            return
+        raise
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _copy_exact(source: Path, destination: Path, expected_digest: str, expected_size: int) -> None:
     source_fd, source_identity = _open_regular(source)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    target_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    temporary = destination.with_name(f".{destination.name}.stage-{uuid.uuid4().hex}")
+    target_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
         with os.fdopen(source_fd, "rb") as origin, os.fdopen(target_fd, "wb") as target:
             hasher = hashlib.sha256(); size = 0
@@ -156,21 +172,37 @@ def _copy_exact(source: Path, destination: Path, expected_digest: str, expected_
             except OSError: pass
     after = source.lstat()
     if source_identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or size != expected_size or hasher.hexdigest() != expected_digest:
+        temporary.unlink(missing_ok=True)
         raise StageError("source changed during copy")
+    os.replace(temporary, destination); _fsync_parent(destination)
+
+
+def _publish_manifest(raw: bytes, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.stage-{uuid.uuid4().hex}")
+    try:
+        with open(temporary, "xb") as target:
+            target.write(raw); target.flush(); os.fsync(target.fileno())
+        os.replace(temporary, destination); _fsync_parent(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def stage(source: Path, destination: Path) -> None:
     if any(destination.iterdir()):
         raise StageError("destination volume is not empty")
-    manifest, descriptors = verify(source)
-    target_manifest = _under(destination, MANIFEST_RELATIVE)
-    target_manifest.parent.mkdir(parents=True, exist_ok=True)
-    with open(target_manifest, "xb") as target:
-        target.write(manifest); target.flush(); os.fsync(target.fileno())
-    for digest, size in descriptors:
-        _copy_exact(_under(source, Path("blobs") / f"sha256-{digest}"), _under(destination, Path("blobs") / f"sha256-{digest}"), digest, size)
-    verify(source)
-    verify(destination)
+    try:
+        manifest, descriptors = verify(source)
+        target_manifest = _under(destination, MANIFEST_RELATIVE)
+        _publish_manifest(manifest, target_manifest)
+        for digest, size in descriptors:
+            _copy_exact(_under(source, Path("blobs") / f"sha256-{digest}"), _under(destination, Path("blobs") / f"sha256-{digest}"), digest, size)
+        verify(source)
+        verify(destination)
+    except Exception:
+        for partial in destination.rglob(".*.stage-*"):
+            partial.unlink(missing_ok=True)
+        raise
 
 
 if __name__ == "__main__":

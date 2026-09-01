@@ -196,13 +196,15 @@ def capture_baseline() -> Baseline:
 
 
 def guard(baseline: Baseline) -> None:
-    try: files, directories = _namespace()
-    except OSError as exc: raise GuardDrift("namespace unavailable") from exc
-    if set(files) != set(baseline.files) or set(directories) != set(baseline.directories): raise GuardDrift("namespace changed")
-    if any(_identity(value) != baseline.directories[key] for key, value in directories.items()): raise GuardDrift("directory identity changed")
-    for relative, metadata in files.items():
-        descriptor, expected = baseline.files[relative]
-        if _identity(metadata) != expected or _identity(os.fstat(descriptor)) != expected: raise GuardDrift("file identity changed")
+    try:
+        files, directories = _namespace()
+        if set(files) != set(baseline.files) or set(directories) != set(baseline.directories): raise GuardDrift("namespace changed")
+        if any(_identity(value) != baseline.directories[key] for key, value in directories.items()): raise GuardDrift("directory identity changed")
+        for relative, metadata in files.items():
+            descriptor, expected = baseline.files[relative]
+            if _identity(metadata) != expected or _identity(os.fstat(descriptor)) != expected: raise GuardDrift("file identity changed")
+    except OSError as exc:
+        raise GuardDrift("namespace unavailable") from exc
 
 
 def verify_bundle(*, deadline: float | None = None) -> str:
@@ -287,8 +289,24 @@ def _validated_response(value: Any) -> tuple[str, str]:
     return message["content"], value["created_at"]
 
 
+def _wait_local_ollama(*, deadline: float) -> dict[str, Any]:
+    """Wait only for the local listener to appear; never retry a warm-up turn."""
+    pause = 0.1
+    while True:
+        try:
+            return _ollama("/api/tags", deadline=deadline)
+        except ClosedError as exc:
+            if not isinstance(exc.__cause__, ConnectionRefusedError):
+                raise
+            remaining = _remaining(deadline, "Ollama listener readiness")
+            time.sleep(min(pause, remaining))
+            pause = min(pause * 2, 1.0)
+
+
 def _warm(*, deadline: float | None = None) -> None:
-    tags = _ollama("/api/tags", deadline=deadline)
+    if deadline is None:
+        raise ClosedError("warm-up requires an absolute startup deadline")
+    tags = _wait_local_ollama(deadline=deadline)
     if not isinstance(tags, dict) or set(tags) != {"models"} or not isinstance(tags["models"], list):
         raise ClosedError("Ollama readiness rejected")
     warm = _ollama("/api/chat", {"model": MODEL_TAG, "messages": [{"role": "system", "content": "SYNTHETIC_NON_PHI_ONLY"}, {"role": "user", "content": "SYNTHETIC_NON_PHI_ONLY: reply with ready."}], "stream": False, "options": {"num_predict": 4096}}, deadline=deadline)

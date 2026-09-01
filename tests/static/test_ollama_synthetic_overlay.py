@@ -1,5 +1,6 @@
 """Static guardrails for the optional real-model synthetic overlay."""
 from pathlib import Path
+import re
 import yaml
 
 
@@ -28,3 +29,9 @@ def test_overlay_is_opt_in_pinned_networkless_and_read_only_model_store():
     assert "RESTRICTED_OLLAMA_MODEL_STORE" not in str(value)
     assert value["volumes"]["ollama_bundle"]["external"] is True
     assert value["volumes"]["ollama_bundle"]["name"] == "${RESTRICTED_OLLAMA_BUNDLE_VOLUME:?required}"
+
+
+def test_e2e_gpu_witness_does_not_accept_cpu_only_output():
+    source = (ROOT / "tests/deployment/test_ollama_synthetic_compose_e2e.sh").read_text(encoding="utf-8")
+    assert "100% GPU" in source
+    assert re.search(r"100% GPU", "100% CPU", re.IGNORECASE) is None

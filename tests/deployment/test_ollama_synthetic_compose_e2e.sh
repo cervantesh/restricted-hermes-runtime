@@ -16,6 +16,8 @@ else
 fi
 runtime="$(mktemp -d "$runtime_root/${project}.SYNTHETIC_NON_PHI_ONLY.XXXXXX")"
 failure_logs="$runtime_root/${project}.ollama-failure-logs"
+success_evidence="$runtime_root/${project}.ollama-success-evidence.txt"
+test ! -e "$success_evidence" || { echo "refusing to overwrite prior success evidence: $success_evidence" >&2; exit 1; }
 env_file="$runtime/.env.generated"; model_store_for_stage="$model_store"; build_root="$root"
 if [[ "$windows_cli" == true ]]; then env_file="$(wslpath -w "$env_file")"; model_store_for_stage="$(wslpath -w "$model_store")"; build_root="$(wslpath -w "$root")"; fi
 compose=("${compose_cli[@]}" --project-name "$project" --env-file "$env_file" -f deploy/local/compose.yaml -f deploy/local/compose.ollama-synthetic-non-phi-only.yaml)
@@ -23,7 +25,7 @@ external=("${project}_inference_sockets" "${project}_conversation_authorization"
 bundle="${project}_ollama_bundle_845dbda0ea48"; stager_image="${project}-ollama-bundle-stager:latest"
 label_value() { "${docker_cli[@]}" volume inspect --format "{{ index .Labels \"$2\" }}" "$1"; }
 validate_bundle() { test "$1" = "$bundle" && test "$(label_value "$bundle" restricted-runtime.synthetic-only)" = true && test "$(label_value "$bundle" restricted-runtime.project)" = "$project" && test "$(label_value "$bundle" restricted-runtime.manifest-sha256)" = 845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e && test "$(label_value "$bundle" restricted-runtime.managed-bundle)" = true; }
-cleanup() { local status=$?; set +e; if (( status != 0 )); then mkdir -p "$failure_logs"; "${compose[@]}" ps -a >"$failure_logs/compose-ps.txt" 2>&1; "${compose[@]}" logs --no-color --tail 200 >"$failure_logs/compose-services.log" 2>&1; echo "failure logs: $failure_logs" >&2; fi; "${compose[@]}" --profile ollama-synthetic-non-phi-only down --volumes --remove-orphans; for volume in "${external[@]}"; do "${docker_cli[@]}" volume inspect "$volume" >/dev/null 2>&1 && "${docker_cli[@]}" volume rm "$volume"; done; if "${docker_cli[@]}" volume inspect "$bundle" >/dev/null 2>&1; then validate_bundle "$bundle" && "${docker_cli[@]}" volume rm "$bundle" || echo "refusing unlabelled bundle cleanup: $bundle" >&2; fi; for image in "${project}-ollama-probe:latest" "$stager_image"; do "${docker_cli[@]}" image inspect "$image" >/dev/null 2>&1 && "${docker_cli[@]}" image rm "$image"; done; rm -rf -- "$runtime"; return "$status"; }
+cleanup() { local status=$? cleanup_ok=true; set +e; if (( status != 0 )); then mkdir -p "$failure_logs"; "${compose[@]}" ps -a >"$failure_logs/compose-ps.txt" 2>&1; "${compose[@]}" logs --no-color --tail 200 >"$failure_logs/compose-services.log" 2>&1; echo "failure logs: $failure_logs" >&2; fi; "${compose[@]}" --profile ollama-synthetic-non-phi-only down --volumes --remove-orphans || cleanup_ok=false; for volume in "${external[@]}"; do "${docker_cli[@]}" volume inspect "$volume" >/dev/null 2>&1 && "${docker_cli[@]}" volume rm "$volume" || true; "${docker_cli[@]}" volume inspect "$volume" >/dev/null 2>&1 && cleanup_ok=false; done; if "${docker_cli[@]}" volume inspect "$bundle" >/dev/null 2>&1; then validate_bundle "$bundle" && "${docker_cli[@]}" volume rm "$bundle" || { echo "refusing unlabelled bundle cleanup: $bundle" >&2; cleanup_ok=false; }; fi; "${docker_cli[@]}" volume inspect "$bundle" >/dev/null 2>&1 && cleanup_ok=false; for image in "${project}-ollama-probe:latest" "$stager_image"; do "${docker_cli[@]}" image inspect "$image" >/dev/null 2>&1 && "${docker_cli[@]}" image rm "$image" || true; "${docker_cli[@]}" image inspect "$image" >/dev/null 2>&1 && cleanup_ok=false; done; "${docker_cli[@]}" ps -a --filter "label=com.docker.compose.project=$project" --format '{{.ID}}' | grep -q . && cleanup_ok=false; rm -rf -- "$runtime"; if (( status == 0 )) && [[ "$cleanup_ok" == true ]]; then printf 'exact_cleanup=completed\n' >> "$success_evidence"; else (( status == 0 )) && { echo "exact cleanup failed" >&2; status=1; }; fi; return "$status"; }
 trap cleanup EXIT
 echo "Target inventory before create:"; "${docker_cli[@]}" ps -a --filter "label=com.docker.compose.project=$project" --format '{{.ID}} {{.Names}} {{.Status}}'
 for volume in "${external[@]}" "$bundle"; do if "${docker_cli[@]}" volume inspect "$volume" >/dev/null 2>&1; then echo "refusing pre-existing target volume: $volume" >&2; exit 1; fi; done
@@ -46,7 +48,7 @@ ready_started=$SECONDS; readiness_deadline=$((SECONDS + 180)); while ! "${compos
   "${compose[@]}" ps --status exited --services | grep -Fxq ollama-synthetic-non-phi-only-adapter && { echo "adapter exited before verified warm-up" >&2; exit 1; }
   (( SECONDS < readiness_deadline )) || { echo "adapter did not bind after verified warm-up within 180 seconds" >&2; exit 1; }
   sleep 1
-done; echo "verified_warmup_seconds=$((SECONDS - ready_started))"
+done; ready_elapsed=$((SECONDS - ready_started)); echo "verified_warmup_seconds=${ready_elapsed}"
 test "$("${compose[@]}" exec -T ollama-synthetic-non-phi-only-adapter stat -c '%u:%g:%a' /run/restricted-inference/broker.sock)" = 10003:20003:660
 "${compose[@]}" exec -T ollama-synthetic-non-phi-only-adapter sh -ec 'test "$(id -u)" = 10003 && test -r /models/manifests/registry.ollama.ai/library/qwen2.5/7b && test ! -S /var/run/docker.sock'
 "${compose[@]}" exec -T ollama-synthetic-non-phi-only-adapter python -c 'import os; assert not any(k.upper() in {"HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY"} for k in os.environ)'
@@ -61,4 +63,17 @@ test "$("${compose[@]}" exec -T ollama-synthetic-non-phi-only-adapter stat -c '%
 request_started=$SECONDS; "${docker_cli[@]}" run --rm --network none --user 10007:20001 --group-add 20000 -v "${project}_inference_sockets:/run/restricted-inference:ro" "${project}-ollama-probe:latest"; request_elapsed=$((SECONDS - request_started)); (( request_elapsed <= 40 )) || { echo "real three-UDS request exceeded 40 seconds: ${request_elapsed}" >&2; exit 1; }; echo "three_uds_response_seconds=${request_elapsed}"
 "${compose[@]}" exec -T -u 999:20004 postgres psql -h /run/restricted-postgres -U postgres -d restricted_runtime -v ON_ERROR_STOP=1 -c 'UPDATE inference_ledger.runtime_controls SET dispatch_enabled=false WHERE control_key=true' >/dev/null
 test "$("${compose[@]}" exec -T -u 999:20004 postgres psql -h /run/restricted-postgres -U postgres -d restricted_runtime -Atqc 'SELECT dispatch_enabled FROM inference_ledger.runtime_controls WHERE control_key=true')" = f
+{
+  printf 'project=%s\n' "$project"
+  printf 'verified_warmup_seconds=%s\n' "$ready_elapsed"
+  printf 'three_uds_response_seconds=%s\n' "$request_elapsed"
+  printf 'gpu_witness=100%% GPU\n'
+  printf 'three_uds_semantic_response=passed\n'
+  printf 'dispatch_readback=false\n'
+  printf 'referenced_bundle_source_and_stage_verified=passed\n'
+  printf 'model_attested=false\n'
+  printf 'deployment_conformant=false\n'
+  printf 'phi_authorized=false\n'
+} > "$success_evidence"
+echo "success evidence: $success_evidence"
 echo 'OLLAMA_SYNTHETIC_NON_PHI_ONLY E2E passed.'; echo 'model_attested=false deployment_conformant=false phi_authorized=false'

@@ -58,3 +58,18 @@ def test_stage_rejects_manifest_traversal_and_descriptor_limits(tmp_path, monkey
     monkeypatch.setattr(stager, "MAX_DESCRIPTORS", 1)
     with pytest.raises(stager.StageError):
         stager.verify(source)
+
+
+def test_stage_never_publishes_a_partial_canonical_file_when_rename_fails(tmp_path, monkeypatch):
+    source = _source(tmp_path, monkeypatch)
+    destination = tmp_path / "bundle"
+    destination.mkdir()
+
+    def interrupted(*_args):
+        raise OSError("simulated interruption before publication")
+
+    monkeypatch.setattr(stager.os, "replace", interrupted)
+    with pytest.raises(OSError, match="interruption"):
+        stager.stage(source, destination)
+    assert not list(destination.rglob(".*.stage-*"))
+    assert not list(destination.rglob("7b"))

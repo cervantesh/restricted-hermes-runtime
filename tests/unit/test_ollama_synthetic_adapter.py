@@ -320,6 +320,60 @@ def test_warmup_is_one_synthetic_chat_attempt(monkeypatch):
     assert chats[0][1]["messages"] == [{"role": "system", "content": "SYNTHETIC_NON_PHI_ONLY"}, {"role": "user", "content": "SYNTHETIC_NON_PHI_ONLY: reply with ready."}]
 
 
+def test_local_listener_wait_retries_only_connection_refused_before_one_warmup(monkeypatch):
+    calls = []
+    valid = {"model": "qwen2.5:7b", "created_at": "2026-01-01T00:00:00Z", "message": {"role": "assistant", "content": "ready"}, "done": True, "done_reason": "stop", "total_duration": 1, "load_duration": 0, "prompt_eval_count": 1, "prompt_eval_duration": 1, "eval_count": 1, "eval_duration": 1}
+
+    def unavailable():
+        try:
+            raise ConnectionRefusedError("not listening yet")
+        except ConnectionRefusedError as exc:
+            raise adapter.ClosedError("Ollama unavailable") from exc
+
+    def ollama(path, payload=None, *, deadline=None):
+        calls.append((path, payload, deadline))
+        if path == "/api/tags" and len([call for call in calls if call[0] == "/api/tags"]) < 3:
+            unavailable()
+        return {"models": []} if path == "/api/tags" else valid
+
+    monkeypatch.setattr(adapter, "_ollama", ollama)
+    monkeypatch.setattr(adapter.time, "sleep", lambda _duration: None)
+    adapter._warm(deadline=adapter.time.monotonic() + 123.0)
+    assert [call[0] for call in calls] == ["/api/tags", "/api/tags", "/api/tags", "/api/chat"]
+
+
+def test_local_listener_wait_expires_without_retrying_a_warmup(monkeypatch):
+    now = [0.0]
+    attempts = []
+
+    def unavailable(*_args, **_kwargs):
+        attempts.append(True)
+        try:
+            raise ConnectionRefusedError("not listening yet")
+        except ConnectionRefusedError as exc:
+            raise adapter.ClosedError("Ollama unavailable") from exc
+
+    monkeypatch.setattr(adapter, "_ollama", unavailable)
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(adapter.time, "sleep", lambda duration: now.__setitem__(0, now[0] + duration))
+    with pytest.raises(adapter.ClosedError, match="readiness"):
+        adapter._wait_local_ollama(deadline=0.15)
+    assert len(attempts) == 3
+
+
+def test_local_listener_wait_never_retries_other_readiness_failures(monkeypatch):
+    attempts = []
+
+    def failed(*_args, **_kwargs):
+        attempts.append(True)
+        raise adapter.ClosedError("malformed readiness")
+
+    monkeypatch.setattr(adapter, "_ollama", failed)
+    with pytest.raises(adapter.ClosedError, match="malformed"):
+        adapter._wait_local_ollama(deadline=adapter.time.monotonic() + 1)
+    assert attempts == [True]
+
+
 def test_departed_readiness_peer_cannot_kill_broker_response_path():
     class DepartedPeer:
         def sendall(self, _payload):
@@ -345,3 +399,13 @@ def test_guard_oserror_is_fatal_drift(monkeypatch):
     baseline = type("Baseline", (), {"files": {}, "directories": {}})()
     monkeypatch.setattr(adapter, "_namespace", lambda: (_ for _ in ()).throw(OSError("race")))
     with pytest.raises(adapter.GuardDrift): adapter.guard(baseline)
+
+
+def test_guard_fstat_oserror_is_fatal_drift(monkeypatch):
+    metadata = type("Metadata", (), {})()
+    monkeypatch.setattr(adapter, "_namespace", lambda: ({"blob": metadata}, {}))
+    monkeypatch.setattr(adapter, "_identity", lambda _metadata: (1,))
+    monkeypatch.setattr(adapter.os, "fstat", lambda _descriptor: (_ for _ in ()).throw(OSError("fd race")))
+    baseline = type("Baseline", (), {"files": {"blob": (3, (1,))}, "directories": {}})()
+    with pytest.raises(adapter.GuardDrift):
+        adapter.guard(baseline)
