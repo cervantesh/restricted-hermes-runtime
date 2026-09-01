@@ -51,6 +51,9 @@ def test_readyz_is_the_exact_policy_derived_capability_document():
         "response_profile": policy.values["response_profile"],
     }
     assert response.status_code == 200
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["content-length"] == str(len(response.content))
+    assert response.headers["connection"] == "close"
     assert response.json() == expected
     assert readiness_document(policy) == expected
 

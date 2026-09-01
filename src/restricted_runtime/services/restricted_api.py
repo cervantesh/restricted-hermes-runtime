@@ -2,6 +2,7 @@
 from __future__ import annotations
 import sys
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from ..auth import Authenticator
 from ..contracts import ContractError, TurnRequest, load_closed_json
 from ..conversation import ConversationService
@@ -76,7 +77,10 @@ def create_app(runtime: ConversationService, authenticator: Authenticator, gatew
             ready = gateway_ready is not None and gateway_ready()
             if not ready:
                 raise ContractError("gateway policy pair is not ready")
-            return readiness_document(runtime.policy)
+            return JSONResponse(
+                readiness_document(runtime.policy),
+                headers={"Connection": "close"},
+            )
         except Exception:
             raise HTTPException(503,"gateway policy pair is not ready")
     return app
