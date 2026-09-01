@@ -6,7 +6,9 @@ set -euo pipefail
 runtime_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 project="${1:-}"
 readonly RUNTIME_HEAD="4f457a55e84be6d40394f86ad45988fba50a5b07"
-readonly HERMES_HEAD="9032d66ac674ccac3b6f49d76dc454d2483c5247"
+readonly DEFAULT_HERMES_HEAD="9032d66ac674ccac3b6f49d76dc454d2483c5247"
+hermes_head_input="${HERMES_HEAD:-$DEFAULT_HERMES_HEAD}"
+hermes_base_input="${HERMES_BASE_HEAD:-}"
 hermes_source="${HERMES_RESTRICTED_SOURCE:-/mnt/c/dev/hermes-restricted-config}"
 if [[ ! "$project" =~ ^[a-z0-9][a-z0-9_-]{2,48}$ ]]; then
   echo "usage: $0 unique-lowercase-project-name" >&2
@@ -17,9 +19,28 @@ if command -v git.exe >/dev/null 2>&1 && hermes_source_windows="$(wslpath -w "$h
 else
   hermes_git=(git -C "$hermes_source")
 fi
-if ! "${hermes_git[@]}" rev-parse --verify "$HERMES_HEAD^{commit}" >/dev/null; then
+if ! [[ "$hermes_head_input" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "HERMES_HEAD must be an exact lowercase 40-hex commit" >&2
+  exit 1
+fi
+if ! hermes_head="$("${hermes_git[@]}" rev-parse "$hermes_head_input^{commit}" 2>/dev/null)" || [[ "$hermes_head" != "$hermes_head_input" ]]; then
   echo "required Hermes restricted source revision is unavailable" >&2
   exit 1
+fi
+hermes_base_head="not_declared"
+if [[ -n "$hermes_base_input" ]]; then
+  if ! [[ "$hermes_base_input" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "HERMES_BASE_HEAD must be an exact lowercase 40-hex commit" >&2
+    exit 1
+  fi
+  if ! hermes_base_head="$("${hermes_git[@]}" rev-parse "$hermes_base_input^{commit}" 2>/dev/null)" || [[ "$hermes_base_head" != "$hermes_base_input" ]]; then
+    echo "required Hermes base revision is unavailable" >&2
+    exit 1
+  fi
+  if ! "${hermes_git[@]}" merge-base --is-ancestor "$hermes_base_head" "$hermes_head"; then
+    echo "HERMES_BASE_HEAD must be an ancestor of HERMES_HEAD" >&2
+    exit 1
+  fi
 fi
 
 if docker compose version >/dev/null 2>&1; then
@@ -52,7 +73,6 @@ archive_sha256="$(sha256sum "$stage_archive" | awk '{print $1}')"
 mkdir "$stage_root"
 tar -xf "$stage_archive" -C "$stage_root"
 test "$(head -c 24 "$stage_root/deploy/local/socket-init.sh" | od -An -tx1 | tr -d ' \n')" = "23212f62696e2f73680a736574202d65750a696e7374616c"
-hermes_head="$("${hermes_git[@]}" rev-parse "$HERMES_HEAD^{commit}")"
 hermes_tree="$("${hermes_git[@]}" rev-parse "$hermes_head^{tree}")"
 "${hermes_git[@]}" -c core.autocrlf=false archive --format=tar "$hermes_head" > "$hermes_stage_archive"
 hermes_archive_sha256="$(sha256sum "$hermes_stage_archive" | awk '{print $1}')"
@@ -281,6 +301,7 @@ test "$(broker_count)" = 1
   printf 'runtime_stage_archive_sha256=%s\n' "$archive_sha256"
   printf 'runtime_stage=exact_git_head_lf_blob_export\n'
   printf 'hermes_head=%s\n' "$hermes_head"
+  printf 'hermes_base_head=%s\n' "$hermes_base_head"
   printf 'hermes_tree=%s\n' "$hermes_tree"
   printf 'hermes_stage_archive_sha256=%s\n' "$hermes_archive_sha256"
   printf 'hermes_stage=exact_git_head_blob_export\n'

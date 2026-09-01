@@ -67,6 +67,23 @@ def test_client_build_uses_only_exact_runtime_and_hermes_git_archives():
     assert 'diff --quiet -- "$source_file"' not in source
 
 
+def test_explicit_hermes_revision_and_optional_base_are_closed_inputs():
+    source = (ROOT / "tests/deployment/test_hermes_restricted_runtime_e2e.sh").read_text(encoding="utf-8")
+    for required in (
+        'DEFAULT_HERMES_HEAD="9032d66ac674ccac3b6f49d76dc454d2483c5247"',
+        'hermes_head_input="${HERMES_HEAD:-$DEFAULT_HERMES_HEAD}"',
+        'hermes_base_input="${HERMES_BASE_HEAD:-}"',
+        '[[ "$hermes_head_input" =~ ^[0-9a-f]{40}$ ]]',
+        '[[ "$hermes_base_input" =~ ^[0-9a-f]{40}$ ]]',
+        'rev-parse "$hermes_head_input^{commit}"',
+        'rev-parse "$hermes_base_input^{commit}"',
+        'merge-base --is-ancestor "$hermes_base_head" "$hermes_head"',
+        "hermes_base_head",
+    ):
+        assert required in source
+    assert "range-diff" not in source
+
+
 def test_fourth_client_keeps_a_separate_pid_namespace():
     source = (ROOT / "tests/deployment/test_hermes_restricted_runtime_e2e.sh").read_text(encoding="utf-8")
     assert "--pid" not in source
