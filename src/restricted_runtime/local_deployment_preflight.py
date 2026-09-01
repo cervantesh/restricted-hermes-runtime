@@ -11,7 +11,8 @@ from pathlib import Path
 
 import psycopg
 
-from .contracts import ContractError
+from .contracts import ContractError, load_closed_json
+from .policy import PolicyBundle, load_signed_policy
 
 
 def _required(name: str) -> str:
@@ -58,6 +59,49 @@ def _connect_unix(path: str) -> None:
         raise
     except OSError as exc:
         raise ContractError("required deployment socket is unavailable") from exc
+
+
+def _expected_conversation_readiness(policy: PolicyBundle) -> dict[str, object]:
+    policy.validate()
+    return {
+        "schema_version": "restricted-conversation-readiness.v1",
+        "status": "ready",
+        "policy_epoch": policy.epoch,
+        "policy_digest": policy.digest,
+        "classification": policy.values["classification"],
+        "system_instruction_version": policy.values["system_instruction_version"],
+        "allowed_modalities": policy.values["allowed_modalities"],
+        "tools_allowed": policy.values["tools_allowed"],
+        "fallbacks": policy.values["fallbacks"],
+        "max_provider_attempts": policy.values["max_provider_attempts"],
+        "streaming": policy.values["streaming"],
+        "max_output_tokens": policy.values["max_output_tokens"],
+        "max_canonical_input_utf8_bytes": policy.values["max_canonical_input_utf8_bytes"],
+        "response_profile": policy.values["response_profile"],
+    }
+
+
+def validate_conversation_readiness(raw: bytes, policy: PolicyBundle) -> None:
+    """Accept only the exact closed readiness binding for this signed policy."""
+    try:
+        if load_closed_json(raw) != _expected_conversation_readiness(policy):
+            raise ContractError("conversation readiness contract failed")
+    except ContractError as exc:
+        raise ContractError("conversation readiness contract failed") from exc
+
+
+def _read_conversation_readiness(response: bytes, policy: PolicyBundle) -> None:
+    try:
+        head, body = response.split(b"\r\n\r\n", 1)
+        lines = head.split(b"\r\n")
+        if not lines or lines[0] != b"HTTP/1.1 200 OK":
+            raise ContractError("conversation readiness contract failed")
+        lengths = [line.split(b":", 1)[1].strip() for line in lines[1:] if line.lower().startswith(b"content-length:")]
+        if len(lengths) != 1 or b"transfer-encoding:" in head.lower() or not lengths[0].isdigit() or int(lengths[0]) != len(body):
+            raise ContractError("conversation readiness contract failed")
+        validate_conversation_readiness(body, policy)
+    except (IndexError, ValueError, ContractError) as exc:
+        raise ContractError("conversation readiness contract failed") from exc
 
 
 def check(role: str) -> None:
@@ -111,8 +155,12 @@ def ready(role: str) -> None:
                 if not chunk:
                     break
                 response += chunk
-        if not response.startswith(b"HTTP/1.1 200 OK\r\n"):
-            raise ContractError("conversation readiness contract failed")
+        policy = load_signed_policy(
+            Path(_required("RESTRICTED_POLICY_PATH")),
+            Path(_required("RESTRICTED_POLICY_SIGNATURE_PATH")),
+            _required("RESTRICTED_POLICY_PUBLIC_KEY_B64"),
+        )
+        _read_conversation_readiness(response, policy)
         return
     raise ContractError("deployment role rejected")
 

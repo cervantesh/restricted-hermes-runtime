@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException, Request
 from ..auth import Authenticator
 from ..contracts import ContractError, TurnRequest, load_closed_json
 from ..conversation import ConversationService
+from ..policy import PolicyBundle
 
 _TURN_REJECTION_CODES = {
     "inference outcome is indeterminate": "inference_outcome_indeterminate",
@@ -17,6 +18,27 @@ _TURN_REJECTION_CODES = {
 def _turn_rejection_code(error: ContractError) -> str:
     """Return a closed diagnostic label; never log request content or exception text."""
     return _TURN_REJECTION_CODES.get(str(error), "closed_contract_rejection")
+
+
+def readiness_document(policy: PolicyBundle) -> dict[str, object]:
+    """Return the one closed, policy-derived conversation readiness contract."""
+    policy.validate()
+    return {
+        "schema_version": "restricted-conversation-readiness.v1",
+        "status": "ready",
+        "policy_epoch": policy.epoch,
+        "policy_digest": policy.digest,
+        "classification": policy.values["classification"],
+        "system_instruction_version": policy.values["system_instruction_version"],
+        "allowed_modalities": policy.values["allowed_modalities"],
+        "tools_allowed": policy.values["tools_allowed"],
+        "fallbacks": policy.values["fallbacks"],
+        "max_provider_attempts": policy.values["max_provider_attempts"],
+        "streaming": policy.values["streaming"],
+        "max_output_tokens": policy.values["max_output_tokens"],
+        "max_canonical_input_utf8_bytes": policy.values["max_canonical_input_utf8_bytes"],
+        "response_profile": policy.values["response_profile"],
+    }
 
 def create_app(runtime: ConversationService, authenticator: Authenticator, gateway_ready=None) -> FastAPI:
     app=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
@@ -52,11 +74,11 @@ def create_app(runtime: ConversationService, authenticator: Authenticator, gatew
     async def readyz():
         try:
             ready = gateway_ready is not None and gateway_ready()
+            if not ready:
+                raise ContractError("gateway policy pair is not ready")
+            return readiness_document(runtime.policy)
         except Exception:
-            ready = False
-        if not ready:
             raise HTTPException(503,"gateway policy pair is not ready")
-        return {"status":"ready"}
     return app
 
 def unconfigured_app()->FastAPI:
