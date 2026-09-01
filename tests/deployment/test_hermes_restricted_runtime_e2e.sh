@@ -5,7 +5,7 @@ set -euo pipefail
 
 runtime_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 project="${1:-}"
-readonly RUNTIME_HEAD="7f3f7d04e3307921c4ca684f0438e9bfdd1b4266"
+readonly RUNTIME_HEAD="7ce40dad644521c658f2985958be6cfc745d06be"
 readonly HERMES_HEAD="f04d9162a98902926f36e94034821be8f0027bff"
 hermes_source="${HERMES_RESTRICTED_SOURCE:-/mnt/c/dev/hermes-restricted-config}"
 if [[ ! "$project" =~ ^[a-z0-9][a-z0-9_-]{2,48}$ ]]; then
@@ -177,21 +177,37 @@ expect_client_failure() {
   else
     status=$?
   fi
-  test "$status" -eq "$expected_code" && test "$output" = "$expected_symbol"
+  if [[ "$status" != "$expected_code" || "$output" != "$expected_symbol" ]]; then
+    printf 'expected restricted failure code=%s symbol=%s; got code=%s symbol=%s\n' "$expected_code" "$expected_symbol" "$status" "$output" >&2
+    exit 1
+  fi
 }
 broker_count() { "${docker_cli[@]}" run --rm --network none -v "${project}_synthetic_non_phi_only_state:/state:ro" alpine:3.20.3 cat /state/broker-count; }
+client_socket_identity() {
+  "${docker_cli[@]}" run "${client_args[@]}" --entrypoint python "$client_image" -c 'import os,socket,stat,struct; p="/run/restricted-inference/conversation.sock"; info=os.lstat(p); sock=socket.socket(socket.AF_UNIX); sock.connect(p); pid,uid,gid=struct.unpack("3i",sock.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,struct.calcsize("3i"))); print(f"path={info.st_uid}:{info.st_gid}:{stat.S_IMODE(info.st_mode):o} peer={pid}:{uid}:{gid}")'
+}
 epoch="$(sed -n 's/^RESTRICTED_POLICY_EPOCH=//p' "$runtime/.env.generated")"
 digest="$(sed -n 's/^RESTRICTED_POLICY_DIGEST=//p' "$runtime/.env.generated")"
 
 # The operator stopping pre-existing Hermes processes is an external
 # precondition. The required flag below records that declaration only.
+socket_identity="$(client_socket_identity)"
+printf 'e2e_socket_identity=%s\n' "$socket_identity"
+test "$socket_identity" = 'path=10006:20001:660 peer=0:10006:20001'
+client_readiness="$("${docker_cli[@]}" run "${client_args[@]}" --entrypoint python "$client_image" -c "from hermes_cli.restricted_runtime import RestrictedUdsClient; print(RestrictedUdsClient().ready('$epoch', '$digest')['status'])")"
+printf 'e2e_client_readiness=%s\n' "$client_readiness"
+test "$client_readiness" = ready
+printf 'e2e_step=policy-mismatch-control\n'
 expect_client_failure 76 RESTRICTED_POLICY_MISMATCH restricted enable --policy-epoch "$epoch" --policy-digest "$(printf '0%.0s' {1..64})" --confirm-stopped
+printf 'e2e_step=enable\n'
 run_client restricted enable --policy-epoch "$epoch" --policy-digest "$digest" --confirm-stopped >/dev/null
+printf 'e2e_step=doctor\n'
 doctor="$(run_client restricted doctor)"
 for claim in '"runtime_reachable":true' '"policy_bound":true' '"application_restricted":false' '"deployment_conformant":false' '"model_attested":false' '"phi_authorized":false'; do grep -Fq "$claim" <<<"$doctor"; done
 
 "${docker_cli[@]}" run --rm --network none --entrypoint python "$client_image" -c 'from pathlib import Path; forbidden=("run_agent.py","model_tools.py","agent","plugins","tools","memory"); assert all(not (Path("/opt/hermes") / item).exists() for item in forbidden)'
 marker='SYNTHETIC_NON_PHI_ONLY_HERMES_RESTRICTED_E2E'
+printf 'e2e_step=three-uds-turn\n'
 turn_started=$SECONDS
 if ! response="$(printf '%s' "$marker" | "${docker_cli[@]}" run -i "${client_args[@]}" "$client_image" restricted run --stdin)"; then
   echo "restricted three-UDS turn failed" >&2
