@@ -17,13 +17,10 @@ if command -v git.exe >/dev/null 2>&1 && hermes_source_windows="$(wslpath -w "$h
 else
   hermes_git=(git -C "$hermes_source")
 fi
-if [[ "$("${hermes_git[@]}" rev-parse HEAD)" != "$HERMES_HEAD" ]]; then
+if ! "${hermes_git[@]}" rev-parse --verify "$HERMES_HEAD^{commit}" >/dev/null; then
   echo "required Hermes restricted source revision is unavailable" >&2
   exit 1
 fi
-for source_file in hermes_cli/restricted_bootstrap.py hermes_cli/restricted_entry.py hermes_cli/restricted_runtime.py hermes_cli/subcommands/restricted.py; do
-  "${hermes_git[@]}" diff --quiet -- "$source_file" || { echo "restricted Hermes source file is dirty: $source_file" >&2; exit 1; }
-done
 
 if docker compose version >/dev/null 2>&1; then
   docker_cli=(docker); compose_cli=(docker compose); runtime_tmp_root="${RESTRICTED_SYNTHETIC_TMP_ROOT:-/tmp}"; windows_cli=false
@@ -38,6 +35,8 @@ mkdir -p "$runtime_tmp_root"
 runtime="$(mktemp -d "$runtime_tmp_root/${project}.SYNTHETIC_NON_PHI_ONLY.XXXXXX")"
 stage_archive="$runtime/runtime-head.tar"
 stage_root="$runtime/runtime-head"
+hermes_stage_archive="$runtime/hermes-head.tar"
+hermes_stage_root="$runtime/hermes-head"
 failure_logs="$runtime_tmp_root/${project}.hermes-restricted-failure-logs"
 success_evidence="$runtime_tmp_root/${project}.hermes-restricted-success-evidence.txt"
 test ! -e "$success_evidence" || { echo "refusing to overwrite prior success evidence" >&2; exit 1; }
@@ -53,14 +52,20 @@ archive_sha256="$(sha256sum "$stage_archive" | awk '{print $1}')"
 mkdir "$stage_root"
 tar -xf "$stage_archive" -C "$stage_root"
 test "$(head -c 24 "$stage_root/deploy/local/socket-init.sh" | od -An -tx1 | tr -d ' \n')" = "23212f62696e2f73680a736574202d65750a696e7374616c"
+hermes_head="$("${hermes_git[@]}" rev-parse "$HERMES_HEAD^{commit}")"
+hermes_tree="$("${hermes_git[@]}" rev-parse "$hermes_head^{tree}")"
+"${hermes_git[@]}" -c core.autocrlf=false archive --format=tar "$hermes_head" > "$hermes_stage_archive"
+hermes_archive_sha256="$(sha256sum "$hermes_stage_archive" | awk '{print $1}')"
+mkdir "$hermes_stage_root"
+tar -xf "$hermes_stage_archive" -C "$hermes_stage_root"
 
 build_root="$stage_root"
-hermes_build_context="$hermes_source"
-client_dockerfile="$runtime_root/tests/deployment/Dockerfile.restricted_hermes_client"
+hermes_build_context="$hermes_stage_root"
+client_dockerfile="$stage_root/tests/deployment/Dockerfile.restricted_hermes_client"
 if [[ "$windows_cli" == true ]]; then
   env_file="$(wslpath -w "$env_file")"
   build_root="$(wslpath -w "$stage_root")"
-  hermes_build_context="$(wslpath -w "$hermes_source")"
+  hermes_build_context="$(wslpath -w "$hermes_stage_root")"
   client_dockerfile="$(wslpath -w "$client_dockerfile")"
 fi
 compose=("${compose_cli[@]}" --project-name "$project" --env-file "$env_file" -f "$build_root/deploy/local/compose.yaml" -f "$build_root/deploy/local/compose.synthetic-non-phi-only.yaml")
@@ -275,7 +280,10 @@ test "$(broker_count)" = 1
   printf 'runtime_tree=%s\n' "$runtime_tree"
   printf 'runtime_stage_archive_sha256=%s\n' "$archive_sha256"
   printf 'runtime_stage=exact_git_head_lf_blob_export\n'
-  printf 'hermes_head=%s\n' "$HERMES_HEAD"
+  printf 'hermes_head=%s\n' "$hermes_head"
+  printf 'hermes_tree=%s\n' "$hermes_tree"
+  printf 'hermes_stage_archive_sha256=%s\n' "$hermes_archive_sha256"
+  printf 'hermes_stage=exact_git_head_blob_export\n'
   printf 'operator_stop_assertion=external_precondition\n'
   printf 'commands=enable,doctor,run--stdin,policy-mismatch,socket-absent,acl-denied,readiness-altered\n'
   printf 'three_uds_turn_seconds=%s\n' "$turn_elapsed"

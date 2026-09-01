@@ -101,3 +101,20 @@ pre-existing exact target image or volume, so cleanup never reaches resources
 outside its unique project.  These results are runtime behavior evidence only:
 they do not claim PHI authorization, model attestation, or deployment
 conformance.
+
+## Final GREEN with dual Git provenance
+
+`hrrte2e17` repeated the complete witness with the same runtime commit and
+Hermes commit, but now staged **both** sources before Docker received a build
+context. Its durable evidence records the runtime tree/archive above and the
+Hermes tree `abe8263661a9d55a732494deade6e8937dd6232e` with archive SHA-256
+`3cc3b226bc97a6171e6bb9b0eea66aeea6b40e9b0f51c1ed3348e18607bc5636`.
+The staged Hermes archive—not its live worktree—was the client build context;
+the client Dockerfile itself came from the staged runtime archive. Thus
+staged, unstaged, and untracked worktree files cannot enter this witness.
+
+`hrrte2e17` again completed the three-UDS turn in three seconds, passed all
+four fail-closed controls, and completed exact cleanup. Its privacy-safe
+record is `C:\\Temp\\hrrte2e17.hermes-restricted-success-evidence.txt`.
+The earlier `hrrte2e15` and `hrrte2e16` GREEN results remain valid runtime
+lineage, but this final record is the provenance-complete witness.

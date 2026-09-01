@@ -46,6 +46,27 @@ def test_client_image_copies_only_the_closed_hermes_surface():
         assert prohibited not in source
 
 
+def test_client_build_uses_only_exact_runtime_and_hermes_git_archives():
+    source = (ROOT / "tests/deployment/test_hermes_restricted_runtime_e2e.sh").read_text(encoding="utf-8")
+    for required in (
+        'hermes_stage_archive="$runtime/hermes-head.tar"',
+        'hermes_stage_root="$runtime/hermes-head"',
+        '-c core.autocrlf=false archive --format=tar "$hermes_head"',
+        'tar -xf "$hermes_stage_archive" -C "$hermes_stage_root"',
+        'hermes_build_context="$hermes_stage_root"',
+        'client_dockerfile="$stage_root/tests/deployment/Dockerfile.restricted_hermes_client"',
+        "hermes_tree",
+        "hermes_stage_archive_sha256",
+        "hermes_stage=exact_git_head_blob_export",
+    ):
+        assert required in source
+    # The exact archives, not tracked, staged, or untracked worktree content,
+    # are the only two build inputs after their commits are resolved.
+    assert 'hermes_build_context="$hermes_source"' not in source
+    assert 'client_dockerfile="$runtime_root/' not in source
+    assert 'diff --quiet -- "$source_file"' not in source
+
+
 def test_fourth_client_keeps_a_separate_pid_namespace():
     source = (ROOT / "tests/deployment/test_hermes_restricted_runtime_e2e.sh").read_text(encoding="utf-8")
     assert "--pid" not in source
