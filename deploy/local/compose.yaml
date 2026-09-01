@@ -112,7 +112,10 @@ services:
       socket-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h /run/restricted-postgres -U postgres -d restricted_runtime"]
+      # The official entrypoint starts a temporary server to run init scripts.
+      # It can answer pg_isready before it execs the final PID 1 postgres
+      # process, so require both the final process and the existing probe.
+      test: ["CMD-SHELL", "test \"$$(cat /proc/1/comm)\" = postgres && pg_isready -h /run/restricted-postgres -U postgres -d restricted_runtime"]
       interval: 2s
       timeout: 2s
       retries: 30
