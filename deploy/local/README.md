@@ -104,7 +104,8 @@ inference through all three Unix sockets. It never pulls a model at runtime.
 
 Run only with a fresh project and `RESTRICTED_OLLAMA_MODEL_STORE` set to the
 existing model-store path. The harness is
-`tests/deployment/test_ollama_synthetic_compose_e2e.sh`; it inventories the
-store before and after and returns dispatch to false. It remains **not HIPAA**,
+`tests/deployment/test_ollama_synthetic_compose_e2e.sh`; it verifies the exact
+referenced bundle at source and stage, never runtime-mounts the source store,
+and returns dispatch to false. It remains **not HIPAA**,
 **not PHI authorization**, and always emits
 `model_attested=false deployment_conformant=false phi_authorized=false`.
