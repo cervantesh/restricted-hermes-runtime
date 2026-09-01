@@ -15,6 +15,10 @@ from .contracts import ContractError, load_closed_json
 from .policy import PolicyBundle, load_signed_policy
 
 
+MAX_CONVERSATION_READINESS_RESPONSE_BYTES = 1_048_576
+MAX_CONVERSATION_READINESS_HEADER_BYTES = 16_384
+
+
 def _required(name: str) -> str:
     value = os.environ.get(name)
     if not value:
@@ -92,12 +96,32 @@ def validate_conversation_readiness(raw: bytes, policy: PolicyBundle) -> None:
 
 def _read_conversation_readiness(response: bytes, policy: PolicyBundle) -> None:
     try:
+        if len(response) > MAX_CONVERSATION_READINESS_RESPONSE_BYTES:
+            raise ContractError("conversation readiness contract failed")
         head, body = response.split(b"\r\n\r\n", 1)
+        if len(head) > MAX_CONVERSATION_READINESS_HEADER_BYTES:
+            raise ContractError("conversation readiness contract failed")
         lines = head.split(b"\r\n")
         if not lines or lines[0] != b"HTTP/1.1 200 OK":
             raise ContractError("conversation readiness contract failed")
-        lengths = [line.split(b":", 1)[1].strip() for line in lines[1:] if line.lower().startswith(b"content-length:")]
-        if len(lengths) != 1 or b"transfer-encoding:" in head.lower() or not lengths[0].isdigit() or int(lengths[0]) != len(body):
+        headers: dict[bytes, bytes] = {}
+        for line in lines[1:]:
+            key, value = line.split(b":", 1)
+            key = key.lower()
+            if not key or key in headers:
+                raise ContractError("conversation readiness contract failed")
+            headers[key] = value.strip()
+        length = headers.get(b"content-length")
+        if (
+            length is None
+            or not length.isdigit()
+            or b"transfer-encoding" in headers
+            or b"content-encoding" in headers
+            or headers.get(b"content-type") != b"application/json"
+            or headers.get(b"connection", b"").lower() != b"close"
+            or int(length) > MAX_CONVERSATION_READINESS_RESPONSE_BYTES
+            or int(length) != len(body)
+        ):
             raise ContractError("conversation readiness contract failed")
         validate_conversation_readiness(body, policy)
     except (IndexError, ValueError, ContractError) as exc:
@@ -155,6 +179,8 @@ def ready(role: str) -> None:
                 if not chunk:
                     break
                 response += chunk
+                if len(response) > MAX_CONVERSATION_READINESS_RESPONSE_BYTES:
+                    raise ContractError("conversation readiness contract failed")
         policy = load_signed_policy(
             Path(_required("RESTRICTED_POLICY_PATH")),
             Path(_required("RESTRICTED_POLICY_SIGNATURE_PATH")),

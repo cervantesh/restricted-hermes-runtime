@@ -89,11 +89,21 @@ def test_preflight_rejects_duplicate_json_keys():
 def test_preflight_rejects_invalid_http_framing_before_binding_readiness():
     policy = _policy()
     body = json.dumps(readiness_document(policy), separators=(",", ":")).encode("utf-8")
-    _read_conversation_readiness(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body, policy)
+    valid = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+    _read_conversation_readiness(valid, policy)
     for response in (
         b"HTTP/1.1 200 OK\r\n\r\n" + body,
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body,
+        b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body,
         b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n" + body,
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n" + body,
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Encoding: gzip\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body,
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body,
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body,
+        b"HTTP/1.1 200 OK\r\nX-Fill: " + b"x" * 16_385 + b"\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body,
     ):
         with pytest.raises(ContractError, match="readiness"):
             _read_conversation_readiness(response, policy)
+
+    oversized = b"{" + b"x" * 1_048_576
+    with pytest.raises(ContractError, match="readiness"):
+        _read_conversation_readiness(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " + str(len(oversized)).encode("ascii") + b"\r\n\r\n" + oversized, policy)
