@@ -1,0 +1,18 @@
+ARG RUNTIME_BASE
+FROM ${RUNTIME_BASE}
+
+# The base is the already-built local conversation image: it provides the
+# pinned Python/PyYAML runtime, but this image copies only the closed Hermes
+# wrapper and runner surface. No normal agent/provider/plugin tree is present.
+USER root
+WORKDIR /opt/hermes
+COPY hermes_cli/__init__.py /opt/hermes/hermes_cli/__init__.py
+COPY hermes_cli/restricted_bootstrap.py /opt/hermes/hermes_cli/restricted_bootstrap.py
+COPY hermes_cli/restricted_entry.py /opt/hermes/hermes_cli/restricted_entry.py
+COPY hermes_cli/restricted_runtime.py /opt/hermes/hermes_cli/restricted_runtime.py
+COPY hermes_cli/subcommands/__init__.py /opt/hermes/hermes_cli/subcommands/__init__.py
+COPY hermes_cli/subcommands/restricted.py /opt/hermes/hermes_cli/subcommands/restricted.py
+RUN useradd --system --uid 10007 --gid 20001 --groups 20000 hermes-restricted-client
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/hermes
+USER 10007:20001
+ENTRYPOINT ["python", "-c", "import sys; from hermes_cli.restricted_entry import main; sys.argv=['hermes', *sys.argv[1:]]; main()"]
