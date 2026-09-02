@@ -20,6 +20,7 @@ from .mattermost_policy import MAX_EVENT_BYTES, MattermostPolicy
 _MAX_HTTP_BYTES = 1_048_576
 _POST_FIELDS = {"id", "root_id", "channel_id", "user_id", "message", "type", "file_ids", "edit_at", "delete_at"}
 _POST_REQUIRED_FIELDS = _POST_FIELDS - {"file_ids"}
+_UNSAFE_ATTACHMENT_SIGNAL = re.compile(r"attachment|file|image|media|upload", re.IGNORECASE)
 _NAMESPACE = uuid.UUID("024af157-bd86-4bcc-82bf-92890130c620")
 
 
@@ -77,6 +78,7 @@ def _ordinary(post: dict[str, Any], *, policy: MattermostPolicy, require_mention
             or post["channel_id"] not in policy.values["allowed_channel_ids"]
             or not isinstance(post["file_ids"], list) or post["file_ids"]
             or bool(post.get("metadata")) or bool(post.get("props"))
+            or any(name not in _POST_FIELDS and _UNSAFE_ATTACHMENT_SIGNAL.search(name) for name in post)
             or post["edit_at"] != 0 or post["delete_at"] != 0
             or not message.strip() or len(message.encode("utf-8")) > policy.values["max_message_utf8_bytes"]
         ):
@@ -134,6 +136,8 @@ class Ingress:
     def _validated_root(self, post: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         root_id = post["root_id"] or post["id"]
         root = self.rest.get_post(root_id)
+        if isinstance(root, dict) and "file_ids" not in root:
+            root = {**root, "file_ids": []}
         if (
             not _ordinary(root, policy=self.policy, require_mention=True)
             or root.get("id") != root_id or root.get("root_id") not in {"", root_id}

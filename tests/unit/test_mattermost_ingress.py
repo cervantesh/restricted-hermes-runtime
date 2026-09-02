@@ -214,19 +214,33 @@ def event(value: dict, *, channel_type="P") -> MattermostEvent:
     )
 
 
-def test_real_mattermost_text_shape_may_omit_file_ids_but_not_carry_unknown_file_state(tmp_path):
+def test_rest_root_without_file_ids_is_normalized_to_text_only_and_reaches_exact_thread(tmp_path):
     service, rest, conversation = ingress(tmp_path)
-    real_shape = post()
-    del real_shape["file_ids"]
-    service.handle(event(real_shape))
+    del rest.posts[ROOT]["file_ids"]
+    service.handle(event(post()))
     assert len(conversation.calls) == 1
     assert len(rest.created) == 1
-    unsafe = post(
-        "unsafe000000000000000000000", root_id=ROOT, message="reply",
-        metadata={"files": [{"id": "hidden"}]},
-    )
-    service.handle(event(unsafe))
-    assert len(conversation.calls) == 1
+    assert rest.created[0]["channel_id"] == CHANNEL
+    assert rest.created[0]["root_id"] == ROOT
+
+
+@pytest.mark.parametrize(
+    "attachment_state",
+    [
+        {"file_ids": ["file000000000000000000000"]},
+        {"metadata": {"files": [{"id": "hidden"}]}},
+        {"props": {"attachments": [{"id": "hidden"}]}},
+        {"attachment_manifest": {"id": "hidden"}},
+    ],
+)
+def test_rest_root_attachment_representations_have_zero_side_effects(tmp_path, attachment_state):
+    service, rest, conversation = ingress(tmp_path)
+    root = post()
+    root.update(attachment_state)
+    rest.posts[ROOT] = root
+    service.handle(event(post("reply00000000000000000000", root_id=ROOT, message="reply")))
+    assert conversation.calls == []
+    assert rest.created == []
 
 
 def test_whitespace_is_rejected_and_exact_mention_accepts_ordinary_punctuation(tmp_path):

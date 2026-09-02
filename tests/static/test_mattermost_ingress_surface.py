@@ -37,6 +37,31 @@ def test_dedicated_image_is_nonroot_and_removes_unrelated_runtime_modules():
     assert "HERMES" not in recipe and ".env" not in recipe
 
 
+def test_versioned_container_closure_command_is_pytest_free_and_checks_ac9_imports():
+    command = ROOT / "tests/deployment/test_mattermost_ingress_image.sh"
+    source = command.read_text(encoding="utf-8")
+    assert source.startswith("#!/usr/bin/env bash\n")
+    assert "sg-mattermost-004" in source
+    assert 'docker build -f Dockerfile.mattermost-ingress' in source
+    assert 'docker run --rm --network none --entrypoint python' in source
+    assert "pytest" not in source.lower()
+    for module in (
+        "restricted_runtime.gateway",
+        "restricted_runtime.vertex",
+        "restricted_runtime.storage",
+        "restricted_runtime.conversation",
+        "restricted_runtime.crypto",
+        "restricted_runtime.conversation_storage",
+        "run_agent",
+        "tools",
+        "plugins",
+        "fastapi",
+        "uvicorn",
+        "psycopg",
+    ):
+        assert module in source
+
+
 def test_operator_docs_preserve_non_phi_and_crash_delivery_nonclaim():
     docs = (ROOT / "docs/design/restricted-mattermost-ingress.md").read_text(encoding="utf-8")
     for phrase in (
