@@ -19,6 +19,7 @@ from .mattermost_policy import MAX_EVENT_BYTES, MattermostPolicy
 
 _MAX_HTTP_BYTES = 1_048_576
 _POST_FIELDS = {"id", "root_id", "channel_id", "user_id", "message", "type", "file_ids", "edit_at", "delete_at"}
+_POST_REQUIRED_FIELDS = _POST_FIELDS - {"file_ids"}
 _NAMESPACE = uuid.UUID("024af157-bd86-4bcc-82bf-92890130c620")
 
 
@@ -46,8 +47,9 @@ class MattermostEvent:
         if not isinstance(data.get("post"), str) or not isinstance(data.get("channel_type"), str):
             raise ContractError("Mattermost event rejected")
         post = load_closed_json(data["post"])
-        if not isinstance(post, dict) or not _POST_FIELDS <= set(post):
+        if not isinstance(post, dict) or not _POST_REQUIRED_FIELDS <= set(post):
             raise ContractError("Mattermost post rejected")
+        post.setdefault("file_ids", [])
         return cls(post, data["channel_type"])
 
 
@@ -74,8 +76,9 @@ def _ordinary(post: dict[str, Any], *, policy: MattermostPolicy, require_mention
             or post["user_id"] not in policy.values["allowed_user_ids"]
             or post["channel_id"] not in policy.values["allowed_channel_ids"]
             or not isinstance(post["file_ids"], list) or post["file_ids"]
+            or bool(post.get("metadata")) or bool(post.get("props"))
             or post["edit_at"] != 0 or post["delete_at"] != 0
-            or not message or len(message.encode("utf-8")) > policy.values["max_message_utf8_bytes"]
+            or not message.strip() or len(message.encode("utf-8")) > policy.values["max_message_utf8_bytes"]
         ):
             return False
         if require_mention:
@@ -141,6 +144,7 @@ class Ingress:
 
     def handle(self, event: MattermostEvent) -> None:
         try:
+            self.policy.validate()
             if not self._authenticated or event.channel_type != "P":
                 return
             post = event.post

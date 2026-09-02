@@ -214,6 +214,40 @@ def event(value: dict, *, channel_type="P") -> MattermostEvent:
     )
 
 
+def test_real_mattermost_text_shape_may_omit_file_ids_but_not_carry_unknown_file_state(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    real_shape = post()
+    del real_shape["file_ids"]
+    service.handle(event(real_shape))
+    assert len(conversation.calls) == 1
+    assert len(rest.created) == 1
+    unsafe = post(
+        "unsafe000000000000000000000", root_id=ROOT, message="reply",
+        metadata={"files": [{"id": "hidden"}]},
+    )
+    service.handle(event(unsafe))
+    assert len(conversation.calls) == 1
+
+
+def test_whitespace_is_rejected_and_exact_mention_accepts_ordinary_punctuation(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    service.handle(event(post("blankreply000000000000000000", root_id=ROOT, message="   \t")))
+    service.handle(event(post("substring000000000000000000", message="@restricted-bot-extra hello")))
+    assert conversation.calls == []
+    punctuated = post("punctuation00000000000000000", message="Hello, @restricted-bot: help.")
+    rest.posts[punctuated["id"]] = punctuated
+    service.handle(event(punctuated))
+    assert len(conversation.calls) == 1
+
+
+def test_expired_policy_stops_admission_in_a_live_process(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    now = datetime.now(UTC).replace(microsecond=0)
+    service.policy.values["expires_at"] = (now - timedelta(seconds=31)).isoformat().replace("+00:00", "Z")
+    service.handle(event(post()))
+    assert conversation.calls == []
+
+
 def ingress(tmp_path):
     policy = signed_policy(tmp_path)
     rest, conversation = Rest(), Conversation()

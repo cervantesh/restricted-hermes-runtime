@@ -112,6 +112,7 @@ class PeerHandler(BaseHTTPRequestHandler):
     posts = []
     delivered = threading.Event()
     mode = "success"
+    websocket_connections = 0
 
     def log_message(self, *_):
         pass
@@ -127,6 +128,7 @@ class PeerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/v4/websocket":
+            type(self).websocket_connections += 1
             key = self.headers["Sec-WebSocket-Key"]
             accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
             self.send_response(101)
@@ -233,6 +235,7 @@ def test_production_entrypoint_real_paths_keep_diagnostics_content_free(tmp_path
     PeerHandler.mode = mode
     PeerHandler.posts = []
     PeerHandler.delivered = threading.Event()
+    PeerHandler.websocket_connections = 0
     ConversationHandler.mode = mode
     ConversationHandler.turns = 0
     key_path, cert_path = _certificates(tmp_path)
@@ -269,9 +272,10 @@ def test_production_entrypoint_real_paths_keep_diagnostics_content_free(tmp_path
             assert PeerHandler.posts[0]["channel_id"] == CHANNEL
             assert PeerHandler.posts[0]["root_id"] == ROOT_POST
         elif mode == "malformed_websocket":
-            time.sleep(2)
+            time.sleep(3)
             assert ConversationHandler.turns == 0
             assert PeerHandler.posts == []
+            assert PeerHandler.websocket_connections >= 2
         else:
             assert process.wait(timeout=10) == 1
     finally:

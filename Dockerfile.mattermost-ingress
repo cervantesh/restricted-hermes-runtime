@@ -3,7 +3,7 @@ WORKDIR /build
 COPY pyproject.toml ./
 COPY src ./src
 RUN pip install --no-cache-dir --no-deps . \
- && pip install --no-cache-dir 'cryptography>=42,<45' 'websockets>=13,<16' \
+ && pip install --no-cache-dir 'cryptography>=42,<45' 'websockets>=15,<16' \
  && find /usr/local/lib/python3.11/site-packages/restricted_runtime -type f -name '*.py' \
       ! -name '__init__.py' ! -name 'contracts.py' ! -name 'mattermost_policy.py' \
       ! -name 'mattermost_ingress.py' ! -name 'production_mattermost_ingress.py' -delete \
