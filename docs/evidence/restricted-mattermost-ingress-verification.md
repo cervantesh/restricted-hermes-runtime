@@ -24,9 +24,12 @@ round trip and the malformed-WebSocket, authentication-failure, REST-error-body,
 diagnostic paths. Every process capture was checked for token, input, response, raw-event,
 REST-error-body, and root-ID canaries.
 
-The image was built from `Dockerfile.mattermost-ingress`. An import probe succeeded for the
-restricted ingress modules and failed closed for `run_agent`, `gateway`, `tools`, `plugins`,
-`psycopg`, `fastapi`, and `uvicorn`.
+From a clean checkout, `bash tests/deployment/test_mattermost_ingress_image.sh`
+builds `Dockerfile.mattermost-ingress` and runs an import/filesystem closure
+probe inside the production role image. It uses the image's Python interpreter,
+not a test framework installed in that image: the four allowed Mattermost
+modules must import, and every other restricted-runtime module plus normal
+Hermes, `fastapi`, `uvicorn`, and `psycopg` must be absent.
 
 The correction suite additionally uses a real-shaped Mattermost post without `file_ids`, proves
 whitespace rejection and exact mention punctuation, expires a policy while the process remains
