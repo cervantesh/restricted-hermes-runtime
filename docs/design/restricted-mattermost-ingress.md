@@ -1,0 +1,48 @@
+# Restricted Mattermost ingress
+
+This is a **synthetic/non-PHI** implementation. It is not a HIPAA, BAA, PHI
+authorization, or production-deployment claim.
+
+## Closed path
+
+`private Mattermost thread -> restricted Mattermost edge -> conversation.sock`
+
+The signed ingress policy fixes one HTTPS origin, team, bot identity, private
+channel and user allowlists, validity window, downstream inference policy pair,
+text limit, and finite timeout ordering. The bot token is a separate read-only
+mounted file. The process must preflight the exact conversation readiness pair,
+bot account, and every channel before WebSocket authentication. Events are
+ignored until authentication succeeds. Every accepted event freshly fetches
+the channel and root. Replies always carry both the source channel and root;
+there is no flat-post fallback.
+
+Deterministic conversation and request identities preserve thread continuity
+and conversation-ledger idempotency. A live-process atomic claim permits one
+inference and one REST create attempt per source post, including concurrent
+duplicates and timeout-after-accept ambiguity. Crash-safe exactly-once delivery is not claimed;
+that needs verified server idempotency or a durable
+outbox in a separate slice.
+
+## Operator gates
+
+Before any real use, operators remain responsible for Mattermost retention,
+audit configuration and review, backup and restore testing, patching cadence,
+identity provider and membership lifecycle, private-channel governance, TLS
+trust, DNS and IPv4/IPv6 network egress enforcement, secret mounting, firewall
+rules, monitoring, and deployment conformance. The application disables proxy
+discovery and redirects by construction, but application code is not the
+network enforcement boundary.
+
+Required mounts and settings:
+
+- signed ingress JSON/signature and its Ed25519 public key;
+- a regular, non-symlink, size-bounded bot-token file;
+- a CA bundle for the exact self-hosted Mattermost origin;
+- `conversation.sock` reachable through GID 20001;
+- a bot restricted to the allowlisted private channels, with read-channel,
+  read-post and create-post permissions; and
+- WebSocket support enabled, federation/DM/files outside this integration, and
+  no webhook, slash-command, OCR, vision, attachment, plugin, or tool route.
+
+Rollback stops the edge process and revokes the bot token. It does not alter
+the restricted conversation, gateway, broker, database, or provider roles.
