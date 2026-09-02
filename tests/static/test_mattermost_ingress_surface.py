@@ -1,0 +1,52 @@
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_mattermost_role_is_standalone_and_has_no_normal_hermes_or_provider_surface():
+    files = [
+        ROOT / "src/restricted_runtime/mattermost_policy.py",
+        ROOT / "src/restricted_runtime/mattermost_ingress.py",
+        ROOT / "src/restricted_runtime/services/production_mattermost_ingress.py",
+    ]
+    forbidden = ("run_agent", "plugins", "tools", "gateway", "vertex", "database", "conversation_storage")
+    for path in files:
+        imported = set()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+        assert all(term not in module for module in imported for term in forbidden)
+
+
+def test_dedicated_image_is_nonroot_and_removes_unrelated_runtime_modules():
+    recipe = (ROOT / "Dockerfile.mattermost-ingress").read_text(encoding="utf-8")
+    assert "USER restricted-mattermost-ingress" in recipe
+    assert "pip install --no-cache-dir --no-deps ." in recipe
+    assert "psycopg" not in recipe
+    assert "10007" in recipe and "20001" in recipe
+    assert "Dockerfile.local-conversation" not in recipe
+    assert "find /usr/local/lib/python3.11/site-packages/restricted_runtime" in recipe
+    for allowed in ("contracts.py", "mattermost_policy.py", "mattermost_ingress.py", "production_mattermost_ingress.py"):
+        assert f"! -name '{allowed}'" in recipe
+    assert "HERMES" not in recipe and ".env" not in recipe
+
+
+def test_operator_docs_preserve_non_phi_and_crash_delivery_nonclaim():
+    docs = (ROOT / "docs/design/restricted-mattermost-ingress.md").read_text(encoding="utf-8")
+    for phrase in (
+        "synthetic/non-PHI",
+        "crash-safe exactly-once delivery is not claimed",
+        "retention",
+        "audit",
+        "backup",
+        "patching",
+        "identity provider",
+        "network",
+    ):
+        assert phrase.lower() in docs.lower()
