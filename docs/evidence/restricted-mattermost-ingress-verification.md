@@ -28,6 +28,12 @@ The image was built from `Dockerfile.mattermost-ingress`. An import probe succee
 restricted ingress modules and failed closed for `run_agent`, `gateway`, `tools`, `plugins`,
 `psycopg`, `fastapi`, and `uvicorn`.
 
+The correction suite additionally uses a real-shaped Mattermost post without `file_ids`, proves
+whitespace rejection and exact mention punctuation, expires a policy while the process remains
+live, observes an abnormal WebSocket closure reconnect, and executes the versioned image probe
+inside the built role image. `websockets` is constrained to version 15 because the explicit
+`proxy=None` control is part of that API contract.
+
 ## Directed mutation
 
 Temporarily deleting the allowed-user predicate from `_ordinary` made

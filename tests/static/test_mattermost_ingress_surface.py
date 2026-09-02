@@ -50,3 +50,14 @@ def test_operator_docs_preserve_non_phi_and_crash_delivery_nonclaim():
         "network",
     ):
         assert phrase.lower() in docs.lower()
+
+
+def test_websocket_transport_requires_proxy_safe_version_and_reconnects_abnormal_closure():
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    production = (ROOT / "src/restricted_runtime/services/production_mattermost_ingress.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"websockets>=15,<16"' in pyproject
+    assert "ConnectionClosed" in production
+    assert "except (OSError, TimeoutError, ConnectionClosed):" in production
+    assert "delay = min(delay * 2, 30.0)" in production

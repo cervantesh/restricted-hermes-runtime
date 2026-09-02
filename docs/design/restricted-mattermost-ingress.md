@@ -33,6 +33,12 @@ rules, monitoring, and deployment conformance. The application disables proxy
 discovery and redirects by construction, but application code is not the
 network enforcement boundary.
 
+The timeout guarantee is limited to the internally ordered values in the signed
+ingress policy: the configured conversation deadline cannot exceed the UDS
+timeout. The deployment must independently verify that the downstream
+conversation service enforces the declared deadline; this edge cannot infer that
+fact from its readiness document.
+
 Required mounts and settings:
 
 - signed ingress JSON/signature and its Ed25519 public key;

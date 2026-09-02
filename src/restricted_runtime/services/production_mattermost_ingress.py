@@ -78,6 +78,10 @@ def _authenticated_connection(ingress: Ingress, token: str, policy, context: ssl
 
 
 def run() -> None:
+    try:
+        from websockets.exceptions import ConnectionClosed
+    except ImportError as exc:
+        raise ContractError("Mattermost WebSocket transport unavailable") from exc
     for name in ("websockets", "websockets.client", "websockets.protocol"):
         logging.getLogger(name).disabled = True
     ingress, token, policy, context = build_ingress()
@@ -95,7 +99,7 @@ def run() -> None:
                     logging.getLogger("restricted_mattermost").warning("mattermost_event_outcome=rejected")
         except ContractError:
             raise
-        except (OSError, TimeoutError):
+        except (OSError, TimeoutError, ConnectionClosed):
             logging.getLogger("restricted_mattermost").warning("mattermost_connection_outcome=disconnected")
         finally:
             if connection is not None:
