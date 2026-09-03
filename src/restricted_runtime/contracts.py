@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import uuid
 from dataclasses import dataclass
 from enum import StrEnum
@@ -18,6 +17,10 @@ MAX_CANONICAL_BYTES = 131_072
 
 class ContractError(ValueError):
     """A closed-contract rejection; callers must not echo its input."""
+
+
+class ClinicalAuthorizationDenied(ContractError):
+    """An authoritative clinical denial that must never be retried as transient."""
 
 
 class Classification(StrEnum):
