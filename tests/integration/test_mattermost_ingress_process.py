@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import socketserver
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -190,6 +191,13 @@ class PeerHandler(BaseHTTPRequestHandler):
             self._json({"error": "ERROR_BODY_CANARY_092a"}, 404)
             return
         type(self).posts.append(body)
+        # The pinned Mattermost server can durably accept a create-post while
+        # its immediate response disappears.  The edge must treat that as an
+        # ambiguous attempt, not as a retryable delivery.
+        if type(self).mode == "drop_post_response":
+            type(self).delivered.set()
+            self.close_connection = True
+            return
         self._json({"id": "posted-reply", **body}, 201)
         type(self).delivered.set()
 
@@ -316,3 +324,239 @@ def test_production_entrypoint_real_paths_keep_diagnostics_content_free(tmp_path
         assert canary not in logs
     if mode == "success":
         assert "mattermost_ingress_outcome=authenticated_ready" in logs
+
+
+@pytest.fixture(scope="module")
+def installed_mattermost_ingress(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build once; every crash witness executes the wheel, never ``src``."""
+    root = tmp_path_factory.mktemp("installed-mattermost-ingress")
+    wheelhouse = root / "wheelhouse"
+    subprocess.run(
+        [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation", ".", "--wheel-dir", str(wheelhouse)],
+        cwd=ROOT, check=True, capture_output=True, text=True, timeout=120,
+    )
+    wheel = next(wheelhouse.glob("restricted_hermes_runtime-*.whl"))
+    site = root / "site"
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-deps", "--target", str(site), str(wheel)],
+        cwd=ROOT, check=True, capture_output=True, text=True, timeout=120,
+    )
+    return site
+
+
+def _installed_environment(
+    site: Path,
+    policy: Path,
+    signature: Path,
+    public: str,
+    token: Path,
+    certificate: Path,
+    outbox_key: Path,
+    *,
+    wrapper: Path | None = None,
+) -> dict[str, str]:
+    # ``src`` is deliberately absent.  ``cwd`` may be the repository root,
+    # but that root does not contain the package; the child resolves only the
+    # wheel target and an optional external crash wrapper.
+    import_path = [str(site)] if wrapper is None else [str(wrapper), str(site)]
+    return {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(import_path),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "RESTRICTED_MATTERMOST_POLICY_PATH": str(policy),
+        "RESTRICTED_MATTERMOST_POLICY_SIGNATURE_PATH": str(signature),
+        "RESTRICTED_MATTERMOST_POLICY_PUBLIC_KEY_B64": public,
+        "RESTRICTED_MATTERMOST_TOKEN_PATH": str(token),
+        "RESTRICTED_MATTERMOST_CA_PATH": str(certificate),
+        "RESTRICTED_MATTERMOST_OUTBOX_KEY_PATH": str(outbox_key),
+        "HTTP_PROXY": "http://127.0.0.1:1",
+        "HTTPS_PROXY": "http://127.0.0.1:1",
+    }
+
+
+def _outbox_states() -> list[str]:
+    database = OUTBOX_STATE / "mattermost-outbox.sqlite3"
+    with sqlite3.connect(database) as connection:
+        return [row[0] for row in connection.execute("SELECT state FROM records ORDER BY record_tag")]
+
+
+def _wait_for(predicate, *, timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.05)
+    raise AssertionError("timed out waiting for process witness state")
+
+
+def _crash_wrapper(tmp_path: Path, stage: str) -> Path:
+    """External installed-artifact crash injection; production remains untouched."""
+    wrapper = tmp_path / f"crash-{stage}"
+    wrapper.mkdir()
+    if stage == "before_delivered_ack":
+        source = """\
+import os
+from restricted_runtime.mattermost_outbox import DeliveryState, MattermostOutbox
+_original = MattermostOutbox.terminal
+def _stop(self, record, state, *, reason):
+    if state is DeliveryState.DELIVERED:
+        os._exit(86)
+    return _original(self, record, state, reason=reason)
+MattermostOutbox.terminal = _stop
+"""
+    elif stage == "after_inflight_before_http":
+        source = """\
+import os
+from restricted_runtime.mattermost_ingress import MattermostRestClient
+def _stop(self, body):
+    os._exit(87)
+MattermostRestClient.create_post = _stop
+"""
+    else:
+        raise AssertionError(stage)
+    (wrapper / "sitecustomize.py").write_text(source, encoding="utf-8")
+    return wrapper
+
+
+def _start_installed(site: Path, environment: dict[str, str]) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [sys.executable, "-B", "-m", "restricted_runtime.services.production_mattermost_ingress"],
+        cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def _stop(process: subprocess.Popen[str]) -> tuple[str, str]:
+    if process.poll() is None:
+        process.terminate()
+    try:
+        return process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return process.communicate(timeout=10)
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_exit"),
+    [("before_delivered_ack", 86), ("after_inflight_before_http", 87)],
+)
+def test_installed_process_crash_after_inflight_never_reposts_on_replay(
+    tmp_path, installed_mattermost_ingress, stage, expected_exit,
+):
+    """A valid response/claimed dispatch killed externally becomes AMBIGUOUS."""
+    if os.geteuid() != 0:
+        pytest.skip("exact fixed-path process witness requires an isolated root runner")
+    SOCKET.parent.mkdir(parents=True, exist_ok=True)
+    if SOCKET.exists() or OUTBOX_STATE.exists():
+        pytest.skip("fixed process witness paths already belong to another runtime")
+    PeerHandler.mode = "success"
+    PeerHandler.posts = []
+    PeerHandler.delivered = threading.Event()
+    PeerHandler.websocket_connections = 0
+    ConversationHandler.mode = "success"
+    ConversationHandler.turns = 0
+    key_path, cert_path = _certificates(tmp_path)
+    peer = ThreadingHTTPServer(("127.0.0.1", 0), PeerHandler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+    peer.socket = context.wrap_socket(peer.socket, server_side=True)
+    threading.Thread(target=peer.serve_forever, daemon=True).start()
+    conversation = socketserver.ThreadingUnixStreamServer(str(SOCKET), ConversationHandler)
+    threading.Thread(target=conversation.serve_forever, daemon=True).start()
+    policy, signature, public = _policy(tmp_path, peer.server_port)
+    token = tmp_path / "token"
+    token.write_text(TOKEN, encoding="utf-8")
+    outbox_key = tmp_path / "outbox.key"
+    outbox_key.write_bytes(b"m" * 32)
+    os.chmod(outbox_key, 0o600)
+    MattermostOutbox.initialize(OUTBOX_STATE, outbox_key, expected_fingerprint=key_fingerprint(b"m" * 32)).close()
+    wrapper = _crash_wrapper(tmp_path, stage)
+    crashing = _start_installed(
+        installed_mattermost_ingress,
+        _installed_environment(installed_mattermost_ingress, policy, signature, public, token, cert_path, outbox_key, wrapper=wrapper),
+    )
+    restarted: subprocess.Popen[str] | None = None
+    try:
+        assert crashing.wait(timeout=15) == expected_exit
+        if stage == "before_delivered_ack":
+            assert len(PeerHandler.posts) == 1
+        else:
+            assert PeerHandler.posts == []
+        assert _outbox_states() == ["IN_FLIGHT"]
+        restarted = _start_installed(
+            installed_mattermost_ingress,
+            _installed_environment(installed_mattermost_ingress, policy, signature, public, token, cert_path, outbox_key),
+        )
+        _wait_for(lambda: _outbox_states() == ["AMBIGUOUS"])
+        _wait_for(lambda: PeerHandler.websocket_connections >= 2)
+        time.sleep(0.25)  # allow the replayed event to reach the executor
+        assert (len(PeerHandler.posts), ConversationHandler.turns) == ((1, 1) if stage == "before_delivered_ack" else (0, 1))
+    finally:
+        if restarted is not None:
+            _stop(restarted)
+        _stop(crashing)
+        peer.shutdown()
+        peer.server_close()
+        conversation.shutdown()
+        conversation.server_close()
+        SOCKET.unlink(missing_ok=True)
+        shutil.rmtree(OUTBOX_STATE, ignore_errors=True)
+
+
+def test_installed_process_dropped_post_response_is_ambiguous_and_never_reposts(
+    tmp_path, installed_mattermost_ingress,
+):
+    """Mattermost may persist a post while the immediate response is lost."""
+    if os.geteuid() != 0:
+        pytest.skip("exact fixed-path process witness requires an isolated root runner")
+    SOCKET.parent.mkdir(parents=True, exist_ok=True)
+    if SOCKET.exists() or OUTBOX_STATE.exists():
+        pytest.skip("fixed process witness paths already belong to another runtime")
+    PeerHandler.mode = "drop_post_response"
+    PeerHandler.posts = []
+    PeerHandler.delivered = threading.Event()
+    PeerHandler.websocket_connections = 0
+    ConversationHandler.mode = "success"
+    ConversationHandler.turns = 0
+    key_path, cert_path = _certificates(tmp_path)
+    peer = ThreadingHTTPServer(("127.0.0.1", 0), PeerHandler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+    peer.socket = context.wrap_socket(peer.socket, server_side=True)
+    threading.Thread(target=peer.serve_forever, daemon=True).start()
+    conversation = socketserver.ThreadingUnixStreamServer(str(SOCKET), ConversationHandler)
+    threading.Thread(target=conversation.serve_forever, daemon=True).start()
+    policy, signature, public = _policy(tmp_path, peer.server_port)
+    token = tmp_path / "token"
+    token.write_text(TOKEN, encoding="utf-8")
+    outbox_key = tmp_path / "outbox.key"
+    outbox_key.write_bytes(b"m" * 32)
+    os.chmod(outbox_key, 0o600)
+    MattermostOutbox.initialize(OUTBOX_STATE, outbox_key, expected_fingerprint=key_fingerprint(b"m" * 32)).close()
+    first = _start_installed(
+        installed_mattermost_ingress,
+        _installed_environment(installed_mattermost_ingress, policy, signature, public, token, cert_path, outbox_key),
+    )
+    restarted: subprocess.Popen[str] | None = None
+    try:
+        assert PeerHandler.delivered.wait(15)
+        _wait_for(lambda: _outbox_states() == ["AMBIGUOUS"])
+        assert (len(PeerHandler.posts), ConversationHandler.turns) == (1, 1)
+        _stop(first)
+        restarted = _start_installed(
+            installed_mattermost_ingress,
+            _installed_environment(installed_mattermost_ingress, policy, signature, public, token, cert_path, outbox_key),
+        )
+        _wait_for(lambda: PeerHandler.websocket_connections >= 2)
+        time.sleep(0.25)
+        assert _outbox_states() == ["AMBIGUOUS"]
+        assert (len(PeerHandler.posts), ConversationHandler.turns) == (1, 1)
+    finally:
+        _stop(first)
+        if restarted is not None:
+            _stop(restarted)
+        peer.shutdown()
+        peer.server_close()
+        conversation.shutdown()
+        conversation.server_close()
+        SOCKET.unlink(missing_ok=True)
+        shutil.rmtree(OUTBOX_STATE, ignore_errors=True)
