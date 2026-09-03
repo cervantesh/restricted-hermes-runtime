@@ -28,7 +28,7 @@ from .contracts import ContractError, jcs_bytes, load_closed_json
 
 OUTBOX_SCHEMA = "restricted-mattermost-outbox.v1"
 OUTBOX_DB_NAME = "mattermost-outbox.sqlite3"
-_META_SCHEMA = "restricted-mattermost-outbox-meta.v4"
+_META_SCHEMA = "restricted-mattermost-outbox-meta.v5"
 _TERMINAL = {"DELIVERED", "AMBIGUOUS", "BLOCKED", "FAILED", "EXPIRED"}
 _ACTIVE = {"WAITING_COMMIT", "READY", "IN_FLIGHT"}
 _ENVELOPE_FIELDS = {
@@ -160,7 +160,14 @@ def _initialization_directory(path: Path) -> int | None:
 class MattermostOutbox:
     """One encrypted SQLite database with durable source and root fences."""
 
-    def __init__(self, database: Path, master_key: bytes, *, expected_fingerprint: str):
+    def __init__(
+        self,
+        database: Path,
+        master_key: bytes,
+        *,
+        expected_fingerprint: str,
+        bootstrap_nonce_registry: bool = False,
+    ):
         self.path = database
         self._master = master_key
         self.fingerprint = key_fingerprint(master_key)
@@ -172,6 +179,8 @@ class MattermostOutbox:
         self._enc_key = _derive(master_key, self._instance_id, b"aes-256-gcm")
         self._tag_key = _derive(master_key, self._instance_id, b"lookup-hmac-sha256")
         self._row_key = _derive(master_key, self._instance_id, b"row-hmac-sha256")
+        self._nonce_key = _derive(master_key, self._instance_id, b"nonce-registry-hmac-sha256")
+        self._bootstrap_nonce_registry(bootstrap_nonce_registry)
         self._verify_all_rows()
         self._database_write_probe()
 
@@ -212,7 +221,12 @@ class MattermostOutbox:
                 os.chmod(database, 0o600)
             except OSError as exc:
                 raise ContractError("Mattermost outbox database mode unavailable") from exc
-        return cls(database, key, expected_fingerprint=expected_fingerprint)
+        return cls(
+            database,
+            key,
+            expected_fingerprint=expected_fingerprint,
+            bootstrap_nonce_registry=True,
+        )
 
     @classmethod
     def open(cls, state_dir: Path, key_path: Path, *, expected_fingerprint: str) -> "MattermostOutbox":
@@ -286,7 +300,13 @@ class MattermostOutbox:
             connection.execute(
                 "CREATE TABLE records (record_tag TEXT PRIMARY KEY, source_tag TEXT UNIQUE NOT NULL, root_tag TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, payload_expires_at INTEGER NOT NULL, policy_expires_at INTEGER NOT NULL, policy_digest TEXT NOT NULL, nonce BLOB, ciphertext BLOB, reason TEXT, returned_post_tag TEXT, auth_tag TEXT NOT NULL)"
             )
-            connection.execute("CREATE TABLE nonce_tombstones (nonce BLOB PRIMARY KEY NOT NULL)")
+            connection.execute(
+                "CREATE TABLE nonce_tombstones (sequence INTEGER PRIMARY KEY, nonce BLOB UNIQUE NOT NULL, chain_tag TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE nonce_registry (singleton INTEGER PRIMARY KEY CHECK(singleton=1), sequence INTEGER NOT NULL, root_tag TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO nonce_registry VALUES (1, 0, '')")
             connection.execute("CREATE TABLE recovery_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), root_tag TEXT NOT NULL, created_at INTEGER NOT NULL, record_tag TEXT NOT NULL)")
             connection.execute("INSERT INTO recovery_cursor VALUES (1, '', -1, '')")
             connection.execute("CREATE INDEX records_root_order ON records(root_tag, created_at, record_tag)")
@@ -336,6 +356,149 @@ class MattermostOutbox:
         payload = domain.encode("ascii") + b"\0" + b"\0".join(part.encode("utf-8") for part in parts)
         return hmac.new(self._tag_key, payload, hashlib.sha256).hexdigest()
 
+    def _nonce_genesis(self) -> str:
+        return hmac.new(
+            self._nonce_key,
+            jcs_bytes({"schema_version": OUTBOX_SCHEMA, "domain": "nonce-registry.v1"}),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _nonce_chain_tag(self, *, sequence: int, nonce: bytes, previous: str) -> str:
+        try:
+            return hmac.new(
+                self._nonce_key,
+                jcs_bytes(
+                    {
+                        "schema_version": OUTBOX_SCHEMA,
+                        "sequence": sequence,
+                        "nonce": nonce.hex(),
+                        "previous": previous,
+                    }
+                ),
+                hashlib.sha256,
+            ).hexdigest()
+        except (TypeError, ValueError, UnicodeError, ContractError) as exc:
+            raise ContractError("Mattermost outbox nonce registry rejected") from exc
+
+    def _bootstrap_nonce_registry(self, allowed: bool) -> None:
+        """Seal the empty registry only during the explicit initialization path."""
+        try:
+            self._connection.row_factory = sqlite3.Row
+            row = self._connection.execute(
+                "SELECT singleton, sequence, root_tag FROM nonce_registry WHERE singleton=1"
+            ).fetchone()
+            if row is None or row["singleton"] != 1:
+                raise ContractError("Mattermost outbox nonce registry rejected")
+            if row["sequence"] != 0 or row["root_tag"] != "":
+                if allowed:
+                    raise ContractError("Mattermost outbox nonce registry rejected")
+                return
+            if not allowed:
+                raise ContractError("Mattermost outbox nonce registry rejected")
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                if self._connection.execute("SELECT COUNT(*) FROM nonce_tombstones").fetchone()[0] != 0:
+                    raise ContractError("Mattermost outbox nonce registry rejected")
+                updated = self._connection.execute(
+                    "UPDATE nonce_registry SET root_tag=? WHERE singleton=1 AND sequence=0 AND root_tag=''",
+                    (self._nonce_genesis(),),
+                )
+                if updated.rowcount != 1:
+                    raise ContractError("Mattermost outbox nonce registry rejected")
+                self._connection.execute("COMMIT")
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+        except ContractError:
+            raise
+        except sqlite3.Error as exc:
+            raise ContractError("Mattermost outbox nonce registry rejected") from exc
+
+    def _verify_nonce_registry(self) -> None:
+        try:
+            registry_rows = self._connection.execute(
+                "SELECT singleton, sequence, root_tag FROM nonce_registry"
+            ).fetchall()
+            if (
+                len(registry_rows) != 1
+                or registry_rows[0]["singleton"] != 1
+                or not isinstance(registry_rows[0]["sequence"], int)
+                or isinstance(registry_rows[0]["sequence"], bool)
+                or registry_rows[0]["sequence"] < 0
+                or not isinstance(registry_rows[0]["root_tag"], str)
+                or len(registry_rows[0]["root_tag"]) != 64
+            ):
+                raise ContractError("Mattermost outbox nonce registry rejected")
+            previous = self._nonce_genesis()
+            expected_sequence = 1
+            nonce_rows = self._connection.execute(
+                "SELECT sequence, nonce, chain_tag FROM nonce_tombstones ORDER BY sequence"
+            ).fetchall()
+            for row in nonce_rows:
+                sequence, nonce, chain_tag = row["sequence"], row["nonce"], row["chain_tag"]
+                if (
+                    not isinstance(sequence, int)
+                    or isinstance(sequence, bool)
+                    or sequence != expected_sequence
+                    or not isinstance(nonce, bytes)
+                    or len(nonce) != 12
+                    or not isinstance(chain_tag, str)
+                    or len(chain_tag) != 64
+                    or not hmac.compare_digest(
+                        chain_tag,
+                        self._nonce_chain_tag(sequence=sequence, nonce=nonce, previous=previous),
+                    )
+                ):
+                    raise ContractError("Mattermost outbox nonce registry rejected")
+                previous = chain_tag
+                expected_sequence += 1
+            if (
+                registry_rows[0]["sequence"] != expected_sequence - 1
+                or not hmac.compare_digest(registry_rows[0]["root_tag"], previous)
+            ):
+                raise ContractError("Mattermost outbox nonce registry rejected")
+        except ContractError:
+            raise
+        except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
+            raise ContractError("Mattermost outbox nonce registry rejected") from exc
+
+    def _append_nonce(self, nonce: bytes) -> None:
+        """Append one irreversible GCM nonce within the caller's SQLite transaction."""
+        try:
+            row = self._connection.execute(
+                "SELECT singleton, sequence, root_tag FROM nonce_registry WHERE singleton=1"
+            ).fetchone()
+            if (
+                row is None
+                or row["singleton"] != 1
+                or not isinstance(row["sequence"], int)
+                or isinstance(row["sequence"], bool)
+                or row["sequence"] < 0
+                or not isinstance(row["root_tag"], str)
+                or len(row["root_tag"]) != 64
+            ):
+                raise ContractError("Mattermost outbox nonce registry rejected")
+            sequence = row["sequence"] + 1
+            chain_tag = self._nonce_chain_tag(sequence=sequence, nonce=nonce, previous=row["root_tag"])
+            try:
+                self._connection.execute(
+                    "INSERT INTO nonce_tombstones(sequence,nonce,chain_tag) VALUES(?,?,?)",
+                    (sequence, nonce, chain_tag),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ContractError("Mattermost outbox nonce reuse rejected") from exc
+            updated = self._connection.execute(
+                "UPDATE nonce_registry SET sequence=?, root_tag=? WHERE singleton=1 AND sequence=? AND root_tag=?",
+                (sequence, chain_tag, row["sequence"], row["root_tag"]),
+            )
+            if updated.rowcount != 1:
+                raise ContractError("Mattermost outbox nonce registry rejected")
+        except ContractError:
+            raise
+        except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
+            raise ContractError("Mattermost outbox nonce registry rejected") from exc
+
     def _row_auth(self, row: Any) -> str:
         try:
             material: dict[str, Any] = {"schema_version": OUTBOX_SCHEMA}
@@ -380,9 +543,7 @@ class MattermostOutbox:
     def _verify_all_rows(self) -> None:
         try:
             self._connection.row_factory = sqlite3.Row
-            nonce_rows = self._connection.execute("SELECT nonce FROM nonce_tombstones").fetchall()
-            if any(not isinstance(item["nonce"], bytes) or len(item["nonce"]) != 12 for item in nonce_rows):
-                raise ContractError("Mattermost outbox nonce registry rejected")
+            self._verify_nonce_registry()
             cursor_rows = self._connection.execute("SELECT singleton, root_tag, created_at, record_tag FROM recovery_cursor").fetchall()
             if (
                 len(cursor_rows) != 1 or cursor_rows[0]["singleton"] != 1
@@ -422,10 +583,7 @@ class MattermostOutbox:
         nonce = secrets.token_bytes(12)
         if not isinstance(nonce, bytes) or len(nonce) != 12:
             raise ContractError("Mattermost outbox nonce rejected")
-        try:
-            self._connection.execute("INSERT INTO nonce_tombstones(nonce) VALUES(?)", (nonce,))
-        except sqlite3.IntegrityError as exc:
-            raise ContractError("Mattermost outbox nonce reuse rejected") from exc
+        self._append_nonce(nonce)
         payload = AESGCM(self._enc_key).encrypt(nonce, jcs_bytes(envelope), self._aad(record_tag=record_tag, source_tag=source_tag, root_tag=root_tag, policy_digest=envelope["policy_digest"]))
         return nonce, payload
 

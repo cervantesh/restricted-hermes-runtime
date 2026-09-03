@@ -71,6 +71,30 @@ def test_nonce_registry_rejects_repeated_entropy_for_the_lifetime_of_a_database_
         store.close()
 
 
+def test_nonce_registry_history_deletion_is_fatal_after_terminal_payload_erasure(tmp_path):
+    store = _store(tmp_path)
+    try:
+        record, _ = store.reserve(_envelope(), payload_capacity=3, tombstone_capacity=3)
+        store.terminal(record, DeliveryState.BLOCKED, reason="test_terminal")
+        nonce = store._connection.execute("SELECT nonce FROM nonce_tombstones").fetchone()[0]
+        store.close()
+        connection = sqlite3.connect(tmp_path / "state" / "mattermost-outbox.sqlite3")
+        try:
+            connection.execute("DELETE FROM nonce_tombstones WHERE nonce=?", (nonce,))
+            connection.commit()
+        finally:
+            connection.close()
+        with pytest.raises(ContractError, match="nonce registry"):
+            MattermostOutbox.open(
+                tmp_path / "state", tmp_path / "key", expected_fingerprint=key_fingerprint(bytes(range(32)))
+            )
+    finally:
+        try:
+            store.close()
+        except sqlite3.ProgrammingError:
+            pass
+
+
 def test_runtime_open_probes_state_directory_writability_before_using_the_database(tmp_path, monkeypatch):
     store = _store(tmp_path)
     key_path = tmp_path / "key"

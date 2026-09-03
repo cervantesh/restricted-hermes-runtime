@@ -283,10 +283,10 @@ class SerializedDeliveryExecutor:
         if envelope is None:
             return False
         now = int(time.time())
-        if now > envelope["payload_expires_at"]:
+        if now >= envelope["payload_expires_at"]:
             self._block_or_expire(record, "payload_expired")
             return False
-        if now > envelope["policy_expires_at"]:
+        if now >= envelope["policy_expires_at"]:
             self._block_or_expire(record, "policy_expired")
             return False
         return True
