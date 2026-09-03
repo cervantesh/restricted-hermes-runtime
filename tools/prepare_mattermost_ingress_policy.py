@@ -30,6 +30,9 @@ def main() -> None:
     parser.add_argument("--expires-at", required=True)
     parser.add_argument("--max-message-bytes", type=int, default=4096)
     parser.add_argument("--outbox-key-fingerprint", required=True)
+    parser.add_argument("--clinical-binding", action="append", default=[], metavar="CHANNEL_ID:ACTOR_ID")
+    parser.add_argument("--clinical-integration-id", default="hrh-mattermost-01")
+    parser.add_argument("--clinical-timezone", default="America/New_York")
     args = parser.parse_args()
     values = {
         "schema_version": MATTERMOST_POLICY_SCHEMA, "policy_epoch": args.epoch,
@@ -48,6 +51,20 @@ def main() -> None:
         "outbox_payload_retention_seconds": 3600, "outbox_payload_capacity": 1000,
         "outbox_tombstone_capacity": 1000, "outbox_scan_limit": 64, "outbox_scan_interval_seconds": 5,
     }
+    if args.clinical_binding:
+        bindings = []
+        for raw in args.clinical_binding:
+            channel_id, separator, actor_id = raw.partition(":")
+            if not separator:
+                parser.error("--clinical-binding must be CHANNEL_ID:ACTOR_ID")
+            bindings.append({"channel_id": channel_id, "actor_id": actor_id})
+        values.update(
+            clinical_bindings=sorted(bindings, key=lambda item: (item["channel_id"], item["actor_id"])),
+            clinical_integration_id=args.clinical_integration_id,
+            clinical_policy_id="clinical-read-v1",
+            clinical_query_socket_path="/run/restricted-clinical/query.sock",
+            clinical_timezone=args.clinical_timezone,
+        )
     document = MattermostPolicy(values, "")
     document.validate(now=datetime.now(UTC))
     key_raw = Path(args.private_key_file).read_text(encoding="ascii")

@@ -8,14 +8,16 @@ import socket
 import ssl
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
 from .contracts import ContractError, jcs_bytes, load_closed_json
-from .mattermost_outbox import DeliveryState, MattermostOutbox, OutboxRecord
+from .mattermost_outbox import CLINICAL_OUTBOX_SCHEMA, DeliveryState, MattermostOutbox, OutboxRecord
 from .mattermost_policy import MAX_EVENT_BYTES, MattermostPolicy
 
 _MAX_HTTP_BYTES = 1_048_576
@@ -60,6 +62,7 @@ class MattermostApi(Protocol):
     def get_channel(self, channel_id: str, *, definitive: bool = False) -> dict[str, Any]: ...
     def get_post(self, post_id: str, *, definitive: bool = False) -> dict[str, Any]: ...
     def get_channel_member(self, channel_id: str, user_id: str, *, definitive: bool = False) -> dict[str, Any]: ...
+    def get_channel_members(self, channel_id: str, *, definitive: bool = False) -> list[dict[str, Any]]: ...
     def create_post(self, body: dict[str, Any]) -> dict[str, Any]: ...
 
 
@@ -68,6 +71,11 @@ class ConversationApi(Protocol):
     def submit(self, *, conversation_id: str, client_request_id: str, message: str) -> dict[str, Any]: ...
     def create_conversation(self, *, conversation_id: str, deadline: float | None = None) -> dict[str, Any]: ...
     def submit_turn(self, *, conversation_id: str, conversation_epoch: str, client_request_id: str, message: str, deadline: float | None = None) -> dict[str, Any]: ...
+
+
+class ClinicalApi(Protocol):
+    def query(self, request: dict[str, Any]) -> dict[str, Any]: ...
+    def reauthorize_delivery(self, request: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class TransientMattermostError(ContractError):
@@ -103,20 +111,106 @@ def _ordinary(post: dict[str, Any], *, policy: MattermostPolicy, require_mention
         return False
 
 
+_PATIENT_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_DASHES = str.maketrans({"\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2212": "-"})
+_CONFUSABLES = str.maketrans({
+    "\u0430": "a", "\u0435": "e", "\u0456": "i", "\u043c": "m", "\u043e": "o", "\u0440": "p",
+    "\u0442": "t", "\u0445": "x", "\u03b1": "a", "\u03b9": "i", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t", "\u03c7": "x",
+})
+
+
+def _namespace_skeleton(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).translate(_DASHES).translate(_CONFUSABLES).casefold()
+    return "".join(character for character in normalized if unicodedata.category(character) != "Cf")
+
+
+def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]:
+    """Return (ordinary|malformed|valid, patient id), reserving confusable forms."""
+    mention = re.compile(rf"(?<![A-Za-z0-9._-])@{re.escape(bot_username)}(?![A-Za-z0-9._-])")
+    matches = list(mention.finditer(message))
+    if len(matches) != 1:
+        skeleton = _namespace_skeleton(message)
+        return ("malformed", None) if re.search(r"next[-\s]+appointment", skeleton) else ("ordinary", None)
+    match = matches[0]
+    body = (message[:match.start()] + message[match.end():]).strip()
+    skeleton = _namespace_skeleton(body)
+    if re.search(r"next[-\s]+appointment", skeleton) is None:
+        return "ordinary", None
+    exact = re.fullmatch(r"next-appointment ([0-9a-f-]{36})", body)
+    if exact is None or not _PATIENT_UUID.fullmatch(exact.group(1)):
+        return "malformed", None
+    try:
+        if str(uuid.UUID(exact.group(1))) != exact.group(1):
+            return "malformed", None
+    except ValueError:
+        return "malformed", None
+    return "valid", exact.group(1)
+
+
+_CLINICAL_WIRE_FIELDS = {
+    "mattermostActorId", "patientId", "requestId", "integrationId",
+    "clinicalPolicyId", "policyEpoch", "policyDigest",
+}
+_CLINICAL_APPOINTMENT_STATUSES = {
+    "scheduled", "confirmed", "checked_in", "in_progress", "in_service", "post_procedure",
+    "ready_for_checkout", "awaiting_payment", "payment_collected", "checked_out",
+}
+
+
+def _valid_clinical_wire_request(body: dict[str, Any]) -> bool:
+    return (
+        set(body) == _CLINICAL_WIRE_FIELDS
+        and isinstance(body.get("mattermostActorId"), str)
+        and re.fullmatch(r"[a-z0-9]{26}", body["mattermostActorId"]) is not None
+        and isinstance(body.get("patientId"), str) and _PATIENT_UUID.fullmatch(body["patientId"]) is not None
+        and isinstance(body.get("requestId"), str) and re.fullmatch(r"[A-Za-z0-9_-]{8,64}", body["requestId"]) is not None
+        and isinstance(body.get("integrationId"), str) and re.fullmatch(r"[A-Za-z0-9_-]{8,64}", body["integrationId"]) is not None
+        and body.get("clinicalPolicyId") == "clinical-read-v1"
+        and isinstance(body.get("policyEpoch"), str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", body["policyEpoch"]) is not None
+        and isinstance(body.get("policyDigest"), str) and re.fullmatch(r"[0-9a-f]{64}", body["policyDigest"]) is not None
+    )
+
+
+def _valid_clinical_appointment(appointment: Any) -> bool:
+    if (
+        not isinstance(appointment, dict) or set(appointment) != {"id", "date", "time", "duration", "status"}
+        or not isinstance(appointment.get("id"), str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", appointment["id"]) is None
+        or not isinstance(appointment.get("date"), str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", appointment["date"]) is None
+        or not isinstance(appointment.get("time"), str) or re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", appointment["time"]) is None
+        or not isinstance(appointment.get("duration"), int) or isinstance(appointment["duration"], bool)
+        or not 1 <= appointment["duration"] <= 1440 or appointment.get("status") not in _CLINICAL_APPOINTMENT_STATUSES
+    ):
+        return False
+    try:
+        datetime.strptime(appointment["date"], "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
 class Ingress:
     """Reserve authenticated events; the sole executor owns UDS and REST effects."""
-    def __init__(self, policy: MattermostPolicy, rest: MattermostApi, conversation: ConversationApi, outbox: MattermostOutbox):
+    def __init__(self, policy: MattermostPolicy, rest: MattermostApi, conversation: ConversationApi, outbox: MattermostOutbox, *, clinical: ClinicalApi | None = None):
         policy.validate()
-        self.policy, self.rest, self.conversation, self.outbox = policy, rest, conversation, outbox
+        self.policy, self.rest, self.conversation, self.outbox, self.clinical = policy, rest, conversation, outbox, clinical
+        if ("clinical_bindings" in policy.values) != (clinical is not None):
+            raise ContractError("Mattermost clinical client/policy binding rejected")
         self._authenticated = False
         self.executor = SerializedDeliveryExecutor(self)
 
     def preflight(self) -> None:
-        self._readiness_binding()
         self._bot_identity()
+        clinical_channels = {item["channel_id"] for item in self.policy.values.get("clinical_bindings", [])}
+        if any(channel_id not in clinical_channels for channel_id in self.policy.values["allowed_channel_ids"]):
+            self._readiness_binding()
         for channel_id in self.policy.values["allowed_channel_ids"]:
-            self._private_channel(channel_id)
-            self._member(channel_id, self.policy.values["bot_user_id"])
+            if channel_id in clinical_channels:
+                self._direct_channel(channel_id)
+                binding = next(item for item in self.policy.values["clinical_bindings"] if item["channel_id"] == channel_id)
+                self._exact_direct_roster(channel_id, binding["actor_id"])
+            else:
+                self._private_channel(channel_id)
+                self._member(channel_id, self.policy.values["bot_user_id"])
         self.outbox.stale_inflight_to_ambiguous()
         self.executor.drain()
 
@@ -162,6 +256,36 @@ class Ingress:
             raise error("Mattermost channel membership rejected")
         return member
 
+    def _direct_channel(self, channel_id: str, *, definitive: bool = False) -> dict[str, Any]:
+        channel = self.rest.get_channel(channel_id, definitive=definitive)
+        if not isinstance(channel, dict) or channel.get("id") != channel_id or channel.get("type") != "D":
+            error = DefinitiveMattermostError if definitive else ContractError
+            raise error("Mattermost direct channel binding rejected")
+        return channel
+
+    def _exact_direct_roster(self, channel_id: str, actor_id: str, *, definitive: bool = False) -> None:
+        members = self.rest.get_channel_members(channel_id, definitive=definitive)
+        expected = {actor_id, self.policy.values["bot_user_id"]}
+        if not isinstance(members, list) or len(members) != 2 or {
+            item.get("user_id") for item in members if isinstance(item, dict) and item.get("channel_id") == channel_id
+        } != expected:
+            error = DefinitiveMattermostError if definitive else ContractError
+            raise error("Mattermost direct channel roster rejected")
+
+    def _clinical_binding(self, channel_id: str, actor_id: str) -> bool:
+        return {"channel_id": channel_id, "actor_id": actor_id} in self.policy.values.get("clinical_bindings", [])
+
+    def _authorize_clinical_source(self, post: dict[str, Any], *, definitive: bool = False) -> None:
+        self.policy.validate()
+        if (
+            post.get("root_id") != "" or not _ordinary(post, policy=self.policy, require_mention=True)
+            or not self._clinical_binding(post.get("channel_id", ""), post.get("user_id", ""))
+        ):
+            error = DefinitiveMattermostError if definitive else ContractError
+            raise error("Mattermost clinical source binding rejected")
+        self._direct_channel(post["channel_id"], definitive=definitive)
+        self._exact_direct_roster(post["channel_id"], post["user_id"], definitive=definitive)
+
     def _validated_root(self, post: dict[str, Any], *, definitive: bool = False) -> tuple[str, dict[str, Any]]:
         root_id = post["root_id"] or post["id"]
         root = self.rest.get_post(root_id, definitive=definitive)
@@ -205,6 +329,56 @@ class Ingress:
             "response": None, "pending_post_id": str(uuid.uuid5(_NAMESPACE, "delivery\x00" + post["id"])), "returned_post_id": None,
         }
 
+    def _clinical_envelope(self, post: dict[str, Any], patient_id: str) -> dict[str, Any]:
+        expires = int(datetime.fromisoformat(self.policy.values["expires_at"].replace("Z", "+00:00")).timestamp())
+        now = int(time.time())
+        return {
+            "schema_version": CLINICAL_OUTBOX_SCHEMA,
+            "tenant_id": self.policy.values["tenant_id"], "origin": self.policy.origin,
+            "channel_id": post["channel_id"], "root_id": post["id"], "source_id": post["id"],
+            "actor_id": post["user_id"], "patient_id": patient_id, "operation": "next-appointment",
+            "request_id": request_identity(self.policy.values["tenant_id"], self.policy.origin, post["channel_id"], post["id"]),
+            "source_message": post["message"],
+            "clinical_policy_id": self.policy.values["clinical_policy_id"],
+            "policy_epoch": self.policy.values["policy_epoch"], "policy_digest": self.policy.digest,
+            "key_fingerprint": self.policy.values["outbox_key_fingerprint"],
+            "policy_expires_at": expires,
+            "payload_expires_at": min(expires, now + self.policy.values["outbox_payload_retention_seconds"]),
+            "clinic_timezone": None, "appointment": None, "response": None,
+            "pending_post_id": str(uuid.uuid5(_NAMESPACE, "clinical-delivery\x00" + post["id"])),
+            "returned_post_id": None,
+        }
+
+    def _revalidate_clinical_envelope(self, envelope: dict[str, Any]) -> None:
+        if (
+            envelope["policy_epoch"] != self.policy.values["policy_epoch"]
+            or envelope["policy_digest"] != self.policy.digest
+            or envelope["key_fingerprint"] != self.policy.values["outbox_key_fingerprint"]
+            or envelope["clinical_policy_id"] != self.policy.values["clinical_policy_id"]
+            or envelope["operation"] != "next-appointment"
+            or not isinstance(envelope["patient_id"], str) or _PATIENT_UUID.fullmatch(envelope["patient_id"]) is None
+            or envelope["request_id"] != request_identity(
+                self.policy.values["tenant_id"], self.policy.origin, envelope["channel_id"], envelope["source_id"]
+            )
+            or not self._clinical_binding(envelope["channel_id"], envelope["actor_id"])
+        ):
+            raise DefinitiveMattermostError("Mattermost clinical policy binding changed")
+        self._bot_identity(definitive=True)
+        source = self.rest.get_post(envelope["source_id"], definitive=True)
+        if isinstance(source, dict) and "file_ids" not in source:
+            source = {**source, "file_ids": []}
+        if (
+            not isinstance(source, dict) or source.get("id") != envelope["source_id"]
+            or source.get("root_id") != "" or envelope["root_id"] != envelope["source_id"]
+            or source.get("channel_id") != envelope["channel_id"] or source.get("user_id") != envelope["actor_id"]
+            or source.get("message") != envelope["source_message"]
+        ):
+            raise DefinitiveMattermostError("Mattermost clinical source replay binding rejected")
+        command_state, patient_id = _clinical_command(source["message"], self.policy.values["bot_username"])
+        if command_state != "valid" or patient_id != envelope["patient_id"]:
+            raise DefinitiveMattermostError("Mattermost clinical patient replay binding rejected")
+        self._authorize_clinical_source(source, definitive=True)
+
     def _revalidate_envelope(self, envelope: dict[str, Any]) -> None:
         if (
             envelope["policy_epoch"] != self.policy.values["policy_epoch"]
@@ -225,9 +399,23 @@ class Ingress:
     def handle(self, event: MattermostEvent) -> None:
         try:
             self.policy.validate()
-            if not self._authenticated or event.channel_type != "P":
+            if not self._authenticated:
                 return
             post = event.post
+            command_state, patient_id = _clinical_command(post.get("message", ""), self.policy.values["bot_username"])
+            if event.channel_type == "D":
+                if command_state != "valid" or patient_id is None or post.get("root_id") != "":
+                    return
+                self._authorize_clinical_source(post)
+                record, _ = self.outbox.reserve(
+                    self._clinical_envelope(post, patient_id),
+                    payload_capacity=self.policy.values["outbox_payload_capacity"],
+                    tombstone_capacity=self.policy.values["outbox_tombstone_capacity"],
+                )
+                self.executor.signal(record.record_tag)
+                return
+            if command_state != "ordinary" or event.channel_type != "P":
+                return
             root_id = self._authorize_source(post)
             envelope = self._envelope(post, root_id)
             record, _ = self.outbox.reserve(
@@ -297,6 +485,9 @@ class SerializedDeliveryExecutor:
             return
         envelope = record.envelope
         if envelope is None:
+            return
+        if envelope.get("schema_version") == CLINICAL_OUTBOX_SCHEMA:
+            self._process_clinical(record)
             return
         if not self._expiry_fence(record):
             return
@@ -374,6 +565,106 @@ class SerializedDeliveryExecutor:
             return
         self.ingress.outbox.delivered(claimed, returned_post_id=delivered["id"])
 
+    def _process_clinical(self, record: OutboxRecord) -> None:
+        envelope = record.envelope
+        if envelope is None:
+            return
+        if self.ingress.clinical is None:
+            self._block_or_expire(record, "clinical_capability_disabled")
+            return
+        if not self._expiry_fence(record):
+            return
+        try:
+            self.ingress._revalidate_clinical_envelope(envelope)
+        except DefinitiveMattermostError:
+            self._block_or_expire(record, "current_authorization_rejected")
+            return
+        except (ContractError, OSError, TimeoutError, ValueError):
+            return
+        if record.state is DeliveryState.WAITING_COMMIT:
+            request = {
+                "mattermostActorId": envelope["actor_id"], "patientId": envelope["patient_id"],
+                "requestId": envelope["request_id"], "integrationId": self.ingress.policy.values["clinical_integration_id"],
+                "clinicalPolicyId": envelope["clinical_policy_id"], "policyEpoch": envelope["policy_epoch"],
+                "policyDigest": envelope["policy_digest"],
+            }
+            try:
+                result = self.ingress.clinical.query(request)
+            except (ContractError, OSError, TimeoutError, ValueError):
+                return
+            expected = {"clinicTimezone", "appointment"}
+            appointment = result.get("appointment") if isinstance(result, dict) else None
+            if not isinstance(result, dict) or set(result) != expected:
+                self._block_or_expire(record, "clinical_query_not_authorized")
+                return
+            if result.get("clinicTimezone") != self.ingress.policy.values["clinical_timezone"]:
+                self._block_or_expire(record, "clinical_query_timezone")
+                return
+            if appointment is None:
+                response = "No upcoming appointment found."
+                record = self.ingress.outbox.mark_ready(record, {
+                    **envelope, "clinic_timezone": result.get("clinicTimezone"), "appointment": None, "response": response,
+                })
+                envelope = record.envelope
+            else:
+                if not _valid_clinical_appointment(appointment):
+                    self._block_or_expire(record, "clinical_query_shape")
+                    return
+                response = f"Next appointment: {appointment['date']} at {appointment['time']} {result['clinicTimezone']} ({appointment['status']}, {appointment['duration']} minutes)."
+                record = self.ingress.outbox.mark_ready(record, {
+                    **envelope, "clinic_timezone": result["clinicTimezone"], "appointment": appointment, "response": response,
+                })
+                envelope = record.envelope
+        if record.state is not DeliveryState.READY or envelope is None or not self._expiry_fence(record):
+            return
+        try:
+            self.ingress._revalidate_clinical_envelope(envelope)
+            authorization = self.ingress.clinical.reauthorize_delivery({
+                "mattermostActorId": envelope["actor_id"], "patientId": envelope["patient_id"],
+                "requestId": envelope["request_id"], "integrationId": self.ingress.policy.values["clinical_integration_id"],
+                "clinicalPolicyId": envelope["clinical_policy_id"], "policyEpoch": envelope["policy_epoch"],
+                "policyDigest": envelope["policy_digest"],
+            })
+        except DefinitiveMattermostError:
+            self._block_or_expire(record, "delivery_authorization_rejected")
+            return
+        except (ContractError, OSError, TimeoutError, ValueError):
+            return
+        if (
+            not isinstance(authorization, dict)
+            or set(authorization) != {"authorized"} or authorization.get("authorized") is not True
+        ):
+            self._block_or_expire(record, "delivery_authorization_not_authorized")
+            return
+        try:
+            self.ingress._revalidate_clinical_envelope(envelope)
+        except DefinitiveMattermostError:
+            self._block_or_expire(record, "post_authorization_source_rejected")
+            return
+        except (ContractError, OSError, TimeoutError, ValueError):
+            return
+        if not self._expiry_fence(record):
+            return
+        claimed = self.ingress.outbox.claim_delivery(record)
+        if claimed is None or claimed.envelope is None or not self._expiry_fence(claimed):
+            return
+        outbound = {
+            "channel_id": claimed.envelope["channel_id"], "root_id": claimed.envelope["root_id"],
+            "message": claimed.envelope["response"], "pending_post_id": claimed.envelope["pending_post_id"],
+        }
+        try:
+            delivered = self.ingress.rest.create_post(outbound)
+            if (
+                not isinstance(delivered, dict) or not isinstance(delivered.get("id"), str) or not delivered["id"]
+                or delivered.get("channel_id") != outbound["channel_id"] or delivered.get("root_id") != outbound["root_id"]
+                or delivered.get("pending_post_id") != outbound["pending_post_id"]
+            ):
+                raise ContractError("Mattermost clinical delivery binding rejected")
+        except (ContractError, OSError, TimeoutError, ValueError):
+            self.ingress.outbox.terminal(claimed, DeliveryState.AMBIGUOUS, reason="clinical_post_attempt_unconfirmed")
+            return
+        self.ingress.outbox.delivered(claimed, returned_post_id=delivered["id"])
+
 
 class MattermostRestClient:
     """One-origin REST transport with no proxy discovery or redirect handling."""
@@ -383,8 +674,9 @@ class MattermostRestClient:
         self._host, self._port = split.hostname or "", split.port or 443
         self._context = ssl.create_default_context(cafile=str(ca_path) if ca_path else None)
 
-    def _request(self, method: str, path: str, body: dict[str, Any] | None = None, *, definitive_shape: bool = False) -> dict[str, Any]:
-        if not path.startswith("/api/v4/") or "//" in path or "?" in path or "#" in path:
+    def _request(self, method: str, path: str, body: dict[str, Any] | None = None, *, definitive_shape: bool = False, list_response: bool = False) -> Any:
+        member_page = path.endswith("/members?page=0&per_page=3")
+        if not path.startswith("/api/v4/") or "//" in path or "#" in path or ("?" in path and not member_page):
             raise ContractError("Mattermost REST path rejected")
         payload = None if body is None else jcs_bytes(body)
         connection = http.client.HTTPSConnection(
@@ -407,7 +699,7 @@ class MattermostRestClient:
                 if response.getheader("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
                     raise ContractError("Mattermost REST response content type rejected")
                 value = load_closed_json(raw)
-                if not isinstance(value, dict):
+                if not isinstance(value, list if list_response else dict):
                     raise ContractError("Mattermost REST response JSON rejected")
             except ContractError as exc:
                 if definitive_shape:
@@ -424,6 +716,7 @@ class MattermostRestClient:
     def get_me(self, *, definitive: bool = False): return self._request("GET", "/api/v4/users/me", definitive_shape=definitive)
     def get_channel(self, channel_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe=""), definitive_shape=definitive)
     def get_channel_member(self, channel_id, user_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe="") + "/members/" + quote(user_id, safe=""), definitive_shape=definitive)
+    def get_channel_members(self, channel_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe="") + "/members?page=0&per_page=3", definitive_shape=definitive, list_response=True)
     def get_post(self, post_id, *, definitive: bool = False): return self._request("GET", "/api/v4/posts/" + quote(post_id, safe=""), definitive_shape=definitive)
     def create_post(self, body): return self._request("POST", "/api/v4/posts", body)
 
@@ -514,8 +807,6 @@ class ConversationUdsClient:
             raise ContractError("conversation creation response rejected")
         if deadline - time.monotonic() <= 0:
             raise ContractError("conversation transport failed")
-        # Keep the legacy public helper as one shared-budget call path; the
-        # outbox executor uses the split methods to persist the original epoch.
         result = self._request(
             "POST", "/v1/restricted/conversations/" + conversation_id + "/turns",
             {"schema_version": "restricted-turn.v1", "client_request_id": client_request_id,
@@ -526,3 +817,57 @@ class ConversationUdsClient:
         if deadline - time.monotonic() <= 0:
             raise ContractError("conversation transport failed")
         return result
+
+
+class ClinicalQueryUdsClient:
+    """Closed client for one separately authorized HRH-backed clinical service."""
+
+    def __init__(self, policy: MattermostPolicy):
+        path = policy.values.get("clinical_query_socket_path")
+        if path != "/run/restricted-clinical/query.sock":
+            raise ContractError("clinical query socket path rejected")
+        self.policy, self.path = policy, path
+
+    def _request(self, endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
+        if endpoint not in {"/v1/clinical/query", "/v1/clinical/reauthorize-delivery"}:
+            raise ContractError("clinical query endpoint rejected")
+        if not isinstance(body, dict) or not _valid_clinical_wire_request(body):
+            raise ContractError("clinical query request schema rejected")
+        payload = jcs_bytes(body)
+        deadline = time.monotonic() + self.policy.values["uds_timeout_seconds"]
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(min(5, max(0.001, deadline - time.monotonic())))
+                client.connect(self.path)
+                wire = b"POST " + endpoint.encode("ascii") + b" HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
+                client.sendall(wire)
+                chunks, total = [], 0
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    client.settimeout(min(5, remaining))
+                    chunk = client.recv(min(65536, _MAX_HTTP_BYTES + 1 - total))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total > _MAX_HTTP_BYTES:
+                        raise ContractError("clinical query response oversized")
+            head, raw = b"".join(chunks).split(b"\r\n\r\n", 1)
+            if not head.startswith(b"HTTP/1.1 200 OK\r\n"):
+                raise ContractError("clinical query response rejected")
+            value = load_closed_json(raw)
+            if not isinstance(value, dict) or time.monotonic() >= deadline:
+                raise ContractError("clinical query response rejected")
+            return value
+        except ContractError:
+            raise
+        except (OSError, TimeoutError, ValueError) as exc:
+            raise ContractError("clinical query transport failed") from exc
+
+    def query(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._request("/v1/clinical/query", request)
+
+    def reauthorize_delivery(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._request("/v1/clinical/reauthorize-delivery", request)

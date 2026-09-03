@@ -32,6 +32,7 @@ _FIELDS = {
     "outbox_key_fingerprint", "outbox_payload_retention_seconds", "outbox_payload_capacity",
     "outbox_tombstone_capacity", "outbox_scan_limit", "outbox_scan_interval_seconds",
 }
+_CLINICAL_FIELDS = {"clinical_bindings", "clinical_integration_id", "clinical_policy_id", "clinical_query_socket_path", "clinical_timezone"}
 
 
 def _utc(value: Any) -> datetime:
@@ -67,7 +68,8 @@ class MattermostPolicy:
 
     def validate(self, *, now: datetime | None = None) -> None:
         value = self.values
-        if set(value) != _FIELDS or value.get("schema_version") != MATTERMOST_POLICY_SCHEMA:
+        fields = set(value)
+        if (fields != _FIELDS and fields != _FIELDS | _CLINICAL_FIELDS) or value.get("schema_version") != MATTERMOST_POLICY_SCHEMA:
             raise ContractError("Mattermost ingress policy schema is closed")
         split = urlsplit(value.get("origin", ""))
         if (
@@ -86,6 +88,33 @@ class MattermostPolicy:
             raise ContractError("Mattermost bot cannot be an allowed initiator")
         if not isinstance(value.get("bot_username"), str) or not _USERNAME.fullmatch(value["bot_username"]):
             raise ContractError("Mattermost bot username is invalid")
+        if _CLINICAL_FIELDS <= fields:
+            bindings = value["clinical_bindings"]
+            if not isinstance(bindings, list) or not bindings or len(bindings) > 256:
+                raise ContractError("Mattermost clinical bindings are invalid")
+            canonical = []
+            for binding in bindings:
+                if not isinstance(binding, dict) or set(binding) != {"channel_id", "actor_id"}:
+                    raise ContractError("Mattermost clinical binding schema is closed")
+                channel_id, actor_id = binding.get("channel_id"), binding.get("actor_id")
+                if not isinstance(channel_id, str) or re.fullmatch(r"[a-z0-9]{26}", channel_id) is None or not isinstance(actor_id, str) or re.fullmatch(r"[a-z0-9]{26}", actor_id) is None:
+                    raise ContractError("Mattermost clinical binding identity is invalid")
+                if channel_id not in value["allowed_channel_ids"] or actor_id not in value["allowed_user_ids"]:
+                    raise ContractError("Mattermost clinical binding is outside ingress allowlists")
+                canonical.append((channel_id, actor_id))
+            if canonical != sorted(set(canonical)):
+                raise ContractError("Mattermost clinical bindings are not canonical")
+            if len({channel_id for channel_id, _ in canonical}) != len(canonical):
+                raise ContractError("Mattermost clinical channel has multiple actors")
+            if value["clinical_policy_id"] != "clinical-read-v1":
+                raise ContractError("Mattermost clinical policy identity is invalid")
+            if not isinstance(value["clinical_integration_id"], str) or re.fullmatch(r"[A-Za-z0-9_-]{8,64}", value["clinical_integration_id"]) is None:
+                raise ContractError("Mattermost clinical integration identity is invalid")
+            if value["clinical_query_socket_path"] != "/run/restricted-clinical/query.sock":
+                raise ContractError("Mattermost clinical query socket is invalid")
+            timezone = value["clinical_timezone"]
+            if not isinstance(timezone, str) or len(timezone) > 64 or re.fullmatch(r"[A-Za-z]+(?:[_-][A-Za-z]+)*(?:/[A-Za-z]+(?:[_-][A-Za-z]+)*)+", timezone) is None:
+                raise ContractError("Mattermost clinical timezone is invalid")
         digest = value.get("inference_policy_digest")
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ContractError("inference policy digest is invalid")
