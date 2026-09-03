@@ -5,6 +5,8 @@ import hashlib
 import json
 import http.client
 import os
+import subprocess
+import sys
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -897,6 +899,60 @@ def test_durable_scan_cursor_does_not_starve_another_root_after_restart(tmp_path
         assert len(rest.created) == 1
     finally:
         reopened.close()
+
+
+def test_process_lifetime_outbox_owner_blocks_a_second_writer_during_recovery_readiness(tmp_path):
+    """A local SQLite writer cannot erase a selected record before the UDS turn."""
+    service, rest, conversation = ingress(tmp_path)
+    source = post()
+    record, created = service.outbox.reserve(
+        {
+            **service._envelope(source, ROOT),
+            "conversation_epoch": "epoch-one",
+        },
+        payload_capacity=1000,
+        tombstone_capacity=1000,
+    )
+    assert created
+    writer_outcomes = []
+    original_ready = conversation.ready
+    writer = r'''
+import sqlite3, sys
+connection = None
+try:
+    connection = sqlite3.connect(sys.argv[1], isolation_level=None, timeout=0)
+    connection.execute("PRAGMA busy_timeout=0")
+    cursor = connection.execute("DELETE FROM records WHERE record_tag=?", (sys.argv[2],))
+    print("corrupted" if cursor.rowcount == 1 else "missing")
+except sqlite3.Error:
+    print("blocked")
+finally:
+    if connection is not None:
+        connection.close()
+    '''
+
+    def readiness_with_concurrent_writer():
+        if writer_outcomes:
+            return original_ready()
+        result = subprocess.run(
+            [sys.executable, "-c", writer, str(service.outbox.path), record.record_tag],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        writer_outcomes.append(result.stdout.strip())
+        return original_ready()
+
+    conversation.ready = readiness_with_concurrent_writer
+    try:
+        service.executor.drain()
+        durable = service.outbox.get(record.record_tag)
+        assert writer_outcomes == ["blocked"]
+        assert len(conversation.calls) == 1 and len(rest.created) == 1
+        assert durable is not None and durable.state is DeliveryState.DELIVERED
+    finally:
+        service.outbox.close()
 
 
 def test_recovery_passes_one_fresh_signed_deadline_to_creation_and_submission(tmp_path, monkeypatch):

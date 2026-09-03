@@ -60,7 +60,7 @@ returns 503. The focused Mattermost tests and real POSIX process suite are indep
 
 - Contract: `SG-MM-OUTBOX-007`
 - Implementation base: `f9ef9f4518ef217e9382635715760177fb749789`
-- Evidence baseline head: `7be66776208fb54f1548896a44f7af2fe0cb0d19`
+- Evidence baseline head: `7387dcfb9863a7797ca5dd94dea50670a05c521a`
 - Scope: encrypted durable local delivery outbox and bounded recovery for the
   restricted Mattermost ingress. The historical SG-MATTERMOST-001 evidence
   above remains preserved as the initial slice.
@@ -74,6 +74,10 @@ returns 503. The focused Mattermost tests and real POSIX process suite are indep
 - Process witnesses cover crash windows around durable reservation, inference
   turn, delivery claim, and posting boundaries. A post-claim restart becomes
   `AMBIGUOUS`; it is never retried.
+- The owner connection acquires SQLite exclusive locking before its first
+  integrity read and retains it for the process lifetime. A concurrent second
+  process attempting deletion during recovery readiness is rejected; the
+  normal owner still completes its one turn and delivery.
 - Installed-wheel directed mutations individually bite for payload encryption,
   durable terminal metadata, nonce reuse/history, readiness binding, source and
   root fences, CAS, stale in-flight handling, and recovery identity.
@@ -83,6 +87,9 @@ returns 503. The focused Mattermost tests and real POSIX process suite are indep
   while a newer terminal row remains.
 - Windows focused evidence: `107 passed, 7 skipped`.
 - Linux installed-wheel/process causal evidence: `131 passed, 1 skipped`.
+- Latest exclusive-owner closure: Windows focused `103 passed, 4 skipped`;
+  Linux installed wheel `123 passed, 1 skipped` (the skipped witness requires
+  isolated PostgreSQL and POSIX AF_UNIX).
 - Real PostgreSQL recovery witness: `1 passed`.
 - Exact Mattermost `11.7.10` acceptance: `PASS`.
 - Hosted CI run `33745519719`: green.
@@ -94,7 +101,9 @@ of this implementation; it does not turn a completed Mattermost post into an
 exactly-once protocol. `AMBIGUOUS` records are never retried, and the runtime
 does not catch up unseen Mattermost events while it was down.
 
-This remains a single-replica design over one protected local state volume.
+This remains a single-replica design over one protected local state volume;
+the live owner holds SQLite exclusive locking, so a second process cannot open
+or write the outbox until that owner exits.
 Operators own capacity sizing, whole-database retirement/reset, key custody and
 rotation, and backup/restore. The keyed nonce history, per-record transition
 history, and row authentication detect uncoordinated local deletion or

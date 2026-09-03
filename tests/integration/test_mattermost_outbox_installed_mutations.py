@@ -263,9 +263,7 @@ waiting,_=store.reserve(env,payload_capacity=3,tombstone_capacity=3)
 ready=store.mark_ready(waiting,{**env,"response":"answer"})
 snapshot=store._connection.execute('SELECT state,generation,updated_at,nonce_sequence,nonce,ciphertext,reason,returned_post_tag,auth_tag FROM records WHERE record_tag=?',(ready.record_tag,)).fetchone()
 claimed=store.claim_delivery(ready); assert claimed is not None; assert store.delivered(claimed,returned_post_id='returned') is not None
-database=root/'state'/'mattermost-outbox.sqlite3'; conn=sqlite3.connect(database)
-conn.execute('UPDATE records SET state=?,generation=?,updated_at=?,nonce_sequence=?,nonce=?,ciphertext=?,reason=?,returned_post_tag=?,auth_tag=? WHERE record_tag=?',tuple(snapshot)+(ready.record_tag,))
-conn.commit(); conn.close()
+store._connection.execute('UPDATE records SET state=?,generation=?,updated_at=?,nonce_sequence=?,nonce=?,ciphertext=?,reason=?,returned_post_tag=?,auth_tag=? WHERE record_tag=?',tuple(snapshot)+(ready.record_tag,))
 try:
  outcome=store.get(ready.record_tag).state.value; store.close()
 except ContractError:
@@ -298,8 +296,7 @@ env={"schema_version":"restricted-mattermost-outbox.v1","tenant_id":"tenant","or
 store=MattermostOutbox.initialize(root/'state',key,expected_fingerprint=fp)
 first,_=store.reserve(env,payload_capacity=3,tombstone_capacity=3); store.terminal(first,DeliveryState.BLOCKED,reason='test')
 later,_=store.reserve({**env,"source_id":"second","root_id":"second"},payload_capacity=3,tombstone_capacity=3); store.terminal(later,DeliveryState.BLOCKED,reason='test')
-database=root/'state'/'mattermost-outbox.sqlite3'; conn=sqlite3.connect(database)
-conn.execute('DELETE FROM records WHERE record_tag=?',(first.record_tag,)); conn.commit(); conn.close()
+store._connection.execute('DELETE FROM records WHERE record_tag=?',(first.record_tag,))
 try:
  _,created=store.reserve(env,payload_capacity=3,tombstone_capacity=3); outcome='readmitted' if created else 'duplicate'; store.close()
 except ContractError:
@@ -362,6 +359,63 @@ def test_installed_readiness_binding_bypass_releases_recovery_work(installed_art
         "    def _readiness_binding(self) -> None:\n        return\n",
     )
     assert _run(mutant, _READINESS_PROGRAM) == {"state": "DELIVERED", "calls": 1, "posts": 1}
+
+
+_PROCESS_OWNERSHIP_PROGRAM = r'''
+import json, os, sqlite3, subprocess, sys, tempfile
+from pathlib import Path
+from restricted_runtime.contracts import ContractError
+from restricted_runtime.mattermost_outbox import MattermostOutbox, key_fingerprint
+from restricted_runtime.mattermost_ingress import Ingress
+root=Path(tempfile.mkdtemp()); key=root/'key'; key.write_bytes(bytes(range(32))); os.chmod(key,0o600); fp=key_fingerprint(bytes(range(32)))
+class Policy:
+ digest='a'*64; origin='https://mm.example'
+ values={'policy_epoch':'policy','outbox_key_fingerprint':fp,'bot_user_id':'bot','bot_username':'bot','tenant_id':'tenant','team_id':'team','allowed_channel_ids':['channel'],'allowed_user_ids':['user'],'max_message_utf8_bytes':4096,'inference_policy_epoch':'inference','inference_policy_digest':'b'*64,'outbox_scan_limit':3,'conversation_deadline_seconds':4}
+ def validate(self): pass
+class Rest:
+ def __init__(self): self.posts=0
+ def get_me(self,*,definitive=False): return {'id':'bot','username':'bot'}
+ def get_post(self,_,*,definitive=False): return source
+ def get_channel(self,_,*,definitive=False): return {'id':'channel','team_id':'team','type':'P'}
+ def get_channel_member(self,channel,user,*,definitive=False): return {'channel_id':channel,'user_id':user}
+ def create_post(self,body): self.posts+=1; return {'id':'returned','channel_id':body['channel_id'],'root_id':body['root_id'],'pending_post_id':body['pending_post_id']}
+class Conversation:
+ def __init__(self):
+  self.calls=0; self.writer=None; self.writer_outcome=None
+  self.readiness={'schema_version':'restricted-conversation-readiness.v1','status':'ready','policy_epoch':'inference','policy_digest':'b'*64,'classification':'PHI','system_instruction_version':'restricted-phi-system.v1','allowed_modalities':['text'],'tools_allowed':False,'fallbacks':[],'max_provider_attempts':1,'streaming':False,'max_output_tokens':4096,'max_canonical_input_utf8_bytes':131072,'response_profile':'restricted-local-text-response.v1'}
+ def ready(self):
+  if self.writer is not None and self.writer_outcome is None:
+   database,tag=self.writer
+   writer="""import sqlite3,sys\nconnection=None\ntry:\n connection=sqlite3.connect(sys.argv[1],isolation_level=None,timeout=0)\n connection.execute("PRAGMA busy_timeout=0")\n cursor=connection.execute("DELETE FROM records WHERE record_tag=?",(sys.argv[2],))\n print("corrupted" if cursor.rowcount == 1 else "missing")\nexcept sqlite3.Error:\n print("blocked")\nfinally:\n if connection is not None: connection.close()\n"""
+   self.writer_outcome=subprocess.run([sys.executable,'-c',writer,str(database),tag],capture_output=True,text=True,check=True,timeout=10).stdout.strip()
+  return self.readiness
+ def create_conversation(self,*,conversation_id,deadline=None): raise AssertionError('persisted epoch must skip creation')
+ def submit_turn(self,**_): self.calls+=1; return {'schema_version':'restricted-turn-result.v1','turn_id':'turn','conversation_epoch':'epoch','status':'COMMITTED','message':'answer'}
+source={'id':'source','root_id':'','channel_id':'channel','user_id':'user','message':'@bot hello','type':'','file_ids':[],'edit_at':0,'delete_at':0}
+policy=Policy(); rest=Rest(); conversation=Conversation(); store=MattermostOutbox.initialize(root/'state',key,expected_fingerprint=fp); service=Ingress(policy,rest,conversation,store)
+env={'schema_version':'restricted-mattermost-outbox.v1','tenant_id':'tenant','origin':'https://mm.example','channel_id':'channel','root_id':'source','source_id':'source','actor_id':'user','message':'@bot hello','conversation_id':'conversation','conversation_epoch':'epoch','client_request_id':'request','policy_epoch':'policy','policy_digest':'a'*64,'key_fingerprint':fp,'policy_expires_at':4000000000,'payload_expires_at':4000000000,'response':None,'pending_post_id':'pending','returned_post_id':None}
+record,_=store.reserve(env,payload_capacity=3,tombstone_capacity=3); conversation.writer=(store.path,record.record_tag)
+try: service.executor.drain()
+except ContractError: pass
+try: state=store.get(record.record_tag).state.value
+except ContractError: state='rejected'
+print(json.dumps({'writer':conversation.writer_outcome,'calls':conversation.calls,'posts':rest.posts,'state':state}))
+'''
+
+
+def test_installed_exclusive_process_ownership_mutation_reopens_recovery_toctou(installed_artifact, tmp_path):
+    baseline = _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _PROCESS_OWNERSHIP_PROGRAM)
+    assert baseline == {"writer": "blocked", "calls": 1, "posts": 1, "state": "DELIVERED"}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        'locking_mode = connection.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()\n        if locking_mode != ("exclusive",):\n            raise ContractError("Mattermost outbox exclusive ownership rejected")',
+        'connection.execute("PRAGMA locking_mode=NORMAL")',
+    )
+    assert _run(mutant, _PROCESS_OWNERSHIP_PROGRAM) == {
+        "writer": "corrupted", "calls": 1, "posts": 0, "state": "rejected"
+    }
 
 
 _DUPLICATE_PROGRAM = r'''

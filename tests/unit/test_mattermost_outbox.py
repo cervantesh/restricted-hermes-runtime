@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -59,6 +61,7 @@ def test_nonce_registry_rejects_repeated_entropy_for_the_lifetime_of_a_database_
             store.reserve(_envelope(source="second-source", root="second-root"), payload_capacity=3, tombstone_capacity=3)
         assert store._connection.execute("SELECT COUNT(*) FROM nonce_tombstones").fetchone()[0] == 2
         assert store._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 1
+        store.close()
         reopened = MattermostOutbox.open(
             tmp_path / "state", tmp_path / "key", expected_fingerprint=key_fingerprint(bytes(range(32)))
         )
@@ -68,7 +71,10 @@ def test_nonce_registry_rejects_repeated_entropy_for_the_lifetime_of_a_database_
         finally:
             reopened.close()
     finally:
-        store.close()
+        try:
+            store.close()
+        except sqlite3.ProgrammingError:
+            pass
 
 
 def test_nonce_registry_history_deletion_is_fatal_after_terminal_payload_erasure(tmp_path):
@@ -137,15 +143,10 @@ def test_restoring_an_older_authentic_ready_row_after_delivery_is_fatal(tmp_path
         claimed = store.claim_delivery(ready)
         assert claimed is not None
         assert store.delivered(claimed, returned_post_id="returned") is not None
-        connection = sqlite3.connect(tmp_path / "state" / "mattermost-outbox.sqlite3")
-        try:
-            connection.execute(
-                "UPDATE records SET state=?,generation=?,updated_at=?,nonce_sequence=?,nonce=?,ciphertext=?,reason=?,returned_post_tag=?,auth_tag=? WHERE record_tag=?",
-                tuple(ready_snapshot) + (ready.record_tag,),
-            )
-            connection.commit()
-        finally:
-            connection.close()
+        store._connection.execute(
+            "UPDATE records SET state=?,generation=?,updated_at=?,nonce_sequence=?,nonce=?,ciphertext=?,reason=?,returned_post_tag=?,auth_tag=? WHERE record_tag=?",
+            tuple(ready_snapshot) + (ready.record_tag,),
+        )
         with pytest.raises(ContractError, match="record history"):
             store.get(ready.record_tag)
         store.close()
@@ -169,12 +170,7 @@ def test_deleting_an_older_terminal_row_is_fatal_while_newer_terminal_history_re
             _envelope(source="second-source", root="second-root"), payload_capacity=3, tombstone_capacity=3
         )
         assert store.terminal(later, DeliveryState.BLOCKED, reason="test_terminal") is not None
-        connection = sqlite3.connect(tmp_path / "state" / "mattermost-outbox.sqlite3")
-        try:
-            connection.execute("DELETE FROM records WHERE record_tag=?", (first.record_tag,))
-            connection.commit()
-        finally:
-            connection.close()
+        store._connection.execute("DELETE FROM records WHERE record_tag=?", (first.record_tag,))
         with pytest.raises(ContractError, match="record history"):
             store.reserve(_envelope(), payload_capacity=3, tombstone_capacity=3)
         store.close()
@@ -206,6 +202,32 @@ def test_runtime_open_probes_state_directory_writability_before_using_the_databa
             tmp_path / "state", key_path, expected_fingerprint=key_fingerprint(bytes(range(32)))
         )
     assert not list((tmp_path / "state").glob(".mattermost-outbox-write-probe-*"))
+
+
+def test_second_process_cannot_open_the_outbox_while_the_owner_connection_lives(tmp_path):
+    store = _store(tmp_path)
+    try:
+        program = r'''
+from pathlib import Path
+from restricted_runtime.contracts import ContractError
+from restricted_runtime.mattermost_outbox import MattermostOutbox, key_fingerprint
+try:
+    candidate = MattermostOutbox.open(Path(r"""%s"""), Path(r"""%s"""), expected_fingerprint=key_fingerprint(bytes(range(32))))
+    candidate.close()
+    print("opened")
+except ContractError:
+    print("blocked")
+''' % (tmp_path / "state", tmp_path / "key")
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        assert result.stdout.strip() == "blocked"
+    finally:
+        store.close()
 
 
 def test_aad_tag_tampering_and_wrong_key_fail_before_record_use(tmp_path):
