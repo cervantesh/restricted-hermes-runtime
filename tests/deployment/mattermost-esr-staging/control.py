@@ -424,13 +424,20 @@ def websocket_wrong_token() -> None:
                 separators=(",", ":"),
             )
         )
-        try:
-            raw = connection.recv(timeout=10)
-        except ConnectionClosed:
-            return
-        value = json.loads(raw)
-        if not isinstance(value, dict) or value.get("seq_reply") != 1 or value.get("status") == "OK":
-            raise RuntimeError("Mattermost real WebSocket accepted the wrong token")
+        deadline = time.monotonic() + 10
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Mattermost wrong-token WebSocket result deadline exceeded")
+            try:
+                raw = connection.recv(timeout=remaining)
+            except ConnectionClosed:
+                return
+            value = json.loads(raw)
+            if isinstance(value, dict) and value.get("seq_reply") == 1:
+                if value.get("status") == "OK":
+                    raise RuntimeError("Mattermost real WebSocket accepted the wrong token")
+                return
     finally:
         connection.close()
 
@@ -551,6 +558,60 @@ def _save_shapes(value: dict[str, Any]) -> None:
     _atomic_json(STATE / "shape-manifest.json", value)
 
 
+def pending_probe() -> None:
+    topology = _topology()
+    actor, actor_token = login("actor@esr.invalid", _secret("actor_password"))
+    if actor.get("id") != topology["actor_id"]:
+        raise RuntimeError("Mattermost pending probe actor identity changed")
+    pending = str(uuid.uuid5(_NAMESPACE, "pending-probe\x00" + topology["allowed_channel_id"]))
+    outbound = {
+        "channel_id": topology["allowed_channel_id"],
+        "message": "synthetic pending identifier probe",
+        "pending_post_id": pending,
+    }
+    immediate, _ = request("POST", "/posts", outbound, actor_token)
+    post_id = immediate.get("id") if isinstance(immediate, dict) else None
+    if not isinstance(post_id, str) or not post_id:
+        raise RuntimeError("Mattermost pending probe create response rejected")
+    stored, _ = request("GET", f"/posts/{post_id}", token=actor_token)
+    immediate_echo = immediate.get("pending_post_id") == pending
+    stored_echo = isinstance(stored, dict) and stored.get("pending_post_id") == pending
+    bindings = {
+        "immediate_channel": immediate.get("channel_id") == topology["allowed_channel_id"],
+        "immediate_root": immediate.get("root_id") == "",
+        "stored_channel": isinstance(stored, dict) and stored.get("channel_id") == topology["allowed_channel_id"],
+        "stored_root": isinstance(stored, dict) and stored.get("root_id") == "",
+        "same_post": isinstance(stored, dict) and stored.get("id") == post_id,
+    }
+    if not all(bindings.values()) or not immediate_echo or stored_echo:
+        safe = {"bindings": bindings, "immediate_echo": immediate_echo, "stored_echo": stored_echo}
+        raise RuntimeError("Mattermost 11.7.10 pending probe behavior changed: " + json.dumps(safe, sort_keys=True))
+    _save_shapes(
+        {
+            "pending_probe": {
+                "request": _shape(outbound),
+                "immediate_create_response": _shape(immediate),
+                "stored_readback": _shape(stored),
+                "bindings": bindings,
+                "immediate_pending_post_id_echoed": immediate_echo,
+                "stored_pending_post_id_echoed": stored_echo,
+                "production_echo_requirement_accepts_immediate": immediate_echo,
+            }
+        }
+    )
+
+
+def effect_counters() -> None:
+    topology = _topology()
+    _, admin_token = _admin()
+    value = {
+        "turns": _witness().get("turns"),
+        "allowed_replies": len(_bot_posts(topology["allowed_channel_id"], topology["bot_id"], admin_token)),
+        "denied_replies": len(_bot_posts(topology["denied_channel_id"], topology["bot_id"], admin_token)),
+    }
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
 def _upload_file(token: str, channel_id: str) -> tuple[str, dict[str, Any]]:
     boundary = "mmesr-boundary"
     canary = b"MM_ESR_SYNTHETIC_FILE_CANARY_5f3c"
@@ -596,14 +657,16 @@ def scenario(name: str) -> None:
             "root_id": replies[0].get("root_id") == root["id"],
         }
         if not all(bindings.values()):
-            raise RuntimeError("Mattermost create-response bindings changed: " + json.dumps(bindings, sort_keys=True))
-        _save_shapes({
+            raise RuntimeError("Mattermost stored reply bindings changed: " + json.dumps(bindings, sort_keys=True))
+        shapes = json.loads((STATE / "shape-manifest.json").read_text(encoding="utf-8"))
+        shapes.update({
             "root": _shape(root),
-            "create_response": _shape(replies[0]),
-            "create_response_bindings": bindings,
-            "pending_post_id_preserved": replies[0].get("pending_post_id")
+            "stored_reply_readback": _shape(replies[0]),
+            "stored_reply_bindings": bindings,
+            "stored_reply_pending_post_id_preserved": replies[0].get("pending_post_id")
             == str(uuid.uuid5(_NAMESPACE, "delivery\x00" + root["id"])),
         })
+        _save_shapes(shapes)
     elif name == "continuation":
         root_id = run["root_id"]
         reply = _create_post(actor_token, topology["allowed_channel_id"], "synthetic continuation", root_id=root_id)
@@ -619,8 +682,12 @@ def scenario(name: str) -> None:
         _create_post(denied_token, topology["allowed_channel_id"], "@esrbot denied actor")
         quiet(2, 2, root_id=run["root_id"])
     elif name == "denied-channel":
-        _create_post(actor_token, topology["denied_channel_id"], "@esrbot denied private")
-        quiet(2, 2, root_id=run["root_id"])
+        ensure_channel_member(topology["denied_channel_id"], topology["bot_id"], admin_token)
+        try:
+            _create_post(actor_token, topology["denied_channel_id"], "@esrbot denied private")
+            quiet(2, 2, root_id=run["root_id"])
+        finally:
+            remove_channel_member(topology["denied_channel_id"], topology["bot_id"], admin_token)
     elif name == "public":
         ensure_channel_member(topology["public_channel_id"], topology["actor_id"], admin_token)
         ensure_channel_member(topology["public_channel_id"], topology["bot_id"], admin_token)
@@ -678,19 +745,23 @@ def scenario(name: str) -> None:
         if len(set(witness.get("conversation_ids", []))) != 1:
             raise RuntimeError("Mattermost recreation changed restricted conversation identity")
         run.update(main_turns=3, main_replies=3, restart_preserved=True)
-    elif name == "mutation-denied-user":
+    elif name == "mutation-denied-channel":
         before_turns = int(_witness()["turns"])
-        post = _create_post(denied_token, topology["allowed_channel_id"], "@esrbot mutation witness")
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            turns = int(_witness()["turns"])
-            replies = len(_bot_posts(topology["allowed_channel_id"], topology["bot_id"], admin_token, root_id=post["id"]))
-            if turns == before_turns + 1 and replies == 1:
-                run["authorization_mutation_bites"] = True
-                break
-            time.sleep(0.2)
-        else:
-            raise RuntimeError("directed authorization mutation did not make the real-server negative fail")
+        ensure_channel_member(topology["denied_channel_id"], topology["bot_id"], admin_token)
+        try:
+            post = _create_post(actor_token, topology["denied_channel_id"], "@esrbot mutation witness")
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                turns = int(_witness()["turns"])
+                replies = len(_bot_posts(topology["denied_channel_id"], topology["bot_id"], admin_token, root_id=post["id"]))
+                if turns == before_turns + 1 and replies == 1:
+                    run["authorization_mutation_bites"] = True
+                    break
+                time.sleep(0.2)
+            else:
+                raise RuntimeError("directed channel-authorization mutation did not make the real-server negative fail")
+        finally:
+            remove_channel_member(topology["denied_channel_id"], topology["bot_id"], admin_token)
     else:
         raise RuntimeError("unknown staging scenario")
     _save_run(run)
@@ -702,12 +773,21 @@ def report() -> None:
     receipt = json.loads((STATE / "bootstrap-receipt.json").read_text(encoding="utf-8"))
     shapes = json.loads((STATE / "shape-manifest.json").read_text(encoding="utf-8"))
     run = _load_run()
-    bindings = shapes.get("create_response_bindings")
+    bindings = shapes.get("stored_reply_bindings")
     if not isinstance(bindings, dict) or set(bindings) != {"channel_id", "root_id"} or not all(bindings.values()):
         safe_bindings = bindings if isinstance(bindings, dict) else {"shape": False}
-        raise RuntimeError("Mattermost create-response bindings changed: " + json.dumps(safe_bindings, sort_keys=True))
-    if shapes.get("pending_post_id_preserved") is not False:
+        raise RuntimeError("Mattermost stored reply bindings changed: " + json.dumps(safe_bindings, sort_keys=True))
+    if shapes.get("stored_reply_pending_post_id_preserved") is not False:
         raise RuntimeError("Mattermost 11.7.10 pending_post_id behavior changed")
+    pending = shapes.get("pending_probe")
+    if (
+        not isinstance(pending, dict)
+        or pending.get("immediate_pending_post_id_echoed") is not True
+        or pending.get("stored_pending_post_id_echoed") is not False
+        or pending.get("production_echo_requirement_accepts_immediate") is not True
+        or not all(pending.get("bindings", {}).values())
+    ):
+        raise RuntimeError("Mattermost pending probe evidence changed")
     memberships = _bot_memberships(topology["bot_id"], topology["team_id"], topology["allowed_channel_id"], admin_token)
     ephemeral = run.get("ephemeral_direct_channel_digests")
     if (
@@ -741,6 +821,10 @@ def main() -> None:
         bootstrap()
     elif command == "policy":
         activate_policy(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif command == "pending-probe":
+        pending_probe()
+    elif command == "effect-counters":
+        effect_counters()
     elif command == "public-key":
         print((STATE / "policy-public").read_text(encoding="ascii").strip())
     elif command == "tls":

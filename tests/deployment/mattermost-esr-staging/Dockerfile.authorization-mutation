@@ -6,9 +6,14 @@ from pathlib import Path
 
 path = Path("/usr/local/lib/python3.11/site-packages/restricted_runtime/mattermost_ingress.py")
 source = path.read_text(encoding="utf-8")
-guard = '            or post["user_id"] not in policy.values["allowed_user_ids"]\n'
-if source.count(guard) != 1:
-    raise SystemExit("authorization mutation target drifted")
-path.write_text(source.replace(guard, ""), encoding="utf-8")
+guards = (
+    '            or post["channel_id"] not in policy.values["allowed_channel_ids"]\n',
+    '            or channel_id not in self.policy.values["allowed_channel_ids"]\n',
+)
+for guard in guards:
+    if source.count(guard) != 1:
+        raise SystemExit("channel authorization mutation target drifted")
+    source = source.replace(guard, "")
+path.write_text(source, encoding="utf-8")
 PY
 USER restricted-mattermost-ingress

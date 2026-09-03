@@ -10,9 +10,10 @@
 
 This receipt records one clean execution of
 `python tests/deployment/test_mattermost_esr_staging.py`. The harness created a
-unique Compose project from empty volumes and removed that project's containers,
-networks, volumes, generated policy, credentials, keys, and synthetic posts at
-the end of the run.
+unique Compose project from empty volumes and kept its temporary state outside
+the repository. It removed that project's containers, networks, volumes, test
+images, generated policy, credentials, keys, synthetic posts, and temporary
+directory at the end of the run.
 
 ## Supply-chain frame
 
@@ -21,7 +22,8 @@ the end of the run.
 - PostgreSQL `17.10-bookworm`:
   `sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f`
 - Both runtime images were inspected as Linux/amd64 and each running container's
-  image ID was compared with the inspected pinned image ID before scenarios ran.
+  image ID was compared with the inspected pinned image ID before any Mattermost
+  user, bot, team, channel, membership, token, or post was created.
 
 The compatibility claim is limited to those exact digests.
 
@@ -33,23 +35,27 @@ The compatibility claim is limited to those exact digests.
   a plaintext origin all failed before an authenticated ingress became ready.
 - The production ingress emitted its content-free authenticated-ready marker only
   after the real Mattermost WebSocket authentication reply returned `status=OK`.
-- A wrong token terminated the ingress without producing a turn or reply.
+- A direct real-server WebSocket challenge and the production ingress both
+  rejected a wrong token without changing processing or reply counters.
 - An allowed root plus continuation produced two turns and two replies in one
   restricted conversation. After recreating only the Mattermost container, a
   continuation preserved the same root and conversation, resulting in three turns
   and three replies.
 - Denied user, denied private channel, public channel, DM, GM, uploaded file,
   edited/root-without-mention, and removed bot membership produced no additional
-  effects in the unmodified ingress.
-- Real root, continuation, uploaded-file, and create-response shapes were checked.
-  The outbound request carried a deterministic `pending_post_id`; the server
-  preserved channel and root but did not preserve that client field.
+  effects in the unmodified ingress. During the denied-private-channel scenario,
+  the bot was a real channel member, so Mattermost delivered the event and the
+  ingress allowlist—not server fan-out—denied it.
+- Real root, continuation, uploaded-file, immediate create-response, and later
+  stored read-back shapes were checked separately. The immediate response
+  preserved channel, root, and deterministic `pending_post_id`; later read-back
+  preserved channel and root but omitted the client field.
 - The ingress-equivalent network namespace reached only the exact TLS Mattermost
   peer and `conversation.sock`; PostgreSQL, the alternate TLS name, plaintext,
   external DNS, external IPv4, and external IPv6 probes failed.
-- Removing the allowed-user authorization check in a disposable mutated image
-  made the denied-user scenario produce one turn and one reply. This directed
-  mutation proves that the real authorization assertion can fail.
+- Removing both channel-allowlist enforcement points in a disposable mutated
+  image made the denied-channel scenario produce one turn and one reply. This
+  directed mutation proves that the real allowlist assertion can fail.
 - The retained, sanitized evidence was scanned against generated passwords,
   tokens, private keys, synthetic message/response canaries, file canary, and raw
   Mattermost identifiers before exact-project cleanup.
@@ -67,17 +73,17 @@ authentication reply, so the readiness marker was never reached. The corrected
 client sends a UTF-8 WebSocket text frame. The process-level peer now asserts text
 opcode `0x1`, and the exact server reaches authenticated-ready.
 
-The exact server also omitted the client-supplied `pending_post_id` from its
-stored/create response. The pre-change client therefore classified an otherwise
-successful, correctly threaded post as rejected. The corrected response contract
-binds the returned channel and root while the focused transport test independently
-proves the deterministic outbound `pending_post_id`; it does not claim server-side
-idempotency.
+The harness separately captured the immediate create response and a later stored
+read-back for a deterministic probe post. The exact server echoed the supplied
+`pending_post_id` immediately and omitted it from later read-back. Production
+consumes the immediate response, so its original exact channel/root/pending binding
+is retained. The stored omission means this evidence does not claim durable
+server-side idempotency.
 
 ## Test disposition
 
 - Exact Mattermost staging harness: **PASS**
-- Focused Mattermost unit/static tests: **42 passed, 1 Windows symlink skip**
+- Focused Mattermost unit/static tests: **46 passed, 1 Windows symlink skip**
 - Full Windows suite: **316 passed, 21 platform skips, 2 unrelated failures**
 - The same two failures reproduce on the untouched sibling checkout: a migration
   test inherits a passwordless external PostgreSQL URL, and a runtime-wave fixture

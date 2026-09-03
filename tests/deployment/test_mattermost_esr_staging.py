@@ -32,7 +32,7 @@ PROJECT = f"mmesr{os.getpid()}_{int(time.time())}"
 if re.fullmatch(r"[a-z0-9_]+", PROJECT) is None:
     raise SystemExit("invalid Compose project identity")
 
-STATE = Path(tempfile.mkdtemp(prefix="mattermost-esr-", dir=ROOT))
+STATE = Path(tempfile.mkdtemp(prefix="mattermost-esr-"))
 SEED = STATE / "seed"
 EVIDENCE = SEED / "evidence"
 ENV_FILE = STATE / "compose.env"
@@ -176,6 +176,19 @@ def exec_controller(*args: str, timeout: int = 240) -> subprocess.CompletedProce
     return result
 
 
+def wait_mattermost_local(deadline: int = 180) -> None:
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        status = compose(
+            "exec", "--no-TTY", "mattermost", "/mattermost/bin/mmctl", "--local", "system", "status",
+            check=False,
+        )
+        if status.returncode == 0:
+            return
+        time.sleep(0.25)
+    raise RuntimeError("Mattermost local readiness deadline exceeded")
+
+
 def wait_ingress(*, ready: bool, deadline: int = 45, after_ready_count: int = 0) -> str:
     end = time.monotonic() + deadline
     logs = ""
@@ -237,6 +250,7 @@ def main() -> None:
     exec_controller("seed")
     phase("start")
     compose("up", "--detach", "postgres", "mattermost", "uds", timeout=300)
+    image_evidence()
     exec_controller("wait-ready", timeout=240)
     admin_password = (SEED / "admin_password").read_text(encoding="ascii")
     created = compose(
@@ -254,12 +268,13 @@ def main() -> None:
     if not public_key or not base64.b64decode(public_key, validate=True):
         raise RuntimeError("policy public key unavailable")
     set_env("MM_ESR_POLICY_PUBLIC_KEY", public_key)
-    image_evidence()
+    exec_controller("pending-probe")
 
     phase("tls-negatives")
     negative("https://mattermost:8065", "wrong", "correct")
     exec_controller("tls", "wrong")
     compose("restart", "mattermost")
+    wait_mattermost_local()
     negative("https://mattermost:8065", "correct", "correct", verify_replies=False)
     exec_controller("tls", "good")
     compose("restart", "mattermost")
@@ -313,12 +328,19 @@ def main() -> None:
     )
     replace_ingress(image=MUTANT_IMAGE)
     wait_ingress(ready=True)
-    exec_controller("scenario", "mutation-denied-user")
+    exec_controller("scenario", "mutation-denied-channel")
 
     phase("authentication-negative")
+    before_wrong_token = json.loads(exec_controller("effect-counters").stdout)
+    exec_controller("websocket-wrong-token")
+    after_wrong_token = json.loads(exec_controller("effect-counters").stdout)
+    if after_wrong_token != before_wrong_token:
+        raise RuntimeError("wrong-token WebSocket changed processing counters")
     exec_controller("policy", "https://mattermost:8065", "correct", "wrong")
     replace_ingress(image=INGRESS_IMAGE)
     wait_ingress(ready=False)
+    if json.loads(exec_controller("effect-counters").stdout) != before_wrong_token:
+        raise RuntimeError("wrong-token production ingress changed processing counters")
 
     phase("evidence")
     report = exec_controller("report").stdout.strip()

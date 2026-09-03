@@ -183,7 +183,7 @@ class Ingress:
             delivered = self.rest.create_post(outbound)
             if (
                 not isinstance(delivered, dict) or delivered.get("channel_id") != post["channel_id"]
-                or delivered.get("root_id") != root_id
+                or delivered.get("root_id") != root_id or delivered.get("pending_post_id") != pending
             ):
                 raise ContractError("Mattermost delivery binding rejected")
         except (ContractError, KeyError, OSError, TimeoutError, UnicodeError, ValueError):
