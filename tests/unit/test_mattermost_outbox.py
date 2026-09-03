@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from restricted_runtime.contracts import ContractError
+import restricted_runtime.mattermost_outbox as mattermost_outbox
 from restricted_runtime.mattermost_outbox import DeliveryState, MattermostOutbox, key_fingerprint
 
 
@@ -45,6 +46,48 @@ def test_reservation_is_encrypted_unique_and_duplicate_precedes_capacity(tmp_pat
             store.reserve(_envelope(source="source-two", root="root-two"), payload_capacity=1, tombstone_capacity=1)
     finally:
         store.close()
+
+
+def test_nonce_registry_rejects_repeated_entropy_for_the_lifetime_of_a_database_key(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    try:
+        monkeypatch.setattr(mattermost_outbox.secrets, "token_bytes", lambda size: b"n" * size)
+        first, created = store.reserve(_envelope(), payload_capacity=3, tombstone_capacity=3)
+        assert created
+        store.terminal(first, DeliveryState.BLOCKED, reason="test_terminal")
+        with pytest.raises(ContractError, match="nonce reuse"):
+            store.reserve(_envelope(source="second-source", root="second-root"), payload_capacity=3, tombstone_capacity=3)
+        assert store._connection.execute("SELECT COUNT(*) FROM nonce_tombstones").fetchone()[0] == 1
+        assert store._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 1
+        reopened = MattermostOutbox.open(
+            tmp_path / "state", tmp_path / "key", expected_fingerprint=key_fingerprint(bytes(range(32)))
+        )
+        try:
+            with pytest.raises(ContractError, match="nonce reuse"):
+                reopened.reserve(_envelope(source="third-source", root="third-root"), payload_capacity=3, tombstone_capacity=3)
+        finally:
+            reopened.close()
+    finally:
+        store.close()
+
+
+def test_runtime_open_probes_state_directory_writability_before_using_the_database(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    key_path = tmp_path / "key"
+    store.close()
+    original_open = mattermost_outbox.os.open
+
+    def reject_write_probe(path, flags, *args, **kwargs):
+        if Path(path).name.startswith(".mattermost-outbox-write-probe-"):
+            raise PermissionError("read-only state")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(mattermost_outbox.os, "open", reject_write_probe)
+    with pytest.raises(ContractError, match="writable"):
+        MattermostOutbox.open(
+            tmp_path / "state", key_path, expected_fingerprint=key_fingerprint(bytes(range(32)))
+        )
+    assert not list((tmp_path / "state").glob(".mattermost-outbox-write-probe-*"))
 
 
 def test_aad_tag_tampering_and_wrong_key_fail_before_record_use(tmp_path):

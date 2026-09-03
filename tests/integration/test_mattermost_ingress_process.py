@@ -118,6 +118,7 @@ class PeerHandler(BaseHTTPRequestHandler):
     delivered = threading.Event()
     mode = "success"
     websocket_connections = 0
+    rest_calls = 0
     event_posts: list[dict] | None = None
     source_posts: dict[str, dict] = {}
 
@@ -170,7 +171,13 @@ class PeerHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 type(self).delivered.wait(10)
             self.close_connection = True
-        elif self.path == "/api/v4/users/me":
+        else:
+            type(self).rest_calls += 1
+            self._do_rest_get()
+
+    def _do_rest_get(self):
+        """REST resource peer, deliberately separate from WebSocket counting."""
+        if self.path == "/api/v4/users/me":
             if type(self).mode == "rest_error":
                 self._json({"error": "ERROR_BODY_CANARY_092a"}, 500)
             else:
@@ -340,6 +347,59 @@ def test_production_entrypoint_real_paths_keep_diagnostics_content_free(tmp_path
         assert canary not in logs
     if mode == "success":
         assert "mattermost_ingress_outcome=authenticated_ready" in logs
+
+
+def test_installed_readonly_outbox_fails_before_any_rest_or_uds_preflight(
+    tmp_path, installed_mattermost_ingress,
+):
+    """A runtime-only database open must prove writability before touching either peer."""
+    if os.geteuid() != 0:
+        pytest.skip("read-only fixed-path process witness requires an isolated root runner")
+    SOCKET.parent.mkdir(parents=True, exist_ok=True)
+    if SOCKET.exists() or OUTBOX_STATE.exists():
+        pytest.skip("fixed process witness paths already belong to another runtime")
+    PeerHandler.mode = "success"
+    PeerHandler.posts = []
+    PeerHandler.delivered = threading.Event()
+    PeerHandler.websocket_connections = 0
+    PeerHandler.rest_calls = 0
+    PeerHandler.event_posts = None
+    PeerHandler.source_posts = {}
+    ConversationHandler.mode = "success"
+    ConversationHandler.turns = 0
+    key_path, cert_path = _certificates(tmp_path)
+    peer = ThreadingHTTPServer(("127.0.0.1", 0), PeerHandler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+    peer.socket = context.wrap_socket(peer.socket, server_side=True)
+    threading.Thread(target=peer.serve_forever, daemon=True).start()
+    conversation = socketserver.ThreadingUnixStreamServer(str(SOCKET), ConversationHandler)
+    threading.Thread(target=conversation.serve_forever, daemon=True).start()
+    policy, signature, public = _policy(tmp_path, peer.server_port)
+    token = tmp_path / "token"
+    token.write_text(TOKEN, encoding="utf-8")
+    outbox_key = tmp_path / "outbox.key"
+    outbox_key.write_bytes(b"m" * 32)
+    os.chmod(outbox_key, 0o600)
+    MattermostOutbox.initialize(
+        OUTBOX_STATE, outbox_key, expected_fingerprint=key_fingerprint(b"m" * 32)
+    ).close()
+    os.chmod(OUTBOX_STATE / "mattermost-outbox.sqlite3", 0o400)
+    process = _start_installed(
+        installed_mattermost_ingress,
+        _installed_environment(installed_mattermost_ingress, policy, signature, public, token, cert_path, outbox_key),
+    )
+    try:
+        assert process.wait(timeout=15) == 1
+        assert (PeerHandler.rest_calls, PeerHandler.websocket_connections, ConversationHandler.turns, PeerHandler.posts) == (0, 0, 0, [])
+    finally:
+        _stop(process)
+        peer.shutdown()
+        peer.server_close()
+        conversation.shutdown()
+        conversation.server_close()
+        SOCKET.unlink(missing_ok=True)
+        shutil.rmtree(OUTBOX_STATE, ignore_errors=True)
 
 
 @pytest.fixture(scope="module")

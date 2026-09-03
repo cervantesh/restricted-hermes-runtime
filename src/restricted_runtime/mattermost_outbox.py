@@ -28,7 +28,7 @@ from .contracts import ContractError, jcs_bytes, load_closed_json
 
 OUTBOX_SCHEMA = "restricted-mattermost-outbox.v1"
 OUTBOX_DB_NAME = "mattermost-outbox.sqlite3"
-_META_SCHEMA = "restricted-mattermost-outbox-meta.v2"
+_META_SCHEMA = "restricted-mattermost-outbox-meta.v4"
 _TERMINAL = {"DELIVERED", "AMBIGUOUS", "BLOCKED", "FAILED", "EXPIRED"}
 _ACTIVE = {"WAITING_COMMIT", "READY", "IN_FLIGHT"}
 _ENVELOPE_FIELDS = {
@@ -173,6 +173,7 @@ class MattermostOutbox:
         self._tag_key = _derive(master_key, self._instance_id, b"lookup-hmac-sha256")
         self._row_key = _derive(master_key, self._instance_id, b"row-hmac-sha256")
         self._verify_all_rows()
+        self._database_write_probe()
 
     @classmethod
     def initialize(cls, state_dir: Path, key_path: Path, *, expected_fingerprint: str) -> "MattermostOutbox":
@@ -230,7 +231,42 @@ class MattermostOutbox:
             raise
         except OSError as exc:
             raise ContractError("Mattermost outbox database is not initialized") from exc
+        cls._state_write_probe(state_dir)
         return cls(database, _key_file(key_path), expected_fingerprint=expected_fingerprint)
+
+    @staticmethod
+    def _state_write_probe(state_dir: Path) -> None:
+        """Prove the protected state directory can create and remove a file."""
+        descriptor: int | None = None
+        directory: int | None = None
+        name = ".mattermost-outbox-write-probe-" + secrets.token_hex(16)
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+            if os.name != "nt":
+                directory = os.open(state_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+                descriptor = os.open(name, flags, 0o600, dir_fd=directory)
+            else:
+                descriptor = os.open(state_dir / name, flags, 0o600)
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            if directory is not None:
+                os.unlink(name, dir_fd=directory)
+            else:
+                os.unlink(state_dir / name)
+        except OSError as exc:
+            raise ContractError("Mattermost outbox state is not writable") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if directory is not None:
+                try:
+                    os.unlink(name, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+                finally:
+                    os.close(directory)
 
     @staticmethod
     def _configure(connection: sqlite3.Connection) -> None:
@@ -250,6 +286,9 @@ class MattermostOutbox:
             connection.execute(
                 "CREATE TABLE records (record_tag TEXT PRIMARY KEY, source_tag TEXT UNIQUE NOT NULL, root_tag TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, payload_expires_at INTEGER NOT NULL, policy_expires_at INTEGER NOT NULL, policy_digest TEXT NOT NULL, nonce BLOB, ciphertext BLOB, reason TEXT, returned_post_tag TEXT, auth_tag TEXT NOT NULL)"
             )
+            connection.execute("CREATE TABLE nonce_tombstones (nonce BLOB PRIMARY KEY NOT NULL)")
+            connection.execute("CREATE TABLE recovery_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), root_tag TEXT NOT NULL, created_at INTEGER NOT NULL, record_tag TEXT NOT NULL)")
+            connection.execute("INSERT INTO recovery_cursor VALUES (1, '', -1, '')")
             connection.execute("CREATE INDEX records_root_order ON records(root_tag, created_at, record_tag)")
             connection.execute("COMMIT")
         except Exception:
@@ -276,6 +315,19 @@ class MattermostOutbox:
             raise
         except (sqlite3.Error, TypeError) as exc:
             raise ContractError("Mattermost outbox metadata unavailable") from exc
+
+    def _database_write_probe(self) -> None:
+        """Acquire a durable SQLite write transaction without changing outbox state."""
+        try:
+            with self._lock:
+                self._connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._connection.execute("UPDATE meta SET schema_version=schema_version")
+                finally:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+        except sqlite3.Error as exc:
+            raise ContractError("Mattermost outbox database is not writable") from exc
 
     def close(self) -> None:
         self._connection.close()
@@ -328,6 +380,20 @@ class MattermostOutbox:
     def _verify_all_rows(self) -> None:
         try:
             self._connection.row_factory = sqlite3.Row
+            nonce_rows = self._connection.execute("SELECT nonce FROM nonce_tombstones").fetchall()
+            if any(not isinstance(item["nonce"], bytes) or len(item["nonce"]) != 12 for item in nonce_rows):
+                raise ContractError("Mattermost outbox nonce registry rejected")
+            cursor_rows = self._connection.execute("SELECT singleton, root_tag, created_at, record_tag FROM recovery_cursor").fetchall()
+            if (
+                len(cursor_rows) != 1 or cursor_rows[0]["singleton"] != 1
+                or not isinstance(cursor_rows[0]["root_tag"], str)
+                or not isinstance(cursor_rows[0]["created_at"], int)
+                or not isinstance(cursor_rows[0]["record_tag"], str)
+                or (cursor_rows[0]["root_tag"] and len(cursor_rows[0]["root_tag"]) != 64)
+                or (cursor_rows[0]["record_tag"] and len(cursor_rows[0]["record_tag"]) != 64)
+                or bool(cursor_rows[0]["root_tag"]) != bool(cursor_rows[0]["record_tag"])
+            ):
+                raise ContractError("Mattermost outbox recovery cursor rejected")
             rows = self._connection.execute("SELECT * FROM records").fetchall()
             for row in rows:
                 self._verify_row(row)
@@ -354,6 +420,12 @@ class MattermostOutbox:
         if set(envelope) != _ENVELOPE_FIELDS or envelope.get("schema_version") != OUTBOX_SCHEMA:
             raise ContractError("Mattermost outbox envelope schema rejected")
         nonce = secrets.token_bytes(12)
+        if not isinstance(nonce, bytes) or len(nonce) != 12:
+            raise ContractError("Mattermost outbox nonce rejected")
+        try:
+            self._connection.execute("INSERT INTO nonce_tombstones(nonce) VALUES(?)", (nonce,))
+        except sqlite3.IntegrityError as exc:
+            raise ContractError("Mattermost outbox nonce reuse rejected") from exc
         payload = AESGCM(self._enc_key).encrypt(nonce, jcs_bytes(envelope), self._aad(record_tag=record_tag, source_tag=source_tag, root_tag=root_tag, policy_digest=envelope["policy_digest"]))
         return nonce, payload
 
@@ -396,7 +468,6 @@ class MattermostOutbox:
     def reserve(self, envelope: dict[str, Any], *, payload_capacity: int, tombstone_capacity: int) -> tuple[OutboxRecord, bool]:
         """Commit the encrypted reservation before any UDS request."""
         record_tag, source_tag, root_tag = self.record_tag(envelope), self.source_tag(envelope), self.root_tag(envelope)
-        nonce, ciphertext = self._seal(envelope, record_tag=record_tag, source_tag=source_tag, root_tag=root_tag)
         now = _now()
         with self._lock:
             self._connection.row_factory = sqlite3.Row
@@ -420,6 +491,7 @@ class MattermostOutbox:
                 # work than the database can safely retain after completion.
                 if active >= payload_capacity or active + tombstones >= tombstone_capacity:
                     raise ContractError("Mattermost outbox capacity reached")
+                nonce, ciphertext = self._seal(envelope, record_tag=record_tag, source_tag=source_tag, root_tag=root_tag)
                 values = {
                     "record_tag": record_tag, "source_tag": source_tag, "root_tag": root_tag,
                     "state": DeliveryState.WAITING_COMMIT.value, "generation": 0, "created_at": now,
@@ -466,9 +538,6 @@ class MattermostOutbox:
     def _transition(self, record: OutboxRecord, expected: DeliveryState, target: DeliveryState, *, envelope: dict[str, Any] | None, reason: str | None = None, missing_ok: bool = False, returned_post_tag: str | None = None) -> OutboxRecord | None:
         if record.state != expected:
             raise ContractError("Mattermost outbox transition state rejected")
-        nonce = ciphertext = None
-        if envelope is not None:
-            nonce, ciphertext = self._seal(envelope, record_tag=record.record_tag, source_tag=record.source_tag, root_tag=record.root_tag)
         now = _now()
         with self._lock:
             self._connection.row_factory = sqlite3.Row
@@ -486,6 +555,11 @@ class MattermostOutbox:
                         self._connection.execute("COMMIT")
                         return None
                     raise ContractError("Mattermost outbox compare-and-set rejected")
+                nonce = ciphertext = None
+                if envelope is not None:
+                    nonce, ciphertext = self._seal(
+                        envelope, record_tag=record.record_tag, source_tag=record.source_tag, root_tag=record.root_tag
+                    )
                 values = {name: current[name] for name in _ROW_FIELDS}
                 values.update({
                     "state": target.value, "generation": current["generation"] + 1, "updated_at": now,
@@ -536,10 +610,42 @@ class MattermostOutbox:
             )
 
     def candidates(self, limit: int) -> list[OutboxRecord]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ContractError("Mattermost outbox scan limit rejected")
         with self._lock:
             self._connection.row_factory = sqlite3.Row
-            rows = self._connection.execute(
-                "SELECT * FROM records WHERE state IN (?,?,?) ORDER BY root_tag, created_at, record_tag LIMIT ?",
-                tuple(item.value for item in (DeliveryState.WAITING_COMMIT, DeliveryState.READY, DeliveryState.IN_FLIGHT)) + (limit,),
-            ).fetchall()
-            return [self._record(row, self._open_envelope(row) if row["nonce"] is not None else None) for row in rows]
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._connection.execute(
+                    "SELECT root_tag, created_at, record_tag FROM recovery_cursor WHERE singleton=1"
+                ).fetchone()
+                if (
+                    cursor is None or not isinstance(cursor["root_tag"], str)
+                    or not isinstance(cursor["created_at"], int) or not isinstance(cursor["record_tag"], str)
+                ):
+                    raise ContractError("Mattermost outbox recovery cursor rejected")
+                states = tuple(item.value for item in (DeliveryState.WAITING_COMMIT, DeliveryState.READY, DeliveryState.IN_FLIGHT))
+                rows = self._connection.execute(
+                    "SELECT * FROM records WHERE state IN (?,?,?) AND (root_tag>? OR (root_tag=? AND (created_at>? OR (created_at=? AND record_tag>?)))) ORDER BY root_tag, created_at, record_tag LIMIT ?",
+                    states + (cursor["root_tag"], cursor["root_tag"], cursor["created_at"], cursor["created_at"], cursor["record_tag"], limit),
+                ).fetchall()
+                if len(rows) < limit:
+                    rows.extend(self._connection.execute(
+                        "SELECT * FROM records WHERE state IN (?,?,?) AND (root_tag<? OR (root_tag=? AND (created_at<? OR (created_at=? AND record_tag<=?)))) ORDER BY root_tag, created_at, record_tag LIMIT ?",
+                        states + (cursor["root_tag"], cursor["root_tag"], cursor["created_at"], cursor["created_at"], cursor["record_tag"], limit - len(rows)),
+                    ).fetchall())
+                if rows:
+                    self._connection.execute(
+                        "UPDATE recovery_cursor SET root_tag=?, created_at=?, record_tag=? WHERE singleton=1",
+                        (rows[-1]["root_tag"], rows[-1]["created_at"], rows[-1]["record_tag"]),
+                    )
+                result = [
+                    self._record(row, self._open_envelope(row) if row["nonce"] is not None else None)
+                    for row in rows
+                ]
+                self._connection.execute("COMMIT")
+                return result
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise

@@ -56,10 +56,10 @@ class MattermostEvent:
 
 
 class MattermostApi(Protocol):
-    def get_me(self) -> dict[str, Any]: ...
-    def get_channel(self, channel_id: str) -> dict[str, Any]: ...
-    def get_post(self, post_id: str) -> dict[str, Any]: ...
-    def get_channel_member(self, channel_id: str, user_id: str) -> dict[str, Any]: ...
+    def get_me(self, *, definitive: bool = False) -> dict[str, Any]: ...
+    def get_channel(self, channel_id: str, *, definitive: bool = False) -> dict[str, Any]: ...
+    def get_post(self, post_id: str, *, definitive: bool = False) -> dict[str, Any]: ...
+    def get_channel_member(self, channel_id: str, user_id: str, *, definitive: bool = False) -> dict[str, Any]: ...
     def create_post(self, body: dict[str, Any]) -> dict[str, Any]: ...
 
 
@@ -136,7 +136,7 @@ class Ingress:
             raise ContractError("restricted conversation readiness binding rejected")
 
     def _bot_identity(self, *, definitive: bool = False) -> None:
-        me = self.rest.get_me()
+        me = self.rest.get_me(definitive=definitive)
         if not isinstance(me, dict) or me.get("id") != self.policy.values["bot_user_id"] or me.get("username") != self.policy.values["bot_username"]:
             error = DefinitiveMattermostError if definitive else ContractError
             raise error("Mattermost bot identity rejected")
@@ -145,7 +145,7 @@ class Ingress:
         self._authenticated = True
 
     def _private_channel(self, channel_id: str, *, definitive: bool = False) -> dict[str, Any]:
-        channel = self.rest.get_channel(channel_id)
+        channel = self.rest.get_channel(channel_id, definitive=definitive)
         if (
             not isinstance(channel, dict) or channel.get("id") != channel_id
             or channel.get("team_id") != self.policy.values["team_id"] or channel.get("type") != "P"
@@ -155,15 +155,16 @@ class Ingress:
             raise error("Mattermost private channel binding rejected")
         return channel
 
-    def _member(self, channel_id: str, user_id: str) -> dict[str, Any]:
-        member = self.rest.get_channel_member(channel_id, user_id)
+    def _member(self, channel_id: str, user_id: str, *, definitive: bool = False) -> dict[str, Any]:
+        member = self.rest.get_channel_member(channel_id, user_id, definitive=definitive)
         if not isinstance(member, dict) or member.get("channel_id") != channel_id or member.get("user_id") != user_id:
-            raise DefinitiveMattermostError("Mattermost channel membership rejected")
+            error = DefinitiveMattermostError if definitive else ContractError
+            raise error("Mattermost channel membership rejected")
         return member
 
     def _validated_root(self, post: dict[str, Any], *, definitive: bool = False) -> tuple[str, dict[str, Any]]:
         root_id = post["root_id"] or post["id"]
-        root = self.rest.get_post(root_id)
+        root = self.rest.get_post(root_id, definitive=definitive)
         if isinstance(root, dict) and "file_ids" not in root:
             root = {**root, "file_ids": []}
         if (
@@ -180,8 +181,8 @@ class Ingress:
         if not _ordinary(post, policy=self.policy, require_mention=not bool(post.get("root_id"))):
             raise DefinitiveMattermostError("Mattermost source binding rejected")
         self._private_channel(post["channel_id"], definitive=definitive)
-        self._member(post["channel_id"], post["user_id"])
-        self._member(post["channel_id"], self.policy.values["bot_user_id"])
+        self._member(post["channel_id"], post["user_id"], definitive=definitive)
+        self._member(post["channel_id"], self.policy.values["bot_user_id"], definitive=definitive)
         root_id, _ = self._validated_root(post, definitive=definitive)
         return root_id
 
@@ -212,7 +213,7 @@ class Ingress:
         ):
             raise DefinitiveMattermostError("Mattermost outbox policy binding changed")
         self._bot_identity(definitive=True)
-        source = self.rest.get_post(envelope["source_id"])
+        source = self.rest.get_post(envelope["source_id"], definitive=True)
         if isinstance(source, dict) and "file_ids" not in source:
             source = {**source, "file_ids": []}
         if not isinstance(source, dict) or source.get("id") != envelope["source_id"] or source.get("channel_id") != envelope["channel_id"] or source.get("user_id") != envelope["actor_id"]:
@@ -276,6 +277,20 @@ class SerializedDeliveryExecutor:
         target = DeliveryState.EXPIRED if reason == "payload_expired" else DeliveryState.BLOCKED
         self.ingress.outbox.terminal(record, target, reason=reason)
 
+    def _expiry_fence(self, record: OutboxRecord) -> bool:
+        """Fence every outbound boundary against expiry after slow local checks."""
+        envelope = record.envelope
+        if envelope is None:
+            return False
+        now = int(time.time())
+        if now > envelope["payload_expires_at"]:
+            self._block_or_expire(record, "payload_expired")
+            return False
+        if now > envelope["policy_expires_at"]:
+            self._block_or_expire(record, "policy_expired")
+            return False
+        return True
+
     def _process(self, record: OutboxRecord) -> None:
         if record.state is DeliveryState.IN_FLIGHT:
             self.ingress.outbox.terminal(record, DeliveryState.AMBIGUOUS, reason="stale_in_flight")
@@ -283,12 +298,7 @@ class SerializedDeliveryExecutor:
         envelope = record.envelope
         if envelope is None:
             return
-        now = int(time.time())
-        if now > envelope["payload_expires_at"]:
-            self._block_or_expire(record, "payload_expired")
-            return
-        if now > envelope["policy_expires_at"]:
-            self._block_or_expire(record, "policy_expired")
+        if not self._expiry_fence(record):
             return
         try:
             self.ingress._revalidate_envelope(envelope)
@@ -302,6 +312,8 @@ class SerializedDeliveryExecutor:
             try:
                 deadline = time.monotonic() + self.ingress.policy.values["conversation_deadline_seconds"]
                 if envelope["conversation_epoch"] is None:
+                    if not self._expiry_fence(record):
+                        return
                     created = self.ingress.conversation.create_conversation(
                         conversation_id=envelope["conversation_id"], deadline=deadline
                     )
@@ -311,6 +323,8 @@ class SerializedDeliveryExecutor:
                         return
                     envelope = {**envelope, "conversation_epoch": epoch}
                     record = self.ingress.outbox.update_waiting(record, envelope)
+                if not self._expiry_fence(record):
+                    return
                 if deadline - time.monotonic() <= 0:
                     raise TimeoutError
                 result = self.ingress.conversation.submit_turn(
@@ -318,6 +332,8 @@ class SerializedDeliveryExecutor:
                     client_request_id=envelope["client_request_id"], message=envelope["message"], deadline=deadline,
                 )
             except (ContractError, OSError, TimeoutError, ValueError):
+                return
+            if not self._expiry_fence(record):
                 return
             status = result.get("status") if isinstance(result, dict) else None
             if status == "COMMITTED" and isinstance(result.get("message"), str) and result["message"] and result.get("conversation_epoch") == envelope["conversation_epoch"]:
@@ -340,8 +356,12 @@ class SerializedDeliveryExecutor:
             return
         except (ContractError, OSError, TimeoutError, ValueError):
             return
+        if not self._expiry_fence(record):
+            return
         claimed = self.ingress.outbox.claim_delivery(record)
         if claimed is None or claimed.envelope is None:
+            return
+        if not self._expiry_fence(claimed):
             return
         outbound = {"channel_id": claimed.envelope["channel_id"], "root_id": claimed.envelope["root_id"], "message": claimed.envelope["response"], "pending_post_id": claimed.envelope["pending_post_id"]}
         try:
@@ -363,7 +383,7 @@ class MattermostRestClient:
         self._host, self._port = split.hostname or "", split.port or 443
         self._context = ssl.create_default_context(cafile=str(ca_path) if ca_path else None)
 
-    def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(self, method: str, path: str, body: dict[str, Any] | None = None, *, definitive_shape: bool = False) -> dict[str, Any]:
         if not path.startswith("/api/v4/") or "//" in path or "?" in path or "#" in path:
             raise ContractError("Mattermost REST path rejected")
         payload = None if body is None else jcs_bytes(body)
@@ -380,14 +400,19 @@ class MattermostRestClient:
                 if response.status in {403, 404}:
                     raise DefinitiveMattermostError("Mattermost REST current resource rejected")
                 raise TransientMattermostError("Mattermost REST response unavailable")
-            raw = response.read(_MAX_HTTP_BYTES + 1)
-            if len(raw) > _MAX_HTTP_BYTES or response.read(1):
-                raise ContractError("Mattermost REST response oversized")
-            if response.getheader("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-                raise ContractError("Mattermost REST content type rejected")
-            value = load_closed_json(raw)
-            if not isinstance(value, dict):
-                raise ContractError("Mattermost REST JSON rejected")
+            try:
+                raw = response.read(_MAX_HTTP_BYTES + 1)
+                if len(raw) > _MAX_HTTP_BYTES or response.read(1):
+                    raise ContractError("Mattermost REST response oversized")
+                if response.getheader("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                    raise ContractError("Mattermost REST response content type rejected")
+                value = load_closed_json(raw)
+                if not isinstance(value, dict):
+                    raise ContractError("Mattermost REST response JSON rejected")
+            except ContractError as exc:
+                if definitive_shape:
+                    raise DefinitiveMattermostError("Mattermost REST current resource response rejected") from exc
+                raise
             return value
         except ContractError:
             raise
@@ -396,10 +421,10 @@ class MattermostRestClient:
         finally:
             connection.close()
 
-    def get_me(self): return self._request("GET", "/api/v4/users/me")
-    def get_channel(self, channel_id): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe=""))
-    def get_channel_member(self, channel_id, user_id): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe="") + "/members/" + quote(user_id, safe=""))
-    def get_post(self, post_id): return self._request("GET", "/api/v4/posts/" + quote(post_id, safe=""))
+    def get_me(self, *, definitive: bool = False): return self._request("GET", "/api/v4/users/me", definitive_shape=definitive)
+    def get_channel(self, channel_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe=""), definitive_shape=definitive)
+    def get_channel_member(self, channel_id, user_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe="") + "/members/" + quote(user_id, safe=""), definitive_shape=definitive)
+    def get_post(self, post_id, *, definitive: bool = False): return self._request("GET", "/api/v4/posts/" + quote(post_id, safe=""), definitive_shape=definitive)
     def create_post(self, body): return self._request("POST", "/api/v4/posts", body)
 
 

@@ -67,10 +67,10 @@ class _Rest:
         self.posts = {ROOT: source}
         self.created: list[dict[str, object]] = []
 
-    def get_me(self): return {"id": BOT, "username": "restricted-bot"}
-    def get_channel(self, channel_id): return {"id": channel_id, "team_id": TEAM, "type": "P"}
-    def get_channel_member(self, channel_id, user_id): return {"channel_id": channel_id, "user_id": user_id}
-    def get_post(self, post_id): return self.posts[post_id]
+    def get_me(self, *, definitive=False): return {"id": BOT, "username": "restricted-bot"}
+    def get_channel(self, channel_id, *, definitive=False): return {"id": channel_id, "team_id": TEAM, "type": "P"}
+    def get_channel_member(self, channel_id, user_id, *, definitive=False): return {"channel_id": channel_id, "user_id": user_id}
+    def get_post(self, post_id, *, definitive=False): return self.posts[post_id]
     def create_post(self, body):
         self.created.append(body)
         return {"id": "reply000000000000000000000", **body}
