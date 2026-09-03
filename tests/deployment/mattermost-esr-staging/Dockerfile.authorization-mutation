@@ -1,0 +1,14 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path("/usr/local/lib/python3.11/site-packages/restricted_runtime/mattermost_ingress.py")
+source = path.read_text(encoding="utf-8")
+guard = '            or post["user_id"] not in policy.values["allowed_user_ids"]\n'
+if source.count(guard) != 1:
+    raise SystemExit("authorization mutation target drifted")
+path.write_text(source.replace(guard, ""), encoding="utf-8")
+PY
+USER restricted-mattermost-ingress

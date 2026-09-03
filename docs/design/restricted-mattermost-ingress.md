@@ -52,3 +52,16 @@ Required mounts and settings:
 
 Rollback stops the edge process and revokes the bot token. It does not alter
 the restricted conversation, gateway, broker, database, or provider roles.
+
+## Exact ESR staging conformance
+
+`tests/deployment/test_mattermost_esr_staging.sh` is a synthetic, non-PHI
+staging conformance harness for exactly Mattermost Team Edition 11.7.10 on
+Linux/amd64 at its pinned image digest.  It is not a deployment recipe or a
+general Mattermost compatibility claim.  Its isolated TLS topology is only a
+test witness; real operators still own retention, backups and restore, IdP and
+membership governance, audit configuration, patching, production firewalling,
+BAA/HIPAA obligations, and PHI authorization.
+
+The latest exact-digest execution receipt is recorded in
+`docs/evidence/mattermost-11.7.10-staging-conformance.md`.

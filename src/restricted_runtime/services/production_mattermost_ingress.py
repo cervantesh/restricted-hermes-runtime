@@ -54,7 +54,11 @@ def _authenticated_connection(ingress: Ingress, token: str, policy, context: ssl
         compression=None,
     )
     sequence = 1
-    connection.send(jcs_bytes({"seq": sequence, "action": "authentication_challenge", "data": {"token": token}}))
+    # Mattermost's real WebSocket endpoint requires a JSON text frame; a binary
+    # frame is closed before the authentication reply on the pinned ESR server.
+    connection.send(
+        jcs_bytes({"seq": sequence, "action": "authentication_challenge", "data": {"token": token}}).decode("utf-8")
+    )
     deadline = time.monotonic() + policy.values["websocket_timeout_seconds"]
     while True:
         remaining = deadline - time.monotonic()
@@ -74,6 +78,7 @@ def _authenticated_connection(ingress: Ingress, token: str, policy, context: ssl
                 connection.close()
                 raise ContractError("Mattermost WebSocket authentication rejected")
             ingress.mark_authenticated()
+            logging.getLogger("restricted_mattermost").warning("mattermost_ingress_outcome=authenticated_ready")
             return connection
 
 

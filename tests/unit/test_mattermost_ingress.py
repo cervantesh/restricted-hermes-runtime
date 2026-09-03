@@ -4,6 +4,7 @@ import base64
 import json
 import http.client
 import threading
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -449,3 +450,22 @@ def test_delivery_response_mismatch_never_falls_back_to_flat_post(tmp_path):
     assert len(conversation.calls) == 1
     assert len(attempts) == 1
     assert attempts[0]["root_id"] == ROOT
+
+
+def test_delivery_accepts_real_server_response_without_echoed_pending_id(tmp_path, caplog):
+    service, rest, conversation = ingress(tmp_path)
+    attempts = []
+
+    def real_server_shape(body):
+        attempts.append(body)
+        return {"id": "reply", "channel_id": body["channel_id"], "root_id": body["root_id"]}
+
+    rest.create_post = real_server_shape
+    with caplog.at_level("WARNING"):
+        service.handle(event(post()))
+    assert len(conversation.calls) == 1
+    assert len(attempts) == 1
+    assert attempts[0]["pending_post_id"] == str(
+        uuid.uuid5(uuid.UUID("024af157-bd86-4bcc-82bf-92890130c620"), "delivery\x00" + ROOT)
+    )
+    assert "mattermost_event_outcome=rejected" not in caplog.text
