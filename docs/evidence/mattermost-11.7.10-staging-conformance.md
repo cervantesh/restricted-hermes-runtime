@@ -31,16 +31,25 @@ The compatibility claim is limited to those exact digests.
 
 - Two bootstrap invocations converged to the same topology and exactly one usable
   bot token.
-- Wrong CA, a trusted certificate with the wrong SAN, an alternate hostname, and
-  a plaintext origin all failed before an authenticated ingress became ready.
+- Wrong CA, a trusted certificate with the wrong SAN, and an alternate hostname
+  all failed before an authenticated ingress became ready. The `http://` origin
+  was rejected while loading the signed policy; the separate namespace probe
+  confirmed that plaintext transport to the TLS listener was also unavailable.
 - The production ingress emitted its content-free authenticated-ready marker only
   after the real Mattermost WebSocket authentication reply returned `status=OK`.
-- A direct real-server WebSocket challenge and the production ingress both
-  rejected a wrong token without changing processing or reply counters.
+- A direct real-server WebSocket challenge with a token-shaped but nonexistent
+  credential ended without a close frame. The harness does not accept that close
+  alone: it requires the same credential to receive an explicit REST `401` from
+  the exact server. Processing and reply counters remained unchanged. The
+  production wrong-token scenario likewise failed closed during its REST identity
+  preflight, before opening the WebSocket. Production WebSocket
+  authentication-failure handling remains owned by the Linux-only synthetic
+  process witness.
 - An allowed root plus continuation produced two turns and two replies in one
   restricted conversation. After recreating only the Mattermost container, a
   continuation preserved the same root and conversation, resulting in three turns
-  and three replies.
+  and three replies. Production logs captured after the allowed root and
+  continuation contained no content-free delivery-binding rejection marker.
 - Denied user, denied private channel, public channel, DM, GM, uploaded file,
   edited/root-without-mention, and removed bot membership produced no additional
   effects in the unmodified ingress. During the denied-private-channel scenario,
@@ -83,8 +92,12 @@ server-side idempotency.
 ## Test disposition
 
 - Exact Mattermost staging harness: **PASS**
-- Focused Mattermost unit/static tests: **46 passed, 1 Windows symlink skip**
-- Full Windows suite: **316 passed, 21 platform skips, 2 unrelated failures**
+- Focused Mattermost unit/static tests on Windows: **46 passed, 1 skip** because
+  this host could not create the test symlink.
+- Full Windows suite: **316 passed, 21 skips, 2 unrelated failures**. The five
+  production process-witness scenarios are Linux/root/AF_UNIX-owned and do not
+  execute on Windows; the exact image witness executes inside the built Linux
+  container rather than as a Windows-host test.
 - The same two failures reproduce on the untouched sibling checkout: a migration
   test inherits a passwordless external PostgreSQL URL, and a runtime-wave fixture
   expects `ready` while its own comment describes a required `503` fail-closed

@@ -435,7 +435,7 @@ def test_delivery_timeout_after_accept_is_not_retried_or_flattened(tmp_path):
     assert len(attempts) == 1
 
 
-def test_delivery_response_mismatch_never_falls_back_to_flat_post(tmp_path):
+def test_delivery_response_mismatch_never_falls_back_to_flat_post(tmp_path, caplog):
     service, rest, conversation = ingress(tmp_path)
     attempts = []
 
@@ -449,3 +449,4 @@ def test_delivery_response_mismatch_never_falls_back_to_flat_post(tmp_path):
     assert len(conversation.calls) == 1
     assert len(attempts) == 1
     assert attempts[0]["root_id"] == ROOT
+    assert "mattermost_delivery_outcome=rejected_binding" in caplog.text

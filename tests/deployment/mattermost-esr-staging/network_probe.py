@@ -9,14 +9,16 @@ import ssl
 
 
 def denied_connect(host: str, port: int, family: int = socket.AF_INET) -> bool:
-    candidate = socket.socket(family, socket.SOCK_STREAM)
-    candidate.settimeout(2)
+    candidate = None
     try:
+        candidate = socket.socket(family, socket.SOCK_STREAM)
+        candidate.settimeout(2)
         candidate.connect((host, port))
     except OSError:
         return True
     finally:
-        candidate.close()
+        if candidate is not None:
+            candidate.close()
     return False
 
 

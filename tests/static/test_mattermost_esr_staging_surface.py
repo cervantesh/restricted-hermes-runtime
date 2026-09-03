@@ -21,4 +21,8 @@ def test_exact_esr_harness_pins_native_tls_and_internal_networks():
     assert 'dir=ROOT' not in runner
     assert 'wait_mattermost_local()' in runner
     assert 'exec_controller("websocket-wrong-token")' in runner
+    assert 'EVIDENCE / "allowed-delivery.log"' in runner
+    assert 'if "mattermost_delivery_outcome=rejected_binding" in root_logs' in runner
+    assert 'if "mattermost_delivery_outcome=rejected_binding" in continuation_logs' in runner
+    assert "def compose_ps(" in runner
     assert "pytest" not in runner.lower()

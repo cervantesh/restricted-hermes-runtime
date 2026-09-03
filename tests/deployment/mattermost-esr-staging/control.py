@@ -413,6 +413,12 @@ def websocket_wrong_token() -> None:
         close_timeout=10,
         compression=None,
     )
+
+    def record(outcome: str) -> None:
+        run = _load_run()
+        run["wrong_token_challenge_evidence"] = outcome
+        _save_run(run)
+
     try:
         connection.send(
             json.dumps(
@@ -431,12 +437,27 @@ def websocket_wrong_token() -> None:
                 raise RuntimeError("Mattermost wrong-token WebSocket result deadline exceeded")
             try:
                 raw = connection.recv(timeout=remaining)
-            except ConnectionClosed:
-                return
+            except ConnectionClosed as exc:
+                close_reasons = " ".join(
+                    str(getattr(frame, "reason", ""))
+                    for frame in (getattr(exc, "rcvd", None), getattr(exc, "sent", None))
+                    if frame is not None
+                ).lower()
+                if any(marker in close_reasons for marker in ("auth", "token", "unauthor", "forbidden")):
+                    record("websocket_authentication_close")
+                    return
+                try:
+                    request("GET", "/users/me", token=_secret("wrong_token"))
+                except ApiError as rejection:
+                    if rejection.status == 401:
+                        record("unframed_websocket_close_plus_rest_401")
+                        return
+                raise RuntimeError("Mattermost wrong-token WebSocket closed without an authentication rejection") from exc
             value = json.loads(raw)
             if isinstance(value, dict) and value.get("seq_reply") == 1:
                 if value.get("status") == "OK":
                     raise RuntimeError("Mattermost real WebSocket accepted the wrong token")
+                record("websocket_non_ok_response")
                 return
     finally:
         connection.close()
@@ -773,6 +794,13 @@ def report() -> None:
     receipt = json.loads((STATE / "bootstrap-receipt.json").read_text(encoding="utf-8"))
     shapes = json.loads((STATE / "shape-manifest.json").read_text(encoding="utf-8"))
     run = _load_run()
+    wrong_token_evidence = run.get("wrong_token_challenge_evidence")
+    if wrong_token_evidence not in {
+        "websocket_authentication_close",
+        "unframed_websocket_close_plus_rest_401",
+        "websocket_non_ok_response",
+    }:
+        raise RuntimeError("wrong-token authentication evidence missing")
     bindings = shapes.get("stored_reply_bindings")
     if not isinstance(bindings, dict) or set(bindings) != {"channel_id", "root_id"} or not all(bindings.values()):
         safe_bindings = bindings if isinstance(bindings, dict) else {"shape": False}
@@ -804,6 +832,7 @@ def report() -> None:
         "conversation_digest": run.get("conversation_digest"),
         "restart_preserved": run.get("restart_preserved"),
         "authorization_mutation_bites": run.get("authorization_mutation_bites"),
+        "wrong_token_challenge_evidence": wrong_token_evidence,
         "ephemeral_direct_channel_digests": ephemeral,
         "final_bot_memberships": memberships,
         "shape_manifest": shapes,

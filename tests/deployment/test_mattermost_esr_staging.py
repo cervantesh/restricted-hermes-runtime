@@ -58,6 +58,32 @@ def compose(*args: str, check: bool = True, timeout: int = 240) -> subprocess.Co
     )
 
 
+def compose_ps(service: str, *, include_stopped: bool = False) -> list[dict[str, object]]:
+    args = ["ps"]
+    if include_stopped:
+        args.append("--all")
+    result = compose(*args, "--format", "json", service, check=False)
+    raw = result.stdout.strip()
+    if not raw:
+        return []
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            decoded = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("docker compose ps returned invalid JSON") from exc
+    if isinstance(decoded, dict):
+        records = [decoded]
+    elif isinstance(decoded, list):
+        records = decoded
+    else:
+        raise RuntimeError("docker compose ps returned an unexpected JSON shape")
+    if any(not isinstance(record, dict) for record in records):
+        raise RuntimeError("docker compose ps returned a non-object record")
+    return records
+
+
 def phase(name: str) -> None:
     print(f"Mattermost ESR phase={name}", flush=True)
 
@@ -146,8 +172,9 @@ def certificate_material() -> None:
 def prepare() -> None:
     SEED.mkdir()
     EVIDENCE.mkdir()
-    for name in ("admin_password", "actor_password", "denied_password", "run_salt", "wrong_token"):
+    for name in ("admin_password", "actor_password", "denied_password", "run_salt"):
         write_secret(name, secrets.token_hex(32))
+    write_secret("wrong_token", secrets.token_hex(13))  # Mattermost token-shaped, but nonexistent.
     write_secret("postgres_password", secrets.token_hex(32))  # URI-safe DSN interpolation.
     certificate_material()
     env = {
@@ -198,8 +225,13 @@ def wait_ingress(*, ready: bool, deadline: int = 45, after_ready_count: int = 0)
             if not ready:
                 raise RuntimeError("negative ingress unexpectedly became authenticated-ready")
             return logs
-        status = compose("ps", "--all", "--format", "json", "ingress", check=False).stdout.lower()
-        if not ready and ("mattermost_ingress_outcome=terminal" in logs or '"state":"exited"' in status or '"state": "exited"' in status):
+        records = compose_ps("ingress", include_stopped=True)
+        terminal = any(
+            str(record.get("State", "")).lower() in {"dead", "exited"}
+            or "exited" in str(record.get("Status", "")).lower()
+            for record in records
+        )
+        if not ready and ("mattermost_ingress_outcome=terminal" in logs or terminal):
             return logs
         time.sleep(0.25)
     outcome = "authenticated-ready deadline exceeded" if ready else "negative ingress did not fail terminally"
@@ -228,7 +260,10 @@ def image_evidence() -> None:
             raise RuntimeError("pinned image platform mismatch")
         if not any(item.endswith("@" + digest) for item in inspect.get("RepoDigests", [])):
             raise RuntimeError("pinned image digest mismatch")
-        container = json.loads(compose("ps", "--format", "json", service).stdout.splitlines()[0])
+        containers = compose_ps(service)
+        if len(containers) != 1 or not isinstance(containers[0].get("ID"), str):
+            raise RuntimeError("docker compose ps did not identify one running service container")
+        container = containers[0]
         runtime = run("docker", "inspect", "--format", "{{.Image}}", container["ID"]).stdout.strip()
         if runtime != inspect["Id"]:
             raise RuntimeError("running container does not use the inspected pinned image")
@@ -292,18 +327,30 @@ def main() -> None:
     phase("real-server-scenarios")
     phase("scenario-root")
     exec_controller("scenario", "root")
+    root_logs = compose("logs", "--no-color", "ingress").stdout
+    if "mattermost_delivery_outcome=rejected_binding" in root_logs:
+        raise RuntimeError("allowed root produced a rejected delivery outcome")
     phase("cold-ingress-cycle")
     replace_ingress()
     wait_ingress(ready=True)
+    phase("scenario-continuation")
+    exec_controller("scenario", "continuation")
+    continuation_logs = compose("logs", "--no-color", "ingress").stdout
+    if "mattermost_delivery_outcome=rejected_binding" in continuation_logs:
+        raise RuntimeError("allowed continuation produced a rejected delivery outcome")
+    (EVIDENCE / "allowed-delivery.log").write_text(root_logs + continuation_logs, encoding="utf-8")
     for scenario in (
-        "continuation", "denied-user", "denied-channel", "public", "dm", "gm", "file",
+        "denied-user", "denied-channel", "public", "dm", "gm", "file",
         "edited-and-unmentioned", "removed-membership",
     ):
         phase("scenario-" + scenario)
         exec_controller("scenario", scenario)
 
     phase("network-negatives")
-    postgres_container = json.loads(compose("ps", "--format", "json", "postgres").stdout.splitlines()[0])["ID"]
+    postgres_records = compose_ps("postgres")
+    if len(postgres_records) != 1 or not isinstance(postgres_records[0].get("ID"), str):
+        raise RuntimeError("docker compose ps did not identify PostgreSQL")
+    postgres_container = postgres_records[0]["ID"]
     networks = json.loads(run("docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", postgres_container).stdout)
     postgres_ips = [value.get("IPAddress") for value in networks.values() if value.get("IPAddress")]
     if len(postgres_ips) != 1:
@@ -346,7 +393,10 @@ def main() -> None:
     report = exec_controller("report").stdout.strip()
     json.loads(report)
     (EVIDENCE / "report.json").write_text(report, encoding="utf-8")
-    exec_controller("secret-scan", "/seed/evidence/ingress.log", "/seed/evidence/network.json", "/seed/evidence/report.json", "/seed/evidence/images.json")
+    exec_controller(
+        "secret-scan", "/seed/evidence/ingress.log", "/seed/evidence/allowed-delivery.log",
+        "/seed/evidence/network.json", "/seed/evidence/report.json", "/seed/evidence/images.json",
+    )
     print(report)
     phase("cleanup")
     compose("down", "--volumes", "--remove-orphans", timeout=180)
