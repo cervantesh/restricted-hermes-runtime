@@ -138,6 +138,8 @@ class MattermostPolicy:
             raise ContractError("Mattermost deadlines must be integers")
         if not (1 <= rest <= 30 and 1 <= websocket <= 60 and 1 <= downstream <= 60 and downstream <= uds <= 90):
             raise ContractError("Mattermost deadlines are not safely ordered")
+        if "clinical_bindings" in value and uds < 10:
+            raise ContractError("Mattermost clinical deadline is shorter than the adapter ceiling")
         fingerprint = value.get("outbox_key_fingerprint")
         if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
             raise ContractError("Mattermost outbox key fingerprint is invalid")

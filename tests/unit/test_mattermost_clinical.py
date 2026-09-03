@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import uuid
+import hashlib
 
 import pytest
 
 from restricted_runtime.contracts import ContractError
-from restricted_runtime.mattermost_ingress import ClinicalQueryUdsClient, Ingress
+from restricted_runtime.mattermost_ingress import ClinicalQueryUdsClient, Ingress, _clinical_response_digest
 
 from test_mattermost_ingress import (
     BOT,
@@ -22,9 +23,20 @@ from test_mattermost_ingress import (
 from restricted_runtime.mattermost_outbox import MattermostOutbox
 import os
 import re
+from types import SimpleNamespace
+
+import restricted_runtime.mattermost_ingress as mattermost_ingress
 
 
 PATIENT = "123e4567-e89b-42d3-a456-426614174000"
+
+
+def test_response_digest_matches_frozen_hrh_canonical_bytes():
+    raw = b'{"clinicTimezone":"America/New_York","appointment":{"id":"a","date":"2026-09-08","time":"14:30","duration":30,"status":"scheduled"}}'
+    assert _clinical_response_digest({
+        "appointment": {"status": "scheduled", "duration": 30, "time": "14:30", "date": "2026-09-08", "id": "a"},
+        "clinicTimezone": "America/New_York",
+    }) == hashlib.sha256(raw).hexdigest()
 
 
 class Clinical:
@@ -35,7 +47,7 @@ class Clinical:
 
     def query(self, request):
         self.queries.append(request)
-        return {
+        result = {
             "clinicTimezone": "America/New_York",
             "appointment": {
                 "id": "appt0000000000000000000000",
@@ -45,6 +57,7 @@ class Clinical:
                 "status": "scheduled",
             },
         }
+        return {**result, "responseDigest": _clinical_response_digest(result)}
 
     def reauthorize_delivery(self, request):
         self.reauthorizations.append(request)
@@ -99,6 +112,10 @@ def test_exact_root_command_is_deterministic_and_never_reaches_conversation(tmp_
     assert request["mattermostActorId"] == USER
     assert request["patientId"] == PATIENT
     assert request["integrationId"] == "hrh-mattermost-01"
+    assert clinical.reauthorizations[0]["responseDigest"] == _clinical_response_digest({
+        "clinicTimezone": "America/New_York",
+        "appointment": {"id": "appt0000000000000000000000", "date": "2026-09-08", "time": "14:30", "duration": 30, "status": "scheduled"},
+    })
     uuid.UUID(request["requestId"])
     assert rest.created == [{
         "channel_id": CHANNEL,
@@ -181,10 +198,16 @@ def test_clinical_policy_extension_is_all_or_nothing_and_pair_bound(tmp_path):
     with pytest.raises(ContractError):
         signed_policy(tmp_path / "duplicate", values)
 
+    values["clinical_bindings"] = [{"channel_id": CHANNEL, "actor_id": USER}]
+    values["uds_timeout_seconds"] = 9
+    with pytest.raises(ContractError, match="deadline"):
+        signed_policy(tmp_path / "short-deadline", values)
+
 
 def test_no_upcoming_appointment_is_a_closed_deterministic_result(tmp_path):
     service, rest, conversation, clinical = clinical_ingress(tmp_path)
-    clinical.query = lambda request: {"clinicTimezone": "America/New_York", "appointment": None}
+    result = {"clinicTimezone": "America/New_York", "appointment": None}
+    clinical.query = lambda request: {**result, "responseDigest": _clinical_response_digest(result)}
     service.handle(event(rest.posts[ROOT], channel_type="D"))
     assert conversation.calls == []
     assert rest.created[0]["message"] == "No upcoming appointment found."
@@ -193,7 +216,9 @@ def test_no_upcoming_appointment_is_a_closed_deterministic_result(tmp_path):
 def test_unknown_clinical_response_fields_fail_closed(tmp_path):
     service, rest, conversation, clinical = clinical_ingress(tmp_path)
     clinical.query = lambda request: {
-        "clinicTimezone": "America/New_York", "appointment": None, "notes": "must not cross"
+        "clinicTimezone": "America/New_York", "appointment": None,
+        "responseDigest": _clinical_response_digest({"clinicTimezone": "America/New_York", "appointment": None}),
+        "notes": "must not cross"
     }
     service.handle(event(rest.posts[ROOT], channel_type="D"))
     assert conversation.calls == [] and rest.created == []
@@ -277,3 +302,76 @@ def test_source_identity_swap_before_query_discloses_nothing(tmp_path):
     rest.get_post = swapped
     service.handle(event(rest.posts[ROOT], channel_type="D"))
     assert conversation.calls == [] and clinical.queries == [] and rest.created == []
+
+
+def test_integration_identity_is_frozen_in_encrypted_envelope(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    original_signal = service.executor.signal
+    service.executor.signal = lambda _tag: None
+    service.handle(event(rest.posts[ROOT], channel_type="D"))
+    service.executor.signal = original_signal
+    service.policy.values["clinical_integration_id"] = "other-integration"
+    service.executor.drain()
+    assert conversation.calls == [] and clinical.queries == [] and rest.created == []
+
+
+def test_mismatched_response_digest_never_posts(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    original = clinical.query
+
+    def swapped(request):
+        result = original(request)
+        result["appointment"]["time"] = "16:45"
+        return result
+
+    clinical.query = swapped
+    service.handle(event(rest.posts[ROOT], channel_type="D"))
+    assert conversation.calls == [] and rest.created == []
+    assert clinical.reauthorizations == []
+
+
+def test_swapped_self_consistent_dto_is_rejected_by_hrh_digest_binding(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    original = clinical.query
+    authorized_digest = _clinical_response_digest({
+        "clinicTimezone": "America/New_York",
+        "appointment": {"id": "appt0000000000000000000000", "date": "2026-09-08", "time": "14:30", "duration": 30, "status": "scheduled"},
+    })
+
+    def swapped(request):
+        result = original(request)
+        result["appointment"]["time"] = "16:45"
+        result["responseDigest"] = _clinical_response_digest(result)
+        return result
+
+    def reauthorize(request):
+        clinical.reauthorizations.append(request)
+        return {"authorized": request["responseDigest"] == authorized_digest}
+
+    clinical.query = swapped
+    clinical.reauthorize_delivery = reauthorize
+    service.handle(event(rest.posts[ROOT], channel_type="D"))
+    assert conversation.calls == [] and rest.created == []
+    assert len(clinical.reauthorizations) == 1
+
+
+def test_clinical_uds_waits_the_remaining_ten_second_budget_across_six_second_receive(monkeypatch):
+    from test_mattermost_ingress import _Clock, _UdsSocket, _uds_response
+
+    clock = _Clock()
+    result = {"clinicTimezone": "America/New_York", "appointment": None}
+    result["responseDigest"] = _clinical_response_digest(result)
+    peer = _UdsSocket(clock, _uds_response(result), recv_elapsed=6.0)
+    policy = SimpleNamespace(values={
+        "clinical_query_socket_path": "/run/restricted-clinical/query.sock",
+        "uds_timeout_seconds": 10,
+    })
+    monkeypatch.setattr(mattermost_ingress.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(mattermost_ingress.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(mattermost_ingress.socket, "socket", lambda *_: peer)
+    assert ClinicalQueryUdsClient(policy).query({
+        "mattermostActorId": USER, "patientId": PATIENT, "requestId": "request_123",
+        "integrationId": "hrh-mattermost-01", "clinicalPolicyId": "clinical-read-v1",
+        "policyEpoch": "mattermost-e1", "policyDigest": "a" * 64,
+    }) == result
+    assert peer.timeouts[0] == pytest.approx(10.0)

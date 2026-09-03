@@ -53,11 +53,17 @@ def _copy_artifact(installed_artifact: Path, tmp_path: Path) -> Path:
     return target
 
 
-def _mutate(site: Path, relative: str, old: str, new: str) -> None:
+def _mutate(site: Path, relative: str, old: str, new: str, *, occurrence: int = 1) -> None:
     path = site / relative
     source = path.read_text(encoding="utf-8")
-    assert old in source, f"mutation anchor disappeared: {relative}"
-    path.write_text(source.replace(old, new, 1), encoding="utf-8")
+    assert occurrence >= 1 and source.count(old) >= occurrence, f"mutation anchor disappeared: {relative}"
+    before, separator, after = source.rpartition(old) if occurrence == source.count(old) else ("", "", "")
+    if not separator:
+        offset = -1
+        for _ in range(occurrence):
+            offset = source.index(old, offset + 1)
+        before, after = source[:offset], source[offset + len(old):]
+    path.write_text(before + new + after, encoding="utf-8")
 
 
 def _run(site: Path, program: str) -> dict[str, object]:
@@ -611,6 +617,7 @@ def test_installed_skipped_fresh_source_actor_root_authorization_bites(installed
         "restricted_runtime/mattermost_ingress.py",
         'source = self.rest.get_post(envelope["source_id"], definitive=True)',
         'return\n        source = self.rest.get_post(envelope["source_id"], definitive=True)',
+        occurrence=2,
     )
     assert _run(mutant, _AUTH_PROGRAM) == {"outcome": "accepted"}
 
