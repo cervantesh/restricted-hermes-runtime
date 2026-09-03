@@ -411,12 +411,13 @@ def initialize_outbox() -> None:
     if (OUTBOX / "mattermost-outbox.sqlite3").exists():
         return
     # Docker creates an empty root-owned mountpoint before this explicit
-    # operator step. Remove only that exact empty directory so the runtime
-    # initializer itself creates the required 0700 state directory.
+    # operator step. The initializer accepts only this exact empty mountpoint;
+    # harden its mode before creating the database, then assign final ingress
+    # ownership below.
     if OUTBOX.exists():
         if OUTBOX.is_symlink() or not OUTBOX.is_dir() or any(OUTBOX.iterdir()):
             raise RuntimeError("outbox volume is not an empty initialization mountpoint")
-        OUTBOX.rmdir()
+        os.chmod(OUTBOX, 0o700)
     policy = json.loads((INGRESS / "policy.json").read_text(encoding="utf-8"))
     store = MattermostOutbox.initialize(
         OUTBOX,

@@ -135,7 +135,22 @@ class MattermostOutbox:
     @classmethod
     def initialize(cls, state_dir: Path, key_path: Path, *, expected_fingerprint: str) -> "MattermostOutbox":
         """Explicit operator-only initialization; runtime open never creates state."""
-        _state_dir(state_dir, create=True)
+        # A named Docker volume is mounted as an empty directory before the
+        # explicit initializer runs.  Accept that one empty mountpoint, but
+        # never an existing database, entry, symlink, or non-directory.  The
+        # normal runtime path is ``open`` and cannot take this branch.
+        if state_dir.exists():
+            try:
+                details = state_dir.lstat()
+                if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode) or any(state_dir.iterdir()):
+                    raise ContractError("Mattermost outbox initialization state is not empty")
+                _state_dir(state_dir, create=False)
+            except ContractError:
+                raise
+            except OSError as exc:
+                raise ContractError("Mattermost outbox initialization state unavailable") from exc
+        else:
+            _state_dir(state_dir, create=True)
         database = state_dir / OUTBOX_DB_NAME
         key = _key_file(key_path)
         if not hmac.compare_digest(key_fingerprint(key), expected_fingerprint):
