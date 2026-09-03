@@ -114,6 +114,12 @@ def test_installed_lookup_aad_and_tag_check_mutation_bites(installed_artifact, t
     _mutate(
         mutant,
         "restricted_runtime/mattermost_outbox.py",
+        'if not isinstance(auth_tag, str) or not hmac.compare_digest(auth_tag, self._row_auth(row)):',
+        "if False:",
+    )
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
         'return jcs_bytes({"schema_version": OUTBOX_SCHEMA, "record_tag": record_tag, "source_tag": source_tag, "root_tag": root_tag, "policy_digest": policy_digest})',
         'return jcs_bytes({"schema_version": OUTBOX_SCHEMA, "policy_digest": policy_digest})',
     )
@@ -126,6 +132,95 @@ def test_installed_lookup_aad_and_tag_check_mutation_bites(installed_artifact, t
     result = _run(mutant, _PROGRAM)
     assert result["plaintext"] is False
     assert result["tamper"] == "accepted"
+
+
+_TERMINAL_TAMPER_PROGRAM = r'''
+import json, os, sqlite3, tempfile
+from pathlib import Path
+from restricted_runtime.contracts import ContractError
+from restricted_runtime.mattermost_outbox import DeliveryState, MattermostOutbox, key_fingerprint
+root=Path(tempfile.mkdtemp()); key=root/'key'; key.write_bytes(bytes(range(32))); os.chmod(key,0o600)
+env={"schema_version":"restricted-mattermost-outbox.v1","tenant_id":"tenant","origin":"https://mm.example","channel_id":"channel","root_id":"root","source_id":"source","actor_id":"actor","message":"MUTATION_MESSAGE_CANARY","conversation_id":"conversation","conversation_epoch":None,"client_request_id":"request","policy_epoch":"policy","policy_digest":"a"*64,"key_fingerprint":key_fingerprint(bytes(range(32))),"policy_expires_at":4000000000,"payload_expires_at":4000000000,"response":None,"pending_post_id":"pending","returned_post_id":None}
+store=MattermostOutbox.initialize(root/'state',key,expected_fingerprint=env['key_fingerprint'])
+record,_=store.reserve(env,payload_capacity=3,tombstone_capacity=3)
+store.terminal(record,DeliveryState.BLOCKED,reason='test'); store.close()
+database=root/'state'/'mattermost-outbox.sqlite3'; conn=sqlite3.connect(database)
+conn.execute("UPDATE records SET root_tag=?, state='READY' WHERE record_tag=?",('0'*64,record.record_tag)); conn.commit(); conn.close()
+try:
+ MattermostOutbox.open(root/'state',key,expected_fingerprint=env['key_fingerprint']); outcome='accepted'
+except ContractError:
+ outcome='rejected'
+print(json.dumps({'outcome':outcome}))
+'''
+
+
+def test_installed_terminal_metadata_authentication_mutation_bites(installed_artifact, tmp_path):
+    baseline = _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _TERMINAL_TAMPER_PROGRAM)
+    assert baseline == {"outcome": "rejected"}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        "                self._verify_row(row)\n",
+        "                pass\n",
+    )
+    assert _run(mutant, _TERMINAL_TAMPER_PROGRAM) == {"outcome": "accepted"}
+
+
+_READINESS_PROGRAM = r'''
+import json, os, tempfile
+from pathlib import Path
+from restricted_runtime.mattermost_outbox import MattermostOutbox, key_fingerprint
+from restricted_runtime.mattermost_ingress import Ingress
+root=Path(tempfile.mkdtemp()); key=root/'key'; key.write_bytes(bytes(range(32))); os.chmod(key,0o600); fp=key_fingerprint(bytes(range(32)))
+class Policy:
+ digest='a'*64; origin='https://mm.example'
+ values={'policy_epoch':'policy','outbox_key_fingerprint':fp,'bot_user_id':'bot','bot_username':'bot','tenant_id':'tenant','team_id':'team','allowed_channel_ids':['channel'],'allowed_user_ids':['user'],'max_message_utf8_bytes':4096,'inference_policy_epoch':'inference','inference_policy_digest':'b'*64,'outbox_scan_limit':3,'conversation_deadline_seconds':4}
+ def validate(self): pass
+class Rest:
+ def __init__(self): self.posts=0
+ def get_me(self): return {'id':'bot','username':'bot'}
+ def get_post(self,_): return source
+ def get_channel(self,_): return {'id':'channel','team_id':'team','type':'P'}
+ def get_channel_member(self,channel,user): return {'channel_id':channel,'user_id':user}
+ def create_post(self,body): self.posts+=1; return {'id':'returned','channel_id':body['channel_id'],'root_id':body['root_id'],'pending_post_id':body['pending_post_id']}
+class Conversation:
+ def __init__(self): self.calls=0
+ def ready(self): return {'status':'ready'}
+ def create_conversation(self,*,conversation_id,deadline=None): return {'conversation_id':conversation_id,'conversation_epoch':'epoch'}
+ def submit_turn(self,**_): self.calls+=1; return {'schema_version':'restricted-turn-result.v1','turn_id':'turn','conversation_epoch':'epoch','status':'COMMITTED','message':'answer'}
+source={'id':'source','root_id':'','channel_id':'channel','user_id':'user','message':'@bot hello','type':'','file_ids':[],'edit_at':0,'delete_at':0}
+policy=Policy(); rest=Rest(); conversation=Conversation(); store=MattermostOutbox.initialize(root/'state',key,expected_fingerprint=fp); service=Ingress(policy,rest,conversation,store)
+env={'schema_version':'restricted-mattermost-outbox.v1','tenant_id':'tenant','origin':'https://mm.example','channel_id':'channel','root_id':'source','source_id':'source','actor_id':'user','message':'@bot hello','conversation_id':'conversation','conversation_epoch':None,'client_request_id':'request','policy_epoch':'policy','policy_digest':'a'*64,'key_fingerprint':fp,'policy_expires_at':4000000000,'payload_expires_at':4000000000,'response':None,'pending_post_id':'pending','returned_post_id':None}
+record,_=store.reserve(env,payload_capacity=3,tombstone_capacity=3); service.executor.drain(); state=store.get(record.record_tag)
+print(json.dumps({'state':state.state.value,'calls':conversation.calls,'posts':rest.posts}))
+'''
+
+
+def test_installed_readiness_binding_bypass_releases_recovery_work(installed_artifact, tmp_path):
+    baseline = _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _READINESS_PROGRAM)
+    assert baseline == {"state": "WAITING_COMMIT", "calls": 0, "posts": 0}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_ingress.py",
+        "    def _readiness_binding(self) -> None:\n",
+        "    def _readiness_binding(self) -> None:\n        return\n",
+    )
+    assert _run(mutant, _READINESS_PROGRAM) == {"state": "DELIVERED", "calls": 1, "posts": 1}
+
+
+_DUPLICATE_PROGRAM = r'''
+import json, os, tempfile
+from pathlib import Path
+from restricted_runtime.mattermost_outbox import MattermostOutbox, key_fingerprint
+root=Path(tempfile.mkdtemp()); key=root/'key'; key.write_bytes(bytes(range(32))); os.chmod(key,0o600)
+env={"schema_version":"restricted-mattermost-outbox.v1","tenant_id":"tenant","origin":"https://mm.example","channel_id":"channel","root_id":"root","source_id":"source","actor_id":"actor","message":"MUTATION_MESSAGE_CANARY","conversation_id":"conversation","conversation_epoch":None,"client_request_id":"request","policy_epoch":"policy","policy_digest":"a"*64,"key_fingerprint":key_fingerprint(bytes(range(32))),"policy_expires_at":4000000000,"payload_expires_at":4000000000,"response":None,"pending_post_id":"pending","returned_post_id":None}
+store=MattermostOutbox.initialize(root/'state',key,expected_fingerprint=env['key_fingerprint']); record,_=store.reserve(env,payload_capacity=3,tombstone_capacity=3)
+ready=store.mark_ready(record,{**env,"response":"answer"}); flight=store.claim_delivery(ready); store.delivered(flight,returned_post_id="returned")
+duplicate,created=store.reserve(env,payload_capacity=3,tombstone_capacity=3)
+print(json.dumps({"created":created,"distinct":duplicate.record_tag!=record.record_tag,"rows":store._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]}))
+'''
 
 
 def test_installed_effective_source_uniqueness_mutation_admits_duplicate_rows(installed_artifact, tmp_path):
@@ -145,7 +240,7 @@ def test_installed_effective_source_uniqueness_mutation_admits_duplicate_rows(in
     _mutate(
         mutant,
         "restricted_runtime/mattermost_outbox.py",
-        'row = self._connection.execute("SELECT * FROM records WHERE source_tag=?", (source_tag,)).fetchone()',
+        'row = next((item for item in rows if item["source_tag"] == source_tag), None)',
         "row = None",
     )
     _mutate(
@@ -154,11 +249,13 @@ def test_installed_effective_source_uniqueness_mutation_admits_duplicate_rows(in
         'return self._tag("record", envelope["tenant_id"], envelope["origin"], envelope["channel_id"], envelope["source_id"])',
         'return self._tag("record", envelope["tenant_id"], envelope["origin"], envelope["channel_id"], envelope["source_id"], secrets.token_hex(16))',
     )
-    program = _PROGRAM.replace(
-        'print(json.dumps({"plaintext":b"MUTATION_MESSAGE_CANARY" in raw,"tamper":tamper,"module":module.__file__}))',
-        'store.terminal(record, DeliveryState.DELIVERED, reason="test"); duplicate, created=store.reserve(env,payload_capacity=3,tombstone_capacity=3); print(json.dumps({"created":created,"distinct":duplicate.record_tag!=record.record_tag,"rows":store._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]}))',
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        "if (\n            not hmac.compare_digest(self.source_tag(envelope), row[\"source_tag\"])\n            or not hmac.compare_digest(self.root_tag(envelope), row[\"root_tag\"])\n            or not hmac.compare_digest(self.record_tag(envelope), row[\"record_tag\"])\n            or envelope[\"policy_digest\"] != row[\"policy_digest\"]\n        ):",
+        "if False:",
     )
-    result = _run(mutant, program)
+    result = _run(mutant, _DUPLICATE_PROGRAM)
     assert result == {"created": True, "distinct": True, "rows": 2}
 
 
@@ -175,8 +272,8 @@ def test_installed_stale_inflight_ready_mutation_bites(installed_artifact, tmp_p
     _mutate(
         mutant,
         "restricted_runtime/mattermost_outbox.py",
-        '(DeliveryState.AMBIGUOUS.value, now, "restart_in_flight", DeliveryState.IN_FLIGHT.value),',
-        '(DeliveryState.READY.value, now, "restart_in_flight", DeliveryState.IN_FLIGHT.value),',
+        'self.terminal(record, DeliveryState.AMBIGUOUS, reason="restart_in_flight")',
+        'self._transition(record, DeliveryState.IN_FLIGHT, DeliveryState.READY, envelope=record.envelope)',
     )
     assert _run(mutant, _STATE_PROGRAM) == {"changed": 1, "state": "READY"}
 
@@ -194,14 +291,20 @@ def test_installed_non_cas_delivery_mutation_bites(installed_artifact, tmp_path)
     _mutate(
         mutant,
         "restricted_runtime/mattermost_outbox.py",
+        'if current["state"] != expected.value or current["generation"] != record.generation:',
+        'if False:',
+    )
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
         'WHERE record_tag=? AND state=? AND generation=?",',
         'WHERE record_tag=?",',
     )
     _mutate(
         mutant,
         "restricted_runtime/mattermost_outbox.py",
-        '(target.value, now, nonce, ciphertext, reason, record.record_tag, expected.value, record.generation),',
-        '(target.value, now, nonce, ciphertext, reason, record.record_tag),',
+        'record.record_tag, expected.value, record.generation,',
+        'record.record_tag,',
     )
     assert _run(mutant, _CAS_PROGRAM) == {"first": True, "second": True}
 
@@ -215,7 +318,12 @@ _FENCE_PROGRAM = _PROGRAM.replace(
 def test_installed_removed_root_fence_mutation_bites(installed_artifact, tmp_path):
     assert _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _FENCE_PROGRAM) == {"fenced": True}
     mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
-    _mutate(mutant, "restricted_runtime/mattermost_outbox.py", "if fence is not None:", "if False:")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        'if any(item["root_tag"] == root_tag and item["state"] != DeliveryState.DELIVERED.value for item in rows):',
+        "if False:",
+    )
     assert _run(mutant, _FENCE_PROGRAM) == {"fenced": False}
 
 
@@ -224,11 +332,12 @@ _AUTH_PROGRAM = _PROGRAM.replace(
     '''
 from restricted_runtime.mattermost_ingress import Ingress
 class Policy:
- values={"policy_epoch":"policy","outbox_key_fingerprint":env["key_fingerprint"]}
+ values={"policy_epoch":"policy","outbox_key_fingerprint":env["key_fingerprint"],"bot_user_id":"bot","bot_username":"bot"}
  digest="a"*64
  origin="https://mm.example"
  def validate(self): pass
 class Rest:
+ def get_me(self): return {"id":"bot","username":"bot"}
  def get_post(self, source_id): return {"id":source_id,"channel_id":"wrong-channel","user_id":"wrong-actor"}
 service=Ingress(Policy(), Rest(), object(), store)
 try:
@@ -309,12 +418,11 @@ r,_=store.reserve(e,payload_capacity=3,tombstone_capacity=3); client=Conversatio
         check = _run(_copy_artifact(installed_artifact,tmp_path/"check"), f'''from pathlib import Path\nfrom restricted_runtime.mattermost_outbox import MattermostOutbox,key_fingerprint\nimport json\ns=MattermostOutbox.open(Path(r"{baseline}"),Path(r"{key}"),expected_fingerprint=key_fingerprint(bytes(range(32))))\nrows=s._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]\nprint(json.dumps({{"rows":rows}}))''')
         assert check == {"rows":1}
         mutant = _copy_artifact(installed_artifact,tmp_path/"mutant")
-        _mutate(mutant,"restricted_runtime/mattermost_outbox.py",'self._connection.execute("COMMIT")\n                return self._record(row, envelope), True','return self._record(row, envelope), True')
+        _mutate(mutant,"restricted_runtime/mattermost_outbox.py",'self._connection.execute("COMMIT")\n                return result, True','return result, True')
         lost = tmp_path / "lost-state"
-        assert kill_after_turn(mutant,lost) == 86
-        assert not (lost / "mattermost-outbox.sqlite3").exists() or _run(_copy_artifact(installed_artifact,tmp_path/"lostcheck"), f'''from pathlib import Path\nfrom restricted_runtime.mattermost_outbox import MattermostOutbox,key_fingerprint\nimport json\ntry:\n s=MattermostOutbox.open(Path(r"{lost}"),Path(r"{key}"),expected_fingerprint=key_fingerprint(bytes(range(32))))\n n=s._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]\nexcept Exception:\n n=0\nprint(json.dumps({{"rows":n}}))''') == {"rows":0}
-        assert kill_after_turn(mutant,lost) == 86
-        assert counts["turns"] == 3
+        assert kill_after_turn(mutant,lost) == 1
+        assert _run(_copy_artifact(installed_artifact,tmp_path/"lostcheck"), f'''from pathlib import Path\nfrom restricted_runtime.mattermost_outbox import MattermostOutbox,key_fingerprint\nimport json\ns=MattermostOutbox.open(Path(r"{lost}"),Path(r"{key}"),expected_fingerprint=key_fingerprint(bytes(range(32))))\nn=s._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]\nprint(json.dumps({{"rows":n}}))''') == {"rows":0}
+        assert counts["turns"] == 1
     finally:
         fixed.unlink(missing_ok=True)
         server.shutdown()
@@ -555,6 +663,9 @@ class _MemoryOutbox:
         replacement = self._record(record.envelope, state, record.generation + 1, reason)
         self.records[record.record_tag] = replacement
         return replacement
+
+    def delivered(self, record, *, returned_post_id):
+        return self.terminal(record, DeliveryState.DELIVERED, reason="exact_immediate_binding")
 '''
         _mutate(mutant, "restricted_runtime/mattermost_outbox.py", "class MattermostOutbox:", memory_outbox + "\n\nclass MattermostOutbox:")
         _mutate(mutant, "restricted_runtime/mattermost_outbox.py", "        _state_dir(state_dir, create=False)", "        return _MemoryOutbox()")

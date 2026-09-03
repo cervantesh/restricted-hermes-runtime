@@ -66,8 +66,8 @@ class MattermostApi(Protocol):
 class ConversationApi(Protocol):
     def ready(self) -> dict[str, Any]: ...
     def submit(self, *, conversation_id: str, client_request_id: str, message: str) -> dict[str, Any]: ...
-    def create_conversation(self, *, conversation_id: str) -> dict[str, Any]: ...
-    def submit_turn(self, *, conversation_id: str, conversation_epoch: str, client_request_id: str, message: str) -> dict[str, Any]: ...
+    def create_conversation(self, *, conversation_id: str, deadline: float | None = None) -> dict[str, Any]: ...
+    def submit_turn(self, *, conversation_id: str, conversation_epoch: str, client_request_id: str, message: str, deadline: float | None = None) -> dict[str, Any]: ...
 
 
 class TransientMattermostError(ContractError):
@@ -112,6 +112,15 @@ class Ingress:
         self.executor = SerializedDeliveryExecutor(self)
 
     def preflight(self) -> None:
+        self._readiness_binding()
+        self._bot_identity()
+        for channel_id in self.policy.values["allowed_channel_ids"]:
+            self._private_channel(channel_id)
+            self._member(channel_id, self.policy.values["bot_user_id"])
+        self.outbox.stale_inflight_to_ambiguous()
+        self.executor.drain()
+
+    def _readiness_binding(self) -> None:
         readiness = self.conversation.ready()
         expected = {
             "schema_version": "restricted-conversation-readiness.v1", "status": "ready",
@@ -125,26 +134,25 @@ class Ingress:
         }
         if readiness != expected:
             raise ContractError("restricted conversation readiness binding rejected")
+
+    def _bot_identity(self, *, definitive: bool = False) -> None:
         me = self.rest.get_me()
         if not isinstance(me, dict) or me.get("id") != self.policy.values["bot_user_id"] or me.get("username") != self.policy.values["bot_username"]:
-            raise ContractError("Mattermost bot identity rejected")
-        for channel_id in self.policy.values["allowed_channel_ids"]:
-            self._private_channel(channel_id)
-            self._member(channel_id, self.policy.values["bot_user_id"])
-        self.outbox.stale_inflight_to_ambiguous()
-        self.executor.drain()
+            error = DefinitiveMattermostError if definitive else ContractError
+            raise error("Mattermost bot identity rejected")
 
     def mark_authenticated(self) -> None:
         self._authenticated = True
 
-    def _private_channel(self, channel_id: str) -> dict[str, Any]:
+    def _private_channel(self, channel_id: str, *, definitive: bool = False) -> dict[str, Any]:
         channel = self.rest.get_channel(channel_id)
         if (
             not isinstance(channel, dict) or channel.get("id") != channel_id
             or channel.get("team_id") != self.policy.values["team_id"] or channel.get("type") != "P"
             or channel_id not in self.policy.values["allowed_channel_ids"]
         ):
-            raise ContractError("Mattermost private channel binding rejected")
+            error = DefinitiveMattermostError if definitive else ContractError
+            raise error("Mattermost private channel binding rejected")
         return channel
 
     def _member(self, channel_id: str, user_id: str) -> dict[str, Any]:
@@ -153,7 +161,7 @@ class Ingress:
             raise DefinitiveMattermostError("Mattermost channel membership rejected")
         return member
 
-    def _validated_root(self, post: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def _validated_root(self, post: dict[str, Any], *, definitive: bool = False) -> tuple[str, dict[str, Any]]:
         root_id = post["root_id"] or post["id"]
         root = self.rest.get_post(root_id)
         if isinstance(root, dict) and "file_ids" not in root:
@@ -163,17 +171,18 @@ class Ingress:
             or root.get("id") != root_id or root.get("root_id") not in {"", root_id}
             or root.get("channel_id") != post["channel_id"]
         ):
-            raise ContractError("Mattermost root binding rejected")
+            error = DefinitiveMattermostError if definitive else ContractError
+            raise error("Mattermost root binding rejected")
         return root_id, root
 
-    def _authorize_source(self, post: dict[str, Any]) -> str:
+    def _authorize_source(self, post: dict[str, Any], *, definitive: bool = False) -> str:
         self.policy.validate()
         if not _ordinary(post, policy=self.policy, require_mention=not bool(post.get("root_id"))):
             raise DefinitiveMattermostError("Mattermost source binding rejected")
-        self._private_channel(post["channel_id"])
+        self._private_channel(post["channel_id"], definitive=definitive)
         self._member(post["channel_id"], post["user_id"])
         self._member(post["channel_id"], self.policy.values["bot_user_id"])
-        root_id, _ = self._validated_root(post)
+        root_id, _ = self._validated_root(post, definitive=definitive)
         return root_id
 
     def _envelope(self, post: dict[str, Any], root_id: str) -> dict[str, Any]:
@@ -202,12 +211,13 @@ class Ingress:
             or envelope["key_fingerprint"] != self.policy.values["outbox_key_fingerprint"]
         ):
             raise DefinitiveMattermostError("Mattermost outbox policy binding changed")
+        self._bot_identity(definitive=True)
         source = self.rest.get_post(envelope["source_id"])
         if isinstance(source, dict) and "file_ids" not in source:
             source = {**source, "file_ids": []}
         if not isinstance(source, dict) or source.get("id") != envelope["source_id"] or source.get("channel_id") != envelope["channel_id"] or source.get("user_id") != envelope["actor_id"]:
             raise DefinitiveMattermostError("Mattermost source replay binding rejected")
-        root_id = self._authorize_source(source)
+        root_id = self._authorize_source(source, definitive=True)
         if root_id != envelope["root_id"] or source.get("message") != envelope["message"]:
             raise DefinitiveMattermostError("Mattermost source/root replay binding rejected")
 
@@ -227,6 +237,23 @@ class Ingress:
             self.executor.signal(record.record_tag)
         except (ContractError, KeyError, OSError, TimeoutError, UnicodeError, ValueError):
             logging.getLogger("restricted_mattermost").warning("mattermost_event_outcome=rejected")
+
+    def start_periodic_recovery(self) -> tuple[threading.Event, threading.Thread]:
+        """Schedule bounded scans through the existing single serialized executor."""
+        stop = threading.Event()
+
+        def run() -> None:
+            while not stop.wait(self.policy.values["outbox_scan_interval_seconds"]):
+                self.executor.drain()
+
+        worker = threading.Thread(target=run, name="restricted-mattermost-outbox-scan", daemon=True)
+        worker.start()
+        return stop, worker
+
+    def stop_periodic_recovery(self, handle: tuple[threading.Event, threading.Thread]) -> None:
+        stop, worker = handle
+        stop.set()
+        worker.join(timeout=self.policy.values["outbox_scan_interval_seconds"] + 1)
 
 
 class SerializedDeliveryExecutor:
@@ -265,9 +292,7 @@ class SerializedDeliveryExecutor:
             return
         try:
             self.ingress._revalidate_envelope(envelope)
-            readiness = self.ingress.conversation.ready()
-            if not isinstance(readiness, dict) or readiness.get("status") != "ready":
-                return
+            self.ingress._readiness_binding()
         except DefinitiveMattermostError:
             self._block_or_expire(record, "current_authorization_rejected")
             return
@@ -275,17 +300,22 @@ class SerializedDeliveryExecutor:
             return
         if record.state is DeliveryState.WAITING_COMMIT:
             try:
+                deadline = time.monotonic() + self.ingress.policy.values["conversation_deadline_seconds"]
                 if envelope["conversation_epoch"] is None:
-                    created = self.ingress.conversation.create_conversation(conversation_id=envelope["conversation_id"])
+                    created = self.ingress.conversation.create_conversation(
+                        conversation_id=envelope["conversation_id"], deadline=deadline
+                    )
                     epoch = created.get("conversation_epoch") if isinstance(created, dict) else None
                     if created.get("conversation_id") != envelope["conversation_id"] or not isinstance(epoch, str) or not epoch:
                         self.ingress.outbox.terminal(record, DeliveryState.FAILED, reason="conversation_create_shape")
                         return
                     envelope = {**envelope, "conversation_epoch": epoch}
                     record = self.ingress.outbox.update_waiting(record, envelope)
+                if deadline - time.monotonic() <= 0:
+                    raise TimeoutError
                 result = self.ingress.conversation.submit_turn(
                     conversation_id=envelope["conversation_id"], conversation_epoch=envelope["conversation_epoch"],
-                    client_request_id=envelope["client_request_id"], message=envelope["message"],
+                    client_request_id=envelope["client_request_id"], message=envelope["message"], deadline=deadline,
                 )
             except (ContractError, OSError, TimeoutError, ValueError):
                 return
@@ -304,6 +334,7 @@ class SerializedDeliveryExecutor:
             return
         try:
             self.ingress._revalidate_envelope(record.envelope)
+            self.ingress._readiness_binding()
         except DefinitiveMattermostError:
             self._block_or_expire(record, "current_authorization_rejected")
             return
@@ -321,7 +352,7 @@ class SerializedDeliveryExecutor:
             logging.getLogger("restricted_mattermost").warning("mattermost_delivery_outcome=rejected_binding")
             self.ingress.outbox.terminal(claimed, DeliveryState.AMBIGUOUS, reason="post_attempt_unconfirmed")
             return
-        self.ingress.outbox.terminal(claimed, DeliveryState.DELIVERED, reason="exact_immediate_binding")
+        self.ingress.outbox.delivered(claimed, returned_post_id=delivered["id"])
 
 
 class MattermostRestClient:
@@ -438,8 +469,8 @@ class ConversationUdsClient:
     def create_conversation(self, *, conversation_id: str, deadline: float | None = None) -> dict[str, Any]:
         return self._request("POST", "/v1/restricted/conversations/" + conversation_id, deadline=deadline)
 
-    def submit_turn(self, *, conversation_id: str, conversation_epoch: str, client_request_id: str, message: str) -> dict[str, Any]:
-        deadline = time.monotonic() + self.policy.values["conversation_deadline_seconds"]
+    def submit_turn(self, *, conversation_id: str, conversation_epoch: str, client_request_id: str, message: str, deadline: float | None = None) -> dict[str, Any]:
+        deadline = deadline if deadline is not None else time.monotonic() + self.policy.values["conversation_deadline_seconds"]
         result = self._request(
             "POST", "/v1/restricted/conversations/" + conversation_id + "/turns",
             {"schema_version": "restricted-turn.v1", "client_request_id": client_request_id,

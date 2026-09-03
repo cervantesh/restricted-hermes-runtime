@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -50,7 +51,10 @@ def test_aad_tag_tampering_and_wrong_key_fail_before_record_use(tmp_path):
     store = _store(tmp_path)
     try:
         record, _ = store.reserve(_envelope(), payload_capacity=2, tombstone_capacity=2)
-        store._connection.execute("UPDATE records SET source_tag='0' || substr(source_tag, 2) WHERE record_tag=?", (record.record_tag,))
+        store._connection.execute(
+            "UPDATE records SET source_tag=CASE WHEN substr(source_tag,1,1)='0' THEN '1' || substr(source_tag,2) ELSE '0' || substr(source_tag,2) END WHERE record_tag=?",
+            (record.record_tag,),
+        )
         with pytest.raises(ContractError):
             store.get(record.record_tag)
     finally:
@@ -118,8 +122,116 @@ def test_total_tombstone_capacity_reserves_room_for_every_active_record(tmp_path
         # required permanent tombstone fence after both reach terminal states.
         with pytest.raises(ContractError, match="capacity"):
             store.reserve(_envelope(source="second", root="second-root"), payload_capacity=10, tombstone_capacity=1)
-        store.terminal(one, DeliveryState.DELIVERED, reason="bound_response")
+        store.terminal(one, DeliveryState.BLOCKED, reason="bound_response")
         with pytest.raises(ContractError, match="capacity"):
             store.reserve(_envelope(source="third", root="third-root"), payload_capacity=10, tombstone_capacity=1)
     finally:
         store.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [("state", DeliveryState.READY.value), ("root_tag", "0" * 64)],
+)
+def test_terminal_metadata_mutation_is_fatal_before_a_tombstone_can_be_used(tmp_path, column, value):
+    store = _store(tmp_path)
+    key_path = tmp_path / "key"
+    try:
+        record, _ = store.reserve(_envelope(), payload_capacity=2, tombstone_capacity=2)
+        terminal = store.terminal(record, DeliveryState.BLOCKED, reason="test_terminal")
+        assert terminal is not None and terminal.envelope is None
+        store.close()
+        connection = sqlite3.connect(tmp_path / "state" / "mattermost-outbox.sqlite3")
+        try:
+            connection.execute(f"UPDATE records SET {column}=? WHERE record_tag=?", (value, record.record_tag))
+            connection.commit()
+        finally:
+            connection.close()
+        with pytest.raises(ContractError, match="authentication"):
+            MattermostOutbox.open(tmp_path / "state", key_path, expected_fingerprint=key_fingerprint(bytes(range(32))))
+    finally:
+        try:
+            store.close()
+        except sqlite3.ProgrammingError:
+            pass
+
+
+def test_startup_authenticates_inflight_ciphertext_before_any_recovery_effect(tmp_path):
+    store = _store(tmp_path)
+    key_path = tmp_path / "key"
+    try:
+        waiting, _ = store.reserve(_envelope(), payload_capacity=2, tombstone_capacity=2)
+        ready = store.mark_ready(waiting, _envelope(epoch="epoch", response="RESPONSE_CANARY"))
+        assert store.claim_delivery(ready) is not None
+        store._connection.execute("UPDATE records SET ciphertext=x'00' WHERE record_tag=?", (waiting.record_tag,))
+        store.close()
+        with pytest.raises(ContractError, match="authentication"):
+            MattermostOutbox.open(tmp_path / "state", key_path, expected_fingerprint=key_fingerprint(bytes(range(32))))
+    finally:
+        try:
+            store.close()
+        except sqlite3.ProgrammingError:
+            pass
+
+
+def test_tampered_duplicate_fails_with_the_original_contract_error_not_a_rollback_escape(tmp_path):
+    store = _store(tmp_path)
+    try:
+        record, _ = store.reserve(_envelope(), payload_capacity=2, tombstone_capacity=2)
+        store._connection.execute("UPDATE records SET ciphertext=x'00' WHERE record_tag=?", (record.record_tag,))
+        with pytest.raises(ContractError, match="authentication"):
+            store.reserve(_envelope(), payload_capacity=2, tombstone_capacity=2)
+    finally:
+        store.close()
+
+
+def test_delivered_tombstone_authenticates_an_irreversible_returned_post_receipt(tmp_path):
+    store = _store(tmp_path)
+    try:
+        waiting, _ = store.reserve(_envelope(), payload_capacity=2, tombstone_capacity=2)
+        ready = store.mark_ready(waiting, _envelope(epoch="epoch", response="RESPONSE_CANARY"))
+        flight = store.claim_delivery(ready)
+        assert flight is not None
+        delivered = store.delivered(flight, returned_post_id="returned-post-one")
+        assert delivered is not None and delivered.state is DeliveryState.DELIVERED
+        tag = store._connection.execute(
+            "SELECT returned_post_tag FROM records WHERE record_tag=?", (flight.record_tag,)
+        ).fetchone()[0]
+        assert isinstance(tag, str) and len(tag) == 64 and "returned-post-one" not in tag
+        assert tag == store._tag("returned-post", flight.record_tag, "returned-post-one")
+        assert tag != store._tag("returned-post", flight.record_tag, "returned-post-two")
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode hardening")
+def test_initialize_hardens_an_explicit_preexisting_empty_mount_before_sqlite_creation(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o777)
+    os.chmod(state, 0o777)
+    key_path = tmp_path / "key"
+    key = _key(key_path)
+    store = MattermostOutbox.initialize(state, key_path, expected_fingerprint=key_fingerprint(key))
+    try:
+        assert (state.stat().st_mode & 0o777) == 0o700
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink initialization rejection")
+@pytest.mark.parametrize("planted", ["symlink", "database"])
+def test_initialize_rejects_planted_state_before_sqlite_can_follow_or_overwrite_it(tmp_path, planted):
+    state = tmp_path / "state"
+    if planted == "symlink":
+        target = tmp_path / "target"
+        target.mkdir()
+        state.symlink_to(target, target_is_directory=True)
+    else:
+        state.mkdir()
+        (state / "mattermost-outbox.sqlite3").write_bytes(b"not-a-database")
+    key_path = tmp_path / "key"
+    key = _key(key_path)
+    with pytest.raises(ContractError, match="initialization state"):
+        MattermostOutbox.initialize(state, key_path, expected_fingerprint=key_fingerprint(key))
+    if planted == "symlink":
+        assert not (target / "mattermost-outbox.sqlite3").exists()

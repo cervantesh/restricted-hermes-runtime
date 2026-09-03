@@ -28,7 +28,7 @@ from .contracts import ContractError, jcs_bytes, load_closed_json
 
 OUTBOX_SCHEMA = "restricted-mattermost-outbox.v1"
 OUTBOX_DB_NAME = "mattermost-outbox.sqlite3"
-_META_SCHEMA = "restricted-mattermost-outbox-meta.v1"
+_META_SCHEMA = "restricted-mattermost-outbox-meta.v2"
 _TERMINAL = {"DELIVERED", "AMBIGUOUS", "BLOCKED", "FAILED", "EXPIRED"}
 _ACTIVE = {"WAITING_COMMIT", "READY", "IN_FLIGHT"}
 _ENVELOPE_FIELDS = {
@@ -37,6 +37,11 @@ _ENVELOPE_FIELDS = {
     "policy_digest", "key_fingerprint", "policy_expires_at", "payload_expires_at", "response",
     "pending_post_id", "returned_post_id",
 }
+_ROW_FIELDS = (
+    "record_tag", "source_tag", "root_tag", "state", "generation", "created_at", "updated_at",
+    "payload_expires_at", "policy_expires_at", "policy_digest", "nonce", "ciphertext", "reason",
+    "returned_post_tag",
+)
 
 
 class DeliveryState(StrEnum):
@@ -63,6 +68,7 @@ class OutboxRecord:
     policy_expires_at: int
     envelope: dict[str, Any] | None
     reason: str | None
+    returned_post_tag: str | None = None
 
 
 def _now() -> int:
@@ -117,6 +123,40 @@ def _state_dir(path: Path, *, create: bool) -> None:
         raise ContractError("Mattermost outbox state directory unavailable") from exc
 
 
+def _initialization_directory(path: Path) -> int | None:
+    """Harden one explicit empty mount before SQLite is allowed to create a file."""
+    try:
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            path.mkdir(mode=0o700, parents=True, exist_ok=False)
+            before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            raise ContractError("Mattermost outbox initialization state is not empty")
+        if os.name == "nt":
+            if any(path.iterdir()):
+                raise ContractError("Mattermost outbox initialization state is not empty")
+            return None
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino) or not stat.S_ISDIR(opened.st_mode):
+            os.close(descriptor)
+            raise ContractError("Mattermost outbox initialization state changed during open")
+        if any(os.listdir(descriptor)):
+            os.close(descriptor)
+            raise ContractError("Mattermost outbox initialization state is not empty")
+        current_uid = getattr(os, "geteuid", lambda: opened.st_uid)()
+        if opened.st_uid != current_uid and current_uid != 0:
+            os.close(descriptor)
+            raise ContractError("Mattermost outbox initialization ownership rejected")
+        os.fchmod(descriptor, 0o700)
+        return descriptor
+    except ContractError:
+        raise
+    except OSError as exc:
+        raise ContractError("Mattermost outbox initialization state unavailable") from exc
+
+
 class MattermostOutbox:
     """One encrypted SQLite database with durable source and root fences."""
 
@@ -131,35 +171,41 @@ class MattermostOutbox:
         self._instance_id = self._meta()
         self._enc_key = _derive(master_key, self._instance_id, b"aes-256-gcm")
         self._tag_key = _derive(master_key, self._instance_id, b"lookup-hmac-sha256")
+        self._row_key = _derive(master_key, self._instance_id, b"row-hmac-sha256")
+        self._verify_all_rows()
 
     @classmethod
     def initialize(cls, state_dir: Path, key_path: Path, *, expected_fingerprint: str) -> "MattermostOutbox":
         """Explicit operator-only initialization; runtime open never creates state."""
-        # A named Docker volume is mounted as an empty directory before the
-        # explicit initializer runs.  Accept that one empty mountpoint, but
-        # never an existing database, entry, symlink, or non-directory.  The
-        # normal runtime path is ``open`` and cannot take this branch.
-        if state_dir.exists():
-            try:
-                details = state_dir.lstat()
-                if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode) or any(state_dir.iterdir()):
-                    raise ContractError("Mattermost outbox initialization state is not empty")
-            except ContractError:
-                raise
-            except OSError as exc:
-                raise ContractError("Mattermost outbox initialization state unavailable") from exc
-        else:
-            _state_dir(state_dir, create=True)
         database = state_dir / OUTBOX_DB_NAME
         key = _key_file(key_path)
         if not hmac.compare_digest(key_fingerprint(key), expected_fingerprint):
             raise ContractError("Mattermost outbox policy key binding rejected")
-        connection = sqlite3.connect(database, isolation_level=None)
+        directory = _initialization_directory(state_dir)
+        connection: sqlite3.Connection | None = None
         try:
+            if directory is not None:
+                try:
+                    os.stat(OUTBOX_DB_NAME, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ContractError("Mattermost outbox initialization state is not empty")
+                database_for_create = Path(f"/proc/self/fd/{directory}/{OUTBOX_DB_NAME}")
+            else:
+                database_for_create = database
+            connection = sqlite3.connect(database_for_create, isolation_level=None)
             cls._configure(connection)
             cls._create_schema(connection, secrets.token_bytes(16), key_fingerprint(key))
+        except ContractError:
+            raise
+        except (sqlite3.Error, OSError) as exc:
+            raise ContractError("Mattermost outbox database initialization unavailable") from exc
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
+            if directory is not None:
+                os.close(directory)
         if os.name != "nt":
             try:
                 os.chmod(database, 0o600)
@@ -202,7 +248,7 @@ class MattermostOutbox:
             connection.execute("CREATE TABLE meta (schema_version TEXT NOT NULL, instance_id BLOB NOT NULL, key_fingerprint TEXT NOT NULL)")
             connection.execute("INSERT INTO meta VALUES (?, ?, ?)", (_META_SCHEMA, instance_id, fingerprint))
             connection.execute(
-                "CREATE TABLE records (record_tag TEXT PRIMARY KEY, source_tag TEXT UNIQUE NOT NULL, root_tag TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, payload_expires_at INTEGER NOT NULL, policy_expires_at INTEGER NOT NULL, policy_digest TEXT NOT NULL, nonce BLOB, ciphertext BLOB, reason TEXT)"
+                "CREATE TABLE records (record_tag TEXT PRIMARY KEY, source_tag TEXT UNIQUE NOT NULL, root_tag TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, payload_expires_at INTEGER NOT NULL, policy_expires_at INTEGER NOT NULL, policy_digest TEXT NOT NULL, nonce BLOB, ciphertext BLOB, reason TEXT, returned_post_tag TEXT, auth_tag TEXT NOT NULL)"
             )
             connection.execute("CREATE INDEX records_root_order ON records(root_tag, created_at, record_tag)")
             connection.execute("COMMIT")
@@ -238,6 +284,60 @@ class MattermostOutbox:
         payload = domain.encode("ascii") + b"\0" + b"\0".join(part.encode("utf-8") for part in parts)
         return hmac.new(self._tag_key, payload, hashlib.sha256).hexdigest()
 
+    def _row_auth(self, row: Any) -> str:
+        try:
+            material: dict[str, Any] = {"schema_version": OUTBOX_SCHEMA}
+            for name in _ROW_FIELDS:
+                value = row[name]
+                if name in {"nonce", "ciphertext"}:
+                    if value is not None and not isinstance(value, bytes):
+                        raise TypeError(name)
+                    material[name] = value.hex() if value is not None else None
+                elif value is None or isinstance(value, (str, int)) and not isinstance(value, bool):
+                    material[name] = value
+                else:
+                    raise TypeError(name)
+            return hmac.new(self._row_key, jcs_bytes(material), hashlib.sha256).hexdigest()
+        except (KeyError, TypeError, ValueError, UnicodeError, ContractError) as exc:
+            raise ContractError("Mattermost outbox row authentication failed") from exc
+
+    def _verify_row(self, row: sqlite3.Row) -> None:
+        try:
+            state = DeliveryState(row["state"])
+            auth_tag = row["auth_tag"]
+            if not isinstance(auth_tag, str) or not hmac.compare_digest(auth_tag, self._row_auth(row)):
+                raise ContractError("Mattermost outbox row authentication failed")
+            nonce, ciphertext = row["nonce"], row["ciphertext"]
+            if (nonce is None) != (ciphertext is None):
+                raise ContractError("Mattermost outbox row authentication failed")
+            if state.value in _TERMINAL:
+                if nonce is not None or ciphertext is not None:
+                    raise ContractError("Mattermost outbox row authentication failed")
+                if state is DeliveryState.DELIVERED:
+                    if not isinstance(row["returned_post_tag"], str) or not row["returned_post_tag"]:
+                        raise ContractError("Mattermost outbox row authentication failed")
+                elif row["returned_post_tag"] is not None:
+                    raise ContractError("Mattermost outbox row authentication failed")
+            elif nonce is None or ciphertext is None or row["returned_post_tag"] is not None:
+                raise ContractError("Mattermost outbox row authentication failed")
+        except ContractError:
+            raise
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ContractError("Mattermost outbox row authentication failed") from exc
+
+    def _verify_all_rows(self) -> None:
+        try:
+            self._connection.row_factory = sqlite3.Row
+            rows = self._connection.execute("SELECT * FROM records").fetchall()
+            for row in rows:
+                self._verify_row(row)
+                if row["nonce"] is not None:
+                    self._open_envelope(row)
+        except ContractError:
+            raise
+        except sqlite3.Error as exc:
+            raise ContractError("Mattermost outbox row authentication failed") from exc
+
     def source_tag(self, envelope: dict[str, Any]) -> str:
         return self._tag("source", envelope["tenant_id"], envelope["origin"], envelope["channel_id"], envelope["source_id"])
 
@@ -258,6 +358,7 @@ class MattermostOutbox:
         return nonce, payload
 
     def _open_envelope(self, row: sqlite3.Row) -> dict[str, Any]:
+        self._verify_row(row)
         if row["nonce"] is None or row["ciphertext"] is None:
             raise ContractError("Mattermost outbox payload was erased")
         try:
@@ -276,9 +377,13 @@ class MattermostOutbox:
             raise ContractError("Mattermost outbox lookup binding rejected")
         return envelope
 
-    @staticmethod
-    def _record(row: sqlite3.Row, envelope: dict[str, Any] | None) -> OutboxRecord:
-        return OutboxRecord(row["record_tag"], row["source_tag"], row["root_tag"], DeliveryState(row["state"]), row["generation"], row["created_at"], row["updated_at"], row["payload_expires_at"], row["policy_expires_at"], envelope, row["reason"])
+    def _record(self, row: sqlite3.Row, envelope: dict[str, Any] | None) -> OutboxRecord:
+        self._verify_row(row)
+        return OutboxRecord(
+            row["record_tag"], row["source_tag"], row["root_tag"], DeliveryState(row["state"]),
+            row["generation"], row["created_at"], row["updated_at"], row["payload_expires_at"],
+            row["policy_expires_at"], envelope, row["reason"], row["returned_post_tag"],
+        )
 
     def _fetch(self, record_tag: str, *, decrypt: bool = True) -> OutboxRecord | None:
         self._connection.row_factory = sqlite3.Row
@@ -297,30 +402,42 @@ class MattermostOutbox:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("BEGIN IMMEDIATE")
             try:
-                row = self._connection.execute("SELECT * FROM records WHERE source_tag=?", (source_tag,)).fetchone()
+                rows = self._connection.execute("SELECT * FROM records").fetchall()
+                for row in rows:
+                    self._verify_row(row)
+                row = next((item for item in rows if item["source_tag"] == source_tag), None)
                 if row is not None:
+                    result = self._record(row, self._open_envelope(row) if row["nonce"] is not None else None)
                     self._connection.execute("COMMIT")
-                    return self._record(row, self._open_envelope(row) if row["nonce"] is not None else None), False
-                fence = self._connection.execute("SELECT 1 FROM records WHERE root_tag=? AND state<>? LIMIT 1", (root_tag, DeliveryState.DELIVERED.value)).fetchone()
-                if fence is not None:
+                    return result, False
+                if any(item["root_tag"] == root_tag and item["state"] != DeliveryState.DELIVERED.value for item in rows):
                     raise ContractError("Mattermost outbox root is fenced")
-                active = self._connection.execute("SELECT COUNT(*) FROM records WHERE nonce IS NOT NULL").fetchone()[0]
-                tombstones = self._connection.execute("SELECT COUNT(*) FROM records WHERE nonce IS NULL").fetchone()[0]
+                active = sum(item["nonce"] is not None for item in rows)
+                tombstones = len(rows) - active
                 # Every active record must be able to become a permanent
                 # tombstone without exceeding the signed total fence bound.
                 # Limiting only existing erased rows would admit more active
                 # work than the database can safely retain after completion.
                 if active >= payload_capacity or active + tombstones >= tombstone_capacity:
                     raise ContractError("Mattermost outbox capacity reached")
+                values = {
+                    "record_tag": record_tag, "source_tag": source_tag, "root_tag": root_tag,
+                    "state": DeliveryState.WAITING_COMMIT.value, "generation": 0, "created_at": now,
+                    "updated_at": now, "payload_expires_at": envelope["payload_expires_at"],
+                    "policy_expires_at": envelope["policy_expires_at"], "policy_digest": envelope["policy_digest"],
+                    "nonce": nonce, "ciphertext": ciphertext, "reason": None, "returned_post_tag": None,
+                }
                 self._connection.execute(
-                    "INSERT INTO records(record_tag,source_tag,root_tag,state,generation,created_at,updated_at,payload_expires_at,policy_expires_at,policy_digest,nonce,ciphertext,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
-                    (record_tag, source_tag, root_tag, DeliveryState.WAITING_COMMIT.value, 0, now, now, envelope["payload_expires_at"], envelope["policy_expires_at"], envelope["policy_digest"], nonce, ciphertext),
+                    "INSERT INTO records(record_tag,source_tag,root_tag,state,generation,created_at,updated_at,payload_expires_at,policy_expires_at,policy_digest,nonce,ciphertext,reason,returned_post_tag,auth_tag) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    tuple(values[name] for name in _ROW_FIELDS) + (self._row_auth(values),),
                 )
                 row = self._connection.execute("SELECT * FROM records WHERE record_tag=?", (record_tag,)).fetchone()
+                result = self._record(row, envelope)
                 self._connection.execute("COMMIT")
-                return self._record(row, envelope), True
+                return result, True
             except Exception:
-                self._connection.execute("ROLLBACK")
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
                 raise
 
     def update_waiting(self, record: OutboxRecord, envelope: dict[str, Any]) -> OutboxRecord:
@@ -333,11 +450,20 @@ class MattermostOutbox:
         return self._transition(record, DeliveryState.READY, DeliveryState.IN_FLIGHT, envelope=record.envelope, missing_ok=True)
 
     def terminal(self, record: OutboxRecord, state: DeliveryState, *, reason: str) -> OutboxRecord | None:
-        if state.value not in _TERMINAL:
+        if state.value not in _TERMINAL or state is DeliveryState.DELIVERED:
             raise ContractError("Mattermost outbox terminal state rejected")
         return self._transition(record, record.state, state, envelope=None, reason=reason, missing_ok=True)
 
-    def _transition(self, record: OutboxRecord, expected: DeliveryState, target: DeliveryState, *, envelope: dict[str, Any] | None, reason: str | None = None, missing_ok: bool = False) -> OutboxRecord | None:
+    def delivered(self, record: OutboxRecord, *, returned_post_id: str) -> OutboxRecord | None:
+        if not isinstance(returned_post_id, str) or not returned_post_id:
+            raise ContractError("Mattermost returned post receipt rejected")
+        return self._transition(
+            record, DeliveryState.IN_FLIGHT, DeliveryState.DELIVERED, envelope=None,
+            reason="exact_immediate_binding", missing_ok=True,
+            returned_post_tag=self._tag("returned-post", record.record_tag, returned_post_id),
+        )
+
+    def _transition(self, record: OutboxRecord, expected: DeliveryState, target: DeliveryState, *, envelope: dict[str, Any] | None, reason: str | None = None, missing_ok: bool = False, returned_post_tag: str | None = None) -> OutboxRecord | None:
         if record.state != expected:
             raise ContractError("Mattermost outbox transition state rejected")
         nonce = ciphertext = None
@@ -345,18 +471,49 @@ class MattermostOutbox:
             nonce, ciphertext = self._seal(envelope, record_tag=record.record_tag, source_tag=record.source_tag, root_tag=record.root_tag)
         now = _now()
         with self._lock:
-            cursor = self._connection.execute(
-                "UPDATE records SET state=?, generation=generation+1, updated_at=?, nonce=?, ciphertext=?, reason=? WHERE record_tag=? AND state=? AND generation=?",
-                (target.value, now, nonce, ciphertext, reason, record.record_tag, expected.value, record.generation),
-            )
-            if cursor.rowcount != 1:
-                if missing_ok:
-                    return None
-                raise ContractError("Mattermost outbox compare-and-set rejected")
-            refreshed = self.get(record.record_tag)
-            if refreshed is None:
-                raise ContractError("Mattermost outbox record disappeared")
-            return refreshed
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._connection.execute("SELECT * FROM records WHERE record_tag=?", (record.record_tag,)).fetchone()
+                if current is None:
+                    if missing_ok:
+                        self._connection.execute("COMMIT")
+                        return None
+                    raise ContractError("Mattermost outbox compare-and-set rejected")
+                self._verify_row(current)
+                if current["state"] != expected.value or current["generation"] != record.generation:
+                    if missing_ok:
+                        self._connection.execute("COMMIT")
+                        return None
+                    raise ContractError("Mattermost outbox compare-and-set rejected")
+                values = {name: current[name] for name in _ROW_FIELDS}
+                values.update({
+                    "state": target.value, "generation": current["generation"] + 1, "updated_at": now,
+                    "nonce": nonce, "ciphertext": ciphertext, "reason": reason,
+                    "returned_post_tag": returned_post_tag,
+                })
+                cursor = self._connection.execute(
+                    "UPDATE records SET state=?, generation=?, updated_at=?, nonce=?, ciphertext=?, reason=?, returned_post_tag=?, auth_tag=? WHERE record_tag=? AND state=? AND generation=?",
+                    (
+                        values["state"], values["generation"], values["updated_at"], values["nonce"],
+                        values["ciphertext"], values["reason"], values["returned_post_tag"], self._row_auth(values),
+                        record.record_tag, expected.value, record.generation,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ContractError("Mattermost outbox compare-and-set rejected")
+                refreshed_row = self._connection.execute("SELECT * FROM records WHERE record_tag=?", (record.record_tag,)).fetchone()
+                if refreshed_row is None:
+                    raise ContractError("Mattermost outbox record disappeared")
+                refreshed = self._record(
+                    refreshed_row, self._open_envelope(refreshed_row) if refreshed_row["nonce"] is not None else None
+                )
+                self._connection.execute("COMMIT")
+                return refreshed
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
 
     def get(self, record_tag: str) -> OutboxRecord | None:
         with self._lock:
@@ -368,12 +525,15 @@ class MattermostOutbox:
 
     def stale_inflight_to_ambiguous(self) -> int:
         with self._lock:
-            now = _now()
-            cursor = self._connection.execute(
-                "UPDATE records SET state=?, generation=generation+1, updated_at=?, nonce=NULL, ciphertext=NULL, reason=? WHERE state=?",
-                (DeliveryState.AMBIGUOUS.value, now, "restart_in_flight", DeliveryState.IN_FLIGHT.value),
+            self._connection.row_factory = sqlite3.Row
+            rows = self._connection.execute(
+                "SELECT * FROM records WHERE state=?", (DeliveryState.IN_FLIGHT.value,)
+            ).fetchall()
+            records = [self._record(row, self._open_envelope(row)) for row in rows]
+            return sum(
+                self.terminal(record, DeliveryState.AMBIGUOUS, reason="restart_in_flight") is not None
+                for record in records
             )
-            return cursor.rowcount
 
     def candidates(self, limit: int) -> list[OutboxRecord]:
         with self._lock:

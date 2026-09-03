@@ -67,7 +67,7 @@ def policy_values(now: datetime | None = None) -> dict:
         "outbox_payload_retention_seconds": 3600,
         "outbox_payload_capacity": 1000,
         "outbox_tombstone_capacity": 1000,
-        "outbox_scan_limit": 64,
+        "outbox_scan_limit": 64, "outbox_scan_interval_seconds": 1,
     }
 
 
@@ -94,6 +94,7 @@ def signed_policy(tmp_path: Path, values: dict | None = None, now: datetime | No
         lambda value: value.update(inference_policy_digest="bad"),
         lambda value: value.update(uds_timeout_seconds=39, conversation_deadline_seconds=40),
         lambda value: value.update(rest_timeout_seconds=31),
+        lambda value: value.update(outbox_scan_interval_seconds=0),
         lambda value: value.update(extra=True),
     ],
 )
@@ -181,6 +182,7 @@ class Rest:
 class Conversation:
     def __init__(self):
         self.calls = []
+        self.deadlines = []
         self.readiness = {
             "schema_version": "restricted-conversation-readiness.v1",
             "status": "ready",
@@ -205,10 +207,12 @@ class Conversation:
         self.calls.append((conversation_id, client_request_id, message))
         return {"status": "COMMITTED", "message": "synthetic response"}
 
-    def create_conversation(self, *, conversation_id):
+    def create_conversation(self, *, conversation_id, deadline=None):
+        self.deadlines.append(deadline)
         return {"conversation_id": conversation_id, "conversation_epoch": "epoch-one"}
 
-    def submit_turn(self, *, conversation_id, conversation_epoch, client_request_id, message):
+    def submit_turn(self, *, conversation_id, conversation_epoch, client_request_id, message, deadline=None):
+        self.deadlines.append(deadline)
         self.calls.append((conversation_id, client_request_id, message))
         return {"schema_version": "restricted-turn-result.v1", "turn_id": "turn", "conversation_epoch": conversation_epoch, "status": "COMMITTED", "message": "synthetic response"}
 
@@ -537,6 +541,121 @@ def test_restart_after_ready_attempts_one_post_and_after_inflight_never_retries(
     ambiguous = final.get(flight.record_tag)
     assert ambiguous is not None and ambiguous.state is DeliveryState.AMBIGUOUS and ambiguous.envelope is None
     final.close()
+
+
+def test_recovery_readiness_uses_the_exact_preflight_binding_before_uds_or_post(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    source = post()
+    record, _ = service.outbox.reserve(
+        service._envelope(source, service._authorize_source(source)),
+        payload_capacity=1000, tombstone_capacity=1000,
+    )
+    conversation.readiness["policy_digest"] = "b" * 64
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.WAITING_COMMIT
+    assert conversation.calls == [] and rest.created == []
+    conversation.readiness["policy_digest"] = "a" * 64
+    service.executor.drain()
+    assert len(conversation.calls) == 1 and len(rest.created) == 1
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda rest: rest.me.update(username="renamed-bot"),
+        lambda rest: rest.channels[CHANNEL].update(type="O"),
+        lambda rest: rest.posts[ROOT].update(message="@restricted-bot edited"),
+    ],
+)
+def test_recovery_current_bot_channel_and_root_mismatches_are_definitive_blocks(tmp_path, mutate):
+    service, rest, conversation = ingress(tmp_path)
+    source = post()
+    record, _ = service.outbox.reserve(
+        service._envelope(source, service._authorize_source(source)),
+        payload_capacity=1000, tombstone_capacity=1000,
+    )
+    mutate(rest)
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.BLOCKED
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_recovery_passes_one_fresh_signed_deadline_to_creation_and_submission(tmp_path, monkeypatch):
+    service, _rest, conversation = ingress(tmp_path)
+    conversation.deadlines = []
+    source = post()
+    record, _ = service.outbox.reserve(
+        service._envelope(source, service._authorize_source(source)),
+        payload_capacity=1000, tombstone_capacity=1000,
+    )
+    monkeypatch.setattr(mattermost_ingress.time, "monotonic", lambda: 100.0)
+    service.executor.drain()
+    assert record.record_tag
+    assert conversation.deadlines == [140.0, 140.0]
+
+
+def test_periodic_recovery_retries_transient_waiting_work_without_a_new_event(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    source = post()
+    record, _ = service.outbox.reserve(
+        service._envelope(source, service._authorize_source(source)),
+        payload_capacity=1000, tombstone_capacity=1000,
+    )
+    original_submit = conversation.submit_turn
+    first = True
+    delivered = threading.Event()
+
+    def transient_once(**kwargs):
+        nonlocal first
+        if first:
+            first = False
+            raise TimeoutError
+        return original_submit(**kwargs)
+
+    def counted_post(body):
+        value = Rest.create_post(rest, body)
+        delivered.set()
+        return value
+
+    conversation.submit_turn = transient_once
+    rest.create_post = counted_post
+    service.executor.drain()
+    waiting = service.outbox.get(record.record_tag)
+    assert waiting is not None and waiting.state is DeliveryState.WAITING_COMMIT
+    stop = service.start_periodic_recovery()
+    try:
+        assert delivered.wait(3), "periodic recovery did not retry the durable waiting record"
+    finally:
+        service.stop_periodic_recovery(stop)
+    assert len(conversation.calls) == 1 and len(rest.created) == 1
+
+
+def test_periodic_recovery_expires_waiting_payload_without_a_new_event(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    source = post()
+    record, _ = service.outbox.reserve(
+        {**service._envelope(source, service._authorize_source(source)), "payload_expires_at": 0},
+        payload_capacity=1000, tombstone_capacity=1000,
+    )
+    transitioned = threading.Event()
+    original_terminal = service.outbox.terminal
+
+    def observed_terminal(*args, **kwargs):
+        result = original_terminal(*args, **kwargs)
+        transitioned.set()
+        return result
+
+    service.outbox.terminal = observed_terminal
+    handle = service.start_periodic_recovery()
+    try:
+        assert transitioned.wait(3), "periodic recovery did not inspect expired durable work"
+    finally:
+        service.stop_periodic_recovery(handle)
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.EXPIRED
+    assert conversation.calls == [] and rest.created == []
 
 
 class _Clock:

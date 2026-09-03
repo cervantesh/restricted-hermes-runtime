@@ -231,7 +231,7 @@ def _policy(tmp_path: Path, port: int) -> tuple[Path, Path, str]:
         "uds_timeout_seconds": 2, "conversation_deadline_seconds": 1,
         "outbox_key_fingerprint": hashlib.sha256(b"m" * 32).hexdigest(), "outbox_payload_retention_seconds": 3600,
         "outbox_payload_capacity": 1000, "outbox_tombstone_capacity": 1000,
-        "outbox_scan_limit": 64,
+        "outbox_scan_limit": 64, "outbox_scan_interval_seconds": 5,
     }
     private = ed25519.Ed25519PrivateKey.generate()
     policy, signature = tmp_path / "policy.json", tmp_path / "policy.sig"
@@ -240,7 +240,15 @@ def _policy(tmp_path: Path, port: int) -> tuple[Path, Path, str]:
     return policy, signature, base64.b64encode(private.public_key().public_bytes_raw()).decode()
 
 
-def _witness(tmp_path: Path, mode: str, *, expect_delivery: bool) -> tuple[int, int, int, int]:
+def _witness(
+    tmp_path: Path,
+    mode: str,
+    *,
+    expect_delivery: bool,
+    site: Path | None = None,
+) -> tuple[int, int, int, int]:
+    if os.geteuid() != 0:
+        pytest.skip("exact conversation.sock process witness requires an isolated root runner")
     tmp_path.mkdir(parents=True, exist_ok=True)
     SOCKET.parent.mkdir(parents=True, exist_ok=True)
     if SOCKET.exists():
@@ -268,7 +276,7 @@ def _witness(tmp_path: Path, mode: str, *, expect_delivery: bool) -> tuple[int, 
     os.chmod(outbox_key, 0o600)
     MattermostOutbox.initialize(OUTBOX_STATE, outbox_key, expected_fingerprint=key_fingerprint(b"m" * 32)).close()
     environment = {
-        **os.environ, "PYTHONPATH": str(ROOT / "src"), "PYTHONDONTWRITEBYTECODE": "1",
+        **os.environ, "PYTHONPATH": str(site or ROOT / "src"), "PYTHONDONTWRITEBYTECODE": "1",
         "RESTRICTED_MATTERMOST_POLICY_PATH": str(policy),
         "RESTRICTED_MATTERMOST_POLICY_SIGNATURE_PATH": str(signature),
         "RESTRICTED_MATTERMOST_POLICY_PUBLIC_KEY_B64": public,
@@ -317,23 +325,52 @@ def _witness(tmp_path: Path, mode: str, *, expect_delivery: bool) -> tuple[int, 
 
 @pytest.mark.parametrize(
     ("mode", "expected"),
-    [("success", (1, 1, 1, 1)), ("first_hop", (1, 1, 0, 0)), ("second_hop", (1, 1, 1, 0))],
+    [("success", (3, 1, 1, 1)), ("first_hop", (2, 1, 0, 0)), ("second_hop", (2, 1, 1, 0))],
 )
 def test_authenticated_production_event_path_shares_one_signed_uds_deadline(tmp_path, mode, expected):
     assert _witness(tmp_path, mode, expect_delivery=mode == "success") == expected
 
 
+def _installed_artifact(tmp_path: Path) -> Path:
+    wheelhouse = tmp_path / "wheelhouse"
+    subprocess.run(
+        [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation", ".", "--wheel-dir", str(wheelhouse)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    wheel = next(wheelhouse.glob("restricted_hermes_runtime-*.whl"))
+    site = tmp_path / "site"
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-deps", "--target", str(site), str(wheel)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return site
+
+
+def _copy_artifact(site: Path, target: Path) -> Path:
+    shutil.copytree(site, target)
+    for cache in target.rglob("__pycache__"):
+        shutil.rmtree(cache)
+    return target
+
+
 def test_deadline_witness_bites_against_the_installed_independent_request_mutation(tmp_path):
-    assert _witness(tmp_path / "shared", "first_hop", expect_delivery=False) == (1, 1, 0, 0)
-    source_path = ROOT / "src" / "restricted_runtime" / "mattermost_ingress.py"
+    site = _installed_artifact(tmp_path)
+    assert _witness(tmp_path / "shared", "first_hop", expect_delivery=False, site=site) == (2, 1, 0, 0)
+    mutant = _copy_artifact(site, tmp_path / "mutant")
+    source_path = mutant / "restricted_runtime" / "mattermost_ingress.py"
     original = source_path.read_text(encoding="utf-8")
     mutated = original.replace("deadline=deadline", "deadline=None").replace(
         "if deadline - time.monotonic() <= 0:", "if False:"
     )
     assert mutated != original
-    try:
-        source_path.write_text(mutated, encoding="utf-8")
-        assert "deadline=None" in source_path.read_text(encoding="utf-8")
-        assert _witness(tmp_path / "independent", "first_hop", expect_delivery=True) == (1, 1, 1, 1)
-    finally:
-        source_path.write_text(original, encoding="utf-8")
+    source_path.write_text(mutated, encoding="utf-8")
+    assert "deadline=None" in source_path.read_text(encoding="utf-8")
+    assert _witness(tmp_path / "independent", "first_hop", expect_delivery=True, site=mutant) == (3, 1, 1, 1)

@@ -68,7 +68,7 @@ def test_operator_docs_preserve_non_phi_and_duplicate_averse_delivery_contract()
     for phrase in (
         "synthetic/non-PHI",
         "duplicate-averse",
-        "exactly-once",
+        "does not claim exactly-once posting",
         "retention",
         "audit",
         "backup",
