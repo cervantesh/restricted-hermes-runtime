@@ -1,0 +1,98 @@
+x-staging-labels: &staging-labels
+  io.cervantesh.restricted-runtime.synthetic-clinical: "true"
+  io.cervantesh.restricted-runtime.project: ${CLINICAL_STAGING_PROJECT:?required}
+  io.cervantesh.restricted-runtime.state-id: ${CLINICAL_STAGING_STATE_ID:?required}
+
+services:
+  mattermost-postgres:
+    labels: *staging-labels
+  mattermost:
+    labels: *staging-labels
+  operator-proxy:
+    image: nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284
+    user: "101:101"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+    depends_on: [mattermost]
+    volumes:
+      - ../../../deploy/clinical-staging/nginx-stream.conf:/etc/nginx/nginx.conf:ro
+    networks: [operator_access, mattermost_edge]
+    ports:
+      - "127.0.0.1:${CLINICAL_STAGING_PORT:?required}:18444"
+    labels: *staging-labels
+  hrh-postgres:
+    labels: *staging-labels
+  hrh-migrate:
+    labels: *staging-labels
+  hrh:
+    labels: *staging-labels
+    build:
+      args:
+        BUILD_SHA: ${CLINICAL_HRH_BUILD_SHA:?required}
+  hrh-tls:
+    labels: *staging-labels
+  clinical-socket-init:
+    labels: *staging-labels
+  clinical-adapter:
+    labels: *staging-labels
+  ingress:
+    labels: *staging-labels
+  controller:
+    profiles: ["provision"]
+    restart: "no"
+    entrypoint: ["python", "/harness/control.py"]
+    labels: *staging-labels
+
+networks:
+  mattermost_edge:
+    internal: true
+    labels: *staging-labels
+  mattermost_backend:
+    internal: true
+    labels: *staging-labels
+  hrh_backend:
+    internal: true
+    labels: *staging-labels
+  clinical_upstream:
+    internal: true
+    labels: *staging-labels
+  operator_access:
+    internal: false
+    labels: *staging-labels
+
+volumes:
+  mattermost_db:
+    external: true
+    name: ${CLINICAL_VOLUME_MATTERMOST_DB:?required}
+  mattermost_data:
+    external: true
+    name: ${CLINICAL_VOLUME_MATTERMOST_DATA:?required}
+  mattermost_tls:
+    external: true
+    name: ${CLINICAL_VOLUME_MATTERMOST_TLS:?required}
+  hrh_db:
+    external: true
+    name: ${CLINICAL_VOLUME_HRH_DB:?required}
+  hrh_tls:
+    external: true
+    name: ${CLINICAL_VOLUME_HRH_TLS:?required}
+  hrh_secret:
+    external: true
+    name: ${CLINICAL_VOLUME_HRH_SECRET:?required}
+  clinical_config:
+    external: true
+    name: ${CLINICAL_VOLUME_CLINICAL_CONFIG:?required}
+  clinical_socket:
+    external: true
+    name: ${CLINICAL_VOLUME_CLINICAL_SOCKET:?required}
+  ingress_config:
+    external: true
+    name: ${CLINICAL_VOLUME_INGRESS_CONFIG:?required}
+  ingress_outbox:
+    external: true
+    name: ${CLINICAL_VOLUME_INGRESS_OUTBOX:?required}
+  controller_state:
+    external: true
+    name: ${CLINICAL_VOLUME_CONTROLLER_STATE:?required}
