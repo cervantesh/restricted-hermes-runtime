@@ -156,3 +156,60 @@ def test_installed_effective_source_uniqueness_mutation_admits_duplicate_rows(in
     )
     result = _run(mutant, program)
     assert result == {"created": True, "distinct": True, "rows": 2}
+
+
+_STATE_PROGRAM = _PROGRAM.replace(
+    'store._connection.execute("UPDATE records SET source_tag=CASE WHEN substr(source_tag,1,1)=\'0\' THEN \'1\' || substr(source_tag,2) ELSE \'0\' || substr(source_tag,2) END WHERE record_tag=?",(record.record_tag,))\ntry:\n    value=store.get(record.record_tag)\n    tamper="accepted" if value is not None else "empty"\nexcept ContractError:\n    tamper="rejected"\nprint(json.dumps({"plaintext":b"MUTATION_MESSAGE_CANARY" in raw,"tamper":tamper,"module":module.__file__}))',
+    'ready=store.mark_ready(record, {**env,"response":"answer"}); claimed=store.claim_delivery(ready); assert claimed is not None; changed=store.stale_inflight_to_ambiguous(); after=store.get(record.record_tag); print(json.dumps({"changed":changed,"state":after.state.value}))',
+)
+
+
+def test_installed_stale_inflight_ready_mutation_bites(installed_artifact, tmp_path):
+    baseline = _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _STATE_PROGRAM)
+    assert baseline == {"changed": 1, "state": "AMBIGUOUS"}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        '(DeliveryState.AMBIGUOUS.value, now, "restart_in_flight", DeliveryState.IN_FLIGHT.value),',
+        '(DeliveryState.READY.value, now, "restart_in_flight", DeliveryState.IN_FLIGHT.value),',
+    )
+    assert _run(mutant, _STATE_PROGRAM) == {"changed": 1, "state": "READY"}
+
+
+_CAS_PROGRAM = _PROGRAM.replace(
+    'store._connection.execute("UPDATE records SET source_tag=CASE WHEN substr(source_tag,1,1)=\'0\' THEN \'1\' || substr(source_tag,2) ELSE \'0\' || substr(source_tag,2) END WHERE record_tag=?",(record.record_tag,))\ntry:\n    value=store.get(record.record_tag)\n    tamper="accepted" if value is not None else "empty"\nexcept ContractError:\n    tamper="rejected"\nprint(json.dumps({"plaintext":b"MUTATION_MESSAGE_CANARY" in raw,"tamper":tamper,"module":module.__file__}))',
+    'ready=store.mark_ready(record,{**env,"response":"answer"}); stale=store.get(record.record_tag); first=store.claim_delivery(ready); second=store.claim_delivery(stale); print(json.dumps({"first":first is not None,"second":second is not None}))',
+)
+
+
+def test_installed_non_cas_delivery_mutation_bites(installed_artifact, tmp_path):
+    baseline = _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _CAS_PROGRAM)
+    assert baseline == {"first": True, "second": False}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        'WHERE record_tag=? AND state=? AND generation=?",',
+        'WHERE record_tag=?",',
+    )
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        '(target.value, now, nonce, ciphertext, reason, record.record_tag, expected.value, record.generation),',
+        '(target.value, now, nonce, ciphertext, reason, record.record_tag),',
+    )
+    assert _run(mutant, _CAS_PROGRAM) == {"first": True, "second": True}
+
+
+_FENCE_PROGRAM = _PROGRAM.replace(
+    'store._connection.execute("UPDATE records SET source_tag=CASE WHEN substr(source_tag,1,1)=\'0\' THEN \'1\' || substr(source_tag,2) ELSE \'0\' || substr(source_tag,2) END WHERE record_tag=?",(record.record_tag,))\ntry:\n    value=store.get(record.record_tag)\n    tamper="accepted" if value is not None else "empty"\nexcept ContractError:\n    tamper="rejected"\nprint(json.dumps({"plaintext":b"MUTATION_MESSAGE_CANARY" in raw,"tamper":tamper,"module":module.__file__}))',
+    'store.terminal(record, DeliveryState.AMBIGUOUS, reason="test"); later={**env,"source_id":"later-source","message":"later"};\ntry:\n second,created=store.reserve(later,payload_capacity=3,tombstone_capacity=3); fenced=not created\nexcept ContractError:\n fenced=True\nprint(json.dumps({"fenced":fenced}))',
+)
+
+
+def test_installed_removed_root_fence_mutation_bites(installed_artifact, tmp_path):
+    assert _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _FENCE_PROGRAM) == {"fenced": True}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(mutant, "restricted_runtime/mattermost_outbox.py", "if fence is not None:", "if False:")
+    assert _run(mutant, _FENCE_PROGRAM) == {"fenced": False}
