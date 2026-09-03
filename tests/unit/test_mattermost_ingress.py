@@ -17,6 +17,7 @@ from restricted_runtime.contracts import ContractError, jcs_bytes
 import restricted_runtime.mattermost_ingress as mattermost_ingress
 from restricted_runtime.mattermost_ingress import (
     ConversationUdsClient,
+    DefinitiveMattermostError,
     MattermostRestClient,
     Ingress,
     MattermostEvent,
@@ -162,16 +163,16 @@ class Rest:
         self.created = []
         self.me = {"id": BOT, "username": "restricted-bot"}
 
-    def get_me(self):
+    def get_me(self, *, definitive=False):
         return self.me
 
-    def get_channel(self, channel_id):
+    def get_channel(self, channel_id, *, definitive=False):
         return self.channels[channel_id]
 
-    def get_post(self, post_id):
+    def get_post(self, post_id, *, definitive=False):
         return self.posts[post_id]
 
-    def get_channel_member(self, channel_id, user_id):
+    def get_channel_member(self, channel_id, user_id, *, definitive=False):
         return {"channel_id": channel_id, "user_id": user_id}
 
     def create_post(self, body):
@@ -405,6 +406,54 @@ def test_rest_transport_rejects_redirect_error_malformed_and_oversize_without_pr
             client.get_me()
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        (b"{}", {"Content-Type": "text/plain"}),
+        (b"[]", {"Content-Type": "application/json"}),
+        (b"not-json", {"Content-Type": "application/json"}),
+        (b"x" * 1_048_577, {"Content-Type": "application/json"}),
+    ],
+)
+def test_recovery_resource_http_200_shape_rejection_is_definitive(monkeypatch, tmp_path, response):
+    policy = signed_policy(tmp_path)
+
+    class Response:
+        status = 200
+
+        def __init__(self, body, headers):
+            self.body, self.headers, self.offset = body, headers, 0
+
+        def getheader(self, name, default=None):
+            return self.headers.get(name, default)
+
+        def read(self, size=-1):
+            if size < 0:
+                size = len(self.body) - self.offset
+            result = self.body[self.offset:self.offset + size]
+            self.offset += len(result)
+            return result
+
+    class Connection:
+        current = Response(*response)
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            return self.current
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", Connection)
+    with pytest.raises(DefinitiveMattermostError, match="response"):
+        MattermostRestClient(policy, "secret").get_me(definitive=True)
+
+
 def test_events_before_websocket_auth_success_have_zero_side_effects(tmp_path):
     policy = signed_policy(tmp_path)
     rest, conversation = Rest(), Conversation()
@@ -580,6 +629,246 @@ def test_recovery_current_bot_channel_and_root_mismatches_are_definitive_blocks(
     durable = service.outbox.get(record.record_tag)
     assert durable is not None and durable.state is DeliveryState.BLOCKED
     assert conversation.calls == [] and rest.created == []
+
+
+def test_recovery_http_200_array_then_valid_resource_is_blocked_without_release(monkeypatch, tmp_path):
+    policy = signed_policy(tmp_path)
+
+    class Response:
+        status = 200
+
+        def __init__(self, body):
+            self.body, self.offset = body, 0
+
+        def getheader(self, name, default=None):
+            return "application/json" if name == "Content-Type" else default
+
+        def read(self, size=-1):
+            if size < 0:
+                size = len(self.body) - self.offset
+            result = self.body[self.offset:self.offset + size]
+            self.offset += len(result)
+            return result
+
+    class Connection:
+        responses = [Response(b"[]"), Response(jcs_bytes({"id": BOT, "username": "restricted-bot"}))]
+        requests = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            type(self).requests += 1
+
+        def getresponse(self):
+            return type(self).responses.pop(0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", Connection)
+    key = tmp_path / "outbox.key"
+    key.write_bytes(OUTBOX_KEY)
+    os.chmod(key, 0o600)
+    outbox = MattermostOutbox.initialize(
+        tmp_path / "outbox", key, expected_fingerprint=policy.values["outbox_key_fingerprint"]
+    )
+    conversation = Conversation()
+    service = Ingress(policy, MattermostRestClient(policy, "secret"), conversation, outbox)
+    source = post()
+    record, _ = outbox.reserve(
+        service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    try:
+        service.executor.drain()
+        blocked = outbox.get(record.record_tag)
+        assert blocked is not None and blocked.state is DeliveryState.BLOCKED
+        service.executor.drain()
+        assert Connection.requests == 1
+        assert conversation.calls == []
+    finally:
+        outbox.close()
+
+
+def _expiring_waiting_record(service, source, *, expires_at=100):
+    return service.outbox.reserve(
+        {
+            **service._envelope(source, service._authorize_source(source)),
+            "payload_expires_at": expires_at,
+            "policy_expires_at": max(10_000, expires_at),
+        },
+        payload_capacity=1000,
+        tombstone_capacity=1000,
+    )[0]
+
+
+def test_recovery_expiry_fence_stops_before_conversation_after_slow_authorization(tmp_path, monkeypatch):
+    service, rest, conversation = ingress(tmp_path)
+    clock = {"now": 90}
+    monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
+    record = _expiring_waiting_record(service, post())
+    original_me = rest.get_me
+
+    def auth_then_expire(**kwargs):
+        value = original_me(**kwargs)
+        clock["now"] = 101
+        return value
+
+    rest.get_me = auth_then_expire
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.EXPIRED
+    assert conversation.deadlines == [] and conversation.calls == [] and rest.created == []
+
+
+def test_recovery_expiry_fence_stops_before_conversation_after_slow_readiness(tmp_path, monkeypatch):
+    service, rest, conversation = ingress(tmp_path)
+    clock = {"now": 90}
+    monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
+    record = _expiring_waiting_record(service, post())
+    original_ready = conversation.ready
+
+    def readiness_then_expire():
+        value = original_ready()
+        clock["now"] = 101
+        return value
+
+    conversation.ready = readiness_then_expire
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.EXPIRED
+    assert conversation.deadlines == [] and conversation.calls == [] and rest.created == []
+
+
+def test_recovery_expiry_fence_stops_before_turn_after_conversation_create(tmp_path, monkeypatch):
+    service, rest, conversation = ingress(tmp_path)
+    clock = {"now": 90}
+    monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
+    record = _expiring_waiting_record(service, post())
+    created = []
+    original_create = conversation.create_conversation
+
+    def create_then_expire(**kwargs):
+        created.append(kwargs["conversation_id"])
+        value = original_create(**kwargs)
+        clock["now"] = 101
+        return value
+
+    conversation.create_conversation = create_then_expire
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.EXPIRED
+    assert len(created) == 1 and conversation.calls == [] and rest.created == []
+
+
+def test_recovery_expiry_fence_stops_after_slow_turn_before_ready_transition(tmp_path, monkeypatch):
+    service, rest, conversation = ingress(tmp_path)
+    clock = {"now": 90}
+    monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
+    record = _expiring_waiting_record(service, post())
+    original_submit = conversation.submit_turn
+
+    def turn_then_expire(**kwargs):
+        value = original_submit(**kwargs)
+        clock["now"] = 101
+        return value
+
+    conversation.submit_turn = turn_then_expire
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.EXPIRED
+    assert durable.generation == 2 and len(conversation.calls) == 1 and rest.created == []
+
+
+def test_recovery_expiry_fence_stops_before_post_after_claim(tmp_path, monkeypatch):
+    service, rest, _conversation = ingress(tmp_path)
+    clock = {"now": 90}
+    monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
+    source = post()
+    waiting = _expiring_waiting_record(service, source)
+    ready = service.outbox.mark_ready(
+        waiting, {**waiting.envelope, "conversation_epoch": "epoch-one", "response": "synthetic response"}
+    )
+    original_claim = service.outbox.claim_delivery
+
+    def claim_then_expire(record):
+        value = original_claim(record)
+        clock["now"] = 101
+        return value
+
+    service.outbox.claim_delivery = claim_then_expire
+    service.executor.drain()
+    durable = service.outbox.get(ready.record_tag)
+    assert durable is not None and durable.state is DeliveryState.EXPIRED
+    assert rest.created == []
+
+
+def test_recovery_expiry_fence_stops_before_claim_after_ready_readiness(tmp_path, monkeypatch):
+    service, rest, conversation = ingress(tmp_path)
+    clock = {"now": 90}
+    monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
+    waiting = _expiring_waiting_record(service, post())
+    ready = service.outbox.mark_ready(
+        waiting, {**waiting.envelope, "conversation_epoch": "epoch-one", "response": "synthetic response"}
+    )
+    original_ready = conversation.ready
+    claims = []
+
+    def readiness_then_expire():
+        value = original_ready()
+        clock["now"] = 101
+        return value
+
+    def counted_claim(record):
+        claims.append(record.record_tag)
+        return None
+
+    conversation.ready = readiness_then_expire
+    service.outbox.claim_delivery = counted_claim
+    service.executor.drain()
+    durable = service.outbox.get(ready.record_tag)
+    assert durable is not None and durable.state is DeliveryState.EXPIRED
+    assert claims == [] and rest.created == []
+
+
+def test_durable_scan_cursor_does_not_starve_another_root_after_restart(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    service.policy.values["outbox_scan_limit"] = 1
+    first_source = post("first-source000000000000000", message="@restricted-bot first")
+    second_source = post("second-source00000000000000", message="@restricted-bot second")
+    rest.posts[first_source["id"]] = first_source
+    rest.posts[second_source["id"]] = second_source
+    first = _expiring_waiting_record(service, first_source, expires_at=4_000_000_000)
+    second = _expiring_waiting_record(service, second_source, expires_at=4_000_000_000)
+    blocked, released = sorted((first, second), key=lambda item: item.root_tag)
+    attempts = []
+    original_create = conversation.create_conversation
+
+    def transient_first_root(**kwargs):
+        attempts.append(kwargs["conversation_id"])
+        if kwargs["conversation_id"] == blocked.envelope["conversation_id"]:
+            raise TimeoutError
+        return original_create(**kwargs)
+
+    conversation.create_conversation = transient_first_root
+    service.executor.drain()
+    assert attempts == [blocked.envelope["conversation_id"]]
+    service.outbox.close()
+    reopened = MattermostOutbox.open(
+        tmp_path / "outbox", tmp_path / "outbox.key",
+        expected_fingerprint=service.policy.values["outbox_key_fingerprint"],
+    )
+    recovered = Ingress(service.policy, rest, conversation, reopened)
+    try:
+        recovered.executor.drain()
+        durable_blocked = reopened.get(blocked.record_tag)
+        durable_released = reopened.get(released.record_tag)
+        assert attempts == [blocked.envelope["conversation_id"], released.envelope["conversation_id"]]
+        assert durable_blocked is not None and durable_blocked.state is DeliveryState.WAITING_COMMIT
+        assert durable_released is not None and durable_released.state is DeliveryState.DELIVERED
+        assert len(rest.created) == 1
+    finally:
+        reopened.close()
 
 
 def test_recovery_passes_one_fresh_signed_deadline_to_creation_and_submission(tmp_path, monkeypatch):

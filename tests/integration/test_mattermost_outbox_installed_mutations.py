@@ -167,6 +167,39 @@ def test_installed_terminal_metadata_authentication_mutation_bites(installed_art
     assert _run(mutant, _TERMINAL_TAMPER_PROGRAM) == {"outcome": "accepted"}
 
 
+_NONCE_REUSE_PROGRAM = r'''
+import json, os, tempfile
+from pathlib import Path
+from restricted_runtime.contracts import ContractError
+import restricted_runtime.mattermost_outbox as module
+from restricted_runtime.mattermost_outbox import DeliveryState, MattermostOutbox, key_fingerprint
+root=Path(tempfile.mkdtemp()); key=root/'key'; key.write_bytes(bytes(range(32))); os.chmod(key,0o600)
+fp=key_fingerprint(bytes(range(32)))
+env={"schema_version":"restricted-mattermost-outbox.v1","tenant_id":"tenant","origin":"https://mm.example","channel_id":"channel","root_id":"root","source_id":"source","actor_id":"actor","message":"nonce test","conversation_id":"conversation","conversation_epoch":None,"client_request_id":"request","policy_epoch":"policy","policy_digest":"a"*64,"key_fingerprint":fp,"policy_expires_at":4000000000,"payload_expires_at":4000000000,"response":None,"pending_post_id":"pending","returned_post_id":None}
+store=MattermostOutbox.initialize(root/'state',key,expected_fingerprint=fp)
+module.secrets.token_bytes=lambda size: b'n'*size
+first,_=store.reserve(env,payload_capacity=3,tombstone_capacity=3); store.terminal(first,DeliveryState.BLOCKED,reason='test')
+try:
+ store.reserve({**env,"source_id":"second","root_id":"second"},payload_capacity=3,tombstone_capacity=3); outcome='reused'
+except ContractError:
+ outcome='rejected'
+print(json.dumps({'outcome':outcome,'nonces':store._connection.execute('SELECT COUNT(*) FROM nonce_tombstones').fetchone()[0]}))
+'''
+
+
+def test_installed_nonce_registry_mutation_allows_repeated_entropy_reuse(installed_artifact, tmp_path):
+    baseline = _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _NONCE_REUSE_PROGRAM)
+    assert baseline == {"outcome": "rejected", "nonces": 1}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        'self._connection.execute("INSERT INTO nonce_tombstones(nonce) VALUES(?)", (nonce,))',
+        "pass",
+    )
+    assert _run(mutant, _NONCE_REUSE_PROGRAM) == {"outcome": "reused", "nonces": 0}
+
+
 _READINESS_PROGRAM = r'''
 import json, os, tempfile
 from pathlib import Path
@@ -179,10 +212,10 @@ class Policy:
  def validate(self): pass
 class Rest:
  def __init__(self): self.posts=0
- def get_me(self): return {'id':'bot','username':'bot'}
- def get_post(self,_): return source
- def get_channel(self,_): return {'id':'channel','team_id':'team','type':'P'}
- def get_channel_member(self,channel,user): return {'channel_id':channel,'user_id':user}
+ def get_me(self,*,definitive=False): return {'id':'bot','username':'bot'}
+ def get_post(self,_,*,definitive=False): return source
+ def get_channel(self,_,*,definitive=False): return {'id':'channel','team_id':'team','type':'P'}
+ def get_channel_member(self,channel,user,*,definitive=False): return {'channel_id':channel,'user_id':user}
  def create_post(self,body): self.posts+=1; return {'id':'returned','channel_id':body['channel_id'],'root_id':body['root_id'],'pending_post_id':body['pending_post_id']}
 class Conversation:
  def __init__(self): self.calls=0
@@ -337,8 +370,8 @@ class Policy:
  origin="https://mm.example"
  def validate(self): pass
 class Rest:
- def get_me(self): return {"id":"bot","username":"bot"}
- def get_post(self, source_id): return {"id":source_id,"channel_id":"wrong-channel","user_id":"wrong-actor"}
+ def get_me(self,*,definitive=False): return {"id":"bot","username":"bot"}
+ def get_post(self, source_id,*,definitive=False): return {"id":source_id,"channel_id":"wrong-channel","user_id":"wrong-actor"}
 service=Ingress(Policy(), Rest(), object(), store)
 try:
  service._revalidate_envelope(env); outcome="accepted"
@@ -355,8 +388,8 @@ def test_installed_skipped_fresh_source_actor_root_authorization_bites(installed
     _mutate(
         mutant,
         "restricted_runtime/mattermost_ingress.py",
-        'source = self.rest.get_post(envelope["source_id"])',
-        'return\n        source = self.rest.get_post(envelope["source_id"])',
+        'source = self.rest.get_post(envelope["source_id"], definitive=True)',
+        'return\n        source = self.rest.get_post(envelope["source_id"], definitive=True)',
     )
     assert _run(mutant, _AUTH_PROGRAM) == {"outcome": "accepted"}
 
