@@ -74,3 +74,52 @@ def test_cas_inflight_recovery_is_ambiguous_and_terminal_payload_is_erased(tmp_p
         assert recovered is not None and recovered.state is DeliveryState.AMBIGUOUS and recovered.envelope is None
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("terminal", [DeliveryState.AMBIGUOUS, DeliveryState.BLOCKED, DeliveryState.FAILED, DeliveryState.EXPIRED])
+def test_terminal_root_fence_rejects_later_reply_before_capacity_or_payload_use(tmp_path, terminal):
+    store = _store(tmp_path)
+    try:
+        first, _ = store.reserve(_envelope(), payload_capacity=3, tombstone_capacity=3)
+        store.terminal(first, terminal, reason="test_terminal")
+        # A distinct source in the same root must be rejected without growing
+        # the database, even though the downstream conversation epoch could
+        # have reset in the meantime.
+        before = store._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+        with pytest.raises(ContractError, match="root is fenced"):
+            store.reserve(_envelope(source="later-source"), payload_capacity=3, tombstone_capacity=3)
+        assert store._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0] == before
+        independent, created = store.reserve(_envelope(source="independent", root="other-root"), payload_capacity=3, tombstone_capacity=3)
+        assert created and independent.state is DeliveryState.WAITING_COMMIT
+    finally:
+        store.close()
+
+
+def test_compare_and_set_never_dispatches_from_a_stale_ready_generation(tmp_path):
+    store = _store(tmp_path)
+    try:
+        waiting, _ = store.reserve(_envelope(), payload_capacity=3, tombstone_capacity=3)
+        ready = store.mark_ready(waiting, _envelope(epoch="epoch", response="RESPONSE_CANARY"))
+        first = store.claim_delivery(ready)
+        assert first is not None and first.state is DeliveryState.IN_FLIGHT
+        assert store.claim_delivery(ready) is None
+        current = store.get(ready.record_tag)
+        assert current is not None and current.state is DeliveryState.IN_FLIGHT
+    finally:
+        store.close()
+
+
+def test_total_tombstone_capacity_reserves_room_for_every_active_record(tmp_path):
+    store = _store(tmp_path)
+    try:
+        one, created = store.reserve(_envelope(), payload_capacity=10, tombstone_capacity=1)
+        assert created
+        # A second active record would make it impossible to preserve the
+        # required permanent tombstone fence after both reach terminal states.
+        with pytest.raises(ContractError, match="capacity"):
+            store.reserve(_envelope(source="second", root="second-root"), payload_capacity=10, tombstone_capacity=1)
+        store.terminal(one, DeliveryState.DELIVERED, reason="bound_response")
+        with pytest.raises(ContractError, match="capacity"):
+            store.reserve(_envelope(source="third", root="third-root"), payload_capacity=10, tombstone_capacity=1)
+    finally:
+        store.close()
