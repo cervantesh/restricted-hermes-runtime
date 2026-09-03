@@ -13,7 +13,9 @@ from pathlib import Path
 allowed = (
     "restricted_runtime.contracts",
     "restricted_runtime.mattermost_policy",
+    "restricted_runtime.mattermost_outbox",
     "restricted_runtime.mattermost_ingress",
+    "restricted_runtime.services.mattermost_outbox_init",
     "restricted_runtime.services.production_mattermost_ingress",
 )
 for name in allowed:
@@ -70,8 +72,10 @@ assert files == {
     "__init__.py",
     "contracts.py",
     "mattermost_policy.py",
+    "mattermost_outbox.py",
     "mattermost_ingress.py",
     "services/production_mattermost_ingress.py",
+    "services/mattermost_outbox_init.py",
 }, files
 '
 printf '%s\n' 'mattermost ingress image closure: PASS'

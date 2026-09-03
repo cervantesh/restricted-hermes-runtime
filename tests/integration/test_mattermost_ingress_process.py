@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import socketserver
 import ssl
 import subprocess
@@ -22,11 +23,13 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 from cryptography.x509.oid import NameOID
 
 from restricted_runtime.contracts import jcs_bytes
+from restricted_runtime.mattermost_outbox import MattermostOutbox, key_fingerprint
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="real AF_UNIX ingress process witness")
 ROOT = Path(__file__).resolve().parents[2]
 SOCKET = Path("/run/restricted-inference/conversation.sock")
+OUTBOX_STATE = Path("/var/lib/restricted-mattermost-outbox")
 TEAM = "team0000000000000000000000"
 CHANNEL = "chan0000000000000000000000"
 USER = "user0000000000000000000000"
@@ -167,6 +170,11 @@ class PeerHandler(BaseHTTPRequestHandler):
                 self._json({"id": BOT, "username": "restricted-bot"})
         elif self.path == "/api/v4/channels/" + CHANNEL:
             self._json({"id": CHANNEL, "team_id": TEAM, "type": "P"})
+        elif self.path in {
+            "/api/v4/channels/" + CHANNEL + "/members/" + USER,
+            "/api/v4/channels/" + CHANNEL + "/members/" + BOT,
+        }:
+            self._json({"channel_id": CHANNEL, "user_id": self.path.rsplit("/", 1)[-1]})
         elif self.path == "/api/v4/posts/" + ROOT_POST:
             self._json({
                 "id": ROOT_POST, "root_id": "", "channel_id": CHANNEL, "user_id": USER,
@@ -217,6 +225,11 @@ def _policy(tmp_path: Path, port: int, *, fast_timeout: bool = False):
         "clock_skew_seconds": 30, "websocket_timeout_seconds": 5, "rest_timeout_seconds": 5,
         "uds_timeout_seconds": 2 if fast_timeout else 45,
         "conversation_deadline_seconds": 1 if fast_timeout else 40,
+        "outbox_key_fingerprint": hashlib.sha256(b"m" * 32).hexdigest(),
+        "outbox_payload_retention_seconds": 3600,
+        "outbox_payload_capacity": 1000,
+        "outbox_tombstone_capacity": 1000,
+        "outbox_scan_limit": 64,
     }
     private = ed25519.Ed25519PrivateKey.generate()
     policy, signature = tmp_path / "policy.json", tmp_path / "policy.sig"
@@ -235,6 +248,8 @@ def test_production_entrypoint_real_paths_keep_diagnostics_content_free(tmp_path
     SOCKET.parent.mkdir(parents=True, exist_ok=True)
     if SOCKET.exists():
         pytest.skip("conversation.sock already belongs to another runtime")
+    if OUTBOX_STATE.exists():
+        pytest.skip("outbox state path already belongs to another runtime")
     PeerHandler.mode = mode
     PeerHandler.posts = []
     PeerHandler.delivered = threading.Event()
@@ -254,6 +269,10 @@ def test_production_entrypoint_real_paths_keep_diagnostics_content_free(tmp_path
     policy, signature, public = _policy(tmp_path, peer.server_port, fast_timeout=mode == "uds_timeout")
     token = tmp_path / "token"
     token.write_text(TOKEN, encoding="utf-8")
+    outbox_key = tmp_path / "outbox.key"
+    outbox_key.write_bytes(b"m" * 32)
+    os.chmod(outbox_key, 0o600)
+    MattermostOutbox.initialize(OUTBOX_STATE, outbox_key, expected_fingerprint=key_fingerprint(b"m" * 32)).close()
     environment = {
         **os.environ, "PYTHONPATH": str(ROOT / "src"),
         "RESTRICTED_MATTERMOST_POLICY_PATH": str(policy),
@@ -261,6 +280,7 @@ def test_production_entrypoint_real_paths_keep_diagnostics_content_free(tmp_path
         "RESTRICTED_MATTERMOST_POLICY_PUBLIC_KEY_B64": public,
         "RESTRICTED_MATTERMOST_TOKEN_PATH": str(token),
         "RESTRICTED_MATTERMOST_CA_PATH": str(cert_path),
+        "RESTRICTED_MATTERMOST_OUTBOX_KEY_PATH": str(outbox_key),
         "HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1",
     }
     process = subprocess.Popen(
@@ -290,6 +310,7 @@ def test_production_entrypoint_real_paths_keep_diagnostics_content_free(tmp_path
         conversation.shutdown()
         conversation.server_close()
         SOCKET.unlink(missing_ok=True)
+        shutil.rmtree(OUTBOX_STATE, ignore_errors=True)
     logs = stdout + stderr
     for canary in (TOKEN, MESSAGE, RESPONSE, RAW_EVENT, "ERROR_BODY_CANARY_092a", ROOT_POST):
         assert canary not in logs

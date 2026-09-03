@@ -29,6 +29,8 @@ _FIELDS = {
     "delivery_mode", "initiation_mode", "max_message_utf8_bytes", "not_before",
     "expires_at", "clock_skew_seconds", "websocket_timeout_seconds",
     "rest_timeout_seconds", "uds_timeout_seconds", "conversation_deadline_seconds",
+    "outbox_key_fingerprint", "outbox_payload_retention_seconds", "outbox_payload_capacity",
+    "outbox_tombstone_capacity", "outbox_scan_limit",
 }
 
 
@@ -107,6 +109,17 @@ class MattermostPolicy:
             raise ContractError("Mattermost deadlines must be integers")
         if not (1 <= rest <= 30 and 1 <= websocket <= 60 and 1 <= downstream <= 60 and downstream <= uds <= 90):
             raise ContractError("Mattermost deadlines are not safely ordered")
+        fingerprint = value.get("outbox_key_fingerprint")
+        if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise ContractError("Mattermost outbox key fingerprint is invalid")
+        retention, payload_capacity, tombstone_capacity, scan_limit = (
+            value.get("outbox_payload_retention_seconds"), value.get("outbox_payload_capacity"),
+            value.get("outbox_tombstone_capacity"), value.get("outbox_scan_limit"),
+        )
+        if any(not isinstance(item, int) or isinstance(item, bool) for item in (retention, payload_capacity, tombstone_capacity, scan_limit)):
+            raise ContractError("Mattermost outbox limits are invalid")
+        if not (60 <= retention <= 86_400 and 1 <= payload_capacity <= 100_000 and 1 <= tombstone_capacity <= 100_000 and 1 <= scan_limit <= 1_000):
+            raise ContractError("Mattermost outbox limits are outside the closed contract")
         current = now or datetime.now(UTC)
         if current.tzinfo != UTC:
             raise ContractError("Mattermost policy validation clock must be UTC")

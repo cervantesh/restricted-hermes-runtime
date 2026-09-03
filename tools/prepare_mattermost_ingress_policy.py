@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--not-before", required=True)
     parser.add_argument("--expires-at", required=True)
     parser.add_argument("--max-message-bytes", type=int, default=4096)
+    parser.add_argument("--outbox-key-fingerprint", required=True)
     args = parser.parse_args()
     values = {
         "schema_version": MATTERMOST_POLICY_SCHEMA, "policy_epoch": args.epoch,
@@ -43,6 +44,9 @@ def main() -> None:
         "not_before": args.not_before, "expires_at": args.expires_at, "clock_skew_seconds": 30,
         "websocket_timeout_seconds": 10, "rest_timeout_seconds": 8,
         "uds_timeout_seconds": 45, "conversation_deadline_seconds": 40,
+        "outbox_key_fingerprint": args.outbox_key_fingerprint,
+        "outbox_payload_retention_seconds": 3600, "outbox_payload_capacity": 1000,
+        "outbox_tombstone_capacity": 1000, "outbox_scan_limit": 64,
     }
     document = MattermostPolicy(values, "")
     document.validate(now=datetime.now(UTC))

@@ -15,6 +15,7 @@ pytestmark = pytest.mark.skipif(
 
 def test_built_ingress_image_import_surface_is_closed():
     import restricted_runtime.mattermost_ingress  # noqa: F401
+    import restricted_runtime.mattermost_outbox  # noqa: F401
     import restricted_runtime.mattermost_policy  # noqa: F401
 
     forbidden = ("run_agent", "gateway", "tools", "plugins", "psycopg", "fastapi", "uvicorn")

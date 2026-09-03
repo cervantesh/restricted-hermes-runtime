@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ..contracts import ContractError, jcs_bytes, load_closed_json
 from ..mattermost_ingress import ConversationUdsClient, Ingress, MattermostEvent, MattermostRestClient
+from ..mattermost_outbox import MattermostOutbox
 from ..mattermost_policy import MAX_EVENT_BYTES, load_signed_mattermost_policy, load_token
 
 
@@ -36,7 +37,12 @@ def build_ingress() -> tuple[Ingress, str, object, ssl.SSLContext]:
     except (OSError, ssl.SSLError) as exc:
         raise ContractError("Mattermost trust bundle rejected") from exc
     rest = MattermostRestClient(policy, token, ca_path=ca_path)
-    ingress = Ingress(policy, rest, ConversationUdsClient(policy))
+    outbox = MattermostOutbox.open(
+        Path("/var/lib/restricted-mattermost-outbox"),
+        Path(_required("RESTRICTED_MATTERMOST_OUTBOX_KEY_PATH")),
+        expected_fingerprint=policy.values["outbox_key_fingerprint"],
+    )
+    ingress = Ingress(policy, rest, ConversationUdsClient(policy), outbox)
     ingress.preflight()
     return ingress, token, policy, context
 

@@ -20,11 +20,14 @@ from typing import Any
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from restricted_runtime.mattermost_outbox import MattermostOutbox, key_fingerprint
+
 
 STATE = Path("/state")
 INGRESS = Path("/ingress")
 TLS = Path("/tls")
 WITNESS = Path("/witness/counters.json")
+OUTBOX = Path("/var/lib/restricted-mattermost-outbox")
 BASE = "https://mattermost:8065/api/v4"
 _NAMESPACE = uuid.UUID("024af157-bd86-4bcc-82bf-92890130c620")
 _MISSING = object()
@@ -118,6 +121,10 @@ def seed() -> None:
     _copy(Path("/seed/ca.crt"), INGRESS / "correct-ca.crt", mode=0o444, uid=10007, gid=20005)
     _copy(Path("/seed/ca.crt"), INGRESS / "ca.crt", mode=0o444, uid=10007, gid=20005)
     _copy(Path("/seed/wrong-ca.crt"), INGRESS / "wrong-ca.crt", mode=0o444, uid=10007, gid=20005)
+    outbox_key = INGRESS / "outbox.key"
+    outbox_key.write_bytes(os.urandom(32))
+    os.chmod(outbox_key, 0o400)
+    os.chown(outbox_key, 10007, 20005)
     marker.write_text("seeded", encoding="ascii")
     os.chmod(marker, 0o600)
 
@@ -361,6 +368,11 @@ def activate_policy(origin: str, ca_mode: str, token_mode: str) -> None:
         "rest_timeout_seconds": 10,
         "uds_timeout_seconds": 20,
         "conversation_deadline_seconds": 15,
+        "outbox_key_fingerprint": key_fingerprint((INGRESS / "outbox.key").read_bytes()),
+        "outbox_payload_retention_seconds": 3600,
+        "outbox_payload_capacity": 100,
+        "outbox_tombstone_capacity": 100,
+        "outbox_scan_limit": 20,
     }
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     private = _policy_private()
@@ -392,6 +404,22 @@ def activate_policy(origin: str, ca_mode: str, token_mode: str) -> None:
     for name, mode in (("policy.json", 0o440), ("policy.sig", 0o440), ("ca.crt", 0o444), ("bot_token", 0o440)):
         os.chmod(INGRESS / name, mode)
         os.chown(INGRESS / name, 10007, 20005)
+
+
+def initialize_outbox() -> None:
+    """Explicit one-time harness operator action; runtime startup never creates it."""
+    if (OUTBOX / "mattermost-outbox.sqlite3").exists():
+        return
+    policy = json.loads((INGRESS / "policy.json").read_text(encoding="utf-8"))
+    store = MattermostOutbox.initialize(
+        OUTBOX,
+        INGRESS / "outbox.key",
+        expected_fingerprint=policy["outbox_key_fingerprint"],
+    )
+    store.close()
+    for path in (OUTBOX, *OUTBOX.iterdir()):
+        os.chown(path, 10007, 20005)
+    os.chmod(OUTBOX, 0o700)
 
 
 def switch_tls(mode: str) -> None:
@@ -850,6 +878,8 @@ def main() -> None:
         bootstrap()
     elif command == "policy":
         activate_policy(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif command == "outbox-init":
+        initialize_outbox()
     elif command == "pending-probe":
         pending_probe()
     elif command == "effect-counters":
