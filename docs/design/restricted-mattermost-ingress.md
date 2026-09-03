@@ -33,11 +33,18 @@ rules, monitoring, and deployment conformance. The application disables proxy
 discovery and redirects by construction, but application code is not the
 network enforcement boundary.
 
-The timeout guarantee is limited to the internally ordered values in the signed
-ingress policy: the configured conversation deadline cannot exceed the UDS
-timeout. The deployment must independently verify that the downstream
-conversation service enforces the declared deadline; this edge cannot infer that
-fact from its readiness document.
+`conversation_deadline_seconds` is enforced by this edge as one absolute
+monotonic budget for a single `conversation.sock` submission: conversation
+creation and its one turn request share it.  Before every UDS connect, send,
+and receive, the edge recomputes the remaining shared time and applies the
+lesser of that time and the signed per-request UDS cap.  It rechecks after
+response decoding and validation.  If the budget is exhausted, the next UDS
+operation is not started; no retry, fallback, partial response, or Mattermost
+reply follows.
+
+That budget deliberately does not include preflight/readiness, WebSocket
+authentication, Mattermost REST validation, or reply delivery. Those phases
+retain their own signed limits and are not a conversation-deadline SLA.
 
 Required mounts and settings:
 

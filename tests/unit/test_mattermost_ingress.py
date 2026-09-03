@@ -6,12 +6,15 @@ import http.client
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from restricted_runtime.contracts import ContractError, jcs_bytes
+import restricted_runtime.mattermost_ingress as mattermost_ingress
 from restricted_runtime.mattermost_ingress import (
+    ConversationUdsClient,
     MattermostRestClient,
     Ingress,
     MattermostEvent,
@@ -450,3 +453,122 @@ def test_delivery_response_mismatch_never_falls_back_to_flat_post(tmp_path, capl
     assert len(attempts) == 1
     assert attempts[0]["root_id"] == ROOT
     assert "mattermost_delivery_outcome=rejected_binding" in caplog.text
+
+
+class _Clock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+
+class _UdsSocket:
+    def __init__(self, clock: _Clock, response: bytes, *, connect_elapsed=0.0, send_elapsed=0.0, recv_elapsed=0.0):
+        self.clock, self.response = clock, response
+        self.connect_elapsed, self.send_elapsed, self.recv_elapsed = connect_elapsed, send_elapsed, recv_elapsed
+        self.timeouts: list[float] = []
+        self._sent = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def connect(self, _path):
+        self.clock.now += self.connect_elapsed
+
+    def sendall(self, _wire):
+        self._sent = True
+        self.clock.now += self.send_elapsed
+
+    def recv(self, _size):
+        if self._sent:
+            self._sent = False
+            self.clock.now += self.recv_elapsed
+            return self.response
+        return b""
+
+
+def _uds_client(*, uds_timeout_seconds=5, conversation_deadline_seconds=4):
+    return ConversationUdsClient(
+        SimpleNamespace(
+            values={
+                "uds_timeout_seconds": uds_timeout_seconds,
+                "conversation_deadline_seconds": conversation_deadline_seconds,
+            }
+        )
+    )
+
+
+def _uds_response(value: dict) -> bytes:
+    payload = jcs_bytes(value)
+    return b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + payload
+
+
+def test_uds_recomputes_the_shared_remaining_timeout_after_connect(monkeypatch):
+    clock = _Clock()
+    peer = _UdsSocket(
+        clock, _uds_response({"ok": True}), connect_elapsed=0.2, send_elapsed=0.3, recv_elapsed=0.1
+    )
+    monkeypatch.setattr(mattermost_ingress.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(mattermost_ingress.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(mattermost_ingress.socket, "socket", lambda *_: peer)
+    assert _uds_client()._request("POST", "/closed", {"x": "y"}, deadline=1.0) == {"ok": True}
+    assert peer.timeouts[:4] == [1.0, pytest.approx(0.8), pytest.approx(0.5), pytest.approx(0.4)]
+
+
+def test_uds_rejects_zero_or_negative_remaining_time_before_opening_a_socket(monkeypatch):
+    clock = _Clock()
+    opened = False
+
+    def no_socket(*_):
+        nonlocal opened
+        opened = True
+        raise AssertionError("socket must not open after the shared deadline")
+
+    monkeypatch.setattr(mattermost_ingress.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(mattermost_ingress.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(mattermost_ingress.socket, "socket", no_socket)
+    with pytest.raises(ContractError, match="conversation transport failed"):
+        _uds_client()._request("POST", "/closed", {"x": "y"}, deadline=0.0)
+    assert not opened
+
+
+def test_uds_rejects_a_valid_response_when_decode_finishes_after_the_shared_deadline(monkeypatch):
+    clock = _Clock()
+    peer = _UdsSocket(clock, _uds_response({"ok": True}))
+    original_decode = mattermost_ingress.load_closed_json
+
+    def late_decode(raw):
+        value = original_decode(raw)
+        clock.now = 2.0
+        return value
+
+    monkeypatch.setattr(mattermost_ingress.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(mattermost_ingress.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(mattermost_ingress.socket, "socket", lambda *_: peer)
+    monkeypatch.setattr(mattermost_ingress, "load_closed_json", late_decode)
+    with pytest.raises(ContractError, match="conversation transport failed"):
+        _uds_client()._request("POST", "/closed", {"x": "y"}, deadline=1.0)
+
+
+def test_submit_never_starts_turn_when_creation_exhausts_the_shared_deadline(monkeypatch):
+    clock = _Clock()
+    client = _uds_client(conversation_deadline_seconds=1)
+    calls = []
+
+    def exhausted_create(method, path, body=None, *, deadline=None):
+        calls.append((method, path, deadline))
+        clock.now = 2.0
+        return {"conversation_id": "conversation", "conversation_epoch": "epoch"}
+
+    monkeypatch.setattr(mattermost_ingress.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(client, "_request", exhausted_create)
+    with pytest.raises(ContractError, match="conversation transport failed"):
+        client.submit(conversation_id="conversation", client_request_id="request", message="message")
+    assert calls == [("POST", "/v1/restricted/conversations/conversation", 1.0)]
