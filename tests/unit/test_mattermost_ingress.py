@@ -557,6 +557,16 @@ def test_uds_rejects_a_valid_response_when_decode_finishes_after_the_shared_dead
         _uds_client()._request("POST", "/closed", {"x": "y"}, deadline=1.0)
 
 
+def test_uds_rejects_when_a_slow_receive_crosses_the_absolute_deadline(monkeypatch):
+    clock = _Clock()
+    peer = _UdsSocket(clock, _uds_response({"ok": True}), recv_elapsed=1.1)
+    monkeypatch.setattr(mattermost_ingress.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(mattermost_ingress.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(mattermost_ingress.socket, "socket", lambda *_: peer)
+    with pytest.raises(ContractError, match="conversation transport failed"):
+        _uds_client()._request("POST", "/closed", {"x": "y"}, deadline=1.0)
+
+
 def test_submit_never_starts_turn_when_creation_exhausts_the_shared_deadline(monkeypatch):
     clock = _Clock()
     client = _uds_client(conversation_deadline_seconds=1)

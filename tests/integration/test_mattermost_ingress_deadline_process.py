@@ -36,6 +36,8 @@ ROOT_POST = "root0000000000000000000000"
 TOKEN = "TOKEN_CANARY_7c98"
 MESSAGE = "@restricted-bot MESSAGE_CANARY_718d"
 RESPONSE = "RESPONSE_CANARY_c4a1"
+_CAUSAL_DELIVERY_WINDOW_SECONDS = 3
+_STARTUP_WINDOW_SECONDS = 10
 
 
 def _frame(payload: bytes) -> bytes:
@@ -227,9 +229,7 @@ def _policy(tmp_path: Path, port: int) -> tuple[Path, Path, str]:
     return policy, signature, base64.b64encode(private.public_key().public_bytes_raw()).decode()
 
 
-def _witness(tmp_path: Path, mode: str, *, settle_seconds=0.2) -> tuple[int, int, int, int]:
-    if os.geteuid() != 0:
-        pytest.skip("exact conversation.sock process witness requires an isolated root runner")
+def _witness(tmp_path: Path, mode: str, *, expect_delivery: bool) -> tuple[int, int, int, int]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     SOCKET.parent.mkdir(parents=True, exist_ok=True)
     if SOCKET.exists():
@@ -263,26 +263,37 @@ def _witness(tmp_path: Path, mode: str, *, settle_seconds=0.2) -> tuple[int, int
         cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
-        assert state.event_sent.wait(5)
-        if mode == "success":
-            assert state.delivered.wait(5)
-        elif mode == "first_hop":
+        if not state.event_sent.wait(_STARTUP_WINDOW_SECONDS):
+            if process.poll() is None:
+                process.terminate()
+            stdout, stderr = process.communicate(timeout=10)
+            pytest.fail(f"production ingress did not authenticate or receive the event; stdout={stdout!r} stderr={stderr!r}")
+        if mode == "first_hop":
             assert state.create_received.wait(5)
-            time.sleep(settle_seconds)
-        else:
+        elif mode == "second_hop":
             assert state.turn_received.wait(5)
-            time.sleep(settle_seconds)
+        # The delayed peer has accepted a valid request.  Wait for the full
+        # causal window instead of sampling counters immediately afterwards:
+        # a product that restores independent request deadlines must be able
+        # to complete the next hop and post its reply during this window.
+        assert state.delivered.wait(_CAUSAL_DELIVERY_WINDOW_SECONDS) is expect_delivery
         return state.ready, state.creates, state.turns, len(state.posts)
     finally:
         state.release.set()
-        if process.poll() is None:
-            process.terminate()
-        process.communicate(timeout=10)
-        peer.shutdown()
-        peer.server_close()
-        conversation.shutdown()
-        conversation.server_close()
-        SOCKET.unlink(missing_ok=True)
+        try:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=10)
+        finally:
+            peer.shutdown()
+            peer.server_close()
+            conversation.shutdown()
+            conversation.server_close()
+            SOCKET.unlink(missing_ok=True)
 
 
 @pytest.mark.parametrize(
@@ -290,11 +301,11 @@ def _witness(tmp_path: Path, mode: str, *, settle_seconds=0.2) -> tuple[int, int
     [("success", (1, 1, 1, 1)), ("first_hop", (1, 1, 0, 0)), ("second_hop", (1, 1, 1, 0))],
 )
 def test_authenticated_production_event_path_shares_one_signed_uds_deadline(tmp_path, mode, expected):
-    assert _witness(tmp_path, mode) == expected
+    assert _witness(tmp_path, mode, expect_delivery=mode == "success") == expected
 
 
 def test_deadline_witness_bites_against_the_installed_independent_request_mutation(tmp_path):
-    assert _witness(tmp_path / "shared", "first_hop") == (1, 1, 0, 0)
+    assert _witness(tmp_path / "shared", "first_hop", expect_delivery=False) == (1, 1, 0, 0)
     source_path = ROOT / "src" / "restricted_runtime" / "mattermost_ingress.py"
     original = source_path.read_text(encoding="utf-8")
     mutated = original.replace("deadline=deadline", "deadline=None").replace(
@@ -304,6 +315,6 @@ def test_deadline_witness_bites_against_the_installed_independent_request_mutati
     try:
         source_path.write_text(mutated, encoding="utf-8")
         assert "deadline=None" in source_path.read_text(encoding="utf-8")
-        assert _witness(tmp_path / "independent", "first_hop", settle_seconds=1.5) == (1, 1, 1, 1)
+        assert _witness(tmp_path / "independent", "first_hop", expect_delivery=True) == (1, 1, 1, 1)
     finally:
         source_path.write_text(original, encoding="utf-8")
