@@ -213,3 +213,36 @@ def test_installed_removed_root_fence_mutation_bites(installed_artifact, tmp_pat
     mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
     _mutate(mutant, "restricted_runtime/mattermost_outbox.py", "if fence is not None:", "if False:")
     assert _run(mutant, _FENCE_PROGRAM) == {"fenced": False}
+
+
+_AUTH_PROGRAM = _PROGRAM.replace(
+    'print(json.dumps({"plaintext":b"MUTATION_MESSAGE_CANARY" in raw,"tamper":tamper,"module":module.__file__}))',
+    '''
+from restricted_runtime.mattermost_ingress import Ingress
+class Policy:
+ values={"policy_epoch":"policy","outbox_key_fingerprint":env["key_fingerprint"]}
+ digest="a"*64
+ origin="https://mm.example"
+ def validate(self): pass
+class Rest:
+ def get_post(self, source_id): return {"id":source_id,"channel_id":"wrong-channel","user_id":"wrong-actor"}
+service=Ingress(Policy(), Rest(), object(), store)
+try:
+ service._revalidate_envelope(env); outcome="accepted"
+except ContractError:
+ outcome="rejected"
+print(json.dumps({"outcome":outcome}))''',
+)
+
+
+def test_installed_skipped_fresh_source_actor_root_authorization_bites(installed_artifact, tmp_path):
+    """A current source mismatch must stop recovery before UDS or REST release."""
+    assert _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _AUTH_PROGRAM) == {"outcome": "rejected"}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_ingress.py",
+        'source = self.rest.get_post(envelope["source_id"])',
+        'return\n        source = self.rest.get_post(envelope["source_id"])',
+    )
+    assert _run(mutant, _AUTH_PROGRAM) == {"outcome": "accepted"}
