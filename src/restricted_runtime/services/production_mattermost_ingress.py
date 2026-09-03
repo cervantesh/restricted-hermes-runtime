@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from ..contracts import ContractError, jcs_bytes, load_closed_json
-from ..mattermost_ingress import ConversationUdsClient, Ingress, MattermostEvent, MattermostRestClient
+from ..mattermost_ingress import ClinicalQueryUdsClient, ConversationUdsClient, Ingress, MattermostEvent, MattermostRestClient
 from ..mattermost_outbox import MattermostOutbox
 from ..mattermost_policy import MAX_EVENT_BYTES, load_signed_mattermost_policy, load_token
 
@@ -42,7 +42,8 @@ def build_ingress() -> tuple[Ingress, str, object, ssl.SSLContext]:
         Path(_required("RESTRICTED_MATTERMOST_OUTBOX_KEY_PATH")),
         expected_fingerprint=policy.values["outbox_key_fingerprint"],
     )
-    ingress = Ingress(policy, rest, ConversationUdsClient(policy), outbox)
+    clinical = ClinicalQueryUdsClient(policy) if "clinical_bindings" in policy.values else None
+    ingress = Ingress(policy, rest, ConversationUdsClient(policy), outbox, clinical=clinical)
     ingress.preflight()
     return ingress, token, policy, context
 

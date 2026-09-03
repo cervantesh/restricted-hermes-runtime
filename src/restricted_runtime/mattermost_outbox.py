@@ -27,6 +27,7 @@ from .contracts import ContractError, jcs_bytes, load_closed_json
 
 
 OUTBOX_SCHEMA = "restricted-mattermost-outbox.v1"
+CLINICAL_OUTBOX_SCHEMA = "restricted-mattermost-clinical-outbox.v1"
 OUTBOX_DB_NAME = "mattermost-outbox.sqlite3"
 _META_SCHEMA = "restricted-mattermost-outbox-meta.v7"
 _TERMINAL = {"DELIVERED", "AMBIGUOUS", "BLOCKED", "FAILED", "EXPIRED"}
@@ -37,11 +38,26 @@ _ENVELOPE_FIELDS = {
     "policy_digest", "key_fingerprint", "policy_expires_at", "payload_expires_at", "response",
     "pending_post_id", "returned_post_id",
 }
+_CLINICAL_ENVELOPE_FIELDS = {
+    "schema_version", "tenant_id", "origin", "channel_id", "root_id", "source_id", "actor_id",
+    "patient_id", "operation", "request_id", "source_message", "clinical_policy_id", "policy_epoch", "policy_digest",
+    "key_fingerprint", "policy_expires_at", "payload_expires_at", "clinic_timezone", "appointment",
+    "response", "pending_post_id", "returned_post_id",
+}
 _ROW_FIELDS = (
     "record_tag", "source_tag", "root_tag", "state", "generation", "created_at", "updated_at",
     "payload_expires_at", "policy_expires_at", "policy_digest", "nonce_sequence", "nonce", "ciphertext", "reason",
     "returned_post_tag",
 )
+
+
+def _valid_envelope(envelope: dict[str, Any]) -> bool:
+    schema = envelope.get("schema_version")
+    return (
+        schema == OUTBOX_SCHEMA and set(envelope) == _ENVELOPE_FIELDS
+    ) or (
+        schema == CLINICAL_OUTBOX_SCHEMA and set(envelope) == _CLINICAL_ENVELOPE_FIELDS
+    )
 
 
 class DeliveryState(StrEnum):
@@ -774,7 +790,7 @@ class MattermostOutbox:
         return jcs_bytes({"schema_version": OUTBOX_SCHEMA, "record_tag": record_tag, "source_tag": source_tag, "root_tag": root_tag, "policy_digest": policy_digest})
 
     def _seal(self, envelope: dict[str, Any], *, record_tag: str, source_tag: str, root_tag: str) -> tuple[bytes, bytes, int]:
-        if set(envelope) != _ENVELOPE_FIELDS or envelope.get("schema_version") != OUTBOX_SCHEMA:
+        if not _valid_envelope(envelope):
             raise ContractError("Mattermost outbox envelope schema rejected")
         nonce = self._fresh_nonce()
         nonce_sequence = self._append_nonce(nonce)
@@ -790,7 +806,7 @@ class MattermostOutbox:
             envelope = load_closed_json(raw)
         except Exception as exc:
             raise ContractError("Mattermost outbox payload authentication failed") from exc
-        if not isinstance(envelope, dict) or set(envelope) != _ENVELOPE_FIELDS or envelope.get("schema_version") != OUTBOX_SCHEMA:
+        if not isinstance(envelope, dict) or not _valid_envelope(envelope):
             raise ContractError("Mattermost outbox envelope schema rejected")
         if (
             not hmac.compare_digest(self.source_tag(envelope), row["source_tag"])

@@ -16,8 +16,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 RUN groupadd --system --gid 20000 restricted-socket-dir \
  && groupadd --system --gid 20001 restricted-conversation \
+ && groupadd --system --gid 20006 restricted-clinical-query \
  && groupadd --system --gid 20005 restricted-mattermost-ingress \
- && useradd --system --uid 10007 --gid 20005 --groups 20000,20001 restricted-mattermost-ingress \
+ && useradd --system --uid 10007 --gid 20005 --groups 20000,20001,20006 restricted-mattermost-ingress \
  && install -d -o 10007 -g 20005 -m 0700 /var/lib/restricted-mattermost-outbox
 USER restricted-mattermost-ingress
 CMD ["python", "-m", "restricted_runtime.services.production_mattermost_ingress"]
