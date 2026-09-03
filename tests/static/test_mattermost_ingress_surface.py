@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import tomllib
 from pathlib import Path
 
 
@@ -88,3 +89,8 @@ def test_websocket_transport_requires_proxy_safe_version_and_reconnects_abnormal
     assert "ConnectionClosed" in production
     assert "except (OSError, TimeoutError, ConnectionClosed):" in production
     assert "delay = min(delay * 2, 30.0)" in production
+
+
+def test_test_extra_owns_the_no_build_isolation_backend():
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert "setuptools>=69" in pyproject["project"]["optional-dependencies"]["test"]
