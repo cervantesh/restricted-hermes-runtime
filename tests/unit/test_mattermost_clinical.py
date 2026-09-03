@@ -5,7 +5,7 @@ import hashlib
 
 import pytest
 
-from restricted_runtime.contracts import ContractError
+from restricted_runtime.contracts import ClinicalAuthorizationDenied, ContractError
 from restricted_runtime.mattermost_ingress import ClinicalQueryUdsClient, Ingress, _clinical_response_digest
 
 from test_mattermost_ingress import (
@@ -179,6 +179,17 @@ def test_delivery_reauthorization_failures_never_post_phi(tmp_path, status):
     assert rest.created == []
 
 
+def test_authoritative_query_denial_is_terminal_and_never_revives(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    original = clinical.query
+    clinical.query = lambda _request: (_ for _ in ()).throw(ClinicalAuthorizationDenied("denied"))
+    service.handle(event(rest.posts[ROOT], channel_type="D"))
+    clinical.query = original
+    service.executor.drain()
+    assert conversation.calls == [] and clinical.queries == [] and rest.created == []
+    assert service.outbox.candidates(10) == []
+
+
 def test_clinical_policy_extension_is_all_or_nothing_and_pair_bound(tmp_path):
     values = policy_values()
     values["clinical_policy_id"] = "clinical-read-v1"
@@ -273,6 +284,29 @@ def test_clinical_uds_client_rejects_unknown_request_fields_before_transport(tmp
     }
     with pytest.raises(ContractError, match="schema"):
         client.query(request)
+
+
+def test_clinical_uds_client_preserves_authoritative_denial(monkeypatch):
+    from test_mattermost_ingress import _Clock, _UdsSocket
+
+    clock = _Clock()
+    peer = _UdsSocket(
+        clock,
+        b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+    )
+    policy = SimpleNamespace(values={
+        "clinical_query_socket_path": "/run/restricted-clinical/query.sock",
+        "uds_timeout_seconds": 10,
+    })
+    monkeypatch.setattr(mattermost_ingress.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(mattermost_ingress.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(mattermost_ingress.socket, "socket", lambda *_: peer)
+    with pytest.raises(ClinicalAuthorizationDenied):
+        ClinicalQueryUdsClient(policy).query({
+            "mattermostActorId": USER, "patientId": PATIENT, "requestId": "request_123",
+            "integrationId": "hrh-mattermost-01", "clinicalPolicyId": "clinical-read-v1",
+            "policyEpoch": "mattermost-e1", "policyDigest": "a" * 64,
+        })
 
 
 def test_roster_is_revalidated_after_hrh_delivery_authorization(tmp_path):

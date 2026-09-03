@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
-from .contracts import ContractError, jcs_bytes, load_closed_json
+from .contracts import ClinicalAuthorizationDenied, ContractError, jcs_bytes, load_closed_json
 from .mattermost_outbox import CLINICAL_OUTBOX_SCHEMA, DeliveryState, MattermostOutbox, OutboxRecord
 from .mattermost_policy import MAX_EVENT_BYTES, MattermostPolicy
 
@@ -619,6 +619,12 @@ class SerializedDeliveryExecutor:
             }
             try:
                 result = self.ingress.clinical.query(request)
+            except ClinicalAuthorizationDenied:
+                logging.getLogger("restricted_mattermost").warning(
+                    "mattermost_clinical_outcome=authorization_denied"
+                )
+                self._block_or_expire(record, "clinical_query_authorization_denied")
+                return
             except (ContractError, OSError, TimeoutError, ValueError):
                 return
             expected = {"clinicTimezone", "appointment", "responseDigest"}
@@ -665,6 +671,12 @@ class SerializedDeliveryExecutor:
                 "policyDigest": envelope["policy_digest"],
                 "responseDigest": envelope["response_digest"],
             })
+        except ClinicalAuthorizationDenied:
+            logging.getLogger("restricted_mattermost").warning(
+                "mattermost_clinical_outcome=authorization_denied"
+            )
+            self._block_or_expire(record, "delivery_authorization_denied")
+            return
         except DefinitiveMattermostError:
             self._block_or_expire(record, "delivery_authorization_rejected")
             return
@@ -897,6 +909,8 @@ class ClinicalQueryUdsClient:
                     if total > _MAX_HTTP_BYTES:
                         raise ContractError("clinical query response oversized")
             head, raw = b"".join(chunks).split(b"\r\n\r\n", 1)
+            if head.startswith(b"HTTP/1.1 403 Forbidden\r\n"):
+                raise ClinicalAuthorizationDenied("clinical authorization denied")
             if not head.startswith(b"HTTP/1.1 200 OK\r\n"):
                 raise ContractError("clinical query response rejected")
             value = load_closed_json(raw)

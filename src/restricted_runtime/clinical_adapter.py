@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from .contracts import ContractError, jcs_bytes, load_closed_json
+from .contracts import ClinicalAuthorizationDenied, ContractError, jcs_bytes, load_closed_json
 
 MAX_WIRE_BYTES = 65_536
 SOCKET_PATH = "/run/restricted-clinical/query.sock"
@@ -159,6 +159,8 @@ class HrhHttpsClient:
             response = connection.getresponse()
             length = response.getheader("Content-Length")
             content_type = response.getheader("Content-Type")
+            if response.status == 403:
+                raise ClinicalAuthorizationDenied("clinical adapter HRH authorization denied")
             if response.status != 200 or content_type not in {"application/json", "application/json; charset=utf-8"} or length is None or not length.isascii() or not length.isdigit():
                 raise ContractError("clinical adapter HRH response rejected")
             declared = int(length)
@@ -225,6 +227,8 @@ class ClinicalAdapter:
             if not _valid_upstream_response(upstream_path, result):
                 raise ContractError("clinical adapter upstream shape rejected")
             return _reply(b"200 OK", result)
+        except ClinicalAuthorizationDenied:
+            return _reply(b"403 Forbidden")
         except (ContractError, UnicodeError, ValueError):
             return _reply(b"400 Bad Request")
         except (OSError, TimeoutError):

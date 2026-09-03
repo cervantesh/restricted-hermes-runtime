@@ -15,6 +15,7 @@ from restricted_runtime.clinical_adapter import (
     HrhHttpsClient,
     load_api_key,
 )
+from restricted_runtime.contracts import ClinicalAuthorizationDenied
 from restricted_runtime.services import production_clinical_adapter
 
 
@@ -51,6 +52,18 @@ class Upstream:
         if path.endswith("next-appointment"):
             return {"clinicTimezone": "America/New_York", "appointment": None, "responseDigest": RESPONSE_DIGEST}
         return {"authorized": True}
+
+
+class DeniedUpstream:
+    def request(self, path, body):
+        raise ClinicalAuthorizationDenied("denied")
+
+
+def test_authoritative_hrh_denial_is_preserved_across_the_uds_boundary():
+    response = ClinicalAdapter(expected_ingress_uid=10007, upstream=DeniedUpstream()).handle(
+        10007, wire("/v1/clinical/query", BASE)
+    )
+    assert response.startswith(b"HTTP/1.1 403 Forbidden\r\n")
 
 
 def test_adapter_maps_only_two_closed_routes_for_the_authenticated_ingress():
@@ -204,6 +217,18 @@ def test_https_failures_are_closed(monkeypatch, tmp_path, response):
     monkeypatch.setattr("restricted_runtime.clinical_adapter.http.client.HTTPSConnection", lambda *a, **k: Connection(response))
     with pytest.raises(ContractError):
         HrhHttpsClient(config(tmp_path), api_key="secret").request("/api/restricted-hermes/clinical/next-appointment", BASE)
+
+
+def test_https_403_is_an_authoritative_denial(monkeypatch, tmp_path):
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.ssl.create_default_context", lambda cafile: object())
+    monkeypatch.setattr(
+        "restricted_runtime.clinical_adapter.http.client.HTTPSConnection",
+        lambda *a, **k: Connection(Response(status=403)),
+    )
+    with pytest.raises(ClinicalAuthorizationDenied):
+        HrhHttpsClient(config(tmp_path), api_key="secret").request(
+            "/api/restricted-hermes/clinical/next-appointment", BASE
+        )
 
 
 @pytest.mark.parametrize("failure", [TimeoutError(), socket.gaierror(), OSError(), ssl.SSLError("TLS")])
