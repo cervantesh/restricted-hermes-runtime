@@ -185,6 +185,9 @@ class Ingress:
                 not isinstance(delivered, dict) or delivered.get("channel_id") != post["channel_id"]
                 or delivered.get("root_id") != root_id or delivered.get("pending_post_id") != pending
             ):
+                logging.getLogger("restricted_mattermost").warning(
+                    "mattermost_delivery_outcome=rejected_binding"
+                )
                 raise ContractError("Mattermost delivery binding rejected")
         except (ContractError, KeyError, OSError, TimeoutError, UnicodeError, ValueError):
             logging.getLogger("restricted_mattermost").warning("mattermost_event_outcome=rejected")
