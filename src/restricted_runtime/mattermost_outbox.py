@@ -287,6 +287,9 @@ class MattermostOutbox:
     def _configure(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
+        locking_mode = connection.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()
+        if locking_mode != ("exclusive",):
+            raise ContractError("Mattermost outbox exclusive ownership rejected")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA busy_timeout=5000")
         if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
