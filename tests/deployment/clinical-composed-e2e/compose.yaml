@@ -1,0 +1,189 @@
+services:
+  mattermost-postgres:
+    image: postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: mattermost
+      POSTGRES_USER: mattermost
+      POSTGRES_PASSWORD: ${CLINICAL_MM_DB_PASSWORD:?required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mattermost -d mattermost"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    volumes: [mattermost_db:/var/lib/postgresql/data]
+    networks: [mattermost_backend]
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:11.7.10@sha256:84a041d836bf6fbf6a9a78ab699fa5ebe5437bfb6a514b5afad4121fa3800696
+    platform: linux/amd64
+    command: ["/mattermost/bin/mattermost", "server"]
+    depends_on:
+      mattermost-postgres: {condition: service_healthy}
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: postgresql://mattermost:${CLINICAL_MM_DB_PASSWORD:?required}@mattermost-postgres:5432/mattermost?sslmode=disable&connect_timeout=10
+      MM_SERVICESETTINGS_LISTENADDRESS: :8065
+      MM_SERVICESETTINGS_CONNECTIONSECURITY: TLS
+      MM_SERVICESETTINGS_TLSCERTFILE: /run/mattermost-tls/server.crt
+      MM_SERVICESETTINGS_TLSKEYFILE: /run/mattermost-tls/server.key
+      MM_SERVICESETTINGS_SITEURL: https://mattermost:8065
+      MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+      MM_LOGSETTINGS_CONSOLELEVEL: ERROR
+    volumes:
+      - mattermost_data:/mattermost/data
+      - mattermost_tls:/run/mattermost-tls:ro
+    networks: [mattermost_edge, mattermost_backend]
+
+  hrh-postgres:
+    image: postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: hrh
+      POSTGRES_USER: hrh
+      POSTGRES_PASSWORD: ${CLINICAL_HRH_DB_PASSWORD:?required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hrh -d hrh"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    volumes: [hrh_db:/var/lib/postgresql/data]
+    networks: [hrh_backend]
+
+  hrh-migrate:
+    build:
+      context: ${CLINICAL_HRH_ROOT:?required}
+      dockerfile: Dockerfile.migrate
+    environment:
+      DATABASE_URL: postgresql://hrh:${CLINICAL_HRH_DB_PASSWORD:?required}@hrh-postgres:5432/hrh
+    depends_on:
+      hrh-postgres: {condition: service_healthy}
+    networks: [hrh_backend]
+
+  hrh:
+    build:
+      context: ${CLINICAL_HRH_ROOT:?required}
+      dockerfile: Dockerfile.web
+      args:
+        BUILD_SHA: b32970ee053c4caf180d6bdadce9b8d043ab1eba
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      DATABASE_URL: postgresql://hrh:${CLINICAL_HRH_DB_PASSWORD:?required}@hrh-postgres:5432/hrh
+      SESSION_SECRET: ${CLINICAL_HRH_SESSION_SECRET:?required}
+      ENCRYPTION_KEY: ${CLINICAL_HRH_ENCRYPTION_KEY:?required}
+      HRH_SURFACE: portal
+      SEED_DEMO_DATA: "false"
+      OTEL_ENABLED: "false"
+      CLOUD_MONITORING_ENABLED: "false"
+      PROMETHEUS_ENABLED: "false"
+      LOG_LEVEL: error
+    depends_on:
+      hrh-migrate: {condition: service_completed_successfully}
+    networks: [hrh_backend]
+
+  hrh-tls:
+    image: nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284
+    depends_on: [hrh]
+    volumes:
+      - hrh_tls:/run/hrh-tls:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    networks: [hrh_backend, clinical_upstream]
+
+  clinical-socket-init:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile.clinical-adapter
+    image: ${CLINICAL_ADAPTER_IMAGE:?required}
+    user: "0:0"
+    entrypoint: ["sh", "/source/deploy/mattermost/clinical-socket-init.sh"]
+    volumes:
+      - clinical_socket:/run/restricted-clinical
+      - ../../..:/source:ro
+    network_mode: none
+
+  clinical-adapter:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile.clinical-adapter
+    image: ${CLINICAL_ADAPTER_IMAGE:?required}
+    depends_on:
+      clinical-socket-init: {condition: service_completed_successfully}
+      hrh-tls: {condition: service_started}
+    environment:
+      RESTRICTED_CLINICAL_ADAPTER_CONFIG_PATH: /run/clinical-config/adapter.json
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - clinical_socket:/run/restricted-clinical
+      - clinical_config:/run/clinical-config:ro
+      - hrh_secret:/run/hrh-secret:ro
+      - hrh_tls:/run/hrh-tls:ro
+    networks: [clinical_upstream]
+
+  ingress:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile.mattermost-ingress
+    image: ${CLINICAL_INGRESS_IMAGE:?required}
+    depends_on:
+      clinical-adapter: {condition: service_started}
+      mattermost: {condition: service_started}
+    environment:
+      RESTRICTED_MATTERMOST_POLICY_PATH: /run/ingress/policy.json
+      RESTRICTED_MATTERMOST_POLICY_SIGNATURE_PATH: /run/ingress/policy.sig
+      RESTRICTED_MATTERMOST_POLICY_PUBLIC_KEY_B64: ${CLINICAL_POLICY_PUBLIC_KEY:?required}
+      RESTRICTED_MATTERMOST_TOKEN_PATH: /run/ingress/bot_token
+      RESTRICTED_MATTERMOST_CA_PATH: /run/ingress/ca.crt
+      RESTRICTED_MATTERMOST_OUTBOX_KEY_PATH: /run/ingress/outbox.key
+    read_only: true
+    tmpfs: [/tmp]
+    dns: [192.0.2.1]
+    dns_opt: [timeout:1, attempts:1]
+    volumes:
+      - clinical_socket:/run/restricted-clinical
+      - ingress_config:/run/ingress:ro
+      - ingress_outbox:/var/lib/restricted-mattermost-outbox
+    networks: [mattermost_edge]
+
+  controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+      args:
+        BASE_IMAGE: ${CLINICAL_INGRESS_IMAGE:?required}
+    user: "0:0"
+    environment:
+      CLINICAL_HRH_DB_PASSWORD: ${CLINICAL_HRH_DB_PASSWORD:?required}
+    volumes:
+      - ${CLINICAL_SEED:?required}:/seed:ro
+      - ${CLINICAL_HARNESS:?required}:/harness:ro
+      - controller_state:/state
+      - mattermost_tls:/run/mattermost-tls
+      - hrh_tls:/run/hrh-tls
+      - hrh_secret:/run/hrh-secret
+      - clinical_config:/run/clinical-config
+      - ingress_config:/run/ingress
+      - ingress_outbox:/var/lib/restricted-mattermost-outbox
+      - clinical_socket:/run/restricted-clinical
+    networks: [mattermost_edge, hrh_backend, clinical_upstream]
+
+networks:
+  mattermost_edge: {internal: true}
+  mattermost_backend: {internal: true}
+  hrh_backend: {internal: true}
+  clinical_upstream: {internal: true}
+
+volumes:
+  mattermost_db:
+  mattermost_data:
+  mattermost_tls:
+  hrh_db:
+  hrh_tls:
+  hrh_secret:
+  clinical_config:
+  clinical_socket:
+  ingress_config:
+  ingress_outbox:
+  controller_state:
