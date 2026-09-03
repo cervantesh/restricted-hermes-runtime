@@ -427,6 +427,8 @@ def initialize_outbox() -> None:
     store.close()
     for path in (OUTBOX, *OUTBOX.iterdir()):
         os.chown(path, 10007, 20005)
+        if path != OUTBOX:
+            os.chmod(path, 0o600)
     os.chmod(OUTBOX, 0o700)
 
 

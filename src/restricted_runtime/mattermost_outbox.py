@@ -160,14 +160,30 @@ class MattermostOutbox:
             cls._create_schema(connection, secrets.token_bytes(16), key_fingerprint(key))
         finally:
             connection.close()
+        if os.name != "nt":
+            try:
+                os.chmod(database, 0o600)
+            except OSError as exc:
+                raise ContractError("Mattermost outbox database mode unavailable") from exc
         return cls(database, key, expected_fingerprint=expected_fingerprint)
 
     @classmethod
     def open(cls, state_dir: Path, key_path: Path, *, expected_fingerprint: str) -> "MattermostOutbox":
         _state_dir(state_dir, create=False)
         database = state_dir / OUTBOX_DB_NAME
-        if not database.is_file() or database.is_symlink():
-            raise ContractError("Mattermost outbox database is not initialized")
+        try:
+            details = database.lstat()
+            current_uid = getattr(os, "geteuid", lambda: details.st_uid)()
+            if (
+                not stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode)
+                or details.st_uid != current_uid
+                or (os.name != "nt" and stat.S_IMODE(details.st_mode) != 0o600)
+            ):
+                raise ContractError("Mattermost outbox database is not initialized")
+        except ContractError:
+            raise
+        except OSError as exc:
+            raise ContractError("Mattermost outbox database is not initialized") from exc
         return cls(database, _key_file(key_path), expected_fingerprint=expected_fingerprint)
 
     @staticmethod
