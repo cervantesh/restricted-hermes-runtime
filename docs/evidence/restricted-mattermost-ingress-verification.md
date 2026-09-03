@@ -61,6 +61,9 @@ returns 503. The focused Mattermost tests and real POSIX process suite are indep
 - Contract: `SG-MM-OUTBOX-007`
 - Implementation base: `f9ef9f4518ef217e9382635715760177fb749789`
 - Evidence baseline head: `b5258f48d58784d3fe9537f2d4725d04a60b62bc`
+- Final product-code evidence head: `330f96f964ce331fe053b9730b26e6c4ec576a86`.
+  This documentation-only follow-up is deliberately distinct from that tested
+  product head and changes no runtime or test code.
 - Scope: encrypted durable local delivery outbox and bounded recovery for the
   restricted Mattermost ingress. The historical SG-MATTERMOST-001 evidence
   above remains preserved as the initial slice.
@@ -85,12 +88,12 @@ returns 503. The focused Mattermost tests and real POSIX process suite are indep
   to nonce history. RED and installed-wheel mutations cover restoring an older
   authentic `READY` row after `DELIVERED`, and deleting an older terminal row
   while a newer terminal row remains.
-- Windows focused evidence: `107 passed, 7 skipped`.
-- Linux installed-wheel/process causal evidence: `131 passed, 1 skipped`.
-- Latest exclusive-owner closure: Windows focused `103 passed, 4 skipped`;
+- Earlier focused closure evidence: Windows `107 passed, 7 skipped`.
+- Earlier Linux installed-wheel/process causal evidence: `131 passed, 1 skipped`.
+- Prior exclusive-owner closure: Windows focused `103 passed, 4 skipped`;
   Linux installed wheel `123 passed, 1 skipped` (the skipped witness requires
   isolated PostgreSQL and POSIX AF_UNIX).
-- Startup acquisition closure: a write-capable `BEGIN EXCLUSIVE` now precedes
+- Final product-head startup acquisition closure: a write-capable `BEGIN EXCLUSIVE` now precedes
   the first integrity, schema, nonce-history, and row-authentication read. The
   Windows race witness schedules a raw SQLite deletion at that exact first
   integrity read and observes it blocked; the installed-wheel mutation to
@@ -100,7 +103,9 @@ returns 503. The focused Mattermost tests and real POSIX process suite are indep
   witness requires isolated PostgreSQL and POSIX AF_UNIX).
 - Real PostgreSQL recovery witness: `1 passed`.
 - Exact Mattermost `11.7.10` acceptance: `PASS`.
-- Hosted CI run `33745519719`: green.
+- Historical hosted CI run `33745519719`: green.
+- Hosted CI run `33755084881` on final product-code evidence head
+  `330f96f964ce331fe053b9730b26e6c4ec576a86`: green.
 
 ## Current residual and operating boundary
 
