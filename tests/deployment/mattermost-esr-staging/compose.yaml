@@ -1,0 +1,118 @@
+services:
+  postgres:
+    image: postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: mattermost
+      POSTGRES_USER: mattermost
+      POSTGRES_PASSWORD_FILE: /run/postgres-secret/postgres_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mattermost -d mattermost"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - postgres_secret:/run/postgres-secret:ro
+    networks: [backend]
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:11.7.10@sha256:84a041d836bf6fbf6a9a78ab699fa5ebe5437bfb6a514b5afad4121fa3800696
+    platform: linux/amd64
+    command: ["/mattermost/bin/mattermost", "server"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: postgresql://mattermost:${MM_ESR_POSTGRES_PASSWORD:?postgres password required}@postgres:5432/mattermost?sslmode=disable&connect_timeout=10
+      MM_SERVICESETTINGS_LISTENADDRESS: :8065
+      MM_SERVICESETTINGS_CONNECTIONSECURITY: TLS
+      MM_SERVICESETTINGS_TLSCERTFILE: /run/mattermost-tls/server.crt
+      MM_SERVICESETTINGS_TLSKEYFILE: /run/mattermost-tls/server.key
+      MM_SERVICESETTINGS_SITEURL: https://mattermost:8065
+      MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+      MM_LOGSETTINGS_CONSOLELEVEL: ERROR
+    volumes:
+      - mattermost_data:/mattermost/data
+      - mattermost_tls:/run/mattermost-tls:ro
+    networks:
+      edge:
+        aliases: [mattermost-alternate]
+      backend: {}
+
+  uds:
+    image: ${MM_ESR_INGRESS_IMAGE:?ingress image required}
+    user: "0:0"
+    network_mode: none
+    volumes:
+      - ingress_socket:/run/restricted-inference
+      - witness_state:/state
+      - ${MM_ESR_HARNESS:?harness directory required}:/harness:ro
+    command: ["python", "/harness/uds.py"]
+
+  ingress:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile.mattermost-ingress
+    image: ${MM_ESR_INGRESS_IMAGE:?ingress image required}
+    environment:
+      RESTRICTED_MATTERMOST_POLICY_PATH: /run/ingress/policy.json
+      RESTRICTED_MATTERMOST_POLICY_SIGNATURE_PATH: /run/ingress/policy.sig
+      RESTRICTED_MATTERMOST_POLICY_PUBLIC_KEY_B64: ${MM_ESR_POLICY_PUBLIC_KEY:?policy public key required}
+      RESTRICTED_MATTERMOST_TOKEN_PATH: /run/ingress/bot_token
+      RESTRICTED_MATTERMOST_CA_PATH: /run/ingress/ca.crt
+    read_only: true
+    tmpfs: [/tmp]
+    dns: [192.0.2.1]
+    dns_opt: [timeout:1, attempts:1]
+    volumes:
+      - ingress_socket:/run/restricted-inference
+      - ingress_config:/run/ingress:ro
+    networks: [edge]
+
+  probe:
+    image: ${MM_ESR_INGRESS_IMAGE:?ingress image required}
+    environment:
+      MM_ESR_POSTGRES_IP: ${MM_ESR_POSTGRES_IP:?PostgreSQL probe IP required}
+    read_only: true
+    tmpfs: [/tmp]
+    dns: [192.0.2.1]
+    dns_opt: [timeout:1, attempts:1]
+    volumes:
+      - ingress_socket:/run/restricted-inference
+      - ingress_config:/run/ingress:ro
+      - ${MM_ESR_HARNESS:?harness directory required}:/harness:ro
+    networks: [edge]
+    command: ["python", "/harness/network_probe.py"]
+
+  controller:
+    image: ${MM_ESR_INGRESS_IMAGE:?ingress image required}
+    user: "0:0"
+    entrypoint: ["python", "-c", "import time; time.sleep(3600)"]
+    volumes:
+      - ${MM_ESR_HARNESS:?harness directory required}:/harness:ro
+      - ${MM_ESR_SEED:?seed directory required}:/seed:ro
+      - controller_state:/state
+      - ingress_config:/ingress
+      - witness_state:/witness:ro
+      - mattermost_tls:/tls
+      - postgres_secret:/postgres-secret
+    networks: [edge]
+
+networks:
+  edge:
+    internal: true
+  backend:
+    internal: true
+
+volumes:
+  postgres_data:
+  postgres_secret:
+  mattermost_data:
+  mattermost_tls:
+  ingress_config:
+  ingress_socket:
+  controller_state:
+  witness_state:

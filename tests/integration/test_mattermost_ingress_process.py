@@ -44,7 +44,7 @@ def _frame(payload: bytes) -> bytes:
     return b"\x81\x7e" + len(payload).to_bytes(2, "big") + payload
 
 
-def _read_frame(stream) -> bytes:
+def _read_frame(stream) -> tuple[int, bytes]:
     first = stream.read(2)
     if len(first) != 2:
         raise EOFError
@@ -55,7 +55,8 @@ def _read_frame(stream) -> bytes:
         length = int.from_bytes(stream.read(8), "big")
     mask = stream.read(4) if first[1] & 0x80 else b""
     payload = stream.read(length)
-    return bytes(value ^ mask[index % 4] for index, value in enumerate(payload)) if mask else payload
+    decoded = bytes(value ^ mask[index % 4] for index, value in enumerate(payload)) if mask else payload
+    return first[0] & 0x0F, decoded
 
 
 class ConversationHandler(socketserver.StreamRequestHandler):
@@ -136,7 +137,9 @@ class PeerHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "Upgrade")
             self.send_header("Sec-WebSocket-Accept", accept)
             self.end_headers()
-            auth = json.loads(_read_frame(self.rfile))
+            opcode, payload = _read_frame(self.rfile)
+            assert opcode == 0x1
+            auth = json.loads(payload)
             assert auth == {"action": "authentication_challenge", "data": {"token": TOKEN}, "seq": 1}
             status = "FAIL" if type(self).mode == "auth_failure" else "OK"
             self.wfile.write(_frame(jcs_bytes({"seq_reply": 1, "status": status})))
@@ -290,3 +293,5 @@ def test_production_entrypoint_real_paths_keep_diagnostics_content_free(tmp_path
     logs = stdout + stderr
     for canary in (TOKEN, MESSAGE, RESPONSE, RAW_EVENT, "ERROR_BODY_CANARY_092a", ROOT_POST):
         assert canary not in logs
+    if mode == "success":
+        assert "mattermost_ingress_outcome=authenticated_ready" in logs
