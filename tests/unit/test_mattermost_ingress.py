@@ -24,7 +24,7 @@ from restricted_runtime.mattermost_ingress import (
     request_identity,
 )
 from restricted_runtime.mattermost_policy import load_signed_mattermost_policy, load_token
-from restricted_runtime.mattermost_outbox import MattermostOutbox
+from restricted_runtime.mattermost_outbox import DeliveryState, MattermostOutbox
 
 
 ORIGIN = "https://mattermost.internal.example"
@@ -480,6 +480,63 @@ def test_delivery_response_mismatch_never_falls_back_to_flat_post(tmp_path, capl
     assert len(attempts) == 1
     assert attempts[0]["root_id"] == ROOT
     assert "mattermost_delivery_outcome=rejected_binding" in caplog.text
+
+
+def test_restart_after_reservation_recovers_one_waiting_turn_and_one_post(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    source = post()
+    record, created = service.outbox.reserve(
+        service._envelope(source, service._authorize_source(source)),
+        payload_capacity=1000, tombstone_capacity=1000,
+    )
+    assert created and record.state is DeliveryState.WAITING_COMMIT
+    service.outbox.close()
+    reopened = MattermostOutbox.open(
+        tmp_path / "outbox", tmp_path / "outbox.key",
+        expected_fingerprint=service.policy.values["outbox_key_fingerprint"],
+    )
+    recovered = Ingress(service.policy, rest, conversation, reopened)
+    recovered.preflight()
+    assert len(conversation.calls) == 1 and len(rest.created) == 1
+    durable = reopened.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.DELIVERED and durable.envelope is None
+    reopened.close()
+
+
+def test_restart_after_ready_attempts_one_post_and_after_inflight_never_retries(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    source = post()
+    waiting, _ = service.outbox.reserve(
+        service._envelope(source, service._authorize_source(source)),
+        payload_capacity=1000, tombstone_capacity=1000,
+    )
+    ready = service.outbox.mark_ready(waiting, {**waiting.envelope, "conversation_epoch": "epoch-one", "response": "synthetic response"})
+    service.outbox.close()
+    reopened = MattermostOutbox.open(
+        tmp_path / "outbox", tmp_path / "outbox.key",
+        expected_fingerprint=service.policy.values["outbox_key_fingerprint"],
+    )
+    recovered = Ingress(service.policy, rest, conversation, reopened)
+    recovered.preflight()
+    assert len(rest.created) == 1
+    delivered = reopened.get(ready.record_tag)
+    assert delivered is not None and delivered.state is DeliveryState.DELIVERED
+    # A separate ready record models the exact durable IN_FLIGHT boundary: a
+    # replacement process must classify it ambiguous before any HTTP retry.
+    source2 = post("second00000000000000000000", root_id="", message="@restricted-bot second")
+    rest.posts[source2["id"]] = source2
+    wait2, _ = reopened.reserve(recovered._envelope(source2, recovered._authorize_source(source2)), payload_capacity=1000, tombstone_capacity=1000)
+    ready2 = reopened.mark_ready(wait2, {**wait2.envelope, "conversation_epoch": "epoch-two", "response": "synthetic response"})
+    flight = reopened.claim_delivery(ready2)
+    assert flight is not None and flight.state is DeliveryState.IN_FLIGHT
+    reopened.close()
+    final = MattermostOutbox.open(tmp_path / "outbox", tmp_path / "outbox.key", expected_fingerprint=service.policy.values["outbox_key_fingerprint"])
+    restart = Ingress(service.policy, rest, conversation, final)
+    restart.preflight()
+    assert len(rest.created) == 1
+    ambiguous = final.get(flight.record_tag)
+    assert ambiguous is not None and ambiguous.state is DeliveryState.AMBIGUOUS and ambiguous.envelope is None
+    final.close()
 
 
 class _Clock:
