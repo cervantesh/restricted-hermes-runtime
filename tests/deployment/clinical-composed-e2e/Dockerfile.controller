@@ -1,0 +1,5 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN pip install --no-cache-dir "psycopg[binary]==3.2.10"
+ENTRYPOINT ["python", "-c", "import time; time.sleep(3600)"]

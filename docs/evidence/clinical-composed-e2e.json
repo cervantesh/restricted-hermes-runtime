@@ -1,0 +1,61 @@
+{
+  "boundaries": {
+    "adapter_cannot_resolve_mattermost": true,
+    "adapter_resolves_only_hrh_boundary": true,
+    "edge_cannot_resolve_hrh": true,
+    "zero_model_conversation_provider_calls": true
+  },
+  "built_images": {
+    "clinical-adapter": "sha256:c40228bc4db224d5eb18617bbfa0bab4c5e3517f4c9e94b2e0c14c8ce4bcf01d",
+    "hrh": "sha256:191a484cd0f84ff537b0cacda469450e14deba8ed6d8091704fb4e145ff20658",
+    "ingress": "sha256:b640a42066508b46721ceb08aa22bba6762f7d43ca1fbd89f52a4900004ecd45"
+  },
+  "commands": [
+    "python tests/deployment/test_clinical_composed_e2e.py",
+    "python -m pytest tests/static/test_clinical_composed_e2e_surface.py tests/unit/test_clinical_adapter.py tests/unit/test_mattermost_clinical.py -q"
+  ],
+  "crash_invariants": {
+    "delivery_reauthorized": 2,
+    "read_authorized": 1,
+    "read_completed": 1,
+    "response_digest_equal": true
+  },
+  "hrh_head": "b32970ee053c4caf180d6bdadce9b8d043ab1eba",
+  "hrh_tree": "973f5c73b37dffe7171b2e0e6d57719cf54b3e5b",
+  "images": {
+    "mattermost": "mattermost/mattermost-team-edition:11.7.10@sha256:84a041d836bf6fbf6a9a78ab699fa5ebe5437bfb6a514b5afad4121fa3800696",
+    "postgres": "postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f",
+    "tls": "nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284"
+  },
+  "post_counts": {
+    "actor-cross": 0,
+    "channel-cross": 0,
+    "disabled": 0,
+    "missing-appointments": 0,
+    "missing-patients": 0,
+    "recovered": 1,
+    "revoked": 0,
+    "unbound": 0,
+    "valid": 1
+  },
+  "residual_limitations": [
+    "Synthetic data and a test CA were used; this is technical conformance evidence, not a compliance certification.",
+    "The run exercised Linux containers and the pinned Mattermost ESR image, not a production deployment or host-level operating-system controls."
+  ],
+  "runtime_head": "2fc8d706a76af0ab805f516649f04bfd503f2572",
+  "runtime_product_sha": "8049dd7612176b33e65ef19f61f5699aef7e0a28",
+  "runtime_tree": "697b26086ad6a770c8e5acdecc919259d6c8d144",
+  "scenarios": {
+    "actor_cross": "deny",
+    "channel_cross": "deny",
+    "crash_retry": "stable-result",
+    "disabled": "deny",
+    "logs": "no-synthetic-identifiers",
+    "missing_each_permission": "deny",
+    "patient_cross": "deny",
+    "revoked_before_delivery": "zero-post",
+    "swapped_digest": "deny",
+    "unbound": "deny",
+    "valid": "pass"
+  }
+}
