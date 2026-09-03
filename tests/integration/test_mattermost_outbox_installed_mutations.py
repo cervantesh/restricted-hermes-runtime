@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socketserver
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -246,3 +248,73 @@ def test_installed_skipped_fresh_source_actor_root_authorization_bites(installed
         'return\n        source = self.rest.get_post(envelope["source_id"])',
     )
     assert _run(mutant, _AUTH_PROGRAM) == {"outcome": "accepted"}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires real POSIX AF_UNIX process witness")
+def test_installed_reservation_commit_survives_post_turn_crash(installed_artifact, tmp_path):
+    """A sitecustomize kill after the causal UDS reply exposes deferred commit."""
+    fixed = Path("/run/restricted-inference/conversation.sock")
+    if fixed.exists():
+        pytest.skip("conversation socket belongs to another runtime")
+    socket_path = tmp_path / "conversation.sock"
+    counts = {"turns": 0}
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            request_line = self.rfile.readline().decode().split()
+            headers = {}
+            while (line := self.rfile.readline()) != b"\r\n":
+                name, value = line.decode().split(":", 1)
+                headers[name.lower()] = value.strip()
+            raw_body = self.rfile.read(int(headers["content-length"]))
+            if request_line[1].endswith("/turns"):
+                body = json.loads(raw_body)
+                counts["turns"] += 1
+                value = {"schema_version":"restricted-turn-result.v1","turn_id":"turn","conversation_epoch":body["conversation_epoch"],"status":"COMMITTED","message":"response"}
+            else:
+                value = {"schema_version":"restricted-conversation.v1","conversation_id":request_line[1].rsplit("/",1)[-1],"conversation_epoch":"epoch-one"}
+            raw = json.dumps(value).encode()
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw)
+    server = socketserver.ThreadingUnixStreamServer(str(socket_path), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    key = tmp_path / "key"
+    key.write_bytes(bytes(range(32)))
+    os.chmod(key, 0o600)
+    program = r'''
+import os
+from pathlib import Path
+from restricted_runtime.mattermost_outbox import MattermostOutbox,key_fingerprint
+from restricted_runtime.mattermost_ingress import ConversationUdsClient
+class P: values={"uds_timeout_seconds":5,"conversation_deadline_seconds":4}
+key=Path(os.environ["KEY"]); state=Path(os.environ["STATE"]); fp=key_fingerprint(bytes(range(32)))
+store=MattermostOutbox.open(state,key,expected_fingerprint=fp) if state.exists() else MattermostOutbox.initialize(state,key,expected_fingerprint=fp)
+e={"schema_version":"restricted-mattermost-outbox.v1","tenant_id":"t","origin":"https://x","channel_id":"c","root_id":"r","source_id":"s","actor_id":"a","message":"m","conversation_id":"conversation","conversation_epoch":None,"client_request_id":"request","policy_epoch":"p","policy_digest":"a"*64,"key_fingerprint":fp,"policy_expires_at":4000000000,"payload_expires_at":4000000000,"response":None,"pending_post_id":"pending","returned_post_id":None}
+r,_=store.reserve(e,payload_capacity=3,tombstone_capacity=3); client=ConversationUdsClient(P()); created=client.create_conversation(conversation_id=e["conversation_id"]); e={**e,"conversation_epoch":created["conversation_epoch"]}; r=store.update_waiting(r,e); result=client.submit_turn(conversation_id=e["conversation_id"],conversation_epoch=e["conversation_epoch"],client_request_id=e["client_request_id"],message=e["message"]); store.mark_ready(r,{**e,"response":result["message"]})
+'''
+    def kill_after_turn(site, state):
+        wrapper = tmp_path / ("wrapper-" + state.name)
+        wrapper.mkdir(exist_ok=True)
+        (wrapper / "sitecustomize.py").write_text("import os\nfrom restricted_runtime.mattermost_outbox import MattermostOutbox\ndef stop(self,*a,**k): os._exit(86)\nMattermostOutbox.mark_ready=stop\n")
+        fixed.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(socket_path, fixed)
+        try:
+            return subprocess.run([sys.executable,"-B","-c",program], cwd=ROOT, env={**os.environ,"PYTHONPATH":os.pathsep.join((str(wrapper),str(site))),"KEY":str(key),"STATE":str(state)}, timeout=20).returncode
+        finally:
+            fixed.unlink(missing_ok=True)
+    try:
+        baseline = tmp_path / "baseline-state"
+        assert kill_after_turn(_copy_artifact(installed_artifact,tmp_path/"baseline"),baseline) == 86
+        check = _run(_copy_artifact(installed_artifact,tmp_path/"check"), f'''from pathlib import Path\nfrom restricted_runtime.mattermost_outbox import MattermostOutbox,key_fingerprint\nimport json\ns=MattermostOutbox.open(Path(r"{baseline}"),Path(r"{key}"),expected_fingerprint=key_fingerprint(bytes(range(32))))\nrows=s._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]\nprint(json.dumps({{"rows":rows}}))''')
+        assert check == {"rows":1}
+        mutant = _copy_artifact(installed_artifact,tmp_path/"mutant")
+        _mutate(mutant,"restricted_runtime/mattermost_outbox.py",'self._connection.execute("COMMIT")\n                return self._record(row, envelope), True','return self._record(row, envelope), True')
+        lost = tmp_path / "lost-state"
+        assert kill_after_turn(mutant,lost) == 86
+        assert not (lost / "mattermost-outbox.sqlite3").exists() or _run(_copy_artifact(installed_artifact,tmp_path/"lostcheck"), f'''from pathlib import Path\nfrom restricted_runtime.mattermost_outbox import MattermostOutbox,key_fingerprint\nimport json\ntry:\n s=MattermostOutbox.open(Path(r"{lost}"),Path(r"{key}"),expected_fingerprint=key_fingerprint(bytes(range(32))))\n n=s._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]\nexcept Exception:\n n=0\nprint(json.dumps({{"rows":n}}))''') == {"rows":0}
+        assert kill_after_turn(mutant,lost) == 86
+        assert counts["turns"] == 3
+    finally:
+        fixed.unlink(missing_ok=True)
+        server.shutdown()
+        server.server_close()
+        socket_path.unlink(missing_ok=True)
