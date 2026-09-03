@@ -66,7 +66,7 @@ services:
       context: ${CLINICAL_HRH_ROOT:?required}
       dockerfile: Dockerfile.web
       args:
-        BUILD_SHA: b32970ee053c4caf180d6bdadce9b8d043ab1eba
+        BUILD_SHA: ${CLINICAL_HRH_BUILD_SHA:?required}
     environment:
       NODE_ENV: production
       PORT: "8080"

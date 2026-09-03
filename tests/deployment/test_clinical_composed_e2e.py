@@ -31,7 +31,7 @@ MM_IMAGE = "mattermost/mattermost-team-edition:11.7.10@sha256:84a041d836bf6fbf6a
 PG_IMAGE = "postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f"
 NGINX_IMAGE = "nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284"
 RUNTIME_PRODUCT_SHA = "8049dd7612176b33e65ef19f61f5699aef7e0a28"
-HRH_SHA = "b32970ee053c4caf180d6bdadce9b8d043ab1eba"
+HRH_SHA = "89fea476ef95a0dfd3cd60a587ec6cb9e1d3aa1f"
 PROJECT = f"clinicale2e{os.getpid()}_{int(time.time())}"
 STATE = Path(tempfile.mkdtemp(prefix="clinical-composed-e2e-"))
 SEED = STATE / "seed"
@@ -120,6 +120,7 @@ def prepare() -> None:
         "CLINICAL_HRH_ROOT": HRH_ROOT.as_posix(), "CLINICAL_HARNESS": HARNESS.as_posix(), "CLINICAL_SEED": SEED.as_posix(),
         "CLINICAL_INGRESS_IMAGE": INGRESS_IMAGE, "CLINICAL_ADAPTER_IMAGE": ADAPTER_IMAGE,
         "CLINICAL_POLICY_PUBLIC_KEY": "placeholder",
+        "CLINICAL_HRH_BUILD_SHA": HRH_SHA,
     }
     ENV_FILE.write_text("".join(f"{key}={value}\n" for key, value in env.items()), encoding="utf-8")
 
