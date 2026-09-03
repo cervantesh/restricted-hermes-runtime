@@ -17,4 +17,8 @@ def test_exact_esr_harness_pins_native_tls_and_internal_networks():
     assert "ports:" not in compose
     assert "mattermost_ingress_outcome=authenticated_ready" in runner
     assert 'compose("down", "--volumes", "--remove-orphans"' in runner
+    assert 'tempfile.mkdtemp(prefix="mattermost-esr-")' in runner
+    assert 'dir=ROOT' not in runner
+    assert 'wait_mattermost_local()' in runner
+    assert 'exec_controller("websocket-wrong-token")' in runner
     assert "pytest" not in runner.lower()

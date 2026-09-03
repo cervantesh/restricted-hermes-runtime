@@ -63,5 +63,8 @@ test witness; real operators still own retention, backups and restore, IdP and
 membership governance, audit configuration, patching, production firewalling,
 BAA/HIPAA obligations, and PHI authorization.
 
+The harness stores all generated state outside the repository and removes its
+exact Compose resources, test images, and temporary directory on completion.
+
 The latest exact-digest execution receipt is recorded in
 `docs/evidence/mattermost-11.7.10-staging-conformance.md`.
