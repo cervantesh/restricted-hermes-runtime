@@ -118,6 +118,8 @@ class PeerHandler(BaseHTTPRequestHandler):
     delivered = threading.Event()
     mode = "success"
     websocket_connections = 0
+    event_posts: list[dict] | None = None
+    source_posts: dict[str, dict] = {}
 
     def log_message(self, *_):
         pass
@@ -155,10 +157,14 @@ class PeerHandler(BaseHTTPRequestHandler):
                     time.sleep(1)
                     self.close_connection = True
                     return
-                post = {
-                    "id": ROOT_POST, "root_id": "", "channel_id": CHANNEL, "user_id": USER,
-                    "message": MESSAGE, "type": "", "file_ids": [], "edit_at": 0, "delete_at": 0,
-                }
+                post = (
+                    type(self).event_posts.pop(0)
+                    if type(self).event_posts
+                    else {
+                        "id": ROOT_POST, "root_id": "", "channel_id": CHANNEL, "user_id": USER,
+                        "message": MESSAGE, "type": "", "file_ids": [], "edit_at": 0, "delete_at": 0,
+                    }
+                )
                 event = {"event": "posted", "data": {"post": json.dumps(post), "channel_type": "P"}}
                 self.wfile.write(_frame(jcs_bytes(event)))
                 self.wfile.flush()
@@ -176,11 +182,18 @@ class PeerHandler(BaseHTTPRequestHandler):
             "/api/v4/channels/" + CHANNEL + "/members/" + BOT,
         }:
             self._json({"channel_id": CHANNEL, "user_id": self.path.rsplit("/", 1)[-1]})
-        elif self.path == "/api/v4/posts/" + ROOT_POST:
-            self._json({
-                "id": ROOT_POST, "root_id": "", "channel_id": CHANNEL, "user_id": USER,
-                "message": MESSAGE, "type": "", "file_ids": [], "edit_at": 0, "delete_at": 0,
-            })
+        elif self.path.startswith("/api/v4/posts/"):
+            post_id = self.path.rsplit("/", 1)[-1]
+            post = type(self).source_posts.get(post_id)
+            if post is None and post_id == ROOT_POST:
+                post = {
+                    "id": ROOT_POST, "root_id": "", "channel_id": CHANNEL, "user_id": USER,
+                    "message": MESSAGE, "type": "", "file_ids": [], "edit_at": 0, "delete_at": 0,
+                }
+            if post is None:
+                self._json({"error": "ERROR_BODY_CANARY_092a"}, 404)
+            else:
+                self._json(post)
         else:
             self._json({"error": "ERROR_BODY_CANARY_092a"}, 404)
 
@@ -194,7 +207,9 @@ class PeerHandler(BaseHTTPRequestHandler):
         # The pinned Mattermost server can durably accept a create-post while
         # its immediate response disappears.  The edge must treat that as an
         # ambiguous attempt, not as a retryable delivery.
-        if type(self).mode == "drop_post_response":
+        if type(self).mode == "drop_post_response" or (
+            type(self).mode == "drop_first_post_response" and len(type(self).posts) == 1
+        ):
             type(self).delivered.set()
             self.close_connection = True
             return
@@ -262,6 +277,8 @@ def test_production_entrypoint_real_paths_keep_diagnostics_content_free(tmp_path
     PeerHandler.posts = []
     PeerHandler.delivered = threading.Event()
     PeerHandler.websocket_connections = 0
+    PeerHandler.event_posts = None
+    PeerHandler.source_posts = {}
     ConversationHandler.mode = mode
     ConversationHandler.turns = 0
     key_path, cert_path = _certificates(tmp_path)
@@ -404,6 +421,34 @@ def _stop(self, record, state, *, reason):
     return _original(self, record, state, reason=reason)
 MattermostOutbox.terminal = _stop
 """
+    elif stage == "after_reserve_before_turn":
+        source = """\
+import os
+from restricted_runtime.mattermost_outbox import MattermostOutbox
+_original = MattermostOutbox.reserve
+def _stop(self, *args, **kwargs):
+    _original(self, *args, **kwargs)
+    os._exit(88)
+MattermostOutbox.reserve = _stop
+"""
+    elif stage == "after_ready_before_inflight":
+        source = """\
+import os
+from restricted_runtime.mattermost_outbox import MattermostOutbox
+def _stop(self, record):
+    os._exit(89)
+MattermostOutbox.claim_delivery = _stop
+"""
+    elif stage == "concurrent_reserve":
+        source = """\
+import os
+from restricted_runtime.mattermost_outbox import MattermostOutbox
+_original = MattermostOutbox.reserve
+def _stop(self, *args, **kwargs):
+    _original(self, *args, **kwargs)
+    os._exit(90)
+MattermostOutbox.reserve = _stop
+"""
     elif stage == "after_inflight_before_http":
         source = """\
 import os
@@ -435,6 +480,60 @@ def _stop(process: subprocess.Popen[str]) -> tuple[str, str]:
         return process.communicate(timeout=10)
 
 
+class _InstalledProcessHarness:
+    """One TLS Mattermost peer, UDS peer, and real fixed-path SQLite state."""
+
+    def __init__(self, tmp_path: Path):
+        if os.geteuid() != 0:
+            pytest.skip("exact fixed-path process witness requires an isolated root runner")
+        SOCKET.parent.mkdir(parents=True, exist_ok=True)
+        if SOCKET.exists() or OUTBOX_STATE.exists():
+            pytest.skip("fixed process witness paths already belong to another runtime")
+        PeerHandler.mode = "success"
+        PeerHandler.posts = []
+        PeerHandler.delivered = threading.Event()
+        PeerHandler.websocket_connections = 0
+        PeerHandler.event_posts = None
+        PeerHandler.source_posts = {}
+        ConversationHandler.mode = "success"
+        ConversationHandler.turns = 0
+        _key_path, certificate = _certificates(tmp_path)
+        self.peer = ThreadingHTTPServer(("127.0.0.1", 0), PeerHandler)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certificate, _key_path)
+        self.peer.socket = context.wrap_socket(self.peer.socket, server_side=True)
+        threading.Thread(target=self.peer.serve_forever, daemon=True).start()
+        self.conversation = socketserver.ThreadingUnixStreamServer(str(SOCKET), ConversationHandler)
+        threading.Thread(target=self.conversation.serve_forever, daemon=True).start()
+        self.policy, self.signature, self.public = _policy(tmp_path, self.peer.server_port)
+        self.token = tmp_path / "token"
+        self.token.write_text(TOKEN, encoding="utf-8")
+        self.outbox_key = tmp_path / "outbox.key"
+        self.outbox_key.write_bytes(b"m" * 32)
+        os.chmod(self.outbox_key, 0o600)
+        self.certificate = certificate
+        MattermostOutbox.initialize(
+            OUTBOX_STATE, self.outbox_key, expected_fingerprint=key_fingerprint(b"m" * 32)
+        ).close()
+
+    def start(self, site: Path, *, wrapper: Path | None = None) -> subprocess.Popen[str]:
+        return _start_installed(
+            site,
+            _installed_environment(
+                site, self.policy, self.signature, self.public, self.token, self.certificate,
+                self.outbox_key, wrapper=wrapper,
+            ),
+        )
+
+    def close(self) -> None:
+        self.peer.shutdown()
+        self.peer.server_close()
+        self.conversation.shutdown()
+        self.conversation.server_close()
+        SOCKET.unlink(missing_ok=True)
+        shutil.rmtree(OUTBOX_STATE, ignore_errors=True)
+
+
 @pytest.mark.parametrize(
     ("stage", "expected_exit"),
     [("before_delivered_ack", 86), ("after_inflight_before_http", 87)],
@@ -452,6 +551,8 @@ def test_installed_process_crash_after_inflight_never_reposts_on_replay(
     PeerHandler.posts = []
     PeerHandler.delivered = threading.Event()
     PeerHandler.websocket_connections = 0
+    PeerHandler.event_posts = None
+    PeerHandler.source_posts = {}
     ConversationHandler.mode = "success"
     ConversationHandler.turns = 0
     key_path, cert_path = _certificates(tmp_path)
@@ -515,6 +616,8 @@ def test_installed_process_dropped_post_response_is_ambiguous_and_never_reposts(
     PeerHandler.posts = []
     PeerHandler.delivered = threading.Event()
     PeerHandler.websocket_connections = 0
+    PeerHandler.event_posts = None
+    PeerHandler.source_posts = {}
     ConversationHandler.mode = "success"
     ConversationHandler.turns = 0
     key_path, cert_path = _certificates(tmp_path)
@@ -560,3 +663,117 @@ def test_installed_process_dropped_post_response_is_ambiguous_and_never_reposts(
         conversation.server_close()
         SOCKET.unlink(missing_ok=True)
         shutil.rmtree(OUTBOX_STATE, ignore_errors=True)
+
+
+def test_installed_process_reservation_crash_replays_one_turn_and_post(
+    tmp_path, installed_mattermost_ingress,
+):
+    """Reservation is committed before the executor can start a UDS turn."""
+    harness = _InstalledProcessHarness(tmp_path)
+    crashing = harness.start(
+        installed_mattermost_ingress,
+        wrapper=_crash_wrapper(tmp_path, "after_reserve_before_turn"),
+    )
+    restarted: subprocess.Popen[str] | None = None
+    try:
+        assert crashing.wait(timeout=15) == 88
+        assert _outbox_states() == ["WAITING_COMMIT"]
+        assert (ConversationHandler.turns, len(PeerHandler.posts)) == (0, 0)
+        restarted = harness.start(installed_mattermost_ingress)
+        _wait_for(lambda: PeerHandler.websocket_connections >= 2)
+        assert PeerHandler.delivered.wait(15)
+        assert _outbox_states() == ["DELIVERED"]
+        assert (ConversationHandler.turns, len(PeerHandler.posts)) == (1, 1)
+    finally:
+        _stop(crashing)
+        if restarted is not None:
+            _stop(restarted)
+        harness.close()
+
+
+def test_installed_process_ready_crash_recovers_one_post(
+    tmp_path, installed_mattermost_ingress,
+):
+    """A pre-CAS READY record restarts into exactly one outbound attempt."""
+    harness = _InstalledProcessHarness(tmp_path)
+    crashing = harness.start(
+        installed_mattermost_ingress,
+        wrapper=_crash_wrapper(tmp_path, "after_ready_before_inflight"),
+    )
+    restarted: subprocess.Popen[str] | None = None
+    try:
+        assert crashing.wait(timeout=15) == 89
+        assert _outbox_states() == ["READY"]
+        assert (ConversationHandler.turns, len(PeerHandler.posts)) == (1, 0)
+        restarted = harness.start(installed_mattermost_ingress)
+        _wait_for(lambda: PeerHandler.websocket_connections >= 2)
+        assert PeerHandler.delivered.wait(15)
+        assert _outbox_states() == ["DELIVERED"]
+        assert (ConversationHandler.turns, len(PeerHandler.posts)) == (1, 1)
+    finally:
+        _stop(crashing)
+        if restarted is not None:
+            _stop(restarted)
+        harness.close()
+
+
+def test_installed_process_concurrent_duplicate_reservations_replay_once(
+    tmp_path, installed_mattermost_ingress,
+):
+    """Two concurrent ingress processes can reserve only one source row."""
+    harness = _InstalledProcessHarness(tmp_path)
+    wrapper = _crash_wrapper(tmp_path, "concurrent_reserve")
+    first = harness.start(installed_mattermost_ingress, wrapper=wrapper)
+    second = harness.start(installed_mattermost_ingress, wrapper=wrapper)
+    restarted: subprocess.Popen[str] | None = None
+    try:
+        assert first.wait(timeout=15) == 90
+        assert second.wait(timeout=15) == 90
+        assert PeerHandler.websocket_connections >= 2
+        assert _outbox_states() == ["WAITING_COMMIT"]
+        assert (ConversationHandler.turns, len(PeerHandler.posts)) == (0, 0)
+        restarted = harness.start(installed_mattermost_ingress)
+        _wait_for(lambda: PeerHandler.websocket_connections >= 3)
+        assert PeerHandler.delivered.wait(15)
+        assert _outbox_states() == ["DELIVERED"]
+        assert (ConversationHandler.turns, len(PeerHandler.posts)) == (1, 1)
+    finally:
+        _stop(first)
+        _stop(second)
+        if restarted is not None:
+            _stop(restarted)
+        harness.close()
+
+
+def test_installed_process_ambiguous_root_fences_later_reply_but_not_other_root(
+    tmp_path, installed_mattermost_ingress,
+):
+    """A terminal thread never releases later work, while another thread can run."""
+    harness = _InstalledProcessHarness(tmp_path)
+    same_root = {
+        "id": "reply00000000000000000000000", "root_id": ROOT_POST, "channel_id": CHANNEL,
+        "user_id": USER, "message": "later reply", "type": "", "file_ids": [], "edit_at": 0, "delete_at": 0,
+    }
+    other_root = {
+        "id": "root-two0000000000000000000000", "root_id": "", "channel_id": CHANNEL,
+        "user_id": USER, "message": MESSAGE, "type": "", "file_ids": [], "edit_at": 0, "delete_at": 0,
+    }
+    PeerHandler.mode = "drop_first_post_response"
+    PeerHandler.event_posts = [
+        {"id": ROOT_POST, "root_id": "", "channel_id": CHANNEL, "user_id": USER, "message": MESSAGE, "type": "", "file_ids": [], "edit_at": 0, "delete_at": 0},
+        same_root,
+        other_root,
+    ]
+    PeerHandler.source_posts = {same_root["id"]: same_root, other_root["id"]: other_root}
+    process = harness.start(installed_mattermost_ingress)
+    try:
+        _wait_for(lambda: PeerHandler.websocket_connections >= 3, timeout=15)
+        _wait_for(lambda: len(PeerHandler.posts) == 2, timeout=15)
+        _wait_for(lambda: sorted(_outbox_states()) == ["AMBIGUOUS", "DELIVERED"])
+        # The missing third row/turn is the same-root reply rejected before
+        # either capacity admission or UDS execution; the second root remains
+        # independently processable.
+        assert (ConversationHandler.turns, len(PeerHandler.posts)) == (2, 2)
+    finally:
+        _stop(process)
+        harness.close()
