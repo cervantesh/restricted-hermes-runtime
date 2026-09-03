@@ -28,7 +28,7 @@ from .contracts import ContractError, jcs_bytes, load_closed_json
 
 OUTBOX_SCHEMA = "restricted-mattermost-outbox.v1"
 OUTBOX_DB_NAME = "mattermost-outbox.sqlite3"
-_META_SCHEMA = "restricted-mattermost-outbox-meta.v6"
+_META_SCHEMA = "restricted-mattermost-outbox-meta.v7"
 _TERMINAL = {"DELIVERED", "AMBIGUOUS", "BLOCKED", "FAILED", "EXPIRED"}
 _ACTIVE = {"WAITING_COMMIT", "READY", "IN_FLIGHT"}
 _ENVELOPE_FIELDS = {
@@ -180,6 +180,7 @@ class MattermostOutbox:
         self._tag_key = _derive(master_key, self._instance_id, b"lookup-hmac-sha256")
         self._row_key = _derive(master_key, self._instance_id, b"row-hmac-sha256")
         self._nonce_key = _derive(master_key, self._instance_id, b"nonce-registry-hmac-sha256")
+        self._history_key = _derive(master_key, self._instance_id, b"record-history-hmac-sha256")
         self._bootstrap_nonce_registry(bootstrap_nonce_registry)
         self._verify_all_rows()
         self._database_write_probe()
@@ -307,6 +308,9 @@ class MattermostOutbox:
                 "CREATE TABLE nonce_registry (singleton INTEGER PRIMARY KEY CHECK(singleton=1), sequence INTEGER NOT NULL, root_tag TEXT NOT NULL)"
             )
             connection.execute("INSERT INTO nonce_registry VALUES (1, 0, '')")
+            connection.execute(
+                "CREATE TABLE record_history (nonce_sequence INTEGER PRIMARY KEY, record_tag TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL, row_auth_tag TEXT NOT NULL, history_tag TEXT NOT NULL)"
+            )
             connection.execute("CREATE TABLE recovery_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), root_tag TEXT NOT NULL, created_at INTEGER NOT NULL, record_tag TEXT NOT NULL)")
             connection.execute("INSERT INTO recovery_cursor VALUES (1, '', -1, '')")
             connection.execute("CREATE INDEX records_root_order ON records(root_tag, created_at, record_tag)")
@@ -501,6 +505,156 @@ class MattermostOutbox:
         except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
             raise ContractError("Mattermost outbox nonce registry rejected") from exc
 
+    def _fresh_nonce(self) -> bytes:
+        nonce = secrets.token_bytes(12)
+        if not isinstance(nonce, bytes) or len(nonce) != 12:
+            raise ContractError("Mattermost outbox nonce rejected")
+        return nonce
+
+    def _history_anchor_sequence(self) -> int:
+        """Burn a nonce-chain entry for an erased-payload state transition."""
+        try:
+            row = self._connection.execute(
+                "SELECT sequence FROM nonce_registry WHERE singleton=1"
+            ).fetchone()
+            if (
+                row is None
+                or not isinstance(row["sequence"], int)
+                or isinstance(row["sequence"], bool)
+                or row["sequence"] < 0
+            ):
+                raise ContractError("Mattermost outbox nonce registry rejected")
+            sequence = row["sequence"] + 1
+            anchor = hmac.new(
+                self._history_key,
+                b"record-history-anchor\0" + sequence.to_bytes(8, "big"),
+                hashlib.sha256,
+            ).digest()[:12]
+            return self._append_nonce(anchor)
+        except ContractError:
+            raise
+        except (sqlite3.Error, KeyError, OverflowError, TypeError, ValueError) as exc:
+            raise ContractError("Mattermost outbox nonce registry rejected") from exc
+
+    def _history_auth(
+        self,
+        *,
+        nonce_sequence: int,
+        record_tag: str,
+        generation: int,
+        state: str,
+        row_auth_tag: str,
+    ) -> str:
+        try:
+            if (
+                not isinstance(nonce_sequence, int)
+                or isinstance(nonce_sequence, bool)
+                or nonce_sequence < 1
+                or not isinstance(record_tag, str)
+                or len(record_tag) != 64
+                or not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation < 0
+                or not isinstance(state, str)
+                or not isinstance(row_auth_tag, str)
+                or len(row_auth_tag) != 64
+            ):
+                raise TypeError("record history")
+            DeliveryState(state)
+            return hmac.new(
+                self._history_key,
+                jcs_bytes(
+                    {
+                        "schema_version": OUTBOX_SCHEMA,
+                        "domain": "record-history.v1",
+                        "nonce_sequence": nonce_sequence,
+                        "record_tag": record_tag,
+                        "generation": generation,
+                        "state": state,
+                        "row_auth_tag": row_auth_tag,
+                    }
+                ),
+                hashlib.sha256,
+            ).hexdigest()
+        except (TypeError, ValueError, UnicodeError, ContractError) as exc:
+            raise ContractError("Mattermost outbox record history rejected") from exc
+
+    def _append_record_history(self, values: dict[str, Any], row_auth_tag: str) -> None:
+        try:
+            nonce_sequence = values["nonce_sequence"]
+            record_tag = values["record_tag"]
+            generation = values["generation"]
+            state = values["state"]
+            history_tag = self._history_auth(
+                nonce_sequence=nonce_sequence,
+                record_tag=record_tag,
+                generation=generation,
+                state=state,
+                row_auth_tag=row_auth_tag,
+            )
+            self._connection.execute(
+                "INSERT INTO record_history(nonce_sequence,record_tag,generation,state,row_auth_tag,history_tag) VALUES(?,?,?,?,?,?)",
+                (nonce_sequence, record_tag, generation, state, row_auth_tag, history_tag),
+            )
+        except ContractError:
+            raise
+        except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
+            raise ContractError("Mattermost outbox record history rejected") from exc
+
+    def _verify_record_history(self, rows: list[sqlite3.Row], nonce_registry_sequence: int) -> None:
+        try:
+            history_rows = self._connection.execute(
+                "SELECT nonce_sequence,record_tag,generation,state,row_auth_tag,history_tag FROM record_history ORDER BY nonce_sequence"
+            ).fetchall()
+            if len(history_rows) != nonce_registry_sequence:
+                raise ContractError("Mattermost outbox record history rejected")
+            latest: dict[str, sqlite3.Row] = {}
+            for expected_sequence, history in enumerate(history_rows, start=1):
+                nonce_sequence = history["nonce_sequence"]
+                record_tag = history["record_tag"]
+                generation = history["generation"]
+                state = history["state"]
+                row_auth_tag = history["row_auth_tag"]
+                history_tag = history["history_tag"]
+                if (
+                    nonce_sequence != expected_sequence
+                    or not isinstance(history_tag, str)
+                    or len(history_tag) != 64
+                    or not hmac.compare_digest(
+                        history_tag,
+                        self._history_auth(
+                            nonce_sequence=nonce_sequence,
+                            record_tag=record_tag,
+                            generation=generation,
+                            state=state,
+                            row_auth_tag=row_auth_tag,
+                        ),
+                    )
+                ):
+                    raise ContractError("Mattermost outbox record history rejected")
+                previous = latest.get(record_tag)
+                if (previous is None and generation != 0) or (
+                    previous is not None and generation != previous["generation"] + 1
+                ):
+                    raise ContractError("Mattermost outbox record history rejected")
+                latest[record_tag] = history
+            records = {row["record_tag"]: row for row in rows}
+            if len(records) != len(rows) or set(records) != set(latest):
+                raise ContractError("Mattermost outbox record history rejected")
+            for record_tag, row in records.items():
+                history = latest[record_tag]
+                if (
+                    history["nonce_sequence"] != row["nonce_sequence"]
+                    or history["generation"] != row["generation"]
+                    or history["state"] != row["state"]
+                    or not hmac.compare_digest(history["row_auth_tag"], row["auth_tag"])
+                ):
+                    raise ContractError("Mattermost outbox record history rejected")
+        except ContractError:
+            raise
+        except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
+            raise ContractError("Mattermost outbox record history rejected") from exc
+
     def _row_auth(self, row: Any) -> str:
         try:
             material: dict[str, Any] = {"schema_version": OUTBOX_SCHEMA}
@@ -565,6 +719,8 @@ class MattermostOutbox:
                 self._verify_row(row)
                 if row["nonce_sequence"] > nonce_registry_sequence:
                     raise ContractError("Mattermost outbox nonce registry rejected")
+            self._verify_record_history(rows, nonce_registry_sequence)
+            for row in rows:
                 if row["nonce"] is not None:
                     self._open_envelope(row)
         except ContractError:
@@ -587,9 +743,7 @@ class MattermostOutbox:
     def _seal(self, envelope: dict[str, Any], *, record_tag: str, source_tag: str, root_tag: str) -> tuple[bytes, bytes, int]:
         if set(envelope) != _ENVELOPE_FIELDS or envelope.get("schema_version") != OUTBOX_SCHEMA:
             raise ContractError("Mattermost outbox envelope schema rejected")
-        nonce = secrets.token_bytes(12)
-        if not isinstance(nonce, bytes) or len(nonce) != 12:
-            raise ContractError("Mattermost outbox nonce rejected")
+        nonce = self._fresh_nonce()
         nonce_sequence = self._append_nonce(nonce)
         payload = AESGCM(self._enc_key).encrypt(nonce, jcs_bytes(envelope), self._aad(record_tag=record_tag, source_tag=source_tag, root_tag=root_tag, policy_digest=envelope["policy_digest"]))
         return nonce, payload, nonce_sequence
@@ -623,6 +777,7 @@ class MattermostOutbox:
         )
 
     def _fetch(self, record_tag: str, *, decrypt: bool = True) -> OutboxRecord | None:
+        self._verify_all_rows()
         self._connection.row_factory = sqlite3.Row
         row = self._connection.execute("SELECT * FROM records WHERE record_tag=?", (record_tag,)).fetchone()
         if row is None:
@@ -638,6 +793,7 @@ class MattermostOutbox:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("BEGIN IMMEDIATE")
             try:
+                self._verify_all_rows()
                 rows = self._connection.execute("SELECT * FROM records").fetchall()
                 for row in rows:
                     self._verify_row(row)
@@ -667,10 +823,12 @@ class MattermostOutbox:
                     "nonce_sequence": nonce_sequence,
                     "nonce": nonce, "ciphertext": ciphertext, "reason": None, "returned_post_tag": None,
                 }
+                row_auth_tag = self._row_auth(values)
                 self._connection.execute(
                     "INSERT INTO records(record_tag,source_tag,root_tag,state,generation,created_at,updated_at,payload_expires_at,policy_expires_at,policy_digest,nonce_sequence,nonce,ciphertext,reason,returned_post_tag,auth_tag) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    tuple(values[name] for name in _ROW_FIELDS) + (self._row_auth(values),),
+                    tuple(values[name] for name in _ROW_FIELDS) + (row_auth_tag,),
                 )
+                self._append_record_history(values, row_auth_tag)
                 row = self._connection.execute("SELECT * FROM records WHERE record_tag=?", (record_tag,)).fetchone()
                 result = self._record(row, envelope)
                 self._connection.execute("COMMIT")
@@ -711,6 +869,7 @@ class MattermostOutbox:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("BEGIN IMMEDIATE")
             try:
+                self._verify_all_rows()
                 current = self._connection.execute("SELECT * FROM records WHERE record_tag=?", (record.record_tag,)).fetchone()
                 if current is None:
                     if missing_ok:
@@ -724,27 +883,30 @@ class MattermostOutbox:
                         return None
                     raise ContractError("Mattermost outbox compare-and-set rejected")
                 nonce = ciphertext = None
-                nonce_sequence = current["nonce_sequence"]
                 if envelope is not None:
                     nonce, ciphertext, nonce_sequence = self._seal(
                         envelope, record_tag=record.record_tag, source_tag=record.source_tag, root_tag=record.root_tag
                     )
+                else:
+                    nonce_sequence = self._history_anchor_sequence()
                 values = {name: current[name] for name in _ROW_FIELDS}
                 values.update({
                     "state": target.value, "generation": current["generation"] + 1, "updated_at": now,
                     "nonce_sequence": nonce_sequence, "nonce": nonce, "ciphertext": ciphertext, "reason": reason,
                     "returned_post_tag": returned_post_tag,
                 })
+                row_auth_tag = self._row_auth(values)
                 cursor = self._connection.execute(
                     "UPDATE records SET state=?, generation=?, updated_at=?, nonce_sequence=?, nonce=?, ciphertext=?, reason=?, returned_post_tag=?, auth_tag=? WHERE record_tag=? AND state=? AND generation=?",
                     (
                         values["state"], values["generation"], values["updated_at"], values["nonce_sequence"],
-                        values["nonce"], values["ciphertext"], values["reason"], values["returned_post_tag"], self._row_auth(values),
+                        values["nonce"], values["ciphertext"], values["reason"], values["returned_post_tag"], row_auth_tag,
                         record.record_tag, expected.value, record.generation,
                     ),
                 )
                 if cursor.rowcount != 1:
                     raise ContractError("Mattermost outbox compare-and-set rejected")
+                self._append_record_history(values, row_auth_tag)
                 refreshed_row = self._connection.execute("SELECT * FROM records WHERE record_tag=?", (record.record_tag,)).fetchone()
                 if refreshed_row is None:
                     raise ContractError("Mattermost outbox record disappeared")
@@ -761,6 +923,7 @@ class MattermostOutbox:
     def get(self, record_tag: str) -> OutboxRecord | None:
         with self._lock:
             self._connection.row_factory = sqlite3.Row
+            self._verify_all_rows()
             row = self._connection.execute("SELECT * FROM records WHERE record_tag=?", (record_tag,)).fetchone()
             if row is None:
                 return None
@@ -769,6 +932,7 @@ class MattermostOutbox:
     def stale_inflight_to_ambiguous(self) -> int:
         with self._lock:
             self._connection.row_factory = sqlite3.Row
+            self._verify_all_rows()
             rows = self._connection.execute(
                 "SELECT * FROM records WHERE state=?", (DeliveryState.IN_FLIGHT.value,)
             ).fetchall()
@@ -785,6 +949,7 @@ class MattermostOutbox:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("BEGIN IMMEDIATE")
             try:
+                self._verify_all_rows()
                 cursor = self._connection.execute(
                     "SELECT root_tag, created_at, record_tag FROM recovery_cursor WHERE singleton=1"
                 ).fetchone()

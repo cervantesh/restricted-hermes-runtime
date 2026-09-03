@@ -145,7 +145,7 @@ store=MattermostOutbox.initialize(root/'state',key,expected_fingerprint=env['key
 record,_=store.reserve(env,payload_capacity=3,tombstone_capacity=3)
 store.terminal(record,DeliveryState.BLOCKED,reason='test'); store.close()
 database=root/'state'/'mattermost-outbox.sqlite3'; conn=sqlite3.connect(database)
-conn.execute("UPDATE records SET root_tag=?, state='READY' WHERE record_tag=?",('0'*64,record.record_tag)); conn.commit(); conn.close()
+conn.execute("UPDATE records SET root_tag=? WHERE record_tag=?",('0'*64,record.record_tag)); conn.commit(); conn.close()
 try:
  MattermostOutbox.open(root/'state',key,expected_fingerprint=env['key_fingerprint']); outcome='accepted'
 except ContractError:
@@ -189,13 +189,19 @@ print(json.dumps({'outcome':outcome,'nonces':store._connection.execute('SELECT C
 
 def test_installed_nonce_registry_mutation_allows_repeated_entropy_reuse(installed_artifact, tmp_path):
     baseline = _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _NONCE_REUSE_PROGRAM)
-    assert baseline == {"outcome": "rejected", "nonces": 1}
+    assert baseline == {"outcome": "rejected", "nonces": 2}
     mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
     _mutate(
         mutant,
         "restricted_runtime/mattermost_outbox.py",
         'self._connection.execute(\n                    "INSERT INTO nonce_tombstones(sequence,nonce,chain_tag) VALUES(?,?,?)",\n                    (sequence, nonce, chain_tag),\n                )',
         "pass",
+    )
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        'if (\n                registry_rows[0]["sequence"] != expected_sequence - 1\n                or not hmac.compare_digest(registry_rows[0]["root_tag"], previous)\n            ):',
+        "if False:",
     )
     assert _run(mutant, _NONCE_REUSE_PROGRAM) == {"outcome": "reused", "nonces": 0}
 
@@ -235,7 +241,84 @@ def test_installed_nonce_prefix_rollback_cross_link_mutation_bites(installed_art
         'if row["nonce_sequence"] > nonce_registry_sequence:',
         "if False:",
     )
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        "if len(history_rows) != nonce_registry_sequence:",
+        "if False:",
+    )
     assert _run(mutant, _NONCE_PREFIX_ROLLBACK_PROGRAM) == {"outcome": "accepted"}
+
+
+_RESTORED_READY_PROGRAM = r'''
+import json, os, sqlite3, tempfile
+from pathlib import Path
+from restricted_runtime.contracts import ContractError
+from restricted_runtime.mattermost_outbox import MattermostOutbox, key_fingerprint
+root=Path(tempfile.mkdtemp()); key=root/'key'; key.write_bytes(bytes(range(32))); os.chmod(key,0o600)
+fp=key_fingerprint(bytes(range(32)))
+env={"schema_version":"restricted-mattermost-outbox.v1","tenant_id":"tenant","origin":"https://mm.example","channel_id":"channel","root_id":"root","source_id":"source","actor_id":"actor","message":"ready rollback test","conversation_id":"conversation","conversation_epoch":None,"client_request_id":"request","policy_epoch":"policy","policy_digest":"a"*64,"key_fingerprint":fp,"policy_expires_at":4000000000,"payload_expires_at":4000000000,"response":None,"pending_post_id":"pending","returned_post_id":None}
+store=MattermostOutbox.initialize(root/'state',key,expected_fingerprint=fp)
+waiting,_=store.reserve(env,payload_capacity=3,tombstone_capacity=3)
+ready=store.mark_ready(waiting,{**env,"response":"answer"})
+snapshot=store._connection.execute('SELECT state,generation,updated_at,nonce_sequence,nonce,ciphertext,reason,returned_post_tag,auth_tag FROM records WHERE record_tag=?',(ready.record_tag,)).fetchone()
+claimed=store.claim_delivery(ready); assert claimed is not None; assert store.delivered(claimed,returned_post_id='returned') is not None
+database=root/'state'/'mattermost-outbox.sqlite3'; conn=sqlite3.connect(database)
+conn.execute('UPDATE records SET state=?,generation=?,updated_at=?,nonce_sequence=?,nonce=?,ciphertext=?,reason=?,returned_post_tag=?,auth_tag=? WHERE record_tag=?',tuple(snapshot)+(ready.record_tag,))
+conn.commit(); conn.close()
+try:
+ outcome=store.get(ready.record_tag).state.value; store.close()
+except ContractError:
+ outcome='rejected'
+print(json.dumps({'outcome':outcome}))
+'''
+
+
+def test_installed_restored_ready_history_mutation_bites(installed_artifact, tmp_path):
+    baseline = _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _RESTORED_READY_PROGRAM)
+    assert baseline == {"outcome": "rejected"}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        'if (\n                    history["nonce_sequence"] != row["nonce_sequence"]\n                    or history["generation"] != row["generation"]\n                    or history["state"] != row["state"]\n                    or not hmac.compare_digest(history["row_auth_tag"], row["auth_tag"])\n                ):',
+        "if False:",
+    )
+    assert _run(mutant, _RESTORED_READY_PROGRAM) == {"outcome": "READY"}
+
+
+_DELETED_TERMINAL_PROGRAM = r'''
+import json, os, sqlite3, tempfile
+from pathlib import Path
+from restricted_runtime.contracts import ContractError
+from restricted_runtime.mattermost_outbox import DeliveryState, MattermostOutbox, key_fingerprint
+root=Path(tempfile.mkdtemp()); key=root/'key'; key.write_bytes(bytes(range(32))); os.chmod(key,0o600)
+fp=key_fingerprint(bytes(range(32)))
+env={"schema_version":"restricted-mattermost-outbox.v1","tenant_id":"tenant","origin":"https://mm.example","channel_id":"channel","root_id":"root","source_id":"source","actor_id":"actor","message":"terminal delete test","conversation_id":"conversation","conversation_epoch":None,"client_request_id":"request","policy_epoch":"policy","policy_digest":"a"*64,"key_fingerprint":fp,"policy_expires_at":4000000000,"payload_expires_at":4000000000,"response":None,"pending_post_id":"pending","returned_post_id":None}
+store=MattermostOutbox.initialize(root/'state',key,expected_fingerprint=fp)
+first,_=store.reserve(env,payload_capacity=3,tombstone_capacity=3); store.terminal(first,DeliveryState.BLOCKED,reason='test')
+later,_=store.reserve({**env,"source_id":"second","root_id":"second"},payload_capacity=3,tombstone_capacity=3); store.terminal(later,DeliveryState.BLOCKED,reason='test')
+database=root/'state'/'mattermost-outbox.sqlite3'; conn=sqlite3.connect(database)
+conn.execute('DELETE FROM records WHERE record_tag=?',(first.record_tag,)); conn.commit(); conn.close()
+try:
+ _,created=store.reserve(env,payload_capacity=3,tombstone_capacity=3); outcome='readmitted' if created else 'duplicate'; store.close()
+except ContractError:
+ outcome='rejected'
+print(json.dumps({'outcome':outcome}))
+'''
+
+
+def test_installed_deleted_terminal_history_mutation_bites(installed_artifact, tmp_path):
+    baseline = _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _DELETED_TERMINAL_PROGRAM)
+    assert baseline == {"outcome": "rejected"}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        "if len(records) != len(rows) or set(records) != set(latest):",
+        "if False:",
+    )
+    assert _run(mutant, _DELETED_TERMINAL_PROGRAM) == {"outcome": "readmitted"}
 
 
 _READINESS_PROGRAM = r'''

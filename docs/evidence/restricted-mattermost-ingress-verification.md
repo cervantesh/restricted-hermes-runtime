@@ -60,7 +60,7 @@ returns 503. The focused Mattermost tests and real POSIX process suite are indep
 
 - Contract: `SG-MM-OUTBOX-007`
 - Implementation base: `f9ef9f4518ef217e9382635715760177fb749789`
-- Final implementation head: `5dabdacbf8eeca8788835c0fe2c136b2e1a45ff9`
+- Evidence baseline head: `7be66776208fb54f1548896a44f7af2fe0cb0d19`
 - Scope: encrypted durable local delivery outbox and bounded recovery for the
   restricted Mattermost ingress. The historical SG-MATTERMOST-001 evidence
   above remains preserved as the initial slice.
@@ -77,6 +77,10 @@ returns 503. The focused Mattermost tests and real POSIX process suite are indep
 - Installed-wheel directed mutations individually bite for payload encryption,
   durable terminal metadata, nonce reuse/history, readiness binding, source and
   root fences, CAS, stale in-flight handling, and recovery identity.
+- Per-record authenticated transition history is append-only and bound one-for-one
+  to nonce history. RED and installed-wheel mutations cover restoring an older
+  authentic `READY` row after `DELIVERED`, and deleting an older terminal row
+  while a newer terminal row remains.
 - Windows focused evidence: `107 passed, 7 skipped`.
 - Linux installed-wheel/process causal evidence: `131 passed, 1 skipped`.
 - Real PostgreSQL recovery witness: `1 passed`.
@@ -92,12 +96,14 @@ does not catch up unseen Mattermost events while it was down.
 
 This remains a single-replica design over one protected local state volume.
 Operators own capacity sizing, whole-database retirement/reset, key custody and
-rotation, and backup/restore. The keyed nonce history and row authentication
-detect uncoordinated local deletion or alteration, including a rollback of
-nonce history and its authenticated root/sequence to a valid prefix while a
-newer outbox row remains. Only a coherent rollback of the whole state volume is
-the excluded rollback class without an external monotonic anchor; operators
-must not partially restore or edit state.
+rotation, and backup/restore. The keyed nonce history, per-record transition
+history, and row authentication detect uncoordinated local deletion or
+alteration, including a rollback of nonce history and its authenticated
+root/sequence to a valid prefix while a newer outbox row remains, restoration
+of an older authenticated record state, or deletion of a terminal record.
+Only a coherent rollback of the whole state volume is the excluded rollback
+class without an external monotonic anchor; operators must not partially
+restore or edit state.
 
 All verification messages were synthetic and non-PHI. This evidence makes no
 claim of production PHI authorization, HIPAA/BAA or other compliance, IdP
