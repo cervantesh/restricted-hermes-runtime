@@ -28,7 +28,7 @@ from .contracts import ContractError, jcs_bytes, load_closed_json
 
 OUTBOX_SCHEMA = "restricted-mattermost-outbox.v1"
 OUTBOX_DB_NAME = "mattermost-outbox.sqlite3"
-_META_SCHEMA = "restricted-mattermost-outbox-meta.v5"
+_META_SCHEMA = "restricted-mattermost-outbox-meta.v6"
 _TERMINAL = {"DELIVERED", "AMBIGUOUS", "BLOCKED", "FAILED", "EXPIRED"}
 _ACTIVE = {"WAITING_COMMIT", "READY", "IN_FLIGHT"}
 _ENVELOPE_FIELDS = {
@@ -39,7 +39,7 @@ _ENVELOPE_FIELDS = {
 }
 _ROW_FIELDS = (
     "record_tag", "source_tag", "root_tag", "state", "generation", "created_at", "updated_at",
-    "payload_expires_at", "policy_expires_at", "policy_digest", "nonce", "ciphertext", "reason",
+    "payload_expires_at", "policy_expires_at", "policy_digest", "nonce_sequence", "nonce", "ciphertext", "reason",
     "returned_post_tag",
 )
 
@@ -298,7 +298,7 @@ class MattermostOutbox:
             connection.execute("CREATE TABLE meta (schema_version TEXT NOT NULL, instance_id BLOB NOT NULL, key_fingerprint TEXT NOT NULL)")
             connection.execute("INSERT INTO meta VALUES (?, ?, ?)", (_META_SCHEMA, instance_id, fingerprint))
             connection.execute(
-                "CREATE TABLE records (record_tag TEXT PRIMARY KEY, source_tag TEXT UNIQUE NOT NULL, root_tag TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, payload_expires_at INTEGER NOT NULL, policy_expires_at INTEGER NOT NULL, policy_digest TEXT NOT NULL, nonce BLOB, ciphertext BLOB, reason TEXT, returned_post_tag TEXT, auth_tag TEXT NOT NULL)"
+                "CREATE TABLE records (record_tag TEXT PRIMARY KEY, source_tag TEXT UNIQUE NOT NULL, root_tag TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, payload_expires_at INTEGER NOT NULL, policy_expires_at INTEGER NOT NULL, policy_digest TEXT NOT NULL, nonce_sequence INTEGER NOT NULL, nonce BLOB, ciphertext BLOB, reason TEXT, returned_post_tag TEXT, auth_tag TEXT NOT NULL)"
             )
             connection.execute(
                 "CREATE TABLE nonce_tombstones (sequence INTEGER PRIMARY KEY, nonce BLOB UNIQUE NOT NULL, chain_tag TEXT NOT NULL)"
@@ -415,7 +415,7 @@ class MattermostOutbox:
         except sqlite3.Error as exc:
             raise ContractError("Mattermost outbox nonce registry rejected") from exc
 
-    def _verify_nonce_registry(self) -> None:
+    def _verify_nonce_registry(self) -> int:
         try:
             registry_rows = self._connection.execute(
                 "SELECT singleton, sequence, root_tag FROM nonce_registry"
@@ -458,12 +458,13 @@ class MattermostOutbox:
                 or not hmac.compare_digest(registry_rows[0]["root_tag"], previous)
             ):
                 raise ContractError("Mattermost outbox nonce registry rejected")
+            return registry_rows[0]["sequence"]
         except ContractError:
             raise
         except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
             raise ContractError("Mattermost outbox nonce registry rejected") from exc
 
-    def _append_nonce(self, nonce: bytes) -> None:
+    def _append_nonce(self, nonce: bytes) -> int:
         """Append one irreversible GCM nonce within the caller's SQLite transaction."""
         try:
             row = self._connection.execute(
@@ -494,6 +495,7 @@ class MattermostOutbox:
             )
             if updated.rowcount != 1:
                 raise ContractError("Mattermost outbox nonce registry rejected")
+            return sequence
         except ContractError:
             raise
         except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
@@ -522,6 +524,9 @@ class MattermostOutbox:
             auth_tag = row["auth_tag"]
             if not isinstance(auth_tag, str) or not hmac.compare_digest(auth_tag, self._row_auth(row)):
                 raise ContractError("Mattermost outbox row authentication failed")
+            nonce_sequence = row["nonce_sequence"]
+            if not isinstance(nonce_sequence, int) or isinstance(nonce_sequence, bool) or nonce_sequence < 1:
+                raise ContractError("Mattermost outbox row authentication failed")
             nonce, ciphertext = row["nonce"], row["ciphertext"]
             if (nonce is None) != (ciphertext is None):
                 raise ContractError("Mattermost outbox row authentication failed")
@@ -543,7 +548,7 @@ class MattermostOutbox:
     def _verify_all_rows(self) -> None:
         try:
             self._connection.row_factory = sqlite3.Row
-            self._verify_nonce_registry()
+            nonce_registry_sequence = self._verify_nonce_registry()
             cursor_rows = self._connection.execute("SELECT singleton, root_tag, created_at, record_tag FROM recovery_cursor").fetchall()
             if (
                 len(cursor_rows) != 1 or cursor_rows[0]["singleton"] != 1
@@ -558,6 +563,8 @@ class MattermostOutbox:
             rows = self._connection.execute("SELECT * FROM records").fetchall()
             for row in rows:
                 self._verify_row(row)
+                if row["nonce_sequence"] > nonce_registry_sequence:
+                    raise ContractError("Mattermost outbox nonce registry rejected")
                 if row["nonce"] is not None:
                     self._open_envelope(row)
         except ContractError:
@@ -577,15 +584,15 @@ class MattermostOutbox:
     def _aad(self, *, record_tag: str, source_tag: str, root_tag: str, policy_digest: str) -> bytes:
         return jcs_bytes({"schema_version": OUTBOX_SCHEMA, "record_tag": record_tag, "source_tag": source_tag, "root_tag": root_tag, "policy_digest": policy_digest})
 
-    def _seal(self, envelope: dict[str, Any], *, record_tag: str, source_tag: str, root_tag: str) -> tuple[bytes, bytes]:
+    def _seal(self, envelope: dict[str, Any], *, record_tag: str, source_tag: str, root_tag: str) -> tuple[bytes, bytes, int]:
         if set(envelope) != _ENVELOPE_FIELDS or envelope.get("schema_version") != OUTBOX_SCHEMA:
             raise ContractError("Mattermost outbox envelope schema rejected")
         nonce = secrets.token_bytes(12)
         if not isinstance(nonce, bytes) or len(nonce) != 12:
             raise ContractError("Mattermost outbox nonce rejected")
-        self._append_nonce(nonce)
+        nonce_sequence = self._append_nonce(nonce)
         payload = AESGCM(self._enc_key).encrypt(nonce, jcs_bytes(envelope), self._aad(record_tag=record_tag, source_tag=source_tag, root_tag=root_tag, policy_digest=envelope["policy_digest"]))
-        return nonce, payload
+        return nonce, payload, nonce_sequence
 
     def _open_envelope(self, row: sqlite3.Row) -> dict[str, Any]:
         self._verify_row(row)
@@ -649,16 +656,19 @@ class MattermostOutbox:
                 # work than the database can safely retain after completion.
                 if active >= payload_capacity or active + tombstones >= tombstone_capacity:
                     raise ContractError("Mattermost outbox capacity reached")
-                nonce, ciphertext = self._seal(envelope, record_tag=record_tag, source_tag=source_tag, root_tag=root_tag)
+                nonce, ciphertext, nonce_sequence = self._seal(
+                    envelope, record_tag=record_tag, source_tag=source_tag, root_tag=root_tag
+                )
                 values = {
                     "record_tag": record_tag, "source_tag": source_tag, "root_tag": root_tag,
                     "state": DeliveryState.WAITING_COMMIT.value, "generation": 0, "created_at": now,
                     "updated_at": now, "payload_expires_at": envelope["payload_expires_at"],
                     "policy_expires_at": envelope["policy_expires_at"], "policy_digest": envelope["policy_digest"],
+                    "nonce_sequence": nonce_sequence,
                     "nonce": nonce, "ciphertext": ciphertext, "reason": None, "returned_post_tag": None,
                 }
                 self._connection.execute(
-                    "INSERT INTO records(record_tag,source_tag,root_tag,state,generation,created_at,updated_at,payload_expires_at,policy_expires_at,policy_digest,nonce,ciphertext,reason,returned_post_tag,auth_tag) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO records(record_tag,source_tag,root_tag,state,generation,created_at,updated_at,payload_expires_at,policy_expires_at,policy_digest,nonce_sequence,nonce,ciphertext,reason,returned_post_tag,auth_tag) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     tuple(values[name] for name in _ROW_FIELDS) + (self._row_auth(values),),
                 )
                 row = self._connection.execute("SELECT * FROM records WHERE record_tag=?", (record_tag,)).fetchone()
@@ -714,21 +724,22 @@ class MattermostOutbox:
                         return None
                     raise ContractError("Mattermost outbox compare-and-set rejected")
                 nonce = ciphertext = None
+                nonce_sequence = current["nonce_sequence"]
                 if envelope is not None:
-                    nonce, ciphertext = self._seal(
+                    nonce, ciphertext, nonce_sequence = self._seal(
                         envelope, record_tag=record.record_tag, source_tag=record.source_tag, root_tag=record.root_tag
                     )
                 values = {name: current[name] for name in _ROW_FIELDS}
                 values.update({
                     "state": target.value, "generation": current["generation"] + 1, "updated_at": now,
-                    "nonce": nonce, "ciphertext": ciphertext, "reason": reason,
+                    "nonce_sequence": nonce_sequence, "nonce": nonce, "ciphertext": ciphertext, "reason": reason,
                     "returned_post_tag": returned_post_tag,
                 })
                 cursor = self._connection.execute(
-                    "UPDATE records SET state=?, generation=?, updated_at=?, nonce=?, ciphertext=?, reason=?, returned_post_tag=?, auth_tag=? WHERE record_tag=? AND state=? AND generation=?",
+                    "UPDATE records SET state=?, generation=?, updated_at=?, nonce_sequence=?, nonce=?, ciphertext=?, reason=?, returned_post_tag=?, auth_tag=? WHERE record_tag=? AND state=? AND generation=?",
                     (
-                        values["state"], values["generation"], values["updated_at"], values["nonce"],
-                        values["ciphertext"], values["reason"], values["returned_post_tag"], self._row_auth(values),
+                        values["state"], values["generation"], values["updated_at"], values["nonce_sequence"],
+                        values["nonce"], values["ciphertext"], values["reason"], values["returned_post_tag"], self._row_auth(values),
                         record.record_tag, expected.value, record.generation,
                     ),
                 )

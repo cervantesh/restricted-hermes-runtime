@@ -200,6 +200,44 @@ def test_installed_nonce_registry_mutation_allows_repeated_entropy_reuse(install
     assert _run(mutant, _NONCE_REUSE_PROGRAM) == {"outcome": "reused", "nonces": 0}
 
 
+_NONCE_PREFIX_ROLLBACK_PROGRAM = r'''
+import json, os, sqlite3, tempfile
+from pathlib import Path
+from restricted_runtime.contracts import ContractError
+from restricted_runtime.mattermost_outbox import DeliveryState, MattermostOutbox, key_fingerprint
+root=Path(tempfile.mkdtemp()); key=root/'key'; key.write_bytes(bytes(range(32))); os.chmod(key,0o600)
+fp=key_fingerprint(bytes(range(32)))
+env={"schema_version":"restricted-mattermost-outbox.v1","tenant_id":"tenant","origin":"https://mm.example","channel_id":"channel","root_id":"root","source_id":"source","actor_id":"actor","message":"nonce prefix test","conversation_id":"conversation","conversation_epoch":None,"client_request_id":"request","policy_epoch":"policy","policy_digest":"a"*64,"key_fingerprint":fp,"policy_expires_at":4000000000,"payload_expires_at":4000000000,"response":None,"pending_post_id":"pending","returned_post_id":None}
+store=MattermostOutbox.initialize(root/'state',key,expected_fingerprint=fp)
+store.reserve(env,payload_capacity=3,tombstone_capacity=3)
+later,_=store.reserve({**env,"source_id":"second","root_id":"second"},payload_capacity=3,tombstone_capacity=3)
+store.terminal(later,DeliveryState.BLOCKED,reason='test')
+first_root=store._connection.execute('SELECT chain_tag FROM nonce_tombstones WHERE sequence=1').fetchone()[0]
+store.close(); database=root/'state'/'mattermost-outbox.sqlite3'; conn=sqlite3.connect(database)
+conn.execute('DELETE FROM nonce_tombstones WHERE sequence > 1')
+conn.execute('UPDATE nonce_registry SET sequence=1, root_tag=? WHERE singleton=1',(first_root,))
+conn.commit(); conn.close()
+try:
+ MattermostOutbox.open(root/'state',key,expected_fingerprint=fp); outcome='accepted'
+except ContractError:
+ outcome='rejected'
+print(json.dumps({'outcome':outcome}))
+'''
+
+
+def test_installed_nonce_prefix_rollback_cross_link_mutation_bites(installed_artifact, tmp_path):
+    baseline = _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _NONCE_PREFIX_ROLLBACK_PROGRAM)
+    assert baseline == {"outcome": "rejected"}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        'if row["nonce_sequence"] > nonce_registry_sequence:',
+        "if False:",
+    )
+    assert _run(mutant, _NONCE_PREFIX_ROLLBACK_PROGRAM) == {"outcome": "accepted"}
+
+
 _READINESS_PROGRAM = r'''
 import json, os, tempfile
 from pathlib import Path
