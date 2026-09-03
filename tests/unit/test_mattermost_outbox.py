@@ -95,6 +95,36 @@ def test_nonce_registry_history_deletion_is_fatal_after_terminal_payload_erasure
             pass
 
 
+def test_nonce_registry_prefix_rollback_is_fatal_while_newer_terminal_row_remains(tmp_path):
+    store = _store(tmp_path)
+    try:
+        store.reserve(_envelope(), payload_capacity=3, tombstone_capacity=3)
+        later, _ = store.reserve(
+            _envelope(source="second-source", root="second-root"), payload_capacity=3, tombstone_capacity=3
+        )
+        store.terminal(later, DeliveryState.BLOCKED, reason="test_terminal")
+        first_root = store._connection.execute(
+            "SELECT chain_tag FROM nonce_tombstones WHERE sequence=1"
+        ).fetchone()[0]
+        store.close()
+        connection = sqlite3.connect(tmp_path / "state" / "mattermost-outbox.sqlite3")
+        try:
+            connection.execute("DELETE FROM nonce_tombstones WHERE sequence > 1")
+            connection.execute("UPDATE nonce_registry SET sequence=1, root_tag=? WHERE singleton=1", (first_root,))
+            connection.commit()
+        finally:
+            connection.close()
+        with pytest.raises(ContractError, match="nonce registry"):
+            MattermostOutbox.open(
+                tmp_path / "state", tmp_path / "key", expected_fingerprint=key_fingerprint(bytes(range(32)))
+            )
+    finally:
+        try:
+            store.close()
+        except sqlite3.ProgrammingError:
+            pass
+
+
 def test_runtime_open_probes_state_directory_writability_before_using_the_database(tmp_path, monkeypatch):
     store = _store(tmp_path)
     key_path = tmp_path / "key"
