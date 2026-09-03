@@ -40,9 +40,9 @@ _ENVELOPE_FIELDS = {
 }
 _CLINICAL_ENVELOPE_FIELDS = {
     "schema_version", "tenant_id", "origin", "channel_id", "root_id", "source_id", "actor_id",
-    "patient_id", "operation", "request_id", "source_message", "clinical_policy_id", "policy_epoch", "policy_digest",
+    "patient_id", "operation", "request_id", "source_message", "integration_id", "clinical_policy_id", "policy_epoch", "policy_digest",
     "key_fingerprint", "policy_expires_at", "payload_expires_at", "clinic_timezone", "appointment",
-    "response", "pending_post_id", "returned_post_id",
+    "response", "response_digest", "pending_post_id", "returned_post_id",
 }
 _ROW_FIELDS = (
     "record_tag", "source_tag", "root_tag", "state", "generation", "created_at", "updated_at",

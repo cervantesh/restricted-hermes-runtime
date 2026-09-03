@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import http.client
+import hashlib
+import json
 import logging
 import re
 import socket
@@ -157,9 +159,10 @@ _CLINICAL_APPOINTMENT_STATUSES = {
 }
 
 
-def _valid_clinical_wire_request(body: dict[str, Any]) -> bool:
+def _valid_clinical_wire_request(body: dict[str, Any], *, delivery: bool = False) -> bool:
+    fields = _CLINICAL_WIRE_FIELDS | ({"responseDigest"} if delivery else set())
     return (
-        set(body) == _CLINICAL_WIRE_FIELDS
+        set(body) == fields
         and isinstance(body.get("mattermostActorId"), str)
         and re.fullmatch(r"[a-z0-9]{26}", body["mattermostActorId"]) is not None
         and isinstance(body.get("patientId"), str) and _PATIENT_UUID.fullmatch(body["patientId"]) is not None
@@ -168,6 +171,10 @@ def _valid_clinical_wire_request(body: dict[str, Any]) -> bool:
         and body.get("clinicalPolicyId") == "clinical-read-v1"
         and isinstance(body.get("policyEpoch"), str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", body["policyEpoch"]) is not None
         and isinstance(body.get("policyDigest"), str) and re.fullmatch(r"[0-9a-f]{64}", body["policyDigest"]) is not None
+        and (not delivery or (
+            isinstance(body.get("responseDigest"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", body["responseDigest"]) is not None
+        ))
     )
 
 
@@ -186,6 +193,25 @@ def _valid_clinical_appointment(appointment: Any) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _clinical_response_digest(result: dict[str, Any]) -> str:
+    """Hash the frozen HRH projection using its explicit insertion order."""
+    appointment = result.get("appointment")
+    closed: dict[str, Any] = {
+        "clinicTimezone": result.get("clinicTimezone"),
+        "appointment": None,
+    }
+    if isinstance(appointment, dict):
+        closed["appointment"] = {
+            "id": appointment.get("id"),
+            "date": appointment.get("date"),
+            "time": appointment.get("time"),
+            "duration": appointment.get("duration"),
+            "status": appointment.get("status"),
+        }
+    raw = json.dumps(closed, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 class Ingress:
@@ -339,12 +365,14 @@ class Ingress:
             "actor_id": post["user_id"], "patient_id": patient_id, "operation": "next-appointment",
             "request_id": request_identity(self.policy.values["tenant_id"], self.policy.origin, post["channel_id"], post["id"]),
             "source_message": post["message"],
+            "integration_id": self.policy.values["clinical_integration_id"],
             "clinical_policy_id": self.policy.values["clinical_policy_id"],
             "policy_epoch": self.policy.values["policy_epoch"], "policy_digest": self.policy.digest,
             "key_fingerprint": self.policy.values["outbox_key_fingerprint"],
             "policy_expires_at": expires,
             "payload_expires_at": min(expires, now + self.policy.values["outbox_payload_retention_seconds"]),
             "clinic_timezone": None, "appointment": None, "response": None,
+            "response_digest": None,
             "pending_post_id": str(uuid.uuid5(_NAMESPACE, "clinical-delivery\x00" + post["id"])),
             "returned_post_id": None,
         }
@@ -355,6 +383,7 @@ class Ingress:
             or envelope["policy_digest"] != self.policy.digest
             or envelope["key_fingerprint"] != self.policy.values["outbox_key_fingerprint"]
             or envelope["clinical_policy_id"] != self.policy.values["clinical_policy_id"]
+            or envelope["integration_id"] != self.policy.values["clinical_integration_id"]
             or envelope["operation"] != "next-appointment"
             or not isinstance(envelope["patient_id"], str) or _PATIENT_UUID.fullmatch(envelope["patient_id"]) is None
             or envelope["request_id"] != request_identity(
@@ -584,7 +613,7 @@ class SerializedDeliveryExecutor:
         if record.state is DeliveryState.WAITING_COMMIT:
             request = {
                 "mattermostActorId": envelope["actor_id"], "patientId": envelope["patient_id"],
-                "requestId": envelope["request_id"], "integrationId": self.ingress.policy.values["clinical_integration_id"],
+                "requestId": envelope["request_id"], "integrationId": envelope["integration_id"],
                 "clinicalPolicyId": envelope["clinical_policy_id"], "policyEpoch": envelope["policy_epoch"],
                 "policyDigest": envelope["policy_digest"],
             }
@@ -592,7 +621,7 @@ class SerializedDeliveryExecutor:
                 result = self.ingress.clinical.query(request)
             except (ContractError, OSError, TimeoutError, ValueError):
                 return
-            expected = {"clinicTimezone", "appointment"}
+            expected = {"clinicTimezone", "appointment", "responseDigest"}
             appointment = result.get("appointment") if isinstance(result, dict) else None
             if not isinstance(result, dict) or set(result) != expected:
                 self._block_or_expire(record, "clinical_query_not_authorized")
@@ -600,10 +629,19 @@ class SerializedDeliveryExecutor:
             if result.get("clinicTimezone") != self.ingress.policy.values["clinical_timezone"]:
                 self._block_or_expire(record, "clinical_query_timezone")
                 return
+            response_digest = result.get("responseDigest")
+            if (
+                not isinstance(response_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", response_digest) is None
+                or response_digest != _clinical_response_digest(result)
+            ):
+                self._block_or_expire(record, "clinical_query_digest")
+                return
             if appointment is None:
                 response = "No upcoming appointment found."
                 record = self.ingress.outbox.mark_ready(record, {
-                    **envelope, "clinic_timezone": result.get("clinicTimezone"), "appointment": None, "response": response,
+                    **envelope, "clinic_timezone": result.get("clinicTimezone"), "appointment": None,
+                    "response": response, "response_digest": response_digest,
                 })
                 envelope = record.envelope
             else:
@@ -612,7 +650,8 @@ class SerializedDeliveryExecutor:
                     return
                 response = f"Next appointment: {appointment['date']} at {appointment['time']} {result['clinicTimezone']} ({appointment['status']}, {appointment['duration']} minutes)."
                 record = self.ingress.outbox.mark_ready(record, {
-                    **envelope, "clinic_timezone": result["clinicTimezone"], "appointment": appointment, "response": response,
+                    **envelope, "clinic_timezone": result["clinicTimezone"], "appointment": appointment,
+                    "response": response, "response_digest": response_digest,
                 })
                 envelope = record.envelope
         if record.state is not DeliveryState.READY or envelope is None or not self._expiry_fence(record):
@@ -621,9 +660,10 @@ class SerializedDeliveryExecutor:
             self.ingress._revalidate_clinical_envelope(envelope)
             authorization = self.ingress.clinical.reauthorize_delivery({
                 "mattermostActorId": envelope["actor_id"], "patientId": envelope["patient_id"],
-                "requestId": envelope["request_id"], "integrationId": self.ingress.policy.values["clinical_integration_id"],
+                "requestId": envelope["request_id"], "integrationId": envelope["integration_id"],
                 "clinicalPolicyId": envelope["clinical_policy_id"], "policyEpoch": envelope["policy_epoch"],
                 "policyDigest": envelope["policy_digest"],
+                "responseDigest": envelope["response_digest"],
             })
         except DefinitiveMattermostError:
             self._block_or_expire(record, "delivery_authorization_rejected")
@@ -831,22 +871,24 @@ class ClinicalQueryUdsClient:
     def _request(self, endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
         if endpoint not in {"/v1/clinical/query", "/v1/clinical/reauthorize-delivery"}:
             raise ContractError("clinical query endpoint rejected")
-        if not isinstance(body, dict) or not _valid_clinical_wire_request(body):
+        delivery = endpoint == "/v1/clinical/reauthorize-delivery"
+        if not isinstance(body, dict) or not _valid_clinical_wire_request(body, delivery=delivery):
             raise ContractError("clinical query request schema rejected")
         payload = jcs_bytes(body)
         deadline = time.monotonic() + self.policy.values["uds_timeout_seconds"]
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                client.settimeout(min(5, max(0.001, deadline - time.monotonic())))
+                client.settimeout(max(0.001, deadline - time.monotonic()))
                 client.connect(self.path)
                 wire = b"POST " + endpoint.encode("ascii") + b" HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
+                client.settimeout(max(0.001, deadline - time.monotonic()))
                 client.sendall(wire)
                 chunks, total = [], 0
                 while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError
-                    client.settimeout(min(5, remaining))
+                    client.settimeout(remaining)
                     chunk = client.recv(min(65536, _MAX_HTTP_BYTES + 1 - total))
                     if not chunk:
                         break

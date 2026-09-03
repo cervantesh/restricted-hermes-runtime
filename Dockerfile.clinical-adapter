@@ -1,0 +1,19 @@
+FROM python:3.11-slim AS builder
+WORKDIR /build
+COPY pyproject.toml ./
+COPY src ./src
+RUN pip install --no-cache-dir --no-deps . \
+ && find /usr/local/lib/python3.11/site-packages/restricted_runtime -type f -name '*.py' \
+      ! -name '__init__.py' ! -name 'contracts.py' ! -name 'clinical_adapter.py' \
+      ! -name 'production_clinical_adapter.py' -delete \
+ && find /usr/local/lib/python3.11/site-packages/restricted_runtime -type d -name __pycache__ -prune -exec rm -rf {} +
+
+FROM python:3.11-slim
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+RUN groupadd --system --gid 20006 restricted-clinical-query \
+ && groupadd --system --gid 20007 restricted-clinical-adapter \
+ && useradd --system --uid 10008 --gid 20007 --groups 20006 restricted-clinical-adapter
+USER restricted-clinical-adapter
+CMD ["python", "-m", "restricted_runtime.services.production_clinical_adapter"]
