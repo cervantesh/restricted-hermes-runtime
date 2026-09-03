@@ -245,21 +245,38 @@ class ConversationUdsClient:
             raise ContractError("conversation socket path rejected")
         self.policy, self.path = policy, path
 
-    def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
         payload = b"" if body is None else jcs_bytes(body)
-        deadline = time.monotonic() + self.policy.values["uds_timeout_seconds"]
+        request_deadline = time.monotonic() + self.policy.values["uds_timeout_seconds"]
+        if deadline is not None:
+            request_deadline = min(request_deadline, deadline)
+
+        def remaining_timeout() -> float:
+            remaining = request_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            # Preserve the existing five-second socket-operation cap while
+            # never allowing an operation beyond its request/shared deadline.
+            return min(5, remaining)
+
         try:
+            remaining_timeout()
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                client.settimeout(min(5, max(0.001, deadline - time.monotonic())))
+                client.settimeout(remaining_timeout())
                 client.connect(self.path)
                 wire = method.encode() + b" " + path.encode() + b" HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload
+                client.settimeout(remaining_timeout())
                 client.sendall(wire)
                 chunks, total = [], 0
                 while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError
-                    client.settimeout(min(5, remaining))
+                    client.settimeout(remaining_timeout())
                     chunk = client.recv(min(65536, _MAX_HTTP_BYTES + 1 - total))
                     if not chunk:
                         break
@@ -273,6 +290,9 @@ class ConversationUdsClient:
             value = load_closed_json(raw)
             if not isinstance(value, dict):
                 raise ContractError("conversation response rejected")
+            # Decoding/shape validation can itself consume the last budget.
+            # Do not let a valid-but-late response escape this request.
+            remaining_timeout()
             return value
         except ContractError:
             raise
@@ -282,14 +302,20 @@ class ConversationUdsClient:
     def ready(self): return self._request("GET", "/readyz")
 
     def submit(self, *, conversation_id: str, client_request_id: str, message: str):
-        created = self._request("POST", "/v1/restricted/conversations/" + conversation_id)
+        deadline = time.monotonic() + self.policy.values["conversation_deadline_seconds"]
+        created = self._request("POST", "/v1/restricted/conversations/" + conversation_id, deadline=deadline)
         if created.get("conversation_id") != conversation_id or not isinstance(created.get("conversation_epoch"), str):
             raise ContractError("conversation creation response rejected")
+        if deadline - time.monotonic() <= 0:
+            raise ContractError("conversation transport failed")
         result = self._request(
             "POST", "/v1/restricted/conversations/" + conversation_id + "/turns",
             {"schema_version": "restricted-turn.v1", "client_request_id": client_request_id,
              "conversation_epoch": created["conversation_epoch"], "message": message},
+            deadline=deadline,
         )
         if set(result) != {"schema_version", "turn_id", "conversation_epoch", "status", "message"}:
             raise ContractError("conversation turn response rejected")
+        if deadline - time.monotonic() <= 0:
+            raise ContractError("conversation transport failed")
         return result
