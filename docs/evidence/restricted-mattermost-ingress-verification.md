@@ -2,7 +2,11 @@
 
 All message data used in this verification was synthetic and explicitly non-PHI.
 
-## Frozen frame
+## Historical initial slice — SG-MATTERMOST-001
+
+This section preserves the original, pre-outbox implementation evidence. Its
+suite totals and residual boundary are historical, not a statement of the
+current SG-MM-OUTBOX-007 delivery behavior.
 
 - Contract: `SG-MATTERMOST-001`
 - Base: `2f6f116e2818189c436cb51b547cd01bd285f94e`
@@ -52,10 +56,47 @@ DSN rather than its required private-socket/password fixture, and `test_runtime_
 unconfigured conversation root to report ready even though the current production contract
 returns 503. The focused Mattermost tests and real POSIX process suite are independent of both.
 
-## Residual boundary
+## SG-MM-OUTBOX-007 completion evidence
 
-The live-process single-flight proves one inference and one outbound create attempt for concurrent
-duplicates and timeout-after-accept ambiguity. Crash-safe exactly-once response delivery is not
-claimed. That requires a durable delivery outbox or independently verified server-side idempotency.
-Real Mattermost deployment, PHI authorization, HIPAA/BAA conformance, IdP operations, retention,
-audit, backups, patching, and network egress enforcement remain operator gates.
+- Contract: `SG-MM-OUTBOX-007`
+- Implementation base: `f9ef9f4518ef217e9382635715760177fb749789`
+- Final implementation head: `5dabdacbf8eeca8788835c0fe2c136b2e1a45ff9`
+- Scope: encrypted durable local delivery outbox and bounded recovery for the
+  restricted Mattermost ingress. The historical SG-MATTERMOST-001 evidence
+  above remains preserved as the initial slice.
+
+### TDD and adversarial receipts
+
+- RED cases were captured before each closure, including terminal metadata and
+  nonce-registry tampering, readiness-binding bypass, expiry at every
+  irreversible boundary, malformed successful REST shapes, crash windows, and
+  recovery fairness.
+- Process witnesses cover crash windows around durable reservation, inference
+  turn, delivery claim, and posting boundaries. A post-claim restart becomes
+  `AMBIGUOUS`; it is never retried.
+- Installed-wheel directed mutations individually bite for payload encryption,
+  durable terminal metadata, nonce reuse/history, readiness binding, source and
+  root fences, CAS, stale in-flight handling, and recovery identity.
+- Windows focused evidence: `107 passed, 7 skipped`.
+- Linux installed-wheel/process causal evidence: `131 passed, 1 skipped`.
+- Real PostgreSQL recovery witness: `1 passed`.
+- Exact Mattermost `11.7.10` acceptance: `PASS`.
+- Hosted CI run `33745519719`: green.
+
+## Current residual and operating boundary
+
+Delivery is duplicate-averse, not exactly-once. The durable outbox is now part
+of this implementation; it does not turn a completed Mattermost post into an
+exactly-once protocol. `AMBIGUOUS` records are never retried, and the runtime
+does not catch up unseen Mattermost events while it was down.
+
+This remains a single-replica design over one protected local state volume.
+Operators own capacity sizing, terminal-record reset, key custody and rotation,
+and backup/restore. The keyed nonce-history and row authentication fail closed
+for local deletion or alteration, but a coherent rollback to an older complete
+state volume cannot be distinguished without an external anchor.
+
+All verification messages were synthetic and non-PHI. This evidence makes no
+claim of production PHI authorization, HIPAA/BAA or other compliance, IdP
+operation, retention, audit, backups, patching, or network-egress enforcement;
+those remain operator controls.
