@@ -91,10 +91,13 @@ exactly-once protocol. `AMBIGUOUS` records are never retried, and the runtime
 does not catch up unseen Mattermost events while it was down.
 
 This remains a single-replica design over one protected local state volume.
-Operators own capacity sizing, terminal-record reset, key custody and rotation,
-and backup/restore. The keyed nonce-history and row authentication fail closed
-for local deletion or alteration, but a coherent rollback to an older complete
-state volume cannot be distinguished without an external anchor.
+Operators own capacity sizing, whole-database retirement/reset, key custody and
+rotation, and backup/restore. The keyed nonce history and row authentication
+detect uncoordinated local deletion or alteration. A coordinated rollback of
+nonce history and its authenticated root/sequence to a previously valid prefix
+is indistinguishable without an external monotonic anchor, even if other rows
+remain newer. This is the same excluded rollback class: operators must not
+partially restore or edit state.
 
 All verification messages were synthetic and non-PHI. This evidence makes no
 claim of production PHI authorization, HIPAA/BAA or other compliance, IdP
