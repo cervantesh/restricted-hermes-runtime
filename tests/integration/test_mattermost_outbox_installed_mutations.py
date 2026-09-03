@@ -318,3 +318,40 @@ r,_=store.reserve(e,payload_capacity=3,tombstone_capacity=3); client=Conversatio
         server.shutdown()
         server.server_close()
         socket_path.unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL"),
+    reason="requires isolated PostgreSQL and POSIX AF_UNIX",
+)
+def test_installed_recovery_cannot_regenerate_epoch_or_request_after_restart(installed_artifact, tmp_path):
+    """The real PostgreSQL witness must retain the encrypted epoch/request.
+
+    The existing witness drives the actual ``ConversationService`` and its
+    PostgreSQL stores; only its provider is counting.  Running it in a child
+    with a copied wheel proves import resolution targets the installed runtime.
+    The directed mutant changes the recovery executor's persisted identity to
+    a new epoch/request.  Its failure is the forbidden second inference or
+    invalid replay, never a permitted recovery result.
+    """
+    target = "tests/integration/test_mattermost_outbox_postgres_recovery.py::test_real_postgres_recovery_replays_original_epoch_without_second_provider_dispatch"
+
+    def run(site: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+                [sys.executable, "-B", "-m", "pytest", "-vv", target], cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(site), "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True, text=True, timeout=90,
+        )
+
+    baseline = run(_copy_artifact(installed_artifact, tmp_path / "baseline"))
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_ingress.py",
+        "envelope = record.envelope\n        if envelope is None:",
+        'envelope = {**record.envelope, "conversation_epoch": None, "client_request_id": str(uuid.uuid4())}\n        if envelope is None:',
+    )
+    result = run(mutant)
+    assert result.returncode != 0
+    assert "calls" in result.stdout + result.stderr
