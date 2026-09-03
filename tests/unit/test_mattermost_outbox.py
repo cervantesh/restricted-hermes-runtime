@@ -57,7 +57,7 @@ def test_nonce_registry_rejects_repeated_entropy_for_the_lifetime_of_a_database_
         store.terminal(first, DeliveryState.BLOCKED, reason="test_terminal")
         with pytest.raises(ContractError, match="nonce reuse"):
             store.reserve(_envelope(source="second-source", root="second-root"), payload_capacity=3, tombstone_capacity=3)
-        assert store._connection.execute("SELECT COUNT(*) FROM nonce_tombstones").fetchone()[0] == 1
+        assert store._connection.execute("SELECT COUNT(*) FROM nonce_tombstones").fetchone()[0] == 2
         assert store._connection.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 1
         reopened = MattermostOutbox.open(
             tmp_path / "state", tmp_path / "key", expected_fingerprint=key_fingerprint(bytes(range(32)))
@@ -115,6 +115,70 @@ def test_nonce_registry_prefix_rollback_is_fatal_while_newer_terminal_row_remain
         finally:
             connection.close()
         with pytest.raises(ContractError, match="nonce registry"):
+            MattermostOutbox.open(
+                tmp_path / "state", tmp_path / "key", expected_fingerprint=key_fingerprint(bytes(range(32)))
+            )
+    finally:
+        try:
+            store.close()
+        except sqlite3.ProgrammingError:
+            pass
+
+
+def test_restoring_an_older_authentic_ready_row_after_delivery_is_fatal(tmp_path):
+    store = _store(tmp_path)
+    try:
+        waiting, _ = store.reserve(_envelope(), payload_capacity=3, tombstone_capacity=3)
+        ready = store.mark_ready(waiting, {**_envelope(), "response": "answer"})
+        ready_snapshot = store._connection.execute(
+            "SELECT state,generation,updated_at,nonce_sequence,nonce,ciphertext,reason,returned_post_tag,auth_tag FROM records WHERE record_tag=?",
+            (ready.record_tag,),
+        ).fetchone()
+        claimed = store.claim_delivery(ready)
+        assert claimed is not None
+        assert store.delivered(claimed, returned_post_id="returned") is not None
+        connection = sqlite3.connect(tmp_path / "state" / "mattermost-outbox.sqlite3")
+        try:
+            connection.execute(
+                "UPDATE records SET state=?,generation=?,updated_at=?,nonce_sequence=?,nonce=?,ciphertext=?,reason=?,returned_post_tag=?,auth_tag=? WHERE record_tag=?",
+                tuple(ready_snapshot) + (ready.record_tag,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with pytest.raises(ContractError, match="record history"):
+            store.get(ready.record_tag)
+        store.close()
+        with pytest.raises(ContractError, match="record history"):
+            MattermostOutbox.open(
+                tmp_path / "state", tmp_path / "key", expected_fingerprint=key_fingerprint(bytes(range(32)))
+            )
+    finally:
+        try:
+            store.close()
+        except sqlite3.ProgrammingError:
+            pass
+
+
+def test_deleting_an_older_terminal_row_is_fatal_while_newer_terminal_history_remains(tmp_path):
+    store = _store(tmp_path)
+    try:
+        first, _ = store.reserve(_envelope(), payload_capacity=3, tombstone_capacity=3)
+        assert store.terminal(first, DeliveryState.BLOCKED, reason="test_terminal") is not None
+        later, _ = store.reserve(
+            _envelope(source="second-source", root="second-root"), payload_capacity=3, tombstone_capacity=3
+        )
+        assert store.terminal(later, DeliveryState.BLOCKED, reason="test_terminal") is not None
+        connection = sqlite3.connect(tmp_path / "state" / "mattermost-outbox.sqlite3")
+        try:
+            connection.execute("DELETE FROM records WHERE record_tag=?", (first.record_tag,))
+            connection.commit()
+        finally:
+            connection.close()
+        with pytest.raises(ContractError, match="record history"):
+            store.reserve(_envelope(), payload_capacity=3, tombstone_capacity=3)
+        store.close()
+        with pytest.raises(ContractError, match="record history"):
             MattermostOutbox.open(
                 tmp_path / "state", tmp_path / "key", expected_fingerprint=key_fingerprint(bytes(range(32)))
             )
