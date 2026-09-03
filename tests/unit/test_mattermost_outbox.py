@@ -230,6 +230,67 @@ except ContractError:
         store.close()
 
 
+def test_startup_acquires_exclusive_writer_before_its_first_integrity_read(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    key_path = tmp_path / "key"
+    record, _ = store.reserve(_envelope(), payload_capacity=3, tombstone_capacity=3)
+    store.close()
+    original_connect = mattermost_outbox.sqlite3.connect
+    writer_outcomes = []
+    writer = r'''
+import sqlite3, sys
+connection = None
+try:
+    connection = sqlite3.connect(sys.argv[1], isolation_level=None, timeout=0)
+    connection.execute("PRAGMA busy_timeout=0")
+    cursor = connection.execute("DELETE FROM records WHERE record_tag=?", (sys.argv[2],))
+    print("corrupted" if cursor.rowcount == 1 else "missing")
+except sqlite3.Error:
+    print("blocked")
+finally:
+    if connection is not None:
+        connection.close()
+'''
+
+    class ProbeConnection:
+        def __init__(self, inner):
+            object.__setattr__(self, "inner", inner)
+            object.__setattr__(self, "probed", False)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def __setattr__(self, name, value):
+            if name in {"inner", "probed"}:
+                object.__setattr__(self, name, value)
+            else:
+                setattr(self.inner, name, value)
+
+        def execute(self, statement, *args, **kwargs):
+            if statement == "PRAGMA integrity_check" and not self.probed:
+                self.probed = True
+                result = subprocess.run(
+                    [sys.executable, "-c", writer, str(tmp_path / "state" / "mattermost-outbox.sqlite3"), record.record_tag],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=10,
+                )
+                writer_outcomes.append(result.stdout.strip())
+            return self.inner.execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(mattermost_outbox.sqlite3, "connect", lambda *args, **kwargs: ProbeConnection(original_connect(*args, **kwargs)))
+    reopened = MattermostOutbox.open(
+        tmp_path / "state", key_path, expected_fingerprint=key_fingerprint(bytes(range(32)))
+    )
+    try:
+        assert writer_outcomes == ["blocked"]
+        assert reopened.get(record.record_tag) is not None
+        assert not reopened._connection.in_transaction
+    finally:
+        reopened.close()
+
+
 def test_aad_tag_tampering_and_wrong_key_fail_before_record_use(tmp_path):
     store = _store(tmp_path)
     try:
