@@ -45,3 +45,15 @@ def test_clinical_e2e_proves_clean_descendant_sources_and_exact_post_cardinality
     assert "len(responses) != 1" in control
     assert "final-denial-sweep" in runner
     assert "post_count" in control
+
+
+def test_clinical_e2e_uses_current_hrh_build_provenance_and_atomic_policy_refresh():
+    compose = (HARNESS / "compose.yaml").read_text(encoding="utf-8")
+    runner = (ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py").read_text(encoding="utf-8")
+    control = (HARNESS / "control.py").read_text(encoding="utf-8")
+
+    assert "BUILD_SHA: ${CLINICAL_HRH_BUILD_SHA:?required}" in compose
+    assert 'HRH_SHA = "89fea476ef95a0dfd3cd60a587ec6cb9e1d3aa1f"' in runner
+    assert '"CLINICAL_HRH_BUILD_SHA": HRH_SHA' in runner
+    assert "os.replace" in control
+    assert 'command == "policy-digest"' in control

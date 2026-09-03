@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -214,6 +215,9 @@ def seed_hrh() -> None:
 
 
 def policy_private() -> Ed25519PrivateKey:
+    seeded = SEED / "policy-private.pem"
+    if seeded.exists():
+        return serialization.load_pem_private_key(seeded.read_bytes(), password=None)
     path = STATE / "policy-private.pem"
     if path.exists():
         return serialization.load_pem_private_key(path.read_bytes(), password=None)
@@ -222,18 +226,75 @@ def policy_private() -> Ed25519PrivateKey:
     return private
 
 
-def activate_policy() -> None:
+def verify_policy_pair(directory: Path, public_key: Any) -> str:
+    raw = (directory / "policy.json").read_bytes()
+    try:
+        signature = base64.b64decode((directory / "policy.sig").read_bytes(), validate=True)
+        public_key.verify(signature, raw)
+    except Exception as exc:
+        raise RuntimeError("policy/signature mismatch") from exc
+    return hashlib.sha256(raw).hexdigest()
+
+
+def install_policy_pair(
+    directory: Path,
+    raw: bytes,
+    signature: bytes,
+    public_key: Any,
+    *,
+    owner: tuple[int, int] | None = None,
+    fail_at: str | None = None,
+) -> str:
+    replacements = {"policy.json": raw, "policy.sig": signature}
+    for name, payload in replacements.items():
+        temporary = directory / (name + ".new")
+        if temporary.exists():
+            os.chmod(temporary, 0o600)
+            temporary.unlink()
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if owner is not None:
+            os.chown(temporary, *owner)
+        os.chmod(temporary, 0o440)
+    if fail_at == "before-signature":
+        raise RuntimeError("injected failure before signature replace")
+    if os.name == "nt" and (directory / "policy.sig").exists():
+        os.chmod(directory / "policy.sig", 0o600)
+    os.replace(directory / "policy.sig.new", directory / "policy.sig")
+    if fail_at == "before-policy":
+        raise RuntimeError("injected failure before policy replace")
+    if os.name == "nt" and (directory / "policy.json").exists():
+        os.chmod(directory / "policy.json", 0o600)
+    os.replace(directory / "policy.json.new", directory / "policy.json")
+    os.chmod(directory / "policy.sig", 0o440)
+    os.chmod(directory / "policy.json", 0o440)
+    if hasattr(os, "O_DIRECTORY"):
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    return verify_policy_pair(directory, public_key)
+
+
+def activate_policy(epoch: str = "clinical-e1", validity_seconds: int = 3600) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", epoch):
+        raise RuntimeError("invalid synthetic policy epoch")
+    if not -3600 <= validity_seconds <= 86400:
+        raise RuntimeError("invalid synthetic policy lifetime")
     topology = json.loads((STATE / "topology.json").read_text())
     now = datetime.now(UTC).replace(microsecond=0)
     value = {
-        "schema_version": "restricted-mattermost-ingress-policy.v1", "policy_epoch": "clinical-e1",
-        "inference_policy_epoch": "clinical-e1", "inference_policy_digest": "a" * 64,
+        "schema_version": "restricted-mattermost-ingress-policy.v1", "policy_epoch": epoch,
+        "inference_policy_epoch": epoch, "inference_policy_digest": "a" * 64,
         "tenant_id": "clinicaltenant", "origin": "https://mattermost:8065", "team_id": "not-used-clinical",
         "allowed_channel_ids": [topology["actor_dm"]], "allowed_user_ids": [topology["actor_id"]],
         "bot_user_id": topology["bot_id"], "bot_username": "clinicalbot", "allowed_modality": "text",
         "dms_allowed": False, "files_allowed": False, "delivery_mode": "thread-only", "initiation_mode": "explicit-mention",
         "max_message_utf8_bytes": 4096, "not_before": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
-        "expires_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"), "clock_skew_seconds": 30,
+        "expires_at": (now + timedelta(seconds=validity_seconds)).isoformat().replace("+00:00", "Z"), "clock_skew_seconds": 30,
         "websocket_timeout_seconds": 10, "rest_timeout_seconds": 10, "uds_timeout_seconds": 15,
         "conversation_deadline_seconds": 15, "outbox_key_fingerprint": key_fingerprint((INGRESS / "outbox.key").read_bytes()),
         "outbox_payload_retention_seconds": 3600, "outbox_payload_capacity": 100, "outbox_tombstone_capacity": 100,
@@ -244,13 +305,20 @@ def activate_policy() -> None:
     }
     raw = jcs_bytes(value)
     private = policy_private()
-    (INGRESS / "policy.json").write_bytes(raw)
-    (INGRESS / "policy.sig").write_text(base64.b64encode(private.sign(raw)).decode(), encoding="ascii")
+    install_policy_pair(
+        INGRESS,
+        raw,
+        base64.b64encode(private.sign(raw)),
+        private.public_key(),
+        owner=(10007, 20005),
+        fail_at=os.environ.get("CLINICAL_POLICY_INSTALL_FAIL_AT"),
+    )
     _copy(SEED / "ca.crt", INGRESS / "ca.crt", uid=10007, gid=20005, mode=0o444)
-    for name in ("policy.json", "policy.sig"):
-        os.chown(INGRESS / name, 10007, 20005)
-        os.chmod(INGRESS / name, 0o440)
     (STATE / "policy-public").write_text(base64.b64encode(private.public_key().public_bytes_raw()).decode(), encoding="ascii")
+
+
+def policy_digest() -> str:
+    return verify_policy_pair(INGRESS, policy_private().public_key())
 
 
 def initialize_outbox() -> None:
@@ -491,7 +559,14 @@ def main() -> None:
     elif command == "seed-hrh":
         seed_hrh()
     elif command == "policy":
-        activate_policy()
+        activate_policy(
+            sys.argv[2] if len(sys.argv) > 2 else "clinical-e1",
+            int(sys.argv[3]) if len(sys.argv) > 3 else 3600,
+        )
+    elif command == "policy-digest":
+        print(policy_digest())
+    elif command == "policy-verify":
+        print(policy_digest())
     elif command == "public-key":
         print((STATE / "policy-public").read_text())
     elif command == "outbox-init":
