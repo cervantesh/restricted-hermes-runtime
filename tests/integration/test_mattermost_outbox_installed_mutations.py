@@ -194,7 +194,7 @@ def test_installed_nonce_registry_mutation_allows_repeated_entropy_reuse(install
     _mutate(
         mutant,
         "restricted_runtime/mattermost_outbox.py",
-        'self._connection.execute("INSERT INTO nonce_tombstones(nonce) VALUES(?)", (nonce,))',
+        'self._connection.execute(\n                    "INSERT INTO nonce_tombstones(sequence,nonce,chain_tag) VALUES(?,?,?)",\n                    (sequence, nonce, chain_tag),\n                )',
         "pass",
     )
     assert _run(mutant, _NONCE_REUSE_PROGRAM) == {"outcome": "reused", "nonces": 0}

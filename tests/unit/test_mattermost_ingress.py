@@ -702,7 +702,30 @@ def _expiring_waiting_record(service, source, *, expires_at=100):
     )[0]
 
 
-def test_recovery_expiry_fence_stops_before_conversation_after_slow_authorization(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("field", "state"),
+    [("payload_expires_at", DeliveryState.EXPIRED), ("policy_expires_at", DeliveryState.BLOCKED)],
+)
+def test_recovery_expiry_fence_is_exclusive_at_the_exact_signed_wall_clock(tmp_path, monkeypatch, field, state):
+    service, rest, conversation = ingress(tmp_path)
+    clock = {"now": 100}
+    monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
+    source = post()
+    envelope = {
+        **service._envelope(source, service._authorize_source(source)),
+        "payload_expires_at": 4_000_000_000,
+        "policy_expires_at": 4_000_000_000,
+        field: 100,
+    }
+    record, _ = service.outbox.reserve(envelope, payload_capacity=1000, tombstone_capacity=1000)
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is state
+    assert conversation.deadlines == [] and conversation.calls == [] and rest.created == []
+
+
+@pytest.mark.parametrize("expiry_now", [101, 100], ids=["after-expiry", "at-expiry"])
+def test_recovery_expiry_fence_stops_before_conversation_after_slow_authorization(tmp_path, monkeypatch, expiry_now):
     service, rest, conversation = ingress(tmp_path)
     clock = {"now": 90}
     monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
@@ -711,7 +734,7 @@ def test_recovery_expiry_fence_stops_before_conversation_after_slow_authorizatio
 
     def auth_then_expire(**kwargs):
         value = original_me(**kwargs)
-        clock["now"] = 101
+        clock["now"] = expiry_now
         return value
 
     rest.get_me = auth_then_expire
@@ -721,7 +744,8 @@ def test_recovery_expiry_fence_stops_before_conversation_after_slow_authorizatio
     assert conversation.deadlines == [] and conversation.calls == [] and rest.created == []
 
 
-def test_recovery_expiry_fence_stops_before_conversation_after_slow_readiness(tmp_path, monkeypatch):
+@pytest.mark.parametrize("expiry_now", [101, 100], ids=["after-expiry", "at-expiry"])
+def test_recovery_expiry_fence_stops_before_conversation_after_slow_readiness(tmp_path, monkeypatch, expiry_now):
     service, rest, conversation = ingress(tmp_path)
     clock = {"now": 90}
     monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
@@ -730,7 +754,7 @@ def test_recovery_expiry_fence_stops_before_conversation_after_slow_readiness(tm
 
     def readiness_then_expire():
         value = original_ready()
-        clock["now"] = 101
+        clock["now"] = expiry_now
         return value
 
     conversation.ready = readiness_then_expire
@@ -740,7 +764,8 @@ def test_recovery_expiry_fence_stops_before_conversation_after_slow_readiness(tm
     assert conversation.deadlines == [] and conversation.calls == [] and rest.created == []
 
 
-def test_recovery_expiry_fence_stops_before_turn_after_conversation_create(tmp_path, monkeypatch):
+@pytest.mark.parametrize("expiry_now", [101, 100], ids=["after-expiry", "at-expiry"])
+def test_recovery_expiry_fence_stops_before_turn_after_conversation_create(tmp_path, monkeypatch, expiry_now):
     service, rest, conversation = ingress(tmp_path)
     clock = {"now": 90}
     monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
@@ -751,7 +776,7 @@ def test_recovery_expiry_fence_stops_before_turn_after_conversation_create(tmp_p
     def create_then_expire(**kwargs):
         created.append(kwargs["conversation_id"])
         value = original_create(**kwargs)
-        clock["now"] = 101
+        clock["now"] = expiry_now
         return value
 
     conversation.create_conversation = create_then_expire
@@ -761,7 +786,8 @@ def test_recovery_expiry_fence_stops_before_turn_after_conversation_create(tmp_p
     assert len(created) == 1 and conversation.calls == [] and rest.created == []
 
 
-def test_recovery_expiry_fence_stops_after_slow_turn_before_ready_transition(tmp_path, monkeypatch):
+@pytest.mark.parametrize("expiry_now", [101, 100], ids=["after-expiry", "at-expiry"])
+def test_recovery_expiry_fence_stops_after_slow_turn_before_ready_transition(tmp_path, monkeypatch, expiry_now):
     service, rest, conversation = ingress(tmp_path)
     clock = {"now": 90}
     monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
@@ -770,7 +796,7 @@ def test_recovery_expiry_fence_stops_after_slow_turn_before_ready_transition(tmp
 
     def turn_then_expire(**kwargs):
         value = original_submit(**kwargs)
-        clock["now"] = 101
+        clock["now"] = expiry_now
         return value
 
     conversation.submit_turn = turn_then_expire
@@ -780,7 +806,8 @@ def test_recovery_expiry_fence_stops_after_slow_turn_before_ready_transition(tmp
     assert durable.generation == 2 and len(conversation.calls) == 1 and rest.created == []
 
 
-def test_recovery_expiry_fence_stops_before_post_after_claim(tmp_path, monkeypatch):
+@pytest.mark.parametrize("expiry_now", [101, 100], ids=["after-expiry", "at-expiry"])
+def test_recovery_expiry_fence_stops_before_post_after_claim(tmp_path, monkeypatch, expiry_now):
     service, rest, _conversation = ingress(tmp_path)
     clock = {"now": 90}
     monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
@@ -793,7 +820,7 @@ def test_recovery_expiry_fence_stops_before_post_after_claim(tmp_path, monkeypat
 
     def claim_then_expire(record):
         value = original_claim(record)
-        clock["now"] = 101
+        clock["now"] = expiry_now
         return value
 
     service.outbox.claim_delivery = claim_then_expire
@@ -803,7 +830,8 @@ def test_recovery_expiry_fence_stops_before_post_after_claim(tmp_path, monkeypat
     assert rest.created == []
 
 
-def test_recovery_expiry_fence_stops_before_claim_after_ready_readiness(tmp_path, monkeypatch):
+@pytest.mark.parametrize("expiry_now", [101, 100], ids=["after-expiry", "at-expiry"])
+def test_recovery_expiry_fence_stops_before_claim_after_ready_readiness(tmp_path, monkeypatch, expiry_now):
     service, rest, conversation = ingress(tmp_path)
     clock = {"now": 90}
     monkeypatch.setattr(mattermost_ingress.time, "time", lambda: clock["now"])
@@ -816,7 +844,7 @@ def test_recovery_expiry_fence_stops_before_claim_after_ready_readiness(tmp_path
 
     def readiness_then_expire():
         value = original_ready()
-        clock["now"] = 101
+        clock["now"] = expiry_now
         return value
 
     def counted_claim(record):
