@@ -410,6 +410,13 @@ def initialize_outbox() -> None:
     """Explicit one-time harness operator action; runtime startup never creates it."""
     if (OUTBOX / "mattermost-outbox.sqlite3").exists():
         return
+    # Docker creates an empty root-owned mountpoint before this explicit
+    # operator step. Remove only that exact empty directory so the runtime
+    # initializer itself creates the required 0700 state directory.
+    if OUTBOX.exists():
+        if OUTBOX.is_symlink() or not OUTBOX.is_dir() or any(OUTBOX.iterdir()):
+            raise RuntimeError("outbox volume is not an empty initialization mountpoint")
+        OUTBOX.rmdir()
     policy = json.loads((INGRESS / "policy.json").read_text(encoding="utf-8"))
     store = MattermostOutbox.initialize(
         OUTBOX,
