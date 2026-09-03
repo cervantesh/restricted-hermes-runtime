@@ -144,7 +144,6 @@ class MattermostOutbox:
                 details = state_dir.lstat()
                 if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode) or any(state_dir.iterdir()):
                     raise ContractError("Mattermost outbox initialization state is not empty")
-                _state_dir(state_dir, create=False)
             except ContractError:
                 raise
             except OSError as exc:
