@@ -109,7 +109,7 @@ def _edge_policy(runtime: PolicyBundle) -> MattermostPolicy:
         "clock_skew_seconds": 30, "websocket_timeout_seconds": 5, "rest_timeout_seconds": 5,
         "uds_timeout_seconds": 5, "conversation_deadline_seconds": 4,
         "outbox_key_fingerprint": key_fingerprint(OUTBOX_KEY), "outbox_payload_retention_seconds": 3600,
-        "outbox_payload_capacity": 100, "outbox_tombstone_capacity": 100, "outbox_scan_limit": 20,
+        "outbox_payload_capacity": 100, "outbox_tombstone_capacity": 100, "outbox_scan_limit": 20, "outbox_scan_interval_seconds": 5,
     }
     policy = MattermostPolicy(values, hashlib.sha256(jcs_bytes(values)).hexdigest())
     policy.validate()

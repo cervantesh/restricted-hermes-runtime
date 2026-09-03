@@ -26,7 +26,7 @@ dispatch. The record enters `IN_FLIGHT` before any Mattermost POST bytes are
 sent; after that point a restart, timeout, or response-binding failure becomes
 terminal `AMBIGUOUS`, never an automatic resend. This is deliberately
 duplicate-averse, at-most-one POST-attempt behavior -- it does not claim
-exactly-once posting or guaranteed eventual delivery.
+does not claim exactly-once posting or guaranteed eventual delivery.
 
 ## Operator gates
 

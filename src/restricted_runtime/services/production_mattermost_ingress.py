@@ -99,8 +99,10 @@ def run() -> None:
     delay = 1.0
     while True:
         connection = None
+        periodic_recovery = None
         try:
             connection = _authenticated_connection(ingress, token, policy, context)
+            periodic_recovery = ingress.start_periodic_recovery()
             delay = 1.0
             for raw in connection:
                 try:
@@ -113,6 +115,8 @@ def run() -> None:
         except (OSError, TimeoutError, ConnectionClosed):
             logging.getLogger("restricted_mattermost").warning("mattermost_connection_outcome=disconnected")
         finally:
+            if periodic_recovery is not None:
+                ingress.stop_periodic_recovery(periodic_recovery)
             if connection is not None:
                 connection.close()
         time.sleep(delay)

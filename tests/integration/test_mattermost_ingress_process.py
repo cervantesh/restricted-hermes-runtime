@@ -252,7 +252,7 @@ def _policy(tmp_path: Path, port: int, *, fast_timeout: bool = False):
         "outbox_payload_retention_seconds": 3600,
         "outbox_payload_capacity": 1000,
         "outbox_tombstone_capacity": 1000,
-        "outbox_scan_limit": 64,
+        "outbox_scan_limit": 64, "outbox_scan_interval_seconds": 5,
     }
     private = ed25519.Ed25519PrivateKey.generate()
     policy, signature = tmp_path / "policy.json", tmp_path / "policy.sig"
@@ -320,10 +320,9 @@ def test_production_entrypoint_real_paths_keep_diagnostics_content_free(tmp_path
             assert PeerHandler.posts[0]["channel_id"] == CHANNEL
             assert PeerHandler.posts[0]["root_id"] == ROOT_POST
         elif mode == "malformed_websocket":
-            time.sleep(3)
             assert ConversationHandler.turns == 0
             assert PeerHandler.posts == []
-            assert PeerHandler.websocket_connections >= 2
+            _wait_for(lambda: PeerHandler.websocket_connections >= 2, timeout=10)
         else:
             assert process.wait(timeout=10) == 1
     finally:
@@ -413,13 +412,10 @@ def _crash_wrapper(tmp_path: Path, stage: str) -> Path:
     if stage == "before_delivered_ack":
         source = """\
 import os
-from restricted_runtime.mattermost_outbox import DeliveryState, MattermostOutbox
-_original = MattermostOutbox.terminal
-def _stop(self, record, state, *, reason):
-    if state is DeliveryState.DELIVERED:
-        os._exit(86)
-    return _original(self, record, state, reason=reason)
-MattermostOutbox.terminal = _stop
+from restricted_runtime.mattermost_outbox import MattermostOutbox
+def _stop(self, record, *, returned_post_id):
+    os._exit(86)
+MattermostOutbox.delivered = _stop
 """
     elif stage == "after_reserve_before_turn":
         source = """\

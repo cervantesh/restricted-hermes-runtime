@@ -46,7 +46,7 @@ def main() -> None:
         "uds_timeout_seconds": 45, "conversation_deadline_seconds": 40,
         "outbox_key_fingerprint": args.outbox_key_fingerprint,
         "outbox_payload_retention_seconds": 3600, "outbox_payload_capacity": 1000,
-        "outbox_tombstone_capacity": 1000, "outbox_scan_limit": 64,
+        "outbox_tombstone_capacity": 1000, "outbox_scan_limit": 64, "outbox_scan_interval_seconds": 5,
     }
     document = MattermostPolicy(values, "")
     document.validate(now=datetime.now(UTC))

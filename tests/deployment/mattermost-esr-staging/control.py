@@ -372,7 +372,7 @@ def activate_policy(origin: str, ca_mode: str, token_mode: str) -> None:
         "outbox_payload_retention_seconds": 3600,
         "outbox_payload_capacity": 100,
         "outbox_tombstone_capacity": 100,
-        "outbox_scan_limit": 20,
+        "outbox_scan_limit": 20, "outbox_scan_interval_seconds": 5,
     }
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     private = _policy_private()
