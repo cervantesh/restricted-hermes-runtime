@@ -9,9 +9,11 @@ are not merely nominal unit assertions.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import shutil
 import socketserver
+import ssl
 import subprocess
 import sys
 import threading
@@ -355,3 +357,228 @@ def test_installed_recovery_cannot_regenerate_epoch_or_request_after_restart(ins
     result = run(mutant)
     assert result.returncode != 0
     assert "calls" in result.stdout + result.stderr
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or getattr(os, "geteuid", lambda: 1)() != 0,
+    reason="requires isolated Linux AF_UNIX and fixed production state paths",
+)
+def test_installed_memory_fallback_mutation_bites_after_restart(installed_artifact, tmp_path):
+    """A compound memory fallback must turn a restart into a duplicate effect.
+
+    The control starts the actual installed production module with an invalid
+    state database.  It must terminate before any Mattermost REST/WebSocket or
+    conversation UDS effect.  The directed mutant removes that barrier and
+    returns a process-local outbox with the same interface.  Running the same
+    source event through two fresh processes then proves the forbidden effect:
+    one turn and one post per restart, because the memory store forgets the
+    first reservation.
+    """
+    # The parent test process imports only the existing peer harness.  The
+    # production processes below receive a copied wheel through PYTHONPATH and
+    # never inherit this checkout import path.
+    source_path = str(ROOT / "src")
+    sys.path.insert(0, source_path)
+    harness_spec = importlib.util.spec_from_file_location(
+        "mattermost_process_harness", ROOT / "tests/integration/test_mattermost_ingress_process.py"
+    )
+    assert harness_spec and harness_spec.loader
+    harness = importlib.util.module_from_spec(harness_spec)
+    try:
+        harness_spec.loader.exec_module(harness)
+    finally:
+        sys.path.remove(source_path)
+    socket_path = harness.SOCKET
+    state_path = harness.OUTBOX_STATE
+    if socket_path.exists():
+        pytest.skip("conversation.sock already belongs to another runtime")
+    if state_path.exists():
+        pytest.skip("outbox state path already belongs to another runtime")
+
+    peer_handler = harness.PeerHandler
+    conversation_handler = harness.ConversationHandler
+    original_get = peer_handler.do_GET
+
+    def counted_get(self):
+        if self.path != "/api/v4/websocket":
+            type(self).rest_requests += 1
+        return original_get(self)
+
+    peer_handler.do_GET = counted_get
+    peer_handler.mode = "success"
+    conversation_handler.mode = "success"
+    peer = None
+    conversation = None
+    try:
+        peer_handler.rest_requests = 0
+        peer_handler.posts = []
+        peer_handler.delivered = threading.Event()
+        peer_handler.websocket_connections = 0
+        conversation_handler.turns = 0
+        key_path, cert_path = harness._certificates(tmp_path)
+        peer = harness.ThreadingHTTPServer(("127.0.0.1", 0), peer_handler)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert_path, key_path)
+        peer.socket = context.wrap_socket(peer.socket, server_side=True)
+        threading.Thread(target=peer.serve_forever, daemon=True).start()
+        socket_path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        conversation = socketserver.ThreadingUnixStreamServer(str(socket_path), conversation_handler)
+        threading.Thread(target=conversation.serve_forever, daemon=True).start()
+        policy, signature, public = harness._policy(tmp_path, peer.server_port)
+        token = tmp_path / "token"
+        token.write_text(harness.TOKEN, encoding="utf-8")
+        outbox_key = tmp_path / "outbox.key"
+        outbox_key.write_bytes(b"m" * 32)
+        os.chmod(outbox_key, 0o600)
+        state_path.mkdir(mode=0o700)
+        database = state_path / "mattermost-outbox.sqlite3"
+        database.write_bytes(b"INVALID_STATE_AFTER_RESTART")
+        os.chmod(database, 0o600)
+        environment = {
+            **os.environ,
+            "PYTHONPATH": str(ROOT / "src"),
+            "RESTRICTED_MATTERMOST_POLICY_PATH": str(policy),
+            "RESTRICTED_MATTERMOST_POLICY_SIGNATURE_PATH": str(signature),
+            "RESTRICTED_MATTERMOST_POLICY_PUBLIC_KEY_B64": public,
+            "RESTRICTED_MATTERMOST_TOKEN_PATH": str(token),
+            "RESTRICTED_MATTERMOST_CA_PATH": str(cert_path),
+            "RESTRICTED_MATTERMOST_OUTBOX_KEY_PATH": str(outbox_key),
+            "HTTP_PROXY": "http://127.0.0.1:1",
+            "HTTPS_PROXY": "http://127.0.0.1:1",
+        }
+
+        def run_process(site: Path, *, expect_success: bool) -> dict[str, int]:
+            peer_handler.posts = []
+            peer_handler.delivered = threading.Event()
+            peer_handler.websocket_connections = 0
+            peer_handler.rest_requests = 0
+            conversation_handler.turns = 0
+            env = {**environment, "PYTHONPATH": str(site)}
+            process = subprocess.Popen(
+                [sys.executable, "-B", "-m", "restricted_runtime.services.production_mattermost_ingress"],
+                cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                if expect_success:
+                    assert peer_handler.delivered.wait(15)
+                    assert conversation_handler.turns == 1
+                    assert len(peer_handler.posts) == 1
+                    return {
+                        "turns": conversation_handler.turns,
+                        "posts": len(peer_handler.posts),
+                        "websocket": peer_handler.websocket_connections,
+                        "rest": peer_handler.rest_requests,
+                    }
+                assert process.wait(timeout=10) == 1
+                return {
+                    "turns": conversation_handler.turns,
+                    "posts": len(peer_handler.posts),
+                    "websocket": peer_handler.websocket_connections,
+                    "rest": peer_handler.rest_requests,
+                }
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                stdout, stderr = process.communicate(timeout=10)
+                if not expect_success:
+                    assert "mattermost_ingress_outcome=terminal" in stdout + stderr
+
+        baseline_site = _copy_artifact(installed_artifact, tmp_path / "baseline")
+        baseline_origin = _run(
+            baseline_site,
+            'import restricted_runtime.mattermost_outbox as m, json; print(json.dumps({"module":m.__file__}))',
+        )
+        assert str(baseline_origin["module"]).startswith(str(baseline_site))
+        baseline = run_process(baseline_site, expect_success=False)
+        assert baseline == {"turns": 0, "posts": 0, "websocket": 0, "rest": 0}
+
+        mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+        memory_outbox = '''
+class _MemoryOutbox:
+    """Directed mutant only: a non-durable replacement for the real outbox."""
+    def __init__(self):
+        self.records = {}
+
+    @staticmethod
+    def _record(envelope, state, generation=0, reason=None):
+        payload = envelope if state.value not in {"DELIVERED", "AMBIGUOUS", "BLOCKED", "FAILED", "EXPIRED"} else None
+        return OutboxRecord(
+            envelope["source_id"], envelope["source_id"], envelope["root_id"], state,
+            generation, 0, 0, envelope["payload_expires_at"], envelope["policy_expires_at"], payload, reason,
+        )
+
+    def close(self):
+        return None
+
+    def reserve(self, envelope, *, payload_capacity, tombstone_capacity):
+        existing = self.records.get(envelope["source_id"])
+        if existing is not None:
+            return existing, False
+        record = self._record(envelope, DeliveryState.WAITING_COMMIT)
+        self.records[record.record_tag] = record
+        return record, True
+
+    def get(self, record_tag):
+        return self.records.get(record_tag)
+
+    def candidates(self, limit):
+        active = {DeliveryState.WAITING_COMMIT, DeliveryState.READY, DeliveryState.IN_FLIGHT}
+        return [record for record in self.records.values() if record.state in active][:limit]
+
+    def stale_inflight_to_ambiguous(self):
+        changed = 0
+        for key, record in list(self.records.items()):
+            if record.state is DeliveryState.IN_FLIGHT:
+                replacement = self._record(record.envelope, DeliveryState.AMBIGUOUS, record.generation + 1, "restart_in_flight")
+                self.records[key] = replacement
+                changed += 1
+        return changed
+
+    def update_waiting(self, record, envelope):
+        replacement = self._record(envelope, DeliveryState.WAITING_COMMIT, record.generation + 1)
+        self.records[record.record_tag] = replacement
+        return replacement
+
+    def mark_ready(self, record, envelope):
+        replacement = self._record(envelope, DeliveryState.READY, record.generation + 1)
+        self.records[record.record_tag] = replacement
+        return replacement
+
+    def claim_delivery(self, record):
+        if record.state is not DeliveryState.READY:
+            return None
+        replacement = self._record(record.envelope, DeliveryState.IN_FLIGHT, record.generation + 1)
+        self.records[record.record_tag] = replacement
+        return replacement
+
+    def terminal(self, record, state, *, reason):
+        replacement = self._record(record.envelope, state, record.generation + 1, reason)
+        self.records[record.record_tag] = replacement
+        return replacement
+'''
+        _mutate(mutant, "restricted_runtime/mattermost_outbox.py", "class MattermostOutbox:", memory_outbox + "\n\nclass MattermostOutbox:")
+        _mutate(mutant, "restricted_runtime/mattermost_outbox.py", "        _state_dir(state_dir, create=False)", "        return _MemoryOutbox()")
+        mutant_origin = _run(
+            mutant,
+            'import restricted_runtime.mattermost_outbox as m, json; print(json.dumps({"module":m.__file__}))',
+        )
+        assert str(mutant_origin["module"]).startswith(str(mutant))
+        first = run_process(mutant, expect_success=True)
+        second = run_process(mutant, expect_success=True)
+        for result in (first, second):
+            assert result["turns"] == 1
+            assert result["posts"] == 1
+            assert result["websocket"] >= 1
+            assert result["rest"] > 0
+        assert first["turns"] + second["turns"] == 2
+        assert first["posts"] + second["posts"] == 2
+    finally:
+        peer_handler.do_GET = original_get
+        if conversation is not None:
+            conversation.shutdown()
+            conversation.server_close()
+        if peer is not None:
+            peer.shutdown()
+            peer.server_close()
+        socket_path.unlink(missing_ok=True)
+        shutil.rmtree(state_path, ignore_errors=True)
