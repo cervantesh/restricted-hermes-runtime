@@ -418,6 +418,52 @@ def test_installed_exclusive_process_ownership_mutation_reopens_recovery_toctou(
     }
 
 
+_STARTUP_OWNERSHIP_PROGRAM = r'''
+import json, os, sqlite3, subprocess, sys, tempfile
+from pathlib import Path
+from restricted_runtime.contracts import ContractError
+import restricted_runtime.mattermost_outbox as module
+from restricted_runtime.mattermost_outbox import MattermostOutbox, key_fingerprint
+root=Path(tempfile.mkdtemp()); key=root/'key'; key.write_bytes(bytes(range(32))); os.chmod(key,0o600); fp=key_fingerprint(bytes(range(32)))
+env={"schema_version":"restricted-mattermost-outbox.v1","tenant_id":"tenant","origin":"https://mm.example","channel_id":"channel","root_id":"root","source_id":"source","actor_id":"actor","message":"startup owner test","conversation_id":"conversation","conversation_epoch":None,"client_request_id":"request","policy_epoch":"policy","policy_digest":"a"*64,"key_fingerprint":fp,"policy_expires_at":4000000000,"payload_expires_at":4000000000,"response":None,"pending_post_id":"pending","returned_post_id":None}
+store=MattermostOutbox.initialize(root/'state',key,expected_fingerprint=fp); record,_=store.reserve(env,payload_capacity=3,tombstone_capacity=3); store.close()
+writer="""import sqlite3,sys\nconnection=None\ntry:\n connection=sqlite3.connect(sys.argv[1],isolation_level=None,timeout=0)\n connection.execute('PRAGMA busy_timeout=0')\n cursor=connection.execute('DELETE FROM records WHERE record_tag=?',(sys.argv[2],))\n print('corrupted' if cursor.rowcount == 1 else 'missing')\nexcept sqlite3.Error:\n print('blocked')\nfinally:\n if connection is not None: connection.close()\n"""
+original=module.sqlite3.connect; outcomes=[]
+class ProbeConnection:
+ def __init__(self,inner): object.__setattr__(self,'inner',inner); object.__setattr__(self,'probed',False)
+ def __getattr__(self,name): return getattr(self.inner,name)
+ def __setattr__(self,name,value): setattr(self.inner,name,value) if name not in {'inner','probed'} else object.__setattr__(self,name,value)
+ def execute(self,statement,*args,**kwargs):
+  if statement == 'PRAGMA integrity_check' and not self.probed:
+   self.probed=True
+   outcomes.append(subprocess.run([sys.executable,'-c',writer,str(root/'state'/'mattermost-outbox.sqlite3'),record.record_tag],capture_output=True,text=True,check=True,timeout=10).stdout.strip())
+  return self.inner.execute(statement,*args,**kwargs)
+module.sqlite3.connect=lambda *args,**kwargs: ProbeConnection(original(*args,**kwargs))
+try:
+ reopened=MattermostOutbox.open(root/'state',key,expected_fingerprint=fp)
+ result={'writer':outcomes[0],'outcome':'opened','record':reopened.get(record.record_tag) is not None,'transaction':reopened._connection.in_transaction}
+ reopened.close()
+except ContractError:
+ result={'writer':outcomes[0],'outcome':'rejected'}
+finally:
+ module.sqlite3.connect=original
+print(json.dumps(result))
+'''
+
+
+def test_installed_startup_exclusive_transaction_precedes_first_verify(installed_artifact, tmp_path):
+    baseline = _run(_copy_artifact(installed_artifact, tmp_path / "baseline"), _STARTUP_OWNERSHIP_PROGRAM)
+    assert baseline == {"writer": "blocked", "outcome": "opened", "record": True, "transaction": False}
+    mutant = _copy_artifact(installed_artifact, tmp_path / "mutant")
+    _mutate(
+        mutant,
+        "restricted_runtime/mattermost_outbox.py",
+        '            self._configure(connection)\n            connection.execute("BEGIN EXCLUSIVE")\n            return connection',
+        '            self._configure(connection)\n            connection.execute("BEGIN DEFERRED")\n            return connection',
+    )
+    assert _run(mutant, _STARTUP_OWNERSHIP_PROGRAM) == {"writer": "corrupted", "outcome": "rejected"}
+
+
 _DUPLICATE_PROGRAM = r'''
 import json, os, tempfile
 from pathlib import Path

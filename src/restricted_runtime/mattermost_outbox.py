@@ -175,15 +175,31 @@ class MattermostOutbox:
             raise ContractError("Mattermost outbox policy key binding rejected")
         self._lock = threading.RLock()
         self._connection = self._connect()
-        self._instance_id = self._meta()
-        self._enc_key = _derive(master_key, self._instance_id, b"aes-256-gcm")
-        self._tag_key = _derive(master_key, self._instance_id, b"lookup-hmac-sha256")
-        self._row_key = _derive(master_key, self._instance_id, b"row-hmac-sha256")
-        self._nonce_key = _derive(master_key, self._instance_id, b"nonce-registry-hmac-sha256")
-        self._history_key = _derive(master_key, self._instance_id, b"record-history-hmac-sha256")
-        self._bootstrap_nonce_registry(bootstrap_nonce_registry)
-        self._verify_all_rows()
-        self._database_write_probe()
+        try:
+            # ``_connect`` began EXCLUSIVE before this first integrity/schema
+            # read.  Keep it through all startup authentication, then release
+            # only the transaction (not the persistent exclusive lock).
+            self._integrity_check()
+            self._instance_id = self._meta()
+            self._enc_key = _derive(master_key, self._instance_id, b"aes-256-gcm")
+            self._tag_key = _derive(master_key, self._instance_id, b"lookup-hmac-sha256")
+            self._row_key = _derive(master_key, self._instance_id, b"row-hmac-sha256")
+            self._nonce_key = _derive(master_key, self._instance_id, b"nonce-registry-hmac-sha256")
+            self._history_key = _derive(master_key, self._instance_id, b"record-history-hmac-sha256")
+            self._bootstrap_nonce_registry(bootstrap_nonce_registry)
+            self._verify_all_rows()
+            self._database_write_probe()
+            self._connection.execute("COMMIT" if bootstrap_nonce_registry else "ROLLBACK")
+        except ContractError:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            self.close()
+            raise
+        except sqlite3.Error as exc:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            self.close()
+            raise ContractError("Mattermost outbox startup ownership rejected") from exc
 
     @classmethod
     def initialize(cls, state_dir: Path, key_path: Path, *, expected_fingerprint: str) -> "MattermostOutbox":
@@ -292,12 +308,10 @@ class MattermostOutbox:
             raise ContractError("Mattermost outbox exclusive ownership rejected")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA busy_timeout=5000")
-        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise ContractError("Mattermost outbox integrity check failed")
 
     @staticmethod
     def _create_schema(connection: sqlite3.Connection, instance_id: bytes, fingerprint: str) -> None:
-        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("BEGIN EXCLUSIVE")
         try:
             connection.execute("CREATE TABLE meta (schema_version TEXT NOT NULL, instance_id BLOB NOT NULL, key_fingerprint TEXT NOT NULL)")
             connection.execute("INSERT INTO meta VALUES (?, ?, ?)", (_META_SCHEMA, instance_id, fingerprint))
@@ -323,12 +337,29 @@ class MattermostOutbox:
             raise
 
     def _connect(self) -> sqlite3.Connection:
+        connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
             self._configure(connection)
+            connection.execute("BEGIN EXCLUSIVE")
             return connection
+        except ContractError:
+            if connection is not None:
+                connection.close()
+            raise
         except (sqlite3.Error, OSError) as exc:
+            if connection is not None:
+                connection.close()
             raise ContractError("Mattermost outbox database unavailable") from exc
+
+    def _integrity_check(self) -> None:
+        try:
+            if self._connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                raise ContractError("Mattermost outbox integrity check failed")
+        except ContractError:
+            raise
+        except sqlite3.Error as exc:
+            raise ContractError("Mattermost outbox integrity check failed") from exc
 
     def _meta(self) -> bytes:
         try:
@@ -347,6 +378,9 @@ class MattermostOutbox:
         """Acquire a durable SQLite write transaction without changing outbox state."""
         try:
             with self._lock:
+                if self._connection.in_transaction:
+                    self._connection.execute("UPDATE meta SET schema_version=schema_version")
+                    return
                 self._connection.execute("BEGIN IMMEDIATE")
                 try:
                     self._connection.execute("UPDATE meta SET schema_version=schema_version")
@@ -402,21 +436,17 @@ class MattermostOutbox:
                 return
             if not allowed:
                 raise ContractError("Mattermost outbox nonce registry rejected")
-            self._connection.execute("BEGIN IMMEDIATE")
-            try:
-                if self._connection.execute("SELECT COUNT(*) FROM nonce_tombstones").fetchone()[0] != 0:
-                    raise ContractError("Mattermost outbox nonce registry rejected")
-                updated = self._connection.execute(
-                    "UPDATE nonce_registry SET root_tag=? WHERE singleton=1 AND sequence=0 AND root_tag=''",
-                    (self._nonce_genesis(),),
-                )
-                if updated.rowcount != 1:
-                    raise ContractError("Mattermost outbox nonce registry rejected")
-                self._connection.execute("COMMIT")
-            except Exception:
-                if self._connection.in_transaction:
-                    self._connection.execute("ROLLBACK")
-                raise
+            # Startup already owns an EXCLUSIVE transaction.  The genesis
+            # write must remain inside it so no unauthenticated empty registry
+            # can be observed between bootstrap and startup verification.
+            if self._connection.execute("SELECT COUNT(*) FROM nonce_tombstones").fetchone()[0] != 0:
+                raise ContractError("Mattermost outbox nonce registry rejected")
+            updated = self._connection.execute(
+                "UPDATE nonce_registry SET root_tag=? WHERE singleton=1 AND sequence=0 AND root_tag=''",
+                (self._nonce_genesis(),),
+            )
+            if updated.rowcount != 1:
+                raise ContractError("Mattermost outbox nonce registry rejected")
         except ContractError:
             raise
         except sqlite3.Error as exc:

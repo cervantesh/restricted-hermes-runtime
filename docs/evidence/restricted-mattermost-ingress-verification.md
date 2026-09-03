@@ -60,7 +60,7 @@ returns 503. The focused Mattermost tests and real POSIX process suite are indep
 
 - Contract: `SG-MM-OUTBOX-007`
 - Implementation base: `f9ef9f4518ef217e9382635715760177fb749789`
-- Evidence baseline head: `7387dcfb9863a7797ca5dd94dea50670a05c521a`
+- Evidence baseline head: `b5258f48d58784d3fe9537f2d4725d04a60b62bc`
 - Scope: encrypted durable local delivery outbox and bounded recovery for the
   restricted Mattermost ingress. The historical SG-MATTERMOST-001 evidence
   above remains preserved as the initial slice.
@@ -90,6 +90,14 @@ returns 503. The focused Mattermost tests and real POSIX process suite are indep
 - Latest exclusive-owner closure: Windows focused `103 passed, 4 skipped`;
   Linux installed wheel `123 passed, 1 skipped` (the skipped witness requires
   isolated PostgreSQL and POSIX AF_UNIX).
+- Startup acquisition closure: a write-capable `BEGIN EXCLUSIVE` now precedes
+  the first integrity, schema, nonce-history, and row-authentication read. The
+  Windows race witness schedules a raw SQLite deletion at that exact first
+  integrity read and observes it blocked; the installed-wheel mutation to
+  `BEGIN DEFERRED` instead corrupts the row and makes startup reject it. This
+  focused collection passed on Windows with `119 passed, 7 skipped` and in a
+  Python 3.12 Linux installed wheel with `125 passed, 1 skipped` (the skipped
+  witness requires isolated PostgreSQL and POSIX AF_UNIX).
 - Real PostgreSQL recovery witness: `1 passed`.
 - Exact Mattermost `11.7.10` acceptance: `PASS`.
 - Hosted CI run `33745519719`: green.
