@@ -6,7 +6,8 @@ RUN pip install --no-cache-dir --no-deps . \
  && pip install --no-cache-dir 'cryptography>=42,<45' 'websockets>=15,<16' \
  && find /usr/local/lib/python3.11/site-packages/restricted_runtime -type f -name '*.py' \
       ! -name '__init__.py' ! -name 'contracts.py' ! -name 'mattermost_policy.py' \
-      ! -name 'mattermost_ingress.py' ! -name 'production_mattermost_ingress.py' -delete \
+      ! -name 'mattermost_ingress.py' ! -name 'mattermost_outbox.py' \
+      ! -name 'production_mattermost_ingress.py' ! -name 'mattermost_outbox_init.py' -delete \
  && find /usr/local/lib/python3.11/site-packages/restricted_runtime -type d -name __pycache__ -prune -exec rm -rf {} +
 
 FROM python:3.11-slim
@@ -16,6 +17,7 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 RUN groupadd --system --gid 20000 restricted-socket-dir \
  && groupadd --system --gid 20001 restricted-conversation \
  && groupadd --system --gid 20005 restricted-mattermost-ingress \
- && useradd --system --uid 10007 --gid 20005 --groups 20000,20001 restricted-mattermost-ingress
+ && useradd --system --uid 10007 --gid 20005 --groups 20000,20001 restricted-mattermost-ingress \
+ && install -d -o 10007 -g 20005 -m 0700 /var/lib/restricted-mattermost-outbox
 USER restricted-mattermost-ingress
 CMD ["python", "-m", "restricted_runtime.services.production_mattermost_ingress"]

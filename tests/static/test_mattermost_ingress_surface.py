@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_mattermost_role_is_standalone_and_has_no_normal_hermes_or_provider_surface():
     files = [
         ROOT / "src/restricted_runtime/mattermost_policy.py",
+        ROOT / "src/restricted_runtime/mattermost_outbox.py",
         ROOT / "src/restricted_runtime/mattermost_ingress.py",
         ROOT / "src/restricted_runtime/services/production_mattermost_ingress.py",
     ]
@@ -32,7 +33,7 @@ def test_dedicated_image_is_nonroot_and_removes_unrelated_runtime_modules():
     assert "10007" in recipe and "20001" in recipe
     assert "Dockerfile.local-conversation" not in recipe
     assert "find /usr/local/lib/python3.11/site-packages/restricted_runtime" in recipe
-    for allowed in ("contracts.py", "mattermost_policy.py", "mattermost_ingress.py", "production_mattermost_ingress.py"):
+    for allowed in ("contracts.py", "mattermost_policy.py", "mattermost_outbox.py", "mattermost_ingress.py", "production_mattermost_ingress.py", "mattermost_outbox_init.py"):
         assert f"! -name '{allowed}'" in recipe
     assert "HERMES" not in recipe and ".env" not in recipe
 
@@ -62,11 +63,12 @@ def test_versioned_container_closure_command_is_pytest_free_and_checks_ac9_impor
         assert module in source
 
 
-def test_operator_docs_preserve_non_phi_and_crash_delivery_nonclaim():
+def test_operator_docs_preserve_non_phi_and_duplicate_averse_delivery_contract():
     docs = (ROOT / "docs/design/restricted-mattermost-ingress.md").read_text(encoding="utf-8")
     for phrase in (
         "synthetic/non-PHI",
-        "crash-safe exactly-once delivery is not claimed",
+        "duplicate-averse",
+        "exactly-once",
         "retention",
         "audit",
         "backup",

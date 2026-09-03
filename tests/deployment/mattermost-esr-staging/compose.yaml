@@ -63,6 +63,7 @@ services:
       RESTRICTED_MATTERMOST_POLICY_PUBLIC_KEY_B64: ${MM_ESR_POLICY_PUBLIC_KEY:?policy public key required}
       RESTRICTED_MATTERMOST_TOKEN_PATH: /run/ingress/bot_token
       RESTRICTED_MATTERMOST_CA_PATH: /run/ingress/ca.crt
+      RESTRICTED_MATTERMOST_OUTBOX_KEY_PATH: /run/ingress/outbox.key
     read_only: true
     tmpfs: [/tmp]
     dns: [192.0.2.1]
@@ -70,6 +71,7 @@ services:
     volumes:
       - ingress_socket:/run/restricted-inference
       - ingress_config:/run/ingress:ro
+      - ingress_outbox:/var/lib/restricted-mattermost-outbox
     networks: [edge]
 
   probe:
@@ -96,6 +98,7 @@ services:
       - ${MM_ESR_SEED:?seed directory required}:/seed:ro
       - controller_state:/state
       - ingress_config:/ingress
+      - ingress_outbox:/var/lib/restricted-mattermost-outbox
       - witness_state:/witness:ro
       - mattermost_tls:/tls
       - postgres_secret:/postgres-secret
@@ -114,5 +117,6 @@ volumes:
   mattermost_tls:
   ingress_config:
   ingress_socket:
+  ingress_outbox:
   controller_state:
   witness_state:

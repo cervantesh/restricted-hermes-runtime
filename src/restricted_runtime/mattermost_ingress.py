@@ -15,6 +15,7 @@ from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
 from .contracts import ContractError, jcs_bytes, load_closed_json
+from .mattermost_outbox import DeliveryState, MattermostOutbox, OutboxRecord
 from .mattermost_policy import MAX_EVENT_BYTES, MattermostPolicy
 
 _MAX_HTTP_BYTES = 1_048_576
@@ -58,12 +59,23 @@ class MattermostApi(Protocol):
     def get_me(self) -> dict[str, Any]: ...
     def get_channel(self, channel_id: str) -> dict[str, Any]: ...
     def get_post(self, post_id: str) -> dict[str, Any]: ...
+    def get_channel_member(self, channel_id: str, user_id: str) -> dict[str, Any]: ...
     def create_post(self, body: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class ConversationApi(Protocol):
     def ready(self) -> dict[str, Any]: ...
     def submit(self, *, conversation_id: str, client_request_id: str, message: str) -> dict[str, Any]: ...
+    def create_conversation(self, *, conversation_id: str) -> dict[str, Any]: ...
+    def submit_turn(self, *, conversation_id: str, conversation_epoch: str, client_request_id: str, message: str) -> dict[str, Any]: ...
+
+
+class TransientMattermostError(ContractError):
+    """A current REST transport/result cannot authorize a terminal transition."""
+
+
+class DefinitiveMattermostError(ContractError):
+    """An exact current source/destination authorization binding was rejected."""
 
 
 def _ordinary(post: dict[str, Any], *, policy: MattermostPolicy, require_mention: bool) -> bool:
@@ -92,13 +104,12 @@ def _ordinary(post: dict[str, Any], *, policy: MattermostPolicy, require_mention
 
 
 class Ingress:
-    """Validate fresh Mattermost state before a single restricted turn and reply attempt."""
-    def __init__(self, policy: MattermostPolicy, rest: MattermostApi, conversation: ConversationApi):
+    """Reserve authenticated events; the sole executor owns UDS and REST effects."""
+    def __init__(self, policy: MattermostPolicy, rest: MattermostApi, conversation: ConversationApi, outbox: MattermostOutbox):
         policy.validate()
-        self.policy, self.rest, self.conversation = policy, rest, conversation
+        self.policy, self.rest, self.conversation, self.outbox = policy, rest, conversation, outbox
         self._authenticated = False
-        self._claims: set[str] = set()
-        self._claim_lock = threading.Lock()
+        self.executor = SerializedDeliveryExecutor(self)
 
     def preflight(self) -> None:
         readiness = self.conversation.ready()
@@ -119,6 +130,9 @@ class Ingress:
             raise ContractError("Mattermost bot identity rejected")
         for channel_id in self.policy.values["allowed_channel_ids"]:
             self._private_channel(channel_id)
+            self._member(channel_id, self.policy.values["bot_user_id"])
+        self.outbox.stale_inflight_to_ambiguous()
+        self.executor.drain()
 
     def mark_authenticated(self) -> None:
         self._authenticated = True
@@ -133,6 +147,12 @@ class Ingress:
             raise ContractError("Mattermost private channel binding rejected")
         return channel
 
+    def _member(self, channel_id: str, user_id: str) -> dict[str, Any]:
+        member = self.rest.get_channel_member(channel_id, user_id)
+        if not isinstance(member, dict) or member.get("channel_id") != channel_id or member.get("user_id") != user_id:
+            raise DefinitiveMattermostError("Mattermost channel membership rejected")
+        return member
+
     def _validated_root(self, post: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         root_id = post["root_id"] or post["id"]
         root = self.rest.get_post(root_id)
@@ -146,51 +166,162 @@ class Ingress:
             raise ContractError("Mattermost root binding rejected")
         return root_id, root
 
+    def _authorize_source(self, post: dict[str, Any]) -> str:
+        self.policy.validate()
+        if not _ordinary(post, policy=self.policy, require_mention=not bool(post.get("root_id"))):
+            raise DefinitiveMattermostError("Mattermost source binding rejected")
+        self._private_channel(post["channel_id"])
+        self._member(post["channel_id"], post["user_id"])
+        self._member(post["channel_id"], self.policy.values["bot_user_id"])
+        root_id, _ = self._validated_root(post)
+        return root_id
+
+    def _envelope(self, post: dict[str, Any], root_id: str) -> dict[str, Any]:
+        from datetime import datetime
+        expires = int(datetime.fromisoformat(self.policy.values["expires_at"].replace("Z", "+00:00")).timestamp())
+        now = int(time.time())
+        return {
+            "schema_version": "restricted-mattermost-outbox.v1",
+            "tenant_id": self.policy.values["tenant_id"], "origin": self.policy.origin,
+            "channel_id": post["channel_id"], "root_id": root_id, "source_id": post["id"],
+            "actor_id": post["user_id"], "message": post["message"],
+            "conversation_id": conversation_identity(self.policy.values["tenant_id"], self.policy.origin, post["channel_id"], root_id),
+            "conversation_epoch": None,
+            "client_request_id": request_identity(self.policy.values["tenant_id"], self.policy.origin, post["channel_id"], post["id"]),
+            "policy_epoch": self.policy.values["policy_epoch"], "policy_digest": self.policy.digest,
+            "key_fingerprint": self.policy.values["outbox_key_fingerprint"],
+            "policy_expires_at": expires,
+            "payload_expires_at": min(expires, now + self.policy.values["outbox_payload_retention_seconds"]),
+            "response": None, "pending_post_id": str(uuid.uuid5(_NAMESPACE, "delivery\x00" + post["id"])), "returned_post_id": None,
+        }
+
+    def _revalidate_envelope(self, envelope: dict[str, Any]) -> None:
+        if (
+            envelope["policy_epoch"] != self.policy.values["policy_epoch"]
+            or envelope["policy_digest"] != self.policy.digest
+            or envelope["key_fingerprint"] != self.policy.values["outbox_key_fingerprint"]
+        ):
+            raise DefinitiveMattermostError("Mattermost outbox policy binding changed")
+        source = self.rest.get_post(envelope["source_id"])
+        if isinstance(source, dict) and "file_ids" not in source:
+            source = {**source, "file_ids": []}
+        if not isinstance(source, dict) or source.get("id") != envelope["source_id"] or source.get("channel_id") != envelope["channel_id"] or source.get("user_id") != envelope["actor_id"]:
+            raise DefinitiveMattermostError("Mattermost source replay binding rejected")
+        root_id = self._authorize_source(source)
+        if root_id != envelope["root_id"] or source.get("message") != envelope["message"]:
+            raise DefinitiveMattermostError("Mattermost source/root replay binding rejected")
+
     def handle(self, event: MattermostEvent) -> None:
         try:
             self.policy.validate()
             if not self._authenticated or event.channel_type != "P":
                 return
             post = event.post
-            if not _ordinary(post, policy=self.policy, require_mention=not bool(post.get("root_id"))):
-                return
-            self._private_channel(post["channel_id"])
-            root_id, _ = self._validated_root(post)
-            source_id = post["id"]
-            with self._claim_lock:
-                if source_id in self._claims:
-                    return
-                if len(self._claims) >= 100_000:
-                    raise ContractError("Mattermost live claim capacity reached")
-                self._claims.add(source_id)
-            conversation_id = conversation_identity(
-                self.policy.values["tenant_id"], self.policy.origin, post["channel_id"], root_id
+            root_id = self._authorize_source(post)
+            envelope = self._envelope(post, root_id)
+            record, _ = self.outbox.reserve(
+                envelope,
+                payload_capacity=self.policy.values["outbox_payload_capacity"],
+                tombstone_capacity=self.policy.values["outbox_tombstone_capacity"],
             )
-            result = self.conversation.submit(
-                conversation_id=conversation_id,
-                client_request_id=request_identity(
-                    self.policy.values["tenant_id"], self.policy.origin, post["channel_id"], source_id
-                ),
-                message=post["message"],
-            )
-            if not isinstance(result, dict) or result.get("status") != "COMMITTED" or not isinstance(result.get("message"), str) or not result["message"]:
-                raise ContractError("restricted conversation did not commit a response")
-            pending = str(uuid.uuid5(_NAMESPACE, "delivery\x00" + source_id))
-            outbound = {
-                "channel_id": post["channel_id"], "root_id": root_id,
-                "message": result["message"], "pending_post_id": pending,
-            }
-            delivered = self.rest.create_post(outbound)
-            if (
-                not isinstance(delivered, dict) or delivered.get("channel_id") != post["channel_id"]
-                or delivered.get("root_id") != root_id or delivered.get("pending_post_id") != pending
-            ):
-                logging.getLogger("restricted_mattermost").warning(
-                    "mattermost_delivery_outcome=rejected_binding"
-                )
-                raise ContractError("Mattermost delivery binding rejected")
+            self.executor.signal(record.record_tag)
         except (ContractError, KeyError, OSError, TimeoutError, UnicodeError, ValueError):
             logging.getLogger("restricted_mattermost").warning("mattermost_event_outcome=rejected")
+
+
+class SerializedDeliveryExecutor:
+    """The only code path which can call conversation UDS or Mattermost POST."""
+    def __init__(self, ingress: Ingress):
+        self.ingress = ingress
+        self._lock = threading.Lock()
+
+    def signal(self, _record_tag: str) -> None:
+        # Signalling synchronously keeps the existing edge event loop bounded;
+        # the lock is the single global executor and no ingress code dispatches around it.
+        self.drain()
+
+    def drain(self) -> None:
+        with self._lock:
+            for record in self.ingress.outbox.candidates(self.ingress.policy.values["outbox_scan_limit"]):
+                self._process(record)
+
+    def _block_or_expire(self, record: OutboxRecord, reason: str) -> None:
+        target = DeliveryState.EXPIRED if reason == "payload_expired" else DeliveryState.BLOCKED
+        self.ingress.outbox.terminal(record, target, reason=reason)
+
+    def _process(self, record: OutboxRecord) -> None:
+        if record.state is DeliveryState.IN_FLIGHT:
+            self.ingress.outbox.terminal(record, DeliveryState.AMBIGUOUS, reason="stale_in_flight")
+            return
+        envelope = record.envelope
+        if envelope is None:
+            return
+        now = int(time.time())
+        if now > envelope["payload_expires_at"]:
+            self._block_or_expire(record, "payload_expired")
+            return
+        if now > envelope["policy_expires_at"]:
+            self._block_or_expire(record, "policy_expired")
+            return
+        try:
+            self.ingress._revalidate_envelope(envelope)
+            readiness = self.ingress.conversation.ready()
+            if not isinstance(readiness, dict) or readiness.get("status") != "ready":
+                return
+        except DefinitiveMattermostError:
+            self._block_or_expire(record, "current_authorization_rejected")
+            return
+        except (ContractError, OSError, TimeoutError, ValueError):
+            return
+        if record.state is DeliveryState.WAITING_COMMIT:
+            try:
+                if envelope["conversation_epoch"] is None:
+                    created = self.ingress.conversation.create_conversation(conversation_id=envelope["conversation_id"])
+                    epoch = created.get("conversation_epoch") if isinstance(created, dict) else None
+                    if created.get("conversation_id") != envelope["conversation_id"] or not isinstance(epoch, str) or not epoch:
+                        self.ingress.outbox.terminal(record, DeliveryState.FAILED, reason="conversation_create_shape")
+                        return
+                    envelope = {**envelope, "conversation_epoch": epoch}
+                    record = self.ingress.outbox.update_waiting(record, envelope)
+                result = self.ingress.conversation.submit_turn(
+                    conversation_id=envelope["conversation_id"], conversation_epoch=envelope["conversation_epoch"],
+                    client_request_id=envelope["client_request_id"], message=envelope["message"],
+                )
+            except (ContractError, OSError, TimeoutError, ValueError):
+                return
+            status = result.get("status") if isinstance(result, dict) else None
+            if status == "COMMITTED" and isinstance(result.get("message"), str) and result["message"] and result.get("conversation_epoch") == envelope["conversation_epoch"]:
+                self.ingress.outbox.mark_ready(record, {**envelope, "response": result["message"]})
+                record = self.ingress.outbox.get(record.record_tag)
+                if record is None:
+                    return
+            elif status in {"FAILED", "REJECTED", "INDETERMINATE"}:
+                self.ingress.outbox.terminal(record, DeliveryState.FAILED, reason="conversation_terminal")
+                return
+            else:
+                return
+        if record.state is not DeliveryState.READY or record.envelope is None:
+            return
+        try:
+            self.ingress._revalidate_envelope(record.envelope)
+        except DefinitiveMattermostError:
+            self._block_or_expire(record, "current_authorization_rejected")
+            return
+        except (ContractError, OSError, TimeoutError, ValueError):
+            return
+        claimed = self.ingress.outbox.claim_delivery(record)
+        if claimed is None or claimed.envelope is None:
+            return
+        outbound = {"channel_id": claimed.envelope["channel_id"], "root_id": claimed.envelope["root_id"], "message": claimed.envelope["response"], "pending_post_id": claimed.envelope["pending_post_id"]}
+        try:
+            delivered = self.ingress.rest.create_post(outbound)
+            if not isinstance(delivered, dict) or not isinstance(delivered.get("id"), str) or not delivered["id"] or delivered.get("channel_id") != outbound["channel_id"] or delivered.get("root_id") != outbound["root_id"] or delivered.get("pending_post_id") != outbound["pending_post_id"]:
+                raise ContractError("Mattermost delivery binding rejected")
+        except (ContractError, OSError, TimeoutError, ValueError):
+            logging.getLogger("restricted_mattermost").warning("mattermost_delivery_outcome=rejected_binding")
+            self.ingress.outbox.terminal(claimed, DeliveryState.AMBIGUOUS, reason="post_attempt_unconfirmed")
+            return
+        self.ingress.outbox.terminal(claimed, DeliveryState.DELIVERED, reason="exact_immediate_binding")
 
 
 class MattermostRestClient:
@@ -215,7 +346,9 @@ class MattermostRestClient:
             connection.request(method, path, body=payload, headers=headers)
             response = connection.getresponse()
             if response.status not in {200, 201} or response.getheader("Location") is not None:
-                raise ContractError("Mattermost REST response rejected")
+                if response.status in {403, 404}:
+                    raise DefinitiveMattermostError("Mattermost REST current resource rejected")
+                raise TransientMattermostError("Mattermost REST response unavailable")
             raw = response.read(_MAX_HTTP_BYTES + 1)
             if len(raw) > _MAX_HTTP_BYTES or response.read(1):
                 raise ContractError("Mattermost REST response oversized")
@@ -228,12 +361,13 @@ class MattermostRestClient:
         except ContractError:
             raise
         except (OSError, http.client.HTTPException, TimeoutError) as exc:
-            raise ContractError("Mattermost REST transport failed") from exc
+            raise TransientMattermostError("Mattermost REST transport failed") from exc
         finally:
             connection.close()
 
     def get_me(self): return self._request("GET", "/api/v4/users/me")
     def get_channel(self, channel_id): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe=""))
+    def get_channel_member(self, channel_id, user_id): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe="") + "/members/" + quote(user_id, safe=""))
     def get_post(self, post_id): return self._request("GET", "/api/v4/posts/" + quote(post_id, safe=""))
     def create_post(self, body): return self._request("POST", "/api/v4/posts", body)
 
@@ -301,18 +435,35 @@ class ConversationUdsClient:
 
     def ready(self): return self._request("GET", "/readyz")
 
+    def create_conversation(self, *, conversation_id: str, deadline: float | None = None) -> dict[str, Any]:
+        return self._request("POST", "/v1/restricted/conversations/" + conversation_id, deadline=deadline)
+
+    def submit_turn(self, *, conversation_id: str, conversation_epoch: str, client_request_id: str, message: str) -> dict[str, Any]:
+        deadline = time.monotonic() + self.policy.values["conversation_deadline_seconds"]
+        result = self._request(
+            "POST", "/v1/restricted/conversations/" + conversation_id + "/turns",
+            {"schema_version": "restricted-turn.v1", "client_request_id": client_request_id,
+             "conversation_epoch": conversation_epoch, "message": message}, deadline=deadline,
+        )
+        if set(result) != {"schema_version", "turn_id", "conversation_epoch", "status", "message"}:
+            raise ContractError("conversation turn response rejected")
+        if deadline - time.monotonic() <= 0:
+            raise ContractError("conversation transport failed")
+        return result
+
     def submit(self, *, conversation_id: str, client_request_id: str, message: str):
         deadline = time.monotonic() + self.policy.values["conversation_deadline_seconds"]
-        created = self._request("POST", "/v1/restricted/conversations/" + conversation_id, deadline=deadline)
+        created = self.create_conversation(conversation_id=conversation_id, deadline=deadline)
         if created.get("conversation_id") != conversation_id or not isinstance(created.get("conversation_epoch"), str):
             raise ContractError("conversation creation response rejected")
         if deadline - time.monotonic() <= 0:
             raise ContractError("conversation transport failed")
+        # Keep the legacy public helper as one shared-budget call path; the
+        # outbox executor uses the split methods to persist the original epoch.
         result = self._request(
             "POST", "/v1/restricted/conversations/" + conversation_id + "/turns",
             {"schema_version": "restricted-turn.v1", "client_request_id": client_request_id,
-             "conversation_epoch": created["conversation_epoch"], "message": message},
-            deadline=deadline,
+             "conversation_epoch": created["conversation_epoch"], "message": message}, deadline=deadline,
         )
         if set(result) != {"schema_version", "turn_id", "conversation_epoch", "status", "message"}:
             raise ContractError("conversation turn response rejected")

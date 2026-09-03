@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import shutil
 import socketserver
 import ssl
 import subprocess
@@ -23,11 +24,13 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 from cryptography.x509.oid import NameOID
 
 from restricted_runtime.contracts import jcs_bytes
+from restricted_runtime.mattermost_outbox import MattermostOutbox, key_fingerprint
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="real AF_UNIX ingress process witness")
 ROOT = Path(__file__).resolve().parents[2]
 SOCKET = Path("/run/restricted-inference/conversation.sock")
+OUTBOX_STATE = Path("/var/lib/restricted-mattermost-outbox")
 TEAM = "team0000000000000000000000"
 CHANNEL = "chan0000000000000000000000"
 USER = "user0000000000000000000000"
@@ -171,6 +174,11 @@ class _MattermostPeer(BaseHTTPRequestHandler):
             self._json({"id": BOT, "username": "restricted-bot"})
         elif self.path == "/api/v4/channels/" + CHANNEL:
             self._json({"id": CHANNEL, "team_id": TEAM, "type": "P"})
+        elif self.path in {
+            "/api/v4/channels/" + CHANNEL + "/members/" + USER,
+            "/api/v4/channels/" + CHANNEL + "/members/" + BOT,
+        }:
+            self._json({"channel_id": CHANNEL, "user_id": self.path.rsplit("/", 1)[-1]})
         elif self.path == "/api/v4/posts/" + ROOT_POST:
             self._json({
                 "id": ROOT_POST, "root_id": "", "channel_id": CHANNEL, "user_id": USER,
@@ -221,6 +229,9 @@ def _policy(tmp_path: Path, port: int) -> tuple[Path, Path, str]:
         "expires_at": (now + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
         "clock_skew_seconds": 30, "websocket_timeout_seconds": 5, "rest_timeout_seconds": 5,
         "uds_timeout_seconds": 2, "conversation_deadline_seconds": 1,
+        "outbox_key_fingerprint": hashlib.sha256(b"m" * 32).hexdigest(), "outbox_payload_retention_seconds": 3600,
+        "outbox_payload_capacity": 1000, "outbox_tombstone_capacity": 1000,
+        "outbox_scan_limit": 64,
     }
     private = ed25519.Ed25519PrivateKey.generate()
     policy, signature = tmp_path / "policy.json", tmp_path / "policy.sig"
@@ -234,6 +245,8 @@ def _witness(tmp_path: Path, mode: str, *, expect_delivery: bool) -> tuple[int, 
     SOCKET.parent.mkdir(parents=True, exist_ok=True)
     if SOCKET.exists():
         pytest.skip("conversation.sock already belongs to another runtime")
+    if OUTBOX_STATE.exists():
+        pytest.skip("outbox state path already belongs to another runtime")
     state = _State(mode)
     key_path, cert_path = _certificates(tmp_path)
     peer = ThreadingHTTPServer(("127.0.0.1", 0), _MattermostPeer)
@@ -250,6 +263,10 @@ def _witness(tmp_path: Path, mode: str, *, expect_delivery: bool) -> tuple[int, 
     policy, signature, public = _policy(tmp_path, peer.server_port)
     token = tmp_path / "token"
     token.write_text(TOKEN, encoding="utf-8")
+    outbox_key = tmp_path / "outbox.key"
+    outbox_key.write_bytes(b"m" * 32)
+    os.chmod(outbox_key, 0o600)
+    MattermostOutbox.initialize(OUTBOX_STATE, outbox_key, expected_fingerprint=key_fingerprint(b"m" * 32)).close()
     environment = {
         **os.environ, "PYTHONPATH": str(ROOT / "src"), "PYTHONDONTWRITEBYTECODE": "1",
         "RESTRICTED_MATTERMOST_POLICY_PATH": str(policy),
@@ -257,6 +274,7 @@ def _witness(tmp_path: Path, mode: str, *, expect_delivery: bool) -> tuple[int, 
         "RESTRICTED_MATTERMOST_POLICY_PUBLIC_KEY_B64": public,
         "RESTRICTED_MATTERMOST_TOKEN_PATH": str(token),
         "RESTRICTED_MATTERMOST_CA_PATH": str(cert_path),
+        "RESTRICTED_MATTERMOST_OUTBOX_KEY_PATH": str(outbox_key),
     }
     process = subprocess.Popen(
         [sys.executable, "-B", "-m", "restricted_runtime.services.production_mattermost_ingress"],
@@ -294,6 +312,7 @@ def _witness(tmp_path: Path, mode: str, *, expect_delivery: bool) -> tuple[int, 
             conversation.shutdown()
             conversation.server_close()
             SOCKET.unlink(missing_ok=True)
+            shutil.rmtree(OUTBOX_STATE, ignore_errors=True)
 
 
 @pytest.mark.parametrize(

@@ -299,6 +299,9 @@ def main() -> None:
     exec_controller("bootstrap")
     exec_controller("bootstrap")
     exec_controller("policy", "https://mattermost:8065", "correct", "correct")
+    # Explicit persistent-volume initialization is an operator action.  The
+    # ingress process itself only opens the already-bound database.
+    exec_controller("outbox-init")
     public_key = exec_controller("public-key").stdout.strip()
     if not public_key or not base64.b64decode(public_key, validate=True):
         raise RuntimeError("policy public key unavailable")

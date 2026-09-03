@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import http.client
+import os
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +24,7 @@ from restricted_runtime.mattermost_ingress import (
     request_identity,
 )
 from restricted_runtime.mattermost_policy import load_signed_mattermost_policy, load_token
+from restricted_runtime.mattermost_outbox import MattermostOutbox
 
 
 ORIGIN = "https://mattermost.internal.example"
@@ -30,6 +33,7 @@ CHANNEL = "chan0000000000000000000000"
 USER = "user0000000000000000000000"
 BOT = "bot00000000000000000000000"
 ROOT = "root0000000000000000000000"
+OUTBOX_KEY = b"m" * 32
 
 
 def policy_values(now: datetime | None = None) -> dict:
@@ -59,6 +63,11 @@ def policy_values(now: datetime | None = None) -> dict:
         "rest_timeout_seconds": 8,
         "uds_timeout_seconds": 45,
         "conversation_deadline_seconds": 40,
+        "outbox_key_fingerprint": hashlib.sha256(OUTBOX_KEY).hexdigest(),
+        "outbox_payload_retention_seconds": 3600,
+        "outbox_payload_capacity": 1000,
+        "outbox_tombstone_capacity": 1000,
+        "outbox_scan_limit": 64,
     }
 
 
@@ -161,6 +170,9 @@ class Rest:
     def get_post(self, post_id):
         return self.posts[post_id]
 
+    def get_channel_member(self, channel_id, user_id):
+        return {"channel_id": channel_id, "user_id": user_id}
+
     def create_post(self, body):
         self.created.append(body)
         return {"id": "reply000000000000000000000", **body}
@@ -192,6 +204,13 @@ class Conversation:
     def submit(self, *, conversation_id, client_request_id, message):
         self.calls.append((conversation_id, client_request_id, message))
         return {"status": "COMMITTED", "message": "synthetic response"}
+
+    def create_conversation(self, *, conversation_id):
+        return {"conversation_id": conversation_id, "conversation_epoch": "epoch-one"}
+
+    def submit_turn(self, *, conversation_id, conversation_epoch, client_request_id, message):
+        self.calls.append((conversation_id, client_request_id, message))
+        return {"schema_version": "restricted-turn-result.v1", "turn_id": "turn", "conversation_epoch": conversation_epoch, "status": "COMMITTED", "message": "synthetic response"}
 
 
 def post(post_id=ROOT, *, root_id="", user_id=USER, channel_id=CHANNEL, message="@restricted-bot hello", **changes):
@@ -270,7 +289,11 @@ def ingress(tmp_path):
     rest, conversation = Rest(), Conversation()
     root = post()
     rest.posts[ROOT] = root
-    service = Ingress(policy, rest, conversation)
+    key = tmp_path / "outbox.key"
+    key.write_bytes(OUTBOX_KEY)
+    os.chmod(key, 0o600)
+    outbox = MattermostOutbox.initialize(tmp_path / "outbox", key, expected_fingerprint=policy.values["outbox_key_fingerprint"])
+    service = Ingress(policy, rest, conversation, outbox)
     service.preflight()
     service.mark_authenticated()
     return service, rest, conversation
@@ -382,7 +405,10 @@ def test_events_before_websocket_auth_success_have_zero_side_effects(tmp_path):
     policy = signed_policy(tmp_path)
     rest, conversation = Rest(), Conversation()
     rest.posts[ROOT] = post()
-    service = Ingress(policy, rest, conversation)
+    key = tmp_path / "outbox.key"
+    key.write_bytes(OUTBOX_KEY)
+    os.chmod(key, 0o600)
+    service = Ingress(policy, rest, conversation, MattermostOutbox.initialize(tmp_path / "outbox", key, expected_fingerprint=policy.values["outbox_key_fingerprint"]))
     service.preflight()
     service.handle(event(post()))
     assert not conversation.calls and not rest.created
@@ -391,6 +417,7 @@ def test_events_before_websocket_auth_success_have_zero_side_effects(tmp_path):
 def test_fresh_root_and_channel_validation_and_thread_only_delivery(tmp_path):
     service, rest, conversation = ingress(tmp_path)
     reply = post("reply00000000000000000000", root_id=ROOT, message="follow up")
+    rest.posts[reply["id"]] = reply
     service.handle(event(reply))
     assert len(conversation.calls) == 1
     assert rest.created[0]["channel_id"] == CHANNEL
