@@ -21,6 +21,7 @@ from urllib.parse import quote, urlsplit
 from .contracts import ClinicalAuthorizationDenied, ContractError, jcs_bytes, load_closed_json
 from .mattermost_outbox import CLINICAL_OUTBOX_SCHEMA, DeliveryState, MattermostOutbox, OutboxRecord
 from .mattermost_policy import MAX_EVENT_BYTES, MattermostPolicy
+from .upstream_deadline import absolute_upstream_deadline
 
 _MAX_HTTP_BYTES = 1_048_576
 _POST_FIELDS = {"id", "root_id", "channel_id", "user_id", "message", "type", "file_ids", "edit_at", "delete_at"}
@@ -132,6 +133,7 @@ _CONFUSABLES = str.maketrans({
     "\u0430": "a", "\u0435": "e", "\u0456": "i", "\u043c": "m", "\u043e": "o", "\u0440": "p",
     "\u0442": "t", "\u0445": "x", "\u03b1": "a", "\u03b9": "i", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t", "\u03c7": "x",
 })
+_SECONDARY_CLINICAL_CONFUSABLES = str.maketrans({"\u0131": "i"})
 # Unicode 15.1.0 DerivedCoreProperties.txt, Default_Ignorable_Code_Point:
 # https://www.unicode.org/Public/15.1.0/ucd/DerivedCoreProperties.txt
 _UNICODE_15_1_DEFAULT_IGNORABLE_RANGES = (
@@ -152,16 +154,18 @@ def _namespace_ignorable(character: str) -> bool:
     return any(start <= codepoint <= end for start, end in _UNICODE_15_1_DEFAULT_IGNORABLE_RANGES)
 
 
-def _namespace_skeleton(value: str, *, remove_marks: bool = False) -> str:
+def _namespace_skeleton(value: str, *, remove_marks: bool = False, secondary: bool = False) -> str:
     if remove_marks:
         value = unicodedata.normalize("NFD", value)
         value = "".join(character for character in value if not unicodedata.category(character).startswith("M"))
     normalized = unicodedata.normalize("NFKC", value).casefold().translate(_CONFUSABLES).translate(_DASHES)
+    if secondary:
+        normalized = normalized.translate(_SECONDARY_CLINICAL_CONFUSABLES)
     return "".join(character for character in normalized if not _namespace_ignorable(character))
 
 
-def _clinical_namespace(value: str, *, remove_marks: bool = False) -> bool:
-    return re.search(r"next[-_\s]+appointment", _namespace_skeleton(value, remove_marks=remove_marks)) is not None
+def _clinical_namespace(value: str, *, remove_marks: bool = False, secondary: bool = False) -> bool:
+    return re.search(r"next[-_\s]+appointment", _namespace_skeleton(value, remove_marks=remove_marks, secondary=secondary)) is not None
 
 
 def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]:
@@ -169,10 +173,16 @@ def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]
     mention = re.compile(rf"(?<![A-Za-z0-9._-])@{re.escape(bot_username)}(?![A-Za-z0-9._-])")
     matches = list(mention.finditer(message))
     if len(matches) != 1:
-        return ("malformed", None) if _clinical_namespace(message) or _clinical_namespace(message, remove_marks=True) else ("ordinary", None)
+        return ("malformed", None) if any((
+            _clinical_namespace(message), _clinical_namespace(message, remove_marks=True),
+            _clinical_namespace(message, secondary=True), _clinical_namespace(message, remove_marks=True, secondary=True),
+        )) else ("ordinary", None)
     match = matches[0]
     body = (message[:match.start()] + message[match.end():]).strip()
-    if not _clinical_namespace(body) and not _clinical_namespace(body, remove_marks=True):
+    if not any((
+        _clinical_namespace(body), _clinical_namespace(body, remove_marks=True),
+        _clinical_namespace(body, secondary=True), _clinical_namespace(body, remove_marks=True, secondary=True),
+    )):
         return "ordinary", None
     if any(unicodedata.category(character).startswith("M") for character in body):
         return "malformed", None
@@ -475,6 +485,8 @@ class Ingress:
             raise TransientMattermostError("Mattermost source response incomplete")
         if source.get("id") != envelope["source_id"] or source.get("channel_id") != envelope["channel_id"] or source.get("user_id") != envelope["actor_id"]:
             raise DefinitiveMattermostError("Mattermost source replay binding rejected")
+        if _clinical_command(source["message"], self.policy.values["bot_username"])[0] != "ordinary":
+            raise DefinitiveMattermostError("Mattermost source replay clinical namespace rejected")
         root_id = self._authorize_source(source, definitive=True)
         if root_id != envelope["root_id"] or source.get("message") != envelope["message"]:
             raise DefinitiveMattermostError("Mattermost source/root replay binding rejected")
@@ -785,37 +797,56 @@ class MattermostRestClient:
         if not path.startswith("/api/v4/") or "//" in path or "#" in path or ("?" in path and not member_page):
             raise ContractError("Mattermost REST path rejected")
         payload = None if body is None else jcs_bytes(body)
-        connection = http.client.HTTPSConnection(
-            self._host, self._port, timeout=self.policy.values["rest_timeout_seconds"], context=self._context
-        )
-        try:
-            headers = {"Authorization": "Bearer " + self._token, "Accept": "application/json", "Connection": "close"}
-            if payload is not None:
-                headers.update({"Content-Type": "application/json", "Content-Length": str(len(payload))})
-            connection.request(method, path, body=payload, headers=headers)
-            response = connection.getresponse()
-            if response.status not in {200, 201} or response.getheader("Location") is not None:
-                if response.status in {403, 404}:
-                    raise DefinitiveMattermostError("Mattermost REST current resource rejected")
-                raise TransientMattermostError("Mattermost REST response unavailable")
-            try:
-                raw = response.read(_MAX_HTTP_BYTES + 1)
-                if len(raw) > _MAX_HTTP_BYTES or response.read(1):
-                    raise ContractError("Mattermost REST response oversized")
-                if response.getheader("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-                    raise ContractError("Mattermost REST response content type rejected")
-                value = load_closed_json(raw)
-                if not isinstance(value, list if list_response else dict):
-                    raise ContractError("Mattermost REST response JSON rejected")
-            except ContractError as exc:
-                raise TransientMattermostError("Mattermost REST response rejected") from exc
+        deadline = time.monotonic() + self.policy.values["rest_timeout_seconds"]
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError
             return value
+
+        connection = None
+        try:
+            with absolute_upstream_deadline(self.policy.values["rest_timeout_seconds"]):
+                connection = http.client.HTTPSConnection(
+                    self._host, self._port, timeout=remaining(), context=self._context
+                )
+                remaining()
+                headers = {"Authorization": "Bearer " + self._token, "Accept": "application/json", "Connection": "close"}
+                if payload is not None:
+                    headers.update({"Content-Type": "application/json", "Content-Length": str(len(payload))})
+                connection.request(method, path, body=payload, headers=headers)
+                if getattr(connection, "sock", None) is not None:
+                    connection.sock.settimeout(remaining())
+                remaining()
+                response = connection.getresponse()
+                if response.status not in {200, 201} or response.getheader("Location") is not None:
+                    if response.status in {403, 404}:
+                        raise DefinitiveMattermostError("Mattermost REST current resource rejected")
+                    raise TransientMattermostError("Mattermost REST response unavailable")
+                try:
+                    if getattr(connection, "sock", None) is not None:
+                        connection.sock.settimeout(remaining())
+                    remaining()
+                    raw = response.read(_MAX_HTTP_BYTES + 1)
+                    if len(raw) > _MAX_HTTP_BYTES:
+                        raise ContractError("Mattermost REST response oversized")
+                    if response.getheader("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                        raise ContractError("Mattermost REST response content type rejected")
+                    value = load_closed_json(raw)
+                    if not isinstance(value, list if list_response else dict):
+                        raise ContractError("Mattermost REST response JSON rejected")
+                    remaining()
+                except ContractError as exc:
+                    raise TransientMattermostError("Mattermost REST response rejected") from exc
+                return value
         except ContractError:
             raise
         except (OSError, http.client.HTTPException, TimeoutError) as exc:
             raise TransientMattermostError("Mattermost REST transport failed") from exc
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
 
     def get_me(self, *, definitive: bool = False): return self._request("GET", "/api/v4/users/me")
     def get_channel(self, channel_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe=""))

@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import threading
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +37,13 @@ CHANNEL = "chan0000000000000000000000"
 USER = "user0000000000000000000000"
 BOT = "bot00000000000000000000000"
 ROOT = "root0000000000000000000000"
+
+
+@pytest.fixture(autouse=True)
+def portable_rest_deadline(monkeypatch):
+    """HTTP shape tests run on Windows; POSIX alarm behavior is tested directly."""
+    if os.name == "nt":
+        monkeypatch.setattr(mattermost_ingress, "absolute_upstream_deadline", lambda _seconds: nullcontext())
 OUTBOX_KEY = b"m" * 32
 UNICODE_15_1_DEFAULT_IGNORABLE_RANGES = (
     (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160),
@@ -400,6 +408,67 @@ def test_ordinary_unicode_private_channel_text_still_reaches_the_conversation_pa
     assert len(rest.created) == 1
 
 
+def test_dotless_i_clinical_lookalike_is_reserved_in_private_channel(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    candidate = post(message="@restricted-bot next-appo\u0131ntment 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_unrelated_dotless_i_text_reaches_private_conversation_codepoint_exact(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    message = "@restricted-bot patient notes: \u0131 is ordinary text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+def test_legacy_dotless_i_private_record_is_reclassified_before_delivery(tmp_path, ready):
+    service, rest, conversation = ingress(tmp_path)
+    source = post(message="@restricted-bot next-appo\u0131ntment 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = source
+    record, _ = service.outbox.reserve(
+        service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    if ready:
+        record = service.outbox.mark_ready(record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "legacy"})
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state.name == "BLOCKED"
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_rest_timeout_before_delivery_claim_is_retryable(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    source = post()
+    record, _ = service.outbox.reserve(
+        service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    ready = service.outbox.mark_ready(record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "ready"})
+    rest.get_me = lambda **_kwargs: (_ for _ in ()).throw(TimeoutError)
+    service.executor.drain()
+    durable = service.outbox.get(ready.record_tag)
+    assert durable is not None and durable.state is DeliveryState.READY
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_rest_timeout_after_delivery_claim_is_ambiguous_without_resend(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    source = post()
+    record, _ = service.outbox.reserve(
+        service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    ready = service.outbox.mark_ready(record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "ready"})
+    rest.create_post = lambda _body: (_ for _ in ()).throw(TimeoutError)
+    service.executor.drain()
+    durable = service.outbox.get(ready.record_tag)
+    assert durable is not None and durable.state is DeliveryState.AMBIGUOUS
+    assert conversation.calls == [] and rest.created == []
+
+
 def test_ordinary_decomposed_unicode_reaches_the_conversation_byte_for_codepoint_unchanged(tmp_path):
     service, rest, conversation = ingress(tmp_path)
     message = "@restricted-bot cafe\u0301 日本語"
@@ -520,6 +589,55 @@ def test_rest_transport_rejects_redirect_error_malformed_and_oversize_without_pr
         Connection.response = response
         with pytest.raises(ContractError):
             client.get_me()
+
+
+@pytest.mark.parametrize("phase", ["resolver", "upload", "headers"], ids=["before-upload", "before-headers", "before-body"])
+def test_rest_absolute_deadline_stops_later_phases_and_closes_connection(monkeypatch, tmp_path, phase):
+    policy = signed_policy(tmp_path)
+    policy.values["rest_timeout_seconds"] = 2
+    clock = {"now": 0.0}
+
+    class Response:
+        status = 200
+        reads = 0
+
+        def getheader(self, name, default=None):
+            return "application/json" if name == "Content-Type" else default
+
+        def read(self, _size):
+            type(self).reads += 1
+            return b"{}"
+
+    class Connection:
+        requests = responses = closes = 0
+
+        def __init__(self, *_args, **_kwargs):
+            if phase == "resolver":
+                clock["now"] += 3
+
+        def request(self, *_args, **_kwargs):
+            type(self).requests += 1
+            if phase == "upload":
+                clock["now"] += 3
+
+        def getresponse(self):
+            type(self).responses += 1
+            if phase == "headers":
+                clock["now"] += 3
+            return Response()
+
+        def close(self):
+            type(self).closes += 1
+
+    monkeypatch.setattr(mattermost_ingress.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(http.client, "HTTPSConnection", Connection)
+    with pytest.raises(TransientMattermostError, match="transport"):
+        MattermostRestClient(policy, "secret").get_me()
+    expected = {
+        "resolver": (0, 0, 0), "upload": (1, 0, 0), "headers": (1, 1, 0),
+    }[phase]
+    assert (Connection.requests, Connection.responses, Response.reads) == expected
+    assert Connection.closes == 1
 
 
 @pytest.mark.parametrize(
