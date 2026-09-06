@@ -15,6 +15,7 @@ allowed = (
     "restricted_runtime.mattermost_policy",
     "restricted_runtime.mattermost_outbox",
     "restricted_runtime.mattermost_ingress",
+    "restricted_runtime.upstream_deadline",
     "restricted_runtime.services.mattermost_outbox_init",
     "restricted_runtime.services.production_mattermost_ingress",
 )
@@ -74,6 +75,7 @@ assert files == {
     "mattermost_policy.py",
     "mattermost_outbox.py",
     "mattermost_ingress.py",
+    "upstream_deadline.py",
     "services/production_mattermost_ingress.py",
     "services/mattermost_outbox_init.py",
 }, files

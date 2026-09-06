@@ -34,7 +34,7 @@ def test_dedicated_image_is_nonroot_and_removes_unrelated_runtime_modules():
     assert "10007" in recipe and "20001" in recipe
     assert "Dockerfile.local-conversation" not in recipe
     assert "find /usr/local/lib/python3.11/site-packages/restricted_runtime" in recipe
-    for allowed in ("contracts.py", "mattermost_policy.py", "mattermost_outbox.py", "mattermost_ingress.py", "production_mattermost_ingress.py", "mattermost_outbox_init.py"):
+    for allowed in ("contracts.py", "mattermost_policy.py", "mattermost_outbox.py", "mattermost_ingress.py", "upstream_deadline.py", "production_mattermost_ingress.py", "mattermost_outbox_init.py"):
         assert f"! -name '{allowed}'" in recipe
     assert "HERMES" not in recipe and ".env" not in recipe
 
@@ -48,6 +48,7 @@ def test_versioned_container_closure_command_is_pytest_free_and_checks_ac9_impor
     assert 'docker run --rm --network none --entrypoint python' in source
     assert "pytest" not in source.lower()
     for module in (
+        "restricted_runtime.upstream_deadline",
         "restricted_runtime.gateway",
         "restricted_runtime.vertex",
         "restricted_runtime.storage",

@@ -133,7 +133,7 @@ _CONFUSABLES = str.maketrans({
     "\u0430": "a", "\u0435": "e", "\u0456": "i", "\u043c": "m", "\u043e": "o", "\u0440": "p",
     "\u0442": "t", "\u0445": "x", "\u03b1": "a", "\u03b9": "i", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t", "\u03c7": "x",
 })
-_SECONDARY_CLINICAL_CONFUSABLES = str.maketrans({"\u0131": "i"})
+_SECONDARY_CLINICAL_CONFUSABLES = str.maketrans({"\u0131": "i", "\u2043": "-"})
 # Unicode 15.1.0 DerivedCoreProperties.txt, Default_Ignorable_Code_Point:
 # https://www.unicode.org/Public/15.1.0/ucd/DerivedCoreProperties.txt
 _UNICODE_15_1_DEFAULT_IGNORABLE_RANGES = (

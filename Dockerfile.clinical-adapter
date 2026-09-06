@@ -5,6 +5,7 @@ COPY src ./src
 RUN pip install --no-cache-dir --no-deps . \
  && find /usr/local/lib/python3.11/site-packages/restricted_runtime -type f -name '*.py' \
       ! -name '__init__.py' ! -name 'contracts.py' ! -name 'clinical_adapter.py' \
+      ! -name 'upstream_deadline.py' \
       ! -name 'production_clinical_adapter.py' -delete \
  && find /usr/local/lib/python3.11/site-packages/restricted_runtime -type d -name __pycache__ -prune -exec rm -rf {} +
 
