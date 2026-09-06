@@ -44,6 +44,12 @@ UNICODE_15_1_DASH_PUNCTUATION = (
     0x3030, 0x30A0, 0xFE31, 0xFE32, 0xFE58, 0xFE63, 0xFF0D, 0x10EAD,
 )
 
+LETTER_CONFUSABLE_COMMANDS = (
+    ("\u026a", "next-appo\u026antment"), ("\u0269", "next-appo\u0269ntment"),
+    ("\u0251", "next-\u0251ppointment"), ("\u04bd", "n\u04bdxt-appointment"),
+    ("\u1d0f", "next-app\u1d0fintment"),
+)
+
 
 @pytest.fixture(autouse=True)
 def portable_rest_deadline(monkeypatch):
@@ -420,6 +426,50 @@ def test_dotless_i_clinical_lookalike_is_reserved_in_private_channel(tmp_path):
     rest.posts[ROOT] = candidate
     service.handle(event(candidate, channel_type="P"))
     assert conversation.calls == [] and rest.created == []
+
+
+@pytest.mark.parametrize(("character", "command"), LETTER_CONFUSABLE_COMMANDS)
+def test_letter_confusable_clinical_lookalikes_are_reserved_in_private_channel(tmp_path, character, command):
+    service, rest, conversation = ingress(tmp_path)
+    candidate = post(message=f"@restricted-bot {command} 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert mattermost_ingress._clinical_command(candidate["message"], "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == []
+
+
+@pytest.mark.parametrize("character", [character for character, _command in LETTER_CONFUSABLE_COMMANDS])
+def test_unrelated_letter_confusable_text_reaches_private_conversation_codepoint_exact(tmp_path, character):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot ordinary {character} text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+@pytest.mark.parametrize(("_character", "command"), LETTER_CONFUSABLE_COMMANDS)
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+def test_legacy_letter_confusable_record_is_reclassified_before_delivery(tmp_path, ready, _character, command):
+    service, rest, conversation = ingress(tmp_path)
+    source = post(message=f"@restricted-bot {command} 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = source
+    record, _ = service.outbox.reserve(service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000)
+    if ready:
+        record = service.outbox.mark_ready(record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "legacy"})
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.BLOCKED
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_frozen_unicode_15_1_letter_confusable_table_covers_each_secondary_skeleton_mapping():
+    table = mattermost_ingress._UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES
+    assert sum(len(codepoints) for codepoints in table.values()) == 177
+    for letter, codepoints in table.items():
+        for codepoint in codepoints:
+            candidate = "next-appointment".replace(letter, chr(codepoint), 1)
+            assert mattermost_ingress._namespace_skeleton(candidate, secondary=True) == "next-appointment"
 
 
 def test_hyphen_bullet_clinical_lookalike_is_reserved_in_private_channel(tmp_path):
@@ -1574,3 +1624,130 @@ def test_submit_never_starts_turn_when_creation_exhausts_the_shared_deadline(mon
     with pytest.raises(ContractError, match="conversation transport failed"):
         client.submit(conversation_id="conversation", client_request_id="request", message="message")
     assert calls == [("POST", "/v1/restricted/conversations/conversation", 1.0)]
+
+
+@pytest.mark.parametrize("status", ["FAILED", "REJECTED", "INDETERMINATE", "RECEIVED", "REQUEST_COMMITTED", "INFERENCE_PENDING", "RESPONSE_RECEIVED"])
+def test_submit_turn_accepts_exact_known_status_documents(monkeypatch, status):
+    client = _uds_client()
+    status_document = {
+        "schema_version": "restricted-turn-status.v1", "turn_id": "turn-id",
+        "conversation_epoch": "epoch", "status": status,
+    }
+    monkeypatch.setattr(client, "_request", lambda *_args, **_kwargs: status_document)
+    assert client.submit_turn(
+        conversation_id="conversation", conversation_epoch="epoch", client_request_id="request", message="message"
+    ) == status_document
+
+
+def test_legacy_submit_uses_the_same_exact_status_validator(monkeypatch):
+    client = _uds_client()
+    responses = iter((
+        {"conversation_id": "conversation", "conversation_epoch": "epoch"},
+        {"schema_version": "restricted-turn-status.v1", "turn_id": "turn-id", "conversation_epoch": "epoch", "status": "FAILED"},
+    ))
+    monkeypatch.setattr(client, "_request", lambda *_args, **_kwargs: next(responses))
+    assert client.submit(conversation_id="conversation", client_request_id="request", message="message")["status"] == "FAILED"
+
+
+def test_submit_turn_preserves_the_exact_committed_result_contract(monkeypatch):
+    client = _uds_client()
+    committed = {
+        "schema_version": "restricted-turn-result.v1", "turn_id": "turn-id",
+        "conversation_epoch": "epoch", "status": "COMMITTED", "message": "committed response",
+    }
+    monkeypatch.setattr(client, "_request", lambda *_args, **_kwargs: committed)
+    assert client.submit_turn(
+        conversation_id="conversation", conversation_epoch="epoch", client_request_id="request", message="message"
+    ) == committed
+
+
+@pytest.mark.parametrize("result", [
+    {"schema_version": "restricted-turn-result.v1", "turn_id": "turn", "conversation_epoch": "epoch", "status": "COMMITTED"},
+    {"schema_version": "restricted-turn-result.v1", "turn_id": "turn", "conversation_epoch": "epoch", "status": "FAILED", "message": "wrong"},
+    {"schema_version": "restricted-turn-status.v1", "turn_id": "turn", "conversation_epoch": "epoch", "status": "FAILED", "message": "wrong"},
+    {"schema_version": "restricted-turn-status.v1", "turn_id": "turn", "conversation_epoch": "epoch", "status": "COMMITTED"},
+    {"schema_version": "restricted-turn-status.v1", "turn_id": "turn", "conversation_epoch": "other", "status": "FAILED"},
+    {"schema_version": "restricted-turn-status.v1", "turn_id": "", "conversation_epoch": "epoch", "status": "FAILED"},
+    {"schema_version": "restricted-turn-status.v1", "turn_id": "turn", "conversation_epoch": "e" * 129, "status": "FAILED"},
+    {"schema_version": "unknown", "turn_id": "turn", "conversation_epoch": "epoch", "status": "FAILED"},
+])
+def test_submit_turn_rejects_cross_product_and_binding_mismatches(monkeypatch, result):
+    client = _uds_client()
+    monkeypatch.setattr(client, "_request", lambda *_args, **_kwargs: result)
+    with pytest.raises(ContractError, match="conversation turn response rejected"):
+        client.submit_turn(conversation_id="conversation", conversation_epoch="epoch", client_request_id="request", message="message")
+
+
+@pytest.mark.parametrize("status", ["FAILED", "REJECTED", "INDETERMINATE"])
+def test_terminal_conversation_status_fails_outbox_once_without_recovery_resubmit(tmp_path, status):
+    service, rest, conversation = ingress(tmp_path)
+    source = post()
+    record, _ = service.outbox.reserve(
+        service._envelope(source, service._authorize_source(source)), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    calls = 0
+
+    def terminal_status(**kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "schema_version": "restricted-turn-status.v1", "turn_id": "turn-id",
+            "conversation_epoch": kwargs["conversation_epoch"], "status": status,
+        }
+
+    conversation.submit_turn = terminal_status
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.FAILED and calls == 1 and rest.created == []
+    service.executor.drain()
+    assert calls == 1
+
+
+@pytest.mark.parametrize("status", ["RECEIVED", "REQUEST_COMMITTED", "INFERENCE_PENDING", "RESPONSE_RECEIVED"])
+def test_active_conversation_status_keeps_outbox_waiting_for_idempotent_recovery(tmp_path, status):
+    service, rest, conversation = ingress(tmp_path)
+    source = post()
+    record, _ = service.outbox.reserve(
+        service._envelope(source, service._authorize_source(source)), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    calls = 0
+
+    def active_status(**kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "schema_version": "restricted-turn-status.v1", "turn_id": "turn-id",
+            "conversation_epoch": kwargs["conversation_epoch"], "status": status,
+        }
+
+    conversation.submit_turn = active_status
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.WAITING_COMMIT and calls == 1 and rest.created == []
+    service.executor.drain()
+    assert calls == 2
+
+
+@pytest.mark.parametrize("status", ["FAILED", "INDETERMINATE"])
+def test_real_conversation_service_terminal_result_matches_the_status_wire(status):
+    from restricted_runtime.conversation import ConversationService
+    from restricted_runtime.contracts import ProviderResult, TurnRequest
+    from restricted_runtime.crypto import LocalHmacKey
+    from test_conversation_execution import Keys, Store, policy
+
+    class TerminalGateway:
+        def infer_once(self, envelope, principal):
+            return ProviderResult(status)
+
+    runtime = ConversationService(
+        Store(), TerminalGateway(), LocalHmacKey("k", "v", b"x" * 32), Keys(), policy(), "tenant"
+    )
+    request = TurnRequest.parse({
+        "schema_version": "restricted-turn.v1", "client_request_id": "00000000-0000-0000-0000-000000000001",
+        "conversation_epoch": "epoch", "message": "hello",
+    })
+    result = runtime.submit(request, principal="svc@example.com", conversation_id="conversation")
+    assert result == {
+        "schema_version": "restricted-turn-status.v1", "turn_id": result["turn_id"],
+        "conversation_epoch": "epoch", "status": status,
+    }

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
-from .contracts import ClinicalAuthorizationDenied, ContractError, jcs_bytes, load_closed_json
+from .contracts import ClinicalAuthorizationDenied, ContractError, TurnState, jcs_bytes, load_closed_json
 from .mattermost_outbox import CLINICAL_OUTBOX_SCHEMA, DeliveryState, MattermostOutbox, OutboxRecord
 from .mattermost_policy import MAX_EVENT_BYTES, MattermostPolicy
 from .upstream_deadline import absolute_upstream_deadline
@@ -144,6 +144,26 @@ _SECONDARY_CLINICAL_CONFUSABLES = str.maketrans({
     **{chr(codepoint): "-" for codepoint in _UNICODE_15_1_DASH_PUNCTUATION},
     "\u0131": "i", "\u2043": "-", "\u2212": "-",
 })
+# Unicode 15.1.0 confusables.txt: single-source, single-ASCII-letter mappings
+# for letters in "nextappointment" that remain after NFKC/casefold and the
+# primary namespace maps. This is detection-only, not a general parser.
+# https://www.unicode.org/Public/security/15.1.0/confusables.txt
+_UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES = {
+    "a": (0x237A, 0x0251, 0x13AA, 0x15C5, 0xA4EE, 0x16F40, 0x102A0),
+    "e": (0x212E, 0xAB32, 0x04BD, 0x22FF, 0x0395, 0x1D6AC, 0x1D6E6, 0x1D720, 0x1D75A, 0x1D794, 0x2D39, 0x13AC, 0xA4F0, 0x118A6, 0x118AE, 0x10286),
+    "i": (0x02DB, 0x2373, 0x0131, 0x1D6A4, 0x026A, 0x0269, 0x037A, 0xA647, 0x04CF, 0xAB75, 0x13A5, 0x118C3),
+    "m": (0x039C, 0x1D6B3, 0x1D6ED, 0x1D727, 0x1D761, 0x1D79B, 0x03FA, 0x2C98, 0x13B7, 0x15F0, 0x16D6, 0xA4DF, 0x102B0, 0x10311),
+    "n": (0x0578, 0x057C, 0x039D, 0x1D6B4, 0x1D6EE, 0x1D728, 0x1D762, 0x1D79C, 0x2C9A, 0xA4E0, 0x10513),
+    "o": (0x0C02, 0x0C82, 0x0D02, 0x0D82, 0x0966, 0x0A66, 0x0AE6, 0x0BE6, 0x0C66, 0x0CE6, 0x0D66, 0x0E50, 0x0ED0, 0x1040, 0x0665, 0x06F5, 0x1D0F, 0x1D11, 0xAB3D, 0x03C3, 0x1D6D4, 0x1D70E, 0x1D748, 0x1D782, 0x1D7BC, 0x2C9F, 0x10FF, 0x0585, 0x05E1, 0x0647, 0x1EE24, 0x1EE64, 0x1EE84, 0xFEEB, 0xFEEC, 0xFEEA, 0xFEE9, 0x06BE, 0xFBAC, 0xFBAD, 0xFBAB, 0xFBAA, 0x06C1, 0xFBA8, 0xFBA9, 0xFBA7, 0xFBA6, 0x06D5, 0x0D20, 0x101D, 0x104EA, 0x118C8, 0x118D7, 0x1042C, 0x0030, 0x07C0, 0x09E6, 0x0B66, 0x3007, 0x114D0, 0x118E0, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1FBF0, 0x2C9E, 0x0555, 0x2D54, 0x12D0, 0x0B20, 0x104C2, 0xA4F3, 0x118B5, 0x10292, 0x102AB, 0x10404, 0x10516),
+    "p": (0x2374, 0x2CA3, 0x2CA2, 0x13E2, 0x146D, 0xA4D1, 0x10295),
+    "t": (0x22A4, 0x27D9, 0x1F768, 0x2CA6, 0x13A2, 0xA4D4, 0x16F0A, 0x118BC, 0x10297, 0x102B1, 0x10315),
+    "x": (0x166E, 0x00D7, 0x292B, 0x292C, 0x2A2F, 0x1541, 0x157D, 0x166D, 0x2573, 0x10322, 0x118EC, 0xA7B3, 0x2CAC, 0x2D5D, 0x16B7, 0xA4EB, 0x10290, 0x102B4, 0x10317, 0x10527),
+}
+_SECONDARY_CLINICAL_SOURCE_CONFUSABLES = str.maketrans({
+    ord(chr(codepoint)): letter
+    for letter, codepoints in _UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES.items()
+    for codepoint in codepoints
+})
 # Unicode 15.1.0 DerivedCoreProperties.txt, Default_Ignorable_Code_Point:
 # https://www.unicode.org/Public/15.1.0/ucd/DerivedCoreProperties.txt
 _UNICODE_15_1_DEFAULT_IGNORABLE_RANGES = (
@@ -168,6 +188,8 @@ def _namespace_skeleton(value: str, *, remove_marks: bool = False, secondary: bo
     if remove_marks:
         value = unicodedata.normalize("NFD", value)
         value = "".join(character for character in value if not unicodedata.category(character).startswith("M"))
+    if secondary:
+        value = value.translate(_SECONDARY_CLINICAL_SOURCE_CONFUSABLES)
     normalized = unicodedata.normalize("NFKC", value).casefold().translate(_CONFUSABLES).translate(_DASHES)
     if secondary:
         normalized = normalized.translate(_SECONDARY_CLINICAL_CONFUSABLES)
@@ -932,6 +954,37 @@ class ConversationUdsClient:
     def create_conversation(self, *, conversation_id: str, deadline: float | None = None) -> dict[str, Any]:
         return self._request("POST", "/v1/restricted/conversations/" + conversation_id, deadline=deadline)
 
+    @staticmethod
+    def _valid_identifier(value: Any) -> bool:
+        return isinstance(value, str) and 1 <= len(value) <= 128
+
+    def _turn_response(self, result: Any, *, conversation_epoch: str) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            raise ContractError("conversation turn response rejected")
+        schema = result.get("schema_version")
+        if schema == "restricted-turn-result.v1":
+            if (
+                set(result) != {"schema_version", "turn_id", "conversation_epoch", "status", "message"}
+                or result.get("status") != TurnState.COMMITTED
+                or not isinstance(result.get("message"), str) or not result["message"]
+            ):
+                raise ContractError("conversation turn response rejected")
+        elif schema == "restricted-turn-status.v1":
+            if (
+                set(result) != {"schema_version", "turn_id", "conversation_epoch", "status"}
+                or result.get("status") not in {state.value for state in TurnState if state is not TurnState.COMMITTED}
+            ):
+                raise ContractError("conversation turn response rejected")
+        else:
+            raise ContractError("conversation turn response rejected")
+        if (
+            not self._valid_identifier(result.get("turn_id"))
+            or not self._valid_identifier(result.get("conversation_epoch"))
+            or result["conversation_epoch"] != conversation_epoch
+        ):
+            raise ContractError("conversation turn response rejected")
+        return result
+
     def submit_turn(self, *, conversation_id: str, conversation_epoch: str, client_request_id: str, message: str, deadline: float | None = None) -> dict[str, Any]:
         deadline = deadline if deadline is not None else time.monotonic() + self.policy.values["conversation_deadline_seconds"]
         result = self._request(
@@ -939,8 +992,7 @@ class ConversationUdsClient:
             {"schema_version": "restricted-turn.v1", "client_request_id": client_request_id,
              "conversation_epoch": conversation_epoch, "message": message}, deadline=deadline,
         )
-        if set(result) != {"schema_version", "turn_id", "conversation_epoch", "status", "message"}:
-            raise ContractError("conversation turn response rejected")
+        result = self._turn_response(result, conversation_epoch=conversation_epoch)
         if deadline - time.monotonic() <= 0:
             raise ContractError("conversation transport failed")
         return result
@@ -948,7 +1000,7 @@ class ConversationUdsClient:
     def submit(self, *, conversation_id: str, client_request_id: str, message: str):
         deadline = time.monotonic() + self.policy.values["conversation_deadline_seconds"]
         created = self.create_conversation(conversation_id=conversation_id, deadline=deadline)
-        if created.get("conversation_id") != conversation_id or not isinstance(created.get("conversation_epoch"), str):
+        if created.get("conversation_id") != conversation_id or not self._valid_identifier(created.get("conversation_epoch")):
             raise ContractError("conversation creation response rejected")
         if deadline - time.monotonic() <= 0:
             raise ContractError("conversation transport failed")
@@ -957,8 +1009,7 @@ class ConversationUdsClient:
             {"schema_version": "restricted-turn.v1", "client_request_id": client_request_id,
              "conversation_epoch": created["conversation_epoch"], "message": message}, deadline=deadline,
         )
-        if set(result) != {"schema_version", "turn_id", "conversation_epoch", "status", "message"}:
-            raise ContractError("conversation turn response rejected")
+        result = self._turn_response(result, conversation_epoch=created["conversation_epoch"])
         if deadline - time.monotonic() <= 0:
             raise ContractError("conversation transport failed")
         return result

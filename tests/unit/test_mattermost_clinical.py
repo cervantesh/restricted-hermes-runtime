@@ -19,6 +19,7 @@ from test_mattermost_ingress import (
     policy_values,
     post,
     signed_policy,
+    LETTER_CONFUSABLE_COMMANDS,
 )
 from restricted_runtime.mattermost_outbox import MattermostOutbox
 import os
@@ -151,6 +152,17 @@ def test_dotless_i_clinical_lookalike_is_reserved_in_direct_channel(tmp_path):
     candidate = post(message=f"@restricted-bot next-appo\u0131ntment {PATIENT}")
     rest.posts[ROOT] = candidate
     service.handle(event(candidate, channel_type="D"))
+    assert conversation.calls == [] and clinical.queries == [] and rest.created == []
+    assert service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize(("_character", "command"), LETTER_CONFUSABLE_COMMANDS)
+def test_letter_confusable_clinical_lookalikes_are_reserved_in_direct_channel(tmp_path, _character, command):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    candidate = post(message=f"@restricted-bot {command} {PATIENT}")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="D"))
+    assert mattermost_ingress._clinical_command(candidate["message"], "restricted-bot") == ("malformed", None)
     assert conversation.calls == [] and clinical.queries == [] and rest.created == []
     assert service.outbox.candidates(10) == []
 
