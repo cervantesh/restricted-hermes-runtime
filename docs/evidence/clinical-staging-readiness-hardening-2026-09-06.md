@@ -54,15 +54,22 @@ the separately installed editable checkout.
   `52 passed, 3 warnings`.
 - Role-specific container contracts: `7 passed`.
 - `git diff --check`: pass.
+- Hosted CI on revision `45e883c498df301db68f046bd54339598a39f00f`:
+  [run 34067103832](https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/34067103832)
+  completed successfully. Its three jobs passed: Python 3.11 contracts, Python
+  3.12 contracts, and the synthetic-only Linux/container E2E. The E2E job
+  rebuilt and exercised the composed runtime rather than reusing the local
+  Windows test result.
 
 The temporary PostgreSQL container was created with `--rm`, stopped after the
 run, and verified absent from `docker ps -a`.
 
 ## Remaining evidence gates
 
-- The exact candidate has not yet run the Linux/root/POSIX process witnesses or
-  the complete synthetic clinical Compose lifecycle after these changes.
-- Hosted CI evidence does not exist until this evidence commit is pushed.
+- The Linux/container witnesses and complete synthetic Compose lifecycle are
+  green in hosted CI. Real host-level service-manager validation remains open;
+  a containerized process witness is not evidence for systemd, launchd, or
+  Windows SCM behavior.
 - Dependency and image findings still require a pinned-input inventory,
   reachability triage, and accepted VEX or remediation.
 - Representative operator controls and independent technical/nontechnical
