@@ -195,15 +195,6 @@ _CLINICAL_COMPATIBILITY_SEPARATOR_SKELETONS = str.maketrans({
     for separator, codepoints in _UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS.items()
     for codepoint in codepoints
 })
-_CLINICAL_COMPATIBILITY_SECONDARY_COLLISION = "\uE000"
-_CLINICAL_COMPATIBILITY_SECONDARY_SEPARATOR_SKELETONS = str.maketrans({
-    codepoint: (
-        _CLINICAL_COMPATIBILITY_SECONDARY_COLLISION
-        if codepoint in {0x02DB, 0x037A} else separator
-    )
-    for separator, codepoints in _UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS.items()
-    for codepoint in codepoints
-})
 # Unicode 15.1.0 confusables.txt: single-source, single-ASCII-letter mappings
 # for letters in "nextappointment" that remain after NFKC/casefold and the
 # primary namespace maps. This is detection-only, not a general parser.
@@ -227,9 +218,6 @@ _SECONDARY_CLINICAL_SOURCE_CONFUSABLES = str.maketrans({
 _SECONDARY_CLINICAL_MARK_O_SOURCES = {
     0x0C02: "o", 0x0C82: "o", 0x0D02: "o", 0x0D82: "o",
 }
-_SECONDARY_CLINICAL_MARK_O_REMOVALS = str.maketrans({
-    codepoint: None for codepoint in _SECONDARY_CLINICAL_MARK_O_SOURCES
-})
 _SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES = str.maketrans({
     ord(chr(codepoint)): letter
     for letter, codepoints in _UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES.items()
@@ -274,73 +262,129 @@ def _namespace_mark(character: str) -> bool:
     return ord(character) in _UNICODE_15_1_MARK_ADDITION_CODEPOINTS
 
 
-def _secondary_source_confusable_skeleton(value: str) -> str:
-    """Map Mark ``o`` sources after their non-Mark namespace neighbors normalize."""
-    value = re.sub(
-        rf"(?<=app)[\u0c02\u0c82\u0d02\u0d82](?=[i{_CLINICAL_COMPATIBILITY_SECONDARY_COLLISION}]ntment)",
-        "o", value,
-    )
-    return value.translate(_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES)
-
-
-def _late_secondary_mark_o_context(value: str) -> str:
-    """Resolve preserved Mark ``o`` sources only in the normalized namespace slot."""
-    value = re.sub(
-        rf"(?<=app)[\u0c02\u0c82\u0d02\u0d82](?=[i{_CLINICAL_COMPATIBILITY_SECONDARY_COLLISION}]ntment)",
-        "o", value,
-    )
-    return value.translate(_SECONDARY_CLINICAL_MARK_O_REMOVALS)
-
-
 def _namespace_skeleton(
     value: str, *, remove_marks: bool = False, secondary: bool = False,
     compatibility_separators: bool = False, preserve_compatibility_letter_collisions: bool = False,
 ) -> str:
+    """Deterministic diagnostic skeleton; reservation uses the automaton below."""
     if compatibility_separators:
-        # Each replacement is the source-local UnicodeData compatibility
-        # decomposition after NFKC and mark removal.  Do not strip marks from
-        # unrelated characters in the same message.
-        value = value.translate(
-            _CLINICAL_COMPATIBILITY_SECONDARY_SEPARATOR_SKELETONS
-            if secondary and preserve_compatibility_letter_collisions
-            else _CLINICAL_COMPATIBILITY_SEPARATOR_SKELETONS
-        )
+        value = value.translate(_CLINICAL_COMPATIBILITY_SEPARATOR_SKELETONS)
     if secondary:
         value = value.translate(_SECONDARY_CLINICAL_SOURCE_SEPARATORS)
-        value = value.translate(_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES)
-        if not remove_marks:
-            value = value.translate(_CONFUSABLES)
-            value = value.translate(_SECONDARY_CLINICAL_CONFUSABLES)
-            value = _secondary_source_confusable_skeleton(value)
+        value = value.translate(_SECONDARY_CLINICAL_SOURCE_CONFUSABLES)
     if remove_marks:
         value = unicodedata.normalize("NFD", value)
-        value = "".join(
-            character for character in value
-            if ord(character) in _SECONDARY_CLINICAL_MARK_O_SOURCES or not _namespace_mark(character)
-        )
+        value = "".join(character for character in value if not _namespace_mark(character))
     normalized = unicodedata.normalize("NFKC", value).casefold().translate(_CONFUSABLES).translate(_DASHES)
     if secondary:
         normalized = normalized.translate(_SECONDARY_CLINICAL_CONFUSABLES)
-    normalized = "".join(character for character in normalized if not _namespace_ignorable(character))
-    return _late_secondary_mark_o_context(normalized) if remove_marks and secondary else normalized
+    return "".join(character for character in normalized if not _namespace_ignorable(character))
+
+
+_CLINICAL_AUTOMATON_STATE_COUNT = 17
+_CLINICAL_AUTOMATON_SEPARATOR = None
+_CLINICAL_AUTOMATON_SUFFIX = "ppointment"
+_CLINICAL_COLLISION_SOURCES = frozenset((0x02DB, 0x037A))
+_CLINICAL_COMPATIBILITY_SEPARATOR_OPTIONS = {
+    codepoint: separator
+    for separator, codepoints in _UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS.items()
+    for codepoint in codepoints
+}
+_CLINICAL_SOURCE_SEPARATOR_OPTIONS = {
+    codepoint: separator
+    for separator, codepoints in _UNICODE_15_1_CLINICAL_SEPARATOR_CONFUSABLES.items()
+    for codepoint in codepoints
+}
+
+
+def _normalized_clinical_symbols(character: str) -> tuple[str | None, ...]:
+    """Return deterministic symbols after the established safe normalization."""
+    normalized = unicodedata.normalize("NFD", character)
+    normalized = "".join(symbol for symbol in normalized if not _namespace_mark(symbol))
+    normalized = unicodedata.normalize("NFKC", normalized).casefold()
+    normalized = normalized.translate(_CONFUSABLES).translate(_DASHES)
+    normalized = normalized.translate(_SECONDARY_CLINICAL_CONFUSABLES)
+    return tuple(
+        _CLINICAL_AUTOMATON_SEPARATOR if symbol in "-_" or symbol.isspace() else symbol
+        for symbol in normalized
+        if not _namespace_ignorable(symbol)
+    )
+
+
+def _clinical_source_options(character: str) -> tuple[tuple[str | None, ...], ...]:
+    """Keep bounded source-specific alternatives separate from normalized output."""
+    codepoint = ord(character)
+    if codepoint in _SECONDARY_CLINICAL_MARK_O_SOURCES:
+        return ((), ("o",))
+    if codepoint in _CLINICAL_COLLISION_SOURCES:
+        return ((_CLINICAL_AUTOMATON_SEPARATOR,), ("i",))
+    if codepoint in _CLINICAL_COMPATIBILITY_SEPARATOR_OPTIONS:
+        return ((_CLINICAL_AUTOMATON_SEPARATOR,),)
+    if codepoint in _CLINICAL_SOURCE_SEPARATOR_OPTIONS:
+        return ((_CLINICAL_AUTOMATON_SEPARATOR,),)
+    if codepoint in _SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES:
+        return ((_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES[codepoint],),)
+    return (_normalized_clinical_symbols(character),)
+
+
+def _clinical_automaton_transition(state: int, symbol: str | None) -> int:
+    """Advance one of the fixed ``next<sep>appointment`` recognizer states."""
+    if state == 0:
+        return 1 if symbol == "n" else 0
+    if state < 4:
+        expected = "next"[state]
+    elif state == 4:
+        if symbol is _CLINICAL_AUTOMATON_SEPARATOR:
+            return 5
+        expected = None
+    elif state == 5:
+        if symbol is _CLINICAL_AUTOMATON_SEPARATOR:
+            return 5
+        expected = "a"
+    else:
+        expected = _CLINICAL_AUTOMATON_SUFFIX[state - 6]
+    if symbol == expected:
+        return state + 1
+    return 1 if symbol == "n" else 0
 
 
 def _clinical_namespace(
     value: str, *, remove_marks: bool = False, secondary: bool = False,
     compatibility_separators: bool = False, preserve_compatibility_letter_collisions: bool = False,
+    instrumentation: dict[str, int] | None = None,
 ) -> bool:
-    skeleton = _namespace_skeleton(
-        value, remove_marks=remove_marks, secondary=secondary,
-        compatibility_separators=compatibility_separators,
-        preserve_compatibility_letter_collisions=preserve_compatibility_letter_collisions,
-    )
-    pattern = (
-        rf"next[-_\s{_CLINICAL_COMPATIBILITY_SECONDARY_COLLISION}]+appo"
-        rf"[i{_CLINICAL_COMPATIBILITY_SECONDARY_COLLISION}]ntment"
-        if preserve_compatibility_letter_collisions
-        else r"next[-_\s]+appointment"
-    )
-    return re.search(pattern, skeleton) is not None
+    """Recognize reserved lookalikes without materializing ambiguous interpretations."""
+    del remove_marks, secondary, compatibility_separators, preserve_compatibility_letter_collisions
+    states = {0}
+    max_active_states = 1
+    transition_steps = 0
+    source_tokens = 0
+    for character in value:
+        source_tokens += 1
+        next_states = {0}
+        for option in _clinical_source_options(character):
+            branch = states
+            for symbol in option:
+                transition_steps += len(branch)
+                branch = {_clinical_automaton_transition(state, symbol) for state in branch}
+            next_states.update(branch)
+        states = next_states
+        max_active_states = max(max_active_states, len(states))
+        if 16 in states:
+            if instrumentation is not None:
+                instrumentation.update(
+                    max_active_states=max_active_states,
+                    transition_steps=transition_steps,
+                    source_tokens=source_tokens,
+                )
+            return True
+    if instrumentation is not None:
+        instrumentation.update(
+            max_active_states=max_active_states,
+            transition_steps=transition_steps,
+            source_tokens=source_tokens,
+        )
+    return False
 
 
 def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]:
@@ -348,30 +392,10 @@ def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]
     mention = re.compile(rf"(?<![A-Za-z0-9._-])@{re.escape(bot_username)}(?![A-Za-z0-9._-])")
     matches = list(mention.finditer(message))
     if len(matches) != 1:
-        return ("malformed", None) if any((
-            _clinical_namespace(message), _clinical_namespace(message, remove_marks=True),
-            _clinical_namespace(message, secondary=True), _clinical_namespace(message, remove_marks=True, secondary=True),
-            _clinical_namespace(message, remove_marks=True, compatibility_separators=True),
-            _clinical_namespace(message, secondary=True, compatibility_separators=True),
-            _clinical_namespace(message, secondary=True, compatibility_separators=True,
-                                preserve_compatibility_letter_collisions=True),
-            _clinical_namespace(message, remove_marks=True, secondary=True, compatibility_separators=True),
-            _clinical_namespace(message, remove_marks=True, secondary=True, compatibility_separators=True,
-                                preserve_compatibility_letter_collisions=True),
-        )) else ("ordinary", None)
+        return ("malformed", None) if _clinical_namespace(message) else ("ordinary", None)
     match = matches[0]
     body = (message[:match.start()] + message[match.end():]).strip()
-    if not any((
-        _clinical_namespace(body), _clinical_namespace(body, remove_marks=True),
-        _clinical_namespace(body, secondary=True), _clinical_namespace(body, remove_marks=True, secondary=True),
-        _clinical_namespace(body, remove_marks=True, compatibility_separators=True),
-        _clinical_namespace(body, secondary=True, compatibility_separators=True),
-        _clinical_namespace(body, secondary=True, compatibility_separators=True,
-                            preserve_compatibility_letter_collisions=True),
-        _clinical_namespace(body, remove_marks=True, secondary=True, compatibility_separators=True),
-        _clinical_namespace(body, remove_marks=True, secondary=True, compatibility_separators=True,
-                            preserve_compatibility_letter_collisions=True),
-    )):
+    if not _clinical_namespace(body):
         return "ordinary", None
     if any(unicodedata.category(character).startswith("M") for character in body):
         return "malformed", None

@@ -810,6 +810,110 @@ def test_round13_late_context_mark_o_sources_reserve_private_namespace_without_e
     assert conversation.calls == [] and rest.created == [] and service.outbox.candidates(10) == []
 
 
+def test_round14_set_recognizer_closes_independent_mark_o_and_collision_choices():
+    sources = tuple(map(chr, COMBINING_MARK_O_CONFUSABLES))
+    for first in sources:
+        for second in sources:
+            assert mattermost_ingress._clinical_namespace(f"next-app{first}{second}intment")
+    for candidate in (
+        f"next-app{sources[0]}{sources[1]}{sources[2]}intment",
+        f"next-a{sources[0]}pp{sources[1]}intment",
+        f"next-appo{sources[0]}intment",
+        f"next-app{sources[0]}ointment",
+        "next\u02dbappo\u037antment",
+        "next\u037aappo\u02dbntment",
+        "next\u02dbappo\u02dbntment",
+        "next\u037aappo\u037antment",
+    ):
+        assert mattermost_ingress._clinical_namespace(candidate), candidate.encode("unicode_escape")
+    for index in range(len("next-appointment") + 1):
+        candidate = "next-appointment"
+        candidate = candidate[:index] + sources[0] + candidate[index:]
+        assert mattermost_ingress._clinical_namespace(candidate), (index, candidate.encode("unicode_escape"))
+    assert not mattermost_ingress._clinical_namespace("next-app\u0301intment")
+    assert not mattermost_ingress._clinical_namespace("next-appintment")
+    assert not mattermost_ingress._clinical_namespace("next-apqointment")
+
+
+def test_round14_all_compatibility_separators_compose_with_every_ordered_mark_o_pair():
+    for separator in UNICODE_15_1_COMPATIBILITY_SEPARATOR_SOURCES:
+        for first in COMBINING_MARK_O_CONFUSABLES:
+            for second in COMBINING_MARK_O_CONFUSABLES:
+                assert mattermost_ingress._clinical_namespace(
+                    f"next{chr(separator)}app{chr(first)}{chr(second)}intment"
+                ), (hex(separator), hex(first), hex(second))
+
+
+def test_round14_recognizer_bound_is_linear_for_a_megabyte_ambiguous_nonmatch():
+    prefix = "next-app"
+    suffix = "x"
+    source = "\u0c02"
+    value = prefix + source * (
+        (mattermost_ingress._MAX_HTTP_BYTES - len(prefix.encode("utf-8")) - len(suffix.encode("utf-8")))
+        // len(source.encode("utf-8"))
+    ) + suffix
+    instrumentation: dict[str, int] = {}
+    assert len(value.encode("utf-8")) <= mattermost_ingress._MAX_HTTP_BYTES
+    assert not mattermost_ingress._clinical_namespace(value, instrumentation=instrumentation)
+    assert instrumentation["max_active_states"] >= 3
+    assert instrumentation["max_active_states"] <= 17
+    assert instrumentation["transition_steps"] <= instrumentation["source_tokens"] * 34
+
+
+@pytest.mark.parametrize("namespace", (
+    "next-app\u0c02\u0c82intment",
+    "next-a\u0c02pp\u0c82intment",
+    "next-app\u0c02\u0c82\u0d02intment",
+))
+def test_round14_ambiguous_mark_o_fresh_private_events_have_zero_effects(tmp_path, namespace):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot {namespace} 123e4567-e89b-42d3-a456-426614174000"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == [] and service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize("source", tuple(
+    dict.fromkeys(
+        UNICODE_15_1_COMPATIBILITY_SEPARATOR_SOURCES
+        + COMBINING_MARK_O_CONFUSABLES
+        + (0x02DB, 0x037A)
+    )
+))
+def test_round14_special_sources_outside_namespace_reach_private_conversation_exactly(tmp_path, source):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot ordinary {chr(source)} text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+@pytest.mark.parametrize("namespace", (
+    "next-app\u0c02\u0c82intment",
+    "next-a\u0c02pp\u0c82intment",
+    "next-app\u0c02\u0c82\u0d02intment",
+))
+def test_round14_ambiguous_mark_o_records_never_reach_private_delivery(tmp_path, ready, namespace):
+    service, rest, conversation = ingress(tmp_path)
+    source = post(message=f"@restricted-bot {namespace} 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = source
+    record, _ = service.outbox.reserve(
+        service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    if ready:
+        record = service.outbox.mark_ready(
+            record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "legacy"},
+        )
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.BLOCKED
+    assert conversation.calls == [] and rest.created == []
+
+
 @pytest.mark.parametrize("namespace", (
     "next-\u0430pp\u0c02intment",
     "next-app\u0c02i\u0578tment",
