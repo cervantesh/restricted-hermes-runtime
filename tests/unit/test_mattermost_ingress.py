@@ -58,6 +58,12 @@ UNICODE_15_1_CLINICAL_SEPARATOR_CONFUSABLES = {
 }
 RESIDUAL_CLINICAL_SEPARATOR_SOURCES = (0x06D4, 0x02D7, 0x2796, 0x2CBA, 0x2A29, 0xFB29, 0x2238, 0x2A2A, 0xFF5E, 0x07FA)
 RESIDUAL_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES = (0x00A8, 0x00AF, 0x00B4, 0x00B8, 0x02D8, 0x02D9, 0x02DA, 0x02DB, 0x02DC, 0x02DD, 0x037A, 0x0384, 0x0385, 0x1FBD, 0x1FBF, 0x1FC0, 0x1FC1, 0x1FCD, 0x1FCE, 0x1FCF, 0x1FDD, 0x1FDE, 0x1FDF, 0x1FED, 0x1FEE, 0x1FFD, 0x1FFE, 0x2017, 0x203E, 0x309B, 0x309C, 0xFC5E, 0xFC5F, 0xFC60, 0xFC61, 0xFC62, 0xFC63, 0xFE49, 0xFE4A, 0xFE4B, 0xFE4C, 0xFE70, 0xFE72, 0xFE74, 0xFE76, 0xFE78, 0xFE7A, 0xFE7C, 0xFE7E, 0xFFE3)
+UNICODE_15_1_COMPATIBILITY_SEPARATOR_SOURCES = tuple(
+    codepoint
+    for codepoints in mattermost_ingress._UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS.values()
+    for codepoint in codepoints
+)
+COMBINING_MARK_O_CONFUSABLES = (0x0C02, 0x0C82, 0x0D02, 0x0D82)
 @pytest.fixture(autouse=True)
 def portable_rest_deadline(monkeypatch):
     """HTTP shape tests run on Windows; POSIX alarm behavior is tested directly."""
@@ -647,6 +653,56 @@ def test_compatibility_and_secondary_letter_sources_compose_without_effects(
     service.handle(event(candidate, channel_type="P"))
     assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
     assert conversation.calls == [] and rest.created == [] and service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize("separator_source", UNICODE_15_1_COMPATIBILITY_SEPARATOR_SOURCES)
+@pytest.mark.parametrize("letter_source", COMBINING_MARK_O_CONFUSABLES)
+def test_round12_compatibility_separator_and_combining_o_reserve_private_namespace_without_effects(
+    tmp_path, separator_source, letter_source,
+):
+    service, rest, conversation = ingress(tmp_path)
+    message = (
+        f"@restricted-bot next{chr(separator_source)}app{chr(letter_source)}intment "
+        "123e4567-e89b-42d3-a456-426614174000"
+    )
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == [] and service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize("separator_source", (0x2017, 0x0385, 0xFE49, 0xFFE3))
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+def test_round12_legacy_combining_o_records_are_reclassified_before_delivery(
+    tmp_path, separator_source, ready,
+):
+    service, rest, conversation = ingress(tmp_path)
+    source = post(message=(
+        f"@restricted-bot next{chr(separator_source)}app\u0c02intment "
+        "123e4567-e89b-42d3-a456-426614174000"
+    ))
+    rest.posts[ROOT] = source
+    record, _ = service.outbox.reserve(
+        service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    if ready:
+        record = service.outbox.mark_ready(
+            record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "legacy"},
+        )
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.BLOCKED
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_round12_combining_o_outside_namespace_reaches_private_conversation_exactly(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    message = "@restricted-bot ordinary \u2017 app\u0c02intment text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
 
 
 @pytest.mark.parametrize("codepoint", RESIDUAL_CLINICAL_SEPARATOR_SOURCES)

@@ -20,8 +20,10 @@ from test_mattermost_ingress import (
     post,
     signed_policy,
     LETTER_CONFUSABLE_COMMANDS,
+    COMBINING_MARK_O_CONFUSABLES,
     RESIDUAL_CLINICAL_SEPARATOR_SOURCES,
     RESIDUAL_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES,
+    UNICODE_15_1_COMPATIBILITY_SEPARATOR_SOURCES,
 )
 from restricted_runtime.mattermost_outbox import DeliveryState, MattermostOutbox
 import os
@@ -188,6 +190,22 @@ def test_compatibility_and_secondary_letter_sources_reserve_direct_clinical_name
     service, rest, conversation, clinical = clinical_ingress(tmp_path)
     candidate = post(message=(
         f"@restricted-bot next{chr(separator_source)}appo{chr(letter_source)}ntment {PATIENT}"
+    ))
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="D"))
+    assert mattermost_ingress._clinical_command(candidate["message"], "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and clinical.queries == [] and clinical.reauthorizations == []
+    assert rest.created == [] and service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize("separator_source", UNICODE_15_1_COMPATIBILITY_SEPARATOR_SOURCES)
+@pytest.mark.parametrize("letter_source", COMBINING_MARK_O_CONFUSABLES)
+def test_round12_compatibility_separator_and_combining_o_reserve_direct_clinical_namespace(
+    tmp_path, separator_source, letter_source,
+):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    candidate = post(message=(
+        f"@restricted-bot next{chr(separator_source)}app{chr(letter_source)}intment {PATIENT}"
     ))
     rest.posts[ROOT] = candidate
     service.handle(event(candidate, channel_type="D"))
