@@ -306,6 +306,37 @@ def ingress(tmp_path):
     return service, rest, conversation
 
 
+@pytest.mark.parametrize(
+    ("uppercase", "lowercase", "ascii"),
+    [
+        ("\u0410", "\u0430", "a"), ("\u0415", "\u0435", "e"), ("\u0406", "\u0456", "i"),
+        ("\u041c", "\u043c", "m"), ("\u041e", "\u043e", "o"), ("\u0420", "\u0440", "p"),
+        ("\u0422", "\u0442", "t"), ("\u0425", "\u0445", "x"), ("\u0391", "\u03b1", "a"),
+        ("\u0399", "\u03b9", "i"), ("\u039f", "\u03bf", "o"), ("\u03a1", "\u03c1", "p"),
+        ("\u03a4", "\u03c4", "t"), ("\u03a7", "\u03c7", "x"),
+    ],
+)
+def test_supported_uppercase_and_lowercase_confusables_reserve_the_clinical_namespace_in_an_allowed_private_channel(
+    tmp_path, uppercase, lowercase, ascii,
+):
+    service, rest, conversation = ingress(tmp_path)
+    for glyph in (uppercase, lowercase):
+        candidate = post(message=f"@restricted-bot {'next-appointment'.replace(ascii, glyph, 1)} 123e4567-e89b-42d3-a456-426614174000")
+        rest.posts[ROOT] = candidate
+        service.handle(event(candidate, channel_type="P"))
+        assert conversation.calls == []
+        assert rest.created == []
+
+
+def test_ordinary_private_channel_text_still_reaches_the_conversation_path(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    candidate = post(message="@restricted-bot ordinary request")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert len(conversation.calls) == 1
+    assert len(rest.created) == 1
+
+
 def test_preflight_binds_readiness_bot_and_all_private_channels(tmp_path):
     service, rest, conversation = ingress(tmp_path)
     conversation.readiness["policy_digest"] = "b" * 64

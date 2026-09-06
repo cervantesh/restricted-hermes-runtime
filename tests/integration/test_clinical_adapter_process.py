@@ -44,7 +44,7 @@ listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);listener.bind(path);li
 connection,_=listener.accept()
 with connection:
     raw=receive_one(connection,timeout_seconds=2)
-    connection.sendall(ClinicalAdapter(expected_ingress_uid=int(sys.argv[2]),upstream=Upstream()).handle(peer_uid(connection),raw))
+    connection.sendall(ClinicalAdapter(expected_ingress_uid=int(sys.argv[2]),expected_clinical_timezone='America/New_York',upstream=Upstream()).handle(peer_uid(connection),raw))
 listener.close();os.unlink(path)
 """
 
@@ -104,7 +104,7 @@ listener=_bind_listener_at(sys.argv[1],socket_gid=20006)
 connection,_=listener.accept()
 with connection:
     raw=receive_one(connection,timeout_seconds=3)
-    connection.sendall(ClinicalAdapter(expected_ingress_uid=10007,upstream=Upstream()).handle(peer_uid(connection),raw))
+    connection.sendall(ClinicalAdapter(expected_ingress_uid=10007,expected_clinical_timezone='America/New_York',upstream=Upstream()).handle(peer_uid(connection),raw))
 listener.close();os.unlink(sys.argv[1])
 """
 

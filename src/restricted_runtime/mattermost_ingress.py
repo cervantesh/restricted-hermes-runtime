@@ -122,7 +122,7 @@ _CONFUSABLES = str.maketrans({
 
 
 def _namespace_skeleton(value: str) -> str:
-    normalized = unicodedata.normalize("NFKC", value).translate(_DASHES).translate(_CONFUSABLES).casefold()
+    normalized = unicodedata.normalize("NFKC", value).casefold().translate(_CONFUSABLES).translate(_DASHES)
     return "".join(character for character in normalized if unicodedata.category(character) != "Cf")
 
 

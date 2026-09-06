@@ -72,6 +72,7 @@ def seed_volumes() -> None:
         "api_key_path": "/run/hrh-secret/api-key",
         "ca_path": "/run/hrh-tls/ca.crt",
         "expected_ingress_uid": 10007,
+        "expected_clinical_timezone": "America/New_York",
         "hrh_origin": "https://hrh-tls:8443",
         "timeout_seconds": 10,
     }
