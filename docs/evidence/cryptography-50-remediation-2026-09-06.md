@@ -56,6 +56,12 @@ range. No API or cryptographic construction changed.
   The probe also confirmed the intentionally excluded FastAPI surface remained
   absent.
 - `git diff --check`: pass.
+- Hosted CI on evidence head `4e4780c95f5dc35ac5ba46b1dbfe64e5c31f9e63`
+  completed successfully in
+  [run 34068132326](https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/34068132326):
+  Python 3.11 contracts, Python 3.12 contracts, and the synthetic-only
+  Linux/container E2E all passed. The hosted build resolved the amended
+  dependency on both Python versions and rebuilt the role-specific images.
 
 ## Limits and remaining supply-chain work
 
@@ -67,7 +73,7 @@ range. No API or cryptographic construction changed.
   wheels instead.
 - This receipt does not triage OS packages in base images and is not a VEX,
   SBOM, signature, provenance attestation, or PHI authorization.
-- Hosted Python 3.11/3.12 and Linux container evidence remains pending until
-  this candidate is pushed and its CI run completes.
+- The hosted checks prove the repository's declared Linux/Python matrix. They
+  do not prove unsupported source-build, Intel macOS, or 32-bit Windows paths.
 
 No PHI was used.
