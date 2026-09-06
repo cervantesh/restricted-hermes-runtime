@@ -24,7 +24,7 @@ from restricted_runtime.reconciliation_driver import ReconciliationDriver
 from restricted_runtime.services.restricted_api import create_app
 from restricted_runtime.storage import PostgresContentStore, PostgresLedger
 
-URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL")
 pytestmark=pytest.mark.skipif(not URL,reason="requires isolated PostgreSQL")
 
 def policy():
@@ -101,7 +101,8 @@ def test_conversation_readiness_requires_matching_gateway_policy_and_no_last_kno
     # exercised directly so a nominal unconfigured root cannot satisfy this.
     app=create_app(object(),object(),lambda: True)
     response=TestClient(app).get("/readyz")
-    assert response.status_code==200 and response.json()["status"]=="ready"
+    assert response.status_code==503
+    assert response.json()=={"detail":"gateway policy pair is not ready"}
 
 def test_expired_e1_turn_reconciles_with_its_persisted_policy_pair_after_e2_rollout():
     e1,e2=policy_at("E1"),policy_at("E2");store=PostgresContentStore(URL);key=LocalHmacKey("gateway","1",b"g"*32);turn_id=str(uuid.uuid4())

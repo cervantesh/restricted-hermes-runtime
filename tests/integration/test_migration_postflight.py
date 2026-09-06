@@ -9,7 +9,7 @@ from psycopg.conninfo import conninfo_to_dict
 from restricted_runtime.migration_runner import execute_migration
 
 
-URL = os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+URL = os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not URL, reason="requires isolated PostgreSQL")
 
 

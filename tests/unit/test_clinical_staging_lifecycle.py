@@ -35,6 +35,20 @@ def test_state_path_is_absolute_bounded_and_project_specific(tmp_path: Path):
             module.validate_state_path(invalid, "clinicalstagingdemo")
 
 
+def test_clinical_staging_rejects_state_inside_either_build_context(tmp_path: Path):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+
+    for build_context in (runtime, hrh):
+        state = build_context / f"{project}.synthetic-clinical-staging"
+        with pytest.raises(module.SafetyError, match="build context"):
+            module.ClinicalStaging(runtime, hrh, state, project, 18443)
+
+
 def test_marker_is_closed_and_binds_project_path_and_synthetic_purpose(tmp_path: Path):
     module = load_module()
     state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
@@ -303,6 +317,7 @@ def _publisher_inspections(module, port: str = "18443"):
     return {
         service: {
             "Id": f"id-{service}",
+            "State": {"StartedAt": "2026-09-06T15:00:00.000000000Z"},
             "HostConfig": {"PortBindings": expected() if service == "operator-proxy" else {}},
             "NetworkSettings": {"Ports": expected() if service == "operator-proxy" else {}},
         }
@@ -606,8 +621,11 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
     monkeypatch.setattr(staging, "_network_inspections", lambda: networks)
     tls_probe = {"verified": True, "hostname": "127.0.0.1", "path": "/api/v4/system/ping"}
     monkeypatch.setattr(staging, "_probe_mattermost_tls", lambda: tls_probe)
+    ingress_log_calls: list[tuple[str, ...]] = []
+
     def fake_compose(*args, **_kwargs):
-        if args[:3] == ("logs", "--no-color", "ingress"):
+        if args[:2] == ("logs", "--no-color"):
+            ingress_log_calls.append(args)
             return SimpleNamespace(stdout="mattermost_ingress_outcome=authenticated_ready\n", returncode=0)
         return SimpleNamespace(
             stdout=json.dumps({"uid": 10008, "gid": 20006, "mode": 0o660, "socket": True}),
@@ -629,6 +647,7 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
         staging.status()
 
     controller_checks.clear()
+    ingress_log_calls.clear()
     monkeypatch.setattr(staging, "_built_images", lambda: expected_images)
     result = staging.status()
     assert result["built_images"] == expected_images
@@ -647,6 +666,23 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
     }
     assert result["tls_probe"] == tls_probe
     assert result["network_exception"] == "operator-proxy only: operator_access is non-internal"
+    assert result["ingress_started_at"] == "2026-09-06T15:00:00.000000000Z"
+    assert ingress_log_calls == [
+        (
+            "logs",
+            "--no-color",
+            "--since",
+            "2026-09-06T15:00:00.000000000Z",
+            "ingress",
+        )
+    ]
+
+    inspections["ingress"]["State"] = {}
+    with pytest.raises(module.SafetyError, match="ingress start time"):
+        staging.status()
+    inspections["ingress"]["State"] = {
+        "StartedAt": "2026-09-06T15:00:00.000000000Z"
+    }
 
     inspections["hrh"]["HostConfig"]["PortBindings"] = {"8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "18080"}]}
     with pytest.raises(module.SafetyError, match="non-proxy"):

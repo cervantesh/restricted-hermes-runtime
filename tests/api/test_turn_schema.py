@@ -20,7 +20,7 @@ from restricted_runtime.policy import PolicyBundle
 from restricted_runtime.services.restricted_api import create_app
 from restricted_runtime.storage import PostgresContentStore, PostgresLedger
 
-URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL")
 pytestmark=pytest.mark.skipif(not URL,reason="requires isolated PostgreSQL")
 
 def policy():
