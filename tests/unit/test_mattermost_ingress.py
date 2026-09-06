@@ -400,6 +400,16 @@ def test_ordinary_unicode_private_channel_text_still_reaches_the_conversation_pa
     assert len(rest.created) == 1
 
 
+def test_ordinary_decomposed_unicode_reaches_the_conversation_byte_for_codepoint_unchanged(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    message = "@restricted-bot cafe\u0301 日本語"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert len(conversation.calls) == 1
+    assert conversation.calls[0][2] == message
+
+
 def test_preflight_binds_readiness_bot_and_all_private_channels(tmp_path):
     service, rest, conversation = ingress(tmp_path)
     conversation.readiness["policy_digest"] = "b" * 64

@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from .contracts import ClinicalAuthorizationDenied, ContractError, jcs_bytes, load_closed_json
 
 MAX_WIRE_BYTES = 65_536
+MAX_API_KEY_BYTES = 4096
 SOCKET_PATH = "/run/restricted-clinical/query.sock"
 CLINICAL_SOCKET_GID = 20006
 QUERY_INTERNAL = "/v1/clinical/query"
@@ -107,10 +108,42 @@ class AdapterConfig:
 
 def load_api_key(path: Path, *, expected_uid: int) -> str:
     try:
-        metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != expected_uid or stat.S_IMODE(metadata.st_mode) not in {0o400, 0o600}:
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode)
+            or before.st_uid != expected_uid or stat.S_IMODE(before.st_mode) not in {0o400, 0o600}
+        ):
             raise ContractError("clinical adapter secret permissions rejected")
-        raw = path.read_bytes()
+        if before.st_size > MAX_API_KEY_BYTES + 2:
+            raise ContractError("clinical adapter secret oversized")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_size)
+                != (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_size)
+                or not stat.S_ISREG(opened.st_mode) or opened.st_uid != expected_uid
+                or stat.S_IMODE(opened.st_mode) not in {0o400, 0o600}
+            ):
+                raise ContractError("clinical adapter secret changed during open")
+            chunks, remaining = [], MAX_API_KEY_BYTES + 3
+            while remaining:
+                try:
+                    chunk = os.read(descriptor, remaining)
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+        finally:
+            os.close(descriptor)
+        if len(raw) > MAX_API_KEY_BYTES + 2:
+            raise ContractError("clinical adapter secret oversized")
+        if len(raw) != opened.st_size:
+            raise ContractError("clinical adapter secret size changed during read")
     except ContractError:
         raise
     except OSError as exc:
