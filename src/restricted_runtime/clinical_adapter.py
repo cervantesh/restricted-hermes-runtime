@@ -115,7 +115,7 @@ class AdapterConfig:
         canonical = "https://" + authority + (f":{port}" if port is not None and port != 443 else "")
         if origin_value.rstrip("/") != canonical:
             raise ContractError("clinical adapter HRH origin rejected")
-        if not isinstance(value.get("timeout_seconds"), int) or not 1 <= value["timeout_seconds"] <= 10:
+        if not isinstance(value.get("timeout_seconds"), int) or isinstance(value["timeout_seconds"], bool) or not 1 <= value["timeout_seconds"] <= 10:
             raise ContractError("clinical adapter timeout rejected")
         if not isinstance(value.get("expected_ingress_uid"), int) or isinstance(value["expected_ingress_uid"], bool) or value["expected_ingress_uid"] < 1:
             raise ContractError("clinical adapter principal rejected")

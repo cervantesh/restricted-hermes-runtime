@@ -345,6 +345,35 @@ def test_adapter_configuration_rejects_boolean_expected_ingress_uid(tmp_path, ui
         AdapterConfig.load(path)
 
 
+@pytest.mark.parametrize("timeout", [True, False, 0, 11, 1.5, "1", None])
+def test_adapter_configuration_rejects_nonclosed_timeout_seconds(tmp_path, timeout):
+    path = tmp_path / "adapter.json"
+    path.write_text(json.dumps({
+        "hrh_origin": "https://hrh.internal.example",
+        "ca_path": "/run/secrets/hrh-ca.pem",
+        "api_key_path": "/run/secrets/hrh-clinical-api-key",
+        "timeout_seconds": timeout,
+        "expected_ingress_uid": 10007,
+        "expected_clinical_timezone": "America/New_York",
+    }), encoding="utf-8")
+    with pytest.raises(ContractError, match="timeout"):
+        AdapterConfig.load(path)
+
+
+@pytest.mark.parametrize("timeout", range(1, 11))
+def test_adapter_configuration_accepts_closed_integer_timeout_seconds(tmp_path, timeout):
+    path = tmp_path / "adapter.json"
+    path.write_text(json.dumps({
+        "hrh_origin": "https://hrh.internal.example",
+        "ca_path": "/run/secrets/hrh-ca.pem",
+        "api_key_path": "/run/secrets/hrh-clinical-api-key",
+        "timeout_seconds": timeout,
+        "expected_ingress_uid": 10007,
+        "expected_clinical_timezone": "America/New_York",
+    }), encoding="utf-8")
+    assert AdapterConfig.load(path).timeout_seconds == float(timeout)
+
+
 @pytest.mark.parametrize("uid", [1, 10007])
 def test_adapter_configuration_accepts_numeric_positive_expected_ingress_uid(tmp_path, uid):
     path = tmp_path / "adapter.json"
@@ -374,6 +403,24 @@ def test_production_boolean_expected_ingress_uid_fails_before_downstream_constru
     monkeypatch.setattr(production_clinical_adapter, "HrhHttpsClient", lambda *_args, **_kwargs: pytest.fail("client construction reached"))
     monkeypatch.setattr(production_clinical_adapter, "ClinicalAdapter", lambda *_args, **_kwargs: pytest.fail("adapter construction reached"))
     with pytest.raises(ContractError, match="principal"):
+        production_clinical_adapter.run()
+
+
+def test_production_boolean_timeout_fails_before_downstream_construction(monkeypatch, tmp_path):
+    path = tmp_path / "adapter.json"
+    path.write_text(json.dumps({
+        "hrh_origin": "https://hrh.internal.example",
+        "ca_path": "/run/secrets/hrh-ca.pem",
+        "api_key_path": "/run/secrets/hrh-clinical-api-key",
+        "timeout_seconds": True,
+        "expected_ingress_uid": 10007,
+        "expected_clinical_timezone": "America/New_York",
+    }), encoding="utf-8")
+    monkeypatch.setenv("RESTRICTED_CLINICAL_ADAPTER_CONFIG_PATH", str(path))
+    monkeypatch.setattr(production_clinical_adapter, "load_api_key", lambda *_args, **_kwargs: pytest.fail("secret loading reached"))
+    monkeypatch.setattr(production_clinical_adapter, "HrhHttpsClient", lambda *_args, **_kwargs: pytest.fail("client construction reached"))
+    monkeypatch.setattr(production_clinical_adapter, "ClinicalAdapter", lambda *_args, **_kwargs: pytest.fail("adapter construction reached"))
+    with pytest.raises(ContractError, match="timeout"):
         production_clinical_adapter.run()
 
 

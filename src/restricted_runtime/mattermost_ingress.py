@@ -133,7 +133,17 @@ _CONFUSABLES = str.maketrans({
     "\u0430": "a", "\u0435": "e", "\u0456": "i", "\u043c": "m", "\u043e": "o", "\u0440": "p",
     "\u0442": "t", "\u0445": "x", "\u03b1": "a", "\u03b9": "i", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t", "\u03c7": "x",
 })
-_SECONDARY_CLINICAL_CONFUSABLES = str.maketrans({"\u0131": "i", "\u2043": "-"})
+# Unicode 15.1.0 UnicodeData.txt, General_Category=Pd:
+# https://www.unicode.org/Public/15.1.0/ucd/UnicodeData.txt
+_UNICODE_15_1_DASH_PUNCTUATION = (
+    0x002D, 0x058A, 0x05BE, 0x1400, 0x1806, 0x2010, 0x2011, 0x2012, 0x2013,
+    0x2014, 0x2015, 0x2E17, 0x2E1A, 0x2E3A, 0x2E3B, 0x2E40, 0x2E5D, 0x301C,
+    0x3030, 0x30A0, 0xFE31, 0xFE32, 0xFE58, 0xFE63, 0xFF0D, 0x10EAD,
+)
+_SECONDARY_CLINICAL_CONFUSABLES = str.maketrans({
+    **{chr(codepoint): "-" for codepoint in _UNICODE_15_1_DASH_PUNCTUATION},
+    "\u0131": "i", "\u2043": "-", "\u2212": "-",
+})
 # Unicode 15.1.0 DerivedCoreProperties.txt, Default_Ignorable_Code_Point:
 # https://www.unicode.org/Public/15.1.0/ucd/DerivedCoreProperties.txt
 _UNICODE_15_1_DEFAULT_IGNORABLE_RANGES = (
