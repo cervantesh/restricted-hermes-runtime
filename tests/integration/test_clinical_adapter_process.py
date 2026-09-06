@@ -31,6 +31,42 @@ BODY = {
     "policyDigest": "a" * 64,
 }
 
+DEADLINE_STARTUP_SERVER = r"""
+import signal,sys
+from pathlib import Path
+from types import SimpleNamespace
+import restricted_runtime.services.production_clinical_adapter as production
+marker=Path(sys.argv[1])
+mode=sys.argv[2]
+production.AdapterConfig.load=lambda _path: SimpleNamespace(api_key_path=Path('/unused'),expected_ingress_uid=10007,expected_clinical_timezone='America/New_York',timeout_seconds=1)
+production.load_api_key=lambda *_args,**_kwargs: marker.write_text('secret',encoding='ascii')
+production.HrhHttpsClient=lambda *_args,**_kwargs: marker.write_text('client',encoding='ascii')
+def bind():
+    marker.write_text('bind',encoding='ascii')
+    raise RuntimeError('bound')
+production.bind_listener=bind
+if mode == 'blocked':
+    signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM})
+    production.main()
+    sys.exit(99)
+try:
+    production.run()
+except RuntimeError:
+    pass
+sys.exit(0)
+"""
+
+
+@pytest.mark.parametrize(("mode", "expected"), [("blocked", None), ("clean", "bind")])
+def test_production_adapter_deadline_preflight_handles_inherited_signal_mask_before_side_effects(tmp_path, mode, expected):
+    marker = tmp_path / "startup-marker"
+    result = subprocess.run(
+        [sys.executable, "-c", DEADLINE_STARTUP_SERVER, str(marker), mode], cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")}, capture_output=True, text=True, timeout=5,
+    )
+    assert (result.returncode != 0) is (mode == "blocked")
+    assert (marker.read_text(encoding="ascii") if marker.exists() else None) == expected
+
 SERVER = r"""
 import os,socket,sys
 from pathlib import Path

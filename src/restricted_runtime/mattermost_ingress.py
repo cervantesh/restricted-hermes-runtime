@@ -166,6 +166,33 @@ _SECONDARY_CLINICAL_SOURCE_SEPARATORS = str.maketrans({
     for separator, codepoints in _UNICODE_15_1_CLINICAL_SEPARATOR_CONFUSABLES.items()
     for codepoint in codepoints
 })
+# Unicode 15.1.0 UnicodeData.txt: compatibility-decomposition sources that
+# resolve to exactly one reserved separator in the namespace detector.  This
+# intentionally remains separate from the confusables.txt corpus above.
+# https://www.unicode.org/Public/15.1.0/ucd/UnicodeData.txt
+_UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS = {
+    "-": (0x2011, 0x207B, 0x208B, 0xFE31, 0xFE32, 0xFE58, 0xFE63, 0xFF0D),
+    "_": (0xFE33, 0xFE34, 0xFE4D, 0xFE4E, 0xFE4F, 0xFF3F),
+    " ": (
+        0x00A0, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006,
+        0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x205F, 0x3000, 0x00A8,
+        0x00AF, 0x00B4, 0x00B8, 0x02D8, 0x02D9, 0x02DA, 0x02DB, 0x02DC,
+        0x02DD, 0x037A, 0x0384, 0x1FBD, 0x1FBF, 0x1FC0, 0x1FFE, 0x2017,
+        0x203E, 0x309B, 0x309C, 0xFC5E, 0xFC5F, 0xFC60, 0xFC61, 0xFC62,
+        0xFC63, 0xFE70, 0xFE72, 0xFE74, 0xFE76, 0xFE78, 0xFE7A, 0xFE7C,
+        0xFE7E,
+    ),
+}
+_UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES = frozenset(
+    codepoint
+    for codepoints in _UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS.values()
+    for codepoint in codepoints
+)
+_CLINICAL_COMPATIBILITY_SEPARATOR_SKELETONS = str.maketrans({
+    codepoint: separator
+    for separator, codepoints in _UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS.items()
+    for codepoint in codepoints
+})
 # Unicode 15.1.0 confusables.txt: single-source, single-ASCII-letter mappings
 # for letters in "nextappointment" that remain after NFKC/casefold and the
 # primary namespace maps. This is detection-only, not a general parser.
@@ -206,7 +233,15 @@ def _namespace_ignorable(character: str) -> bool:
     return any(start <= codepoint <= end for start, end in _UNICODE_15_1_DEFAULT_IGNORABLE_RANGES)
 
 
-def _namespace_skeleton(value: str, *, remove_marks: bool = False, secondary: bool = False) -> str:
+def _namespace_skeleton(
+    value: str, *, remove_marks: bool = False, secondary: bool = False,
+    compatibility_separators: bool = False,
+) -> str:
+    if compatibility_separators:
+        # Each replacement is the source-local UnicodeData compatibility
+        # decomposition after NFKC and mark removal.  Do not strip marks from
+        # unrelated characters in the same message.
+        value = value.translate(_CLINICAL_COMPATIBILITY_SEPARATOR_SKELETONS)
     if secondary:
         value = value.translate(_SECONDARY_CLINICAL_SOURCE_SEPARATORS)
     if remove_marks:
@@ -220,8 +255,14 @@ def _namespace_skeleton(value: str, *, remove_marks: bool = False, secondary: bo
     return "".join(character for character in normalized if not _namespace_ignorable(character))
 
 
-def _clinical_namespace(value: str, *, remove_marks: bool = False, secondary: bool = False) -> bool:
-    return re.search(r"next[-_\s]+appointment", _namespace_skeleton(value, remove_marks=remove_marks, secondary=secondary)) is not None
+def _clinical_namespace(
+    value: str, *, remove_marks: bool = False, secondary: bool = False,
+    compatibility_separators: bool = False,
+) -> bool:
+    return re.search(r"next[-_\s]+appointment", _namespace_skeleton(
+        value, remove_marks=remove_marks, secondary=secondary,
+        compatibility_separators=compatibility_separators,
+    )) is not None
 
 
 def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]:
@@ -232,12 +273,14 @@ def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]
         return ("malformed", None) if any((
             _clinical_namespace(message), _clinical_namespace(message, remove_marks=True),
             _clinical_namespace(message, secondary=True), _clinical_namespace(message, remove_marks=True, secondary=True),
+            _clinical_namespace(message, remove_marks=True, compatibility_separators=True),
         )) else ("ordinary", None)
     match = matches[0]
     body = (message[:match.start()] + message[match.end():]).strip()
     if not any((
         _clinical_namespace(body), _clinical_namespace(body, remove_marks=True),
         _clinical_namespace(body, secondary=True), _clinical_namespace(body, remove_marks=True, secondary=True),
+        _clinical_namespace(body, remove_marks=True, compatibility_separators=True),
     )):
         return "ordinary", None
     if any(unicodedata.category(character).startswith("M") for character in body):

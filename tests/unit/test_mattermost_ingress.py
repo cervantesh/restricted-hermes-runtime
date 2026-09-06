@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import threading
+import unicodedata
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -56,6 +57,34 @@ UNICODE_15_1_CLINICAL_SEPARATOR_CONFUSABLES = {
     " ": (0x2028, 0x2029, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2008, 0x2009, 0x200A, 0x205F, 0x00A0, 0x2007, 0x202F),
 }
 RESIDUAL_CLINICAL_SEPARATOR_SOURCES = (0x06D4, 0x02D7, 0x2796, 0x2CBA, 0x2A29, 0xFB29, 0x2238, 0x2A2A, 0xFF5E, 0x07FA)
+UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS = {
+    "-": (0x2011, 0x207B, 0x208B, 0xFE31, 0xFE32, 0xFE58, 0xFE63, 0xFF0D),
+    "_": (0xFE33, 0xFE34, 0xFE4D, 0xFE4E, 0xFE4F, 0xFF3F),
+    " ": (0x00A0, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x205F, 0x3000, 0x00A8, 0x00AF, 0x00B4, 0x00B8, 0x02D8, 0x02D9, 0x02DA, 0x02DB, 0x02DC, 0x02DD, 0x037A, 0x0384, 0x1FBD, 0x1FBF, 0x1FC0, 0x1FFE, 0x2017, 0x203E, 0x309B, 0x309C, 0xFC5E, 0xFC5F, 0xFC60, 0xFC61, 0xFC62, 0xFC63, 0xFE70, 0xFE72, 0xFE74, 0xFE76, 0xFE78, 0xFE7A, 0xFE7C, 0xFE7E),
+}
+RESIDUAL_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES = (0x00A8, 0x00AF, 0x00B4, 0x00B8, 0x02D8, 0x02D9, 0x02DA, 0x02DB, 0x02DC, 0x02DD, 0x037A, 0x0384, 0x1FBD, 0x1FBF, 0x1FC0, 0x1FFE, 0x2017, 0x203E, 0x309B, 0x309C, 0xFC5E, 0xFC5F, 0xFC60, 0xFC61, 0xFC62, 0xFC63, 0xFE70, 0xFE72, 0xFE74, 0xFE76, 0xFE78, 0xFE7A, 0xFE7C, 0xFE7E)
+UNICODE_15_1_COMPATIBILITY_DECOMPOSITION_FIXTURE = {
+    0x2011: (0x2010,), 0x207B: (0x2212,), 0x208B: (0x2212,), 0xFE31: (0x2014,),
+    0xFE32: (0x2013,), 0xFE58: (0x2014,), 0xFE63: (0x002D,), 0xFF0D: (0x002D,),
+    0xFE33: (0x005F,), 0xFE34: (0x005F,), 0xFE4D: (0x005F,), 0xFE4E: (0x005F,),
+    0xFE4F: (0x005F,), 0xFF3F: (0x005F,), 0x00A0: (0x0020,), 0x2000: (0x2002,),
+    0x2001: (0x2003,), 0x2002: (0x0020,), 0x2003: (0x0020,), 0x2004: (0x0020,),
+    0x2005: (0x0020,), 0x2006: (0x0020,), 0x2007: (0x0020,), 0x2008: (0x0020,),
+    0x2009: (0x0020,), 0x200A: (0x0020,), 0x202F: (0x0020,), 0x205F: (0x0020,),
+    0x3000: (0x0020,), 0x00A8: (0x0020, 0x0308), 0x00AF: (0x0020, 0x0304),
+    0x00B4: (0x0020, 0x0301), 0x00B8: (0x0020, 0x0327), 0x02D8: (0x0020, 0x0306),
+    0x02D9: (0x0020, 0x0307), 0x02DA: (0x0020, 0x030A), 0x02DB: (0x0020, 0x0328),
+    0x02DC: (0x0020, 0x0303), 0x02DD: (0x0020, 0x030B), 0x037A: (0x0020, 0x0345),
+    0x0384: (0x0020, 0x0301), 0x1FBD: (0x0020, 0x0313), 0x1FBF: (0x0020, 0x0313),
+    0x1FC0: (0x0020, 0x0342), 0x1FFE: (0x0020, 0x0314), 0x2017: (0x0020, 0x0333),
+    0x203E: (0x0020, 0x0305), 0x309B: (0x0020, 0x3099), 0x309C: (0x0020, 0x309A),
+    0xFC5E: (0x0020, 0x064C, 0x0651), 0xFC5F: (0x0020, 0x064D, 0x0651),
+    0xFC60: (0x0020, 0x064E, 0x0651), 0xFC61: (0x0020, 0x064F, 0x0651),
+    0xFC62: (0x0020, 0x0650, 0x0651), 0xFC63: (0x0020, 0x0651, 0x0670),
+    0xFE70: (0x0020, 0x064B), 0xFE72: (0x0020, 0x064C), 0xFE74: (0x0020, 0x064D),
+    0xFE76: (0x0020, 0x064E), 0xFE78: (0x0020, 0x064F), 0xFE7A: (0x0020, 0x0650),
+    0xFE7C: (0x0020, 0x0651), 0xFE7E: (0x0020, 0x0652),
+}
 
 
 @pytest.fixture(autouse=True)
@@ -551,6 +580,85 @@ def test_frozen_unicode_15_1_separator_confusable_table_is_complete_and_hermetic
     assert mattermost_ingress._clinical_command(
         "@restricted-bot next\ua4feappointment 123e4567-e89b-42d3-a456-426614174000", "restricted-bot"
     )[0] == "ordinary"
+
+
+def test_frozen_unicode_15_1_compatibility_separator_table_is_complete_and_separate():
+    table = mattermost_ingress._UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS
+    assert table == UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS
+    assert tuple(map(len, table.values())) == (8, 6, 49)
+    assert sum(map(len, table.values())) == 63
+    assert mattermost_ingress._UNICODE_15_1_CLINICAL_SEPARATOR_CONFUSABLES == UNICODE_15_1_CLINICAL_SEPARATOR_CONFUSABLES
+    assert set(UNICODE_15_1_COMPATIBILITY_DECOMPOSITION_FIXTURE) == {
+        codepoint for codepoints in table.values() for codepoint in codepoints
+    }
+    for separator, codepoints in table.items():
+        for codepoint in codepoints:
+            decomposed = "".join(chr(item) for item in UNICODE_15_1_COMPATIBILITY_DECOMPOSITION_FIXTURE[codepoint])
+            derived = unicodedata.normalize("NFKC", decomposed)
+            derived = "".join(character for character in derived if not unicodedata.category(character).startswith("M"))
+            derived = derived.casefold().translate(mattermost_ingress._DASHES)
+            assert derived == separator
+            assert mattermost_ingress._namespace_skeleton(
+                f"next{chr(codepoint)}appointment", remove_marks=True,
+                compatibility_separators=True,
+            ) == f"next{separator}appointment"
+
+
+@pytest.mark.parametrize("codepoint", RESIDUAL_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES)
+def test_compatibility_separator_residuals_reserve_private_namespace_without_effects(tmp_path, codepoint):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot next{chr(codepoint)}appointment 123e4567-e89b-42d3-a456-426614174000"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == [] and service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize("codepoint", RESIDUAL_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES)
+def test_compatibility_separator_residuals_outside_namespace_reach_private_conversation_exactly(tmp_path, codepoint):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot ordinary {chr(codepoint)} text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+@pytest.mark.parametrize("codepoint", RESIDUAL_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES)
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+def test_legacy_compatibility_separator_records_are_reclassified_before_delivery(tmp_path, ready, codepoint):
+    service, rest, conversation = ingress(tmp_path)
+    source = post(message=f"@restricted-bot next{chr(codepoint)}appointment 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = source
+    record, _ = service.outbox.reserve(service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000)
+    if ready:
+        record = service.outbox.mark_ready(record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "legacy"})
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.BLOCKED
+    assert conversation.calls == [] and rest.created == []
+
+
+@pytest.mark.parametrize("separator_source, letter_command", [
+    (0x02DB, "next-appo\u02dbntment"), (0x037A, "next-appo\u037antment"),
+])
+def test_compatibility_letter_collision_preserves_both_namespace_interpretations(tmp_path, separator_source, letter_command):
+    separator_message = f"@restricted-bot next{chr(separator_source)}appointment 123e4567-e89b-42d3-a456-426614174000"
+    assert mattermost_ingress._clinical_command(separator_message, "restricted-bot") == ("malformed", None)
+    assert mattermost_ingress._clinical_command(
+        f"@restricted-bot {letter_command} 123e4567-e89b-42d3-a456-426614174000", "restricted-bot"
+    ) == ("malformed", None)
+
+
+def test_unrelated_compatibility_source_does_not_strip_marks_from_other_namespace_text(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    message = "@restricted-bot ordinary \u00a8 then next\ufe49appointment 123e4567-e89b-42d3-a456-426614174000"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("ordinary", None)
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
 
 
 @pytest.mark.parametrize("codepoint", RESIDUAL_CLINICAL_SEPARATOR_SOURCES)
