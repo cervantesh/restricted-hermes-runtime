@@ -210,6 +210,37 @@ _UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES = {
     "t": (0x22A4, 0x27D9, 0x1F768, 0x2CA6, 0x13A2, 0xA4D4, 0x16F0A, 0x118BC, 0x10297, 0x102B1, 0x10315),
     "x": (0x166E, 0x00D7, 0x292B, 0x292C, 0x2A2F, 0x1541, 0x157D, 0x166D, 0x2573, 0x10322, 0x118EC, 0xA7B3, 0x2CAC, 0x2D5D, 0x16B7, 0xA4EB, 0x10290, 0x102B4, 0x10317, 0x10527),
 }
+# Unicode 15.1.0 confusables.txt: the complete source class whose effective
+# skeleton is r, n, or rn at the one ``m`` slot in ``next-appointment``.
+# This remains a bounded detector table, not a general UTS #39 skeleton.
+_UNICODE_15_1_M_SLOT_CONFUSABLES = {
+    "r": (
+        0x1D42B, 0x1D45F, 0x1D493, 0x1D4C7, 0x1D4FB, 0x1D52F, 0x1D563, 0x1D597,
+        0x1D5CB, 0x1D5FF, 0x1D633, 0x1D667, 0x1D69B, 0xAB47, 0xAB48, 0x1D26,
+        0x2C85, 0x0433, 0xAB81, 0x1D216, 0x211B, 0x211C, 0x211D, 0x1D411,
+        0x1D445, 0x1D479, 0x1D4E1, 0x1D57D, 0x1D5B1, 0x1D5E5, 0x1D619, 0x1D64D,
+        0x1D681, 0x01A6, 0x13A1, 0x13D2, 0x104B4, 0x1587, 0xA4E3, 0x16F35,
+        0x027D, 0x027C, 0x024D, 0x0493, 0x1D72,
+    ),
+    "n": (
+        0x1D427, 0x1D45B, 0x1D48F, 0x1D4C3, 0x1D4F7, 0x1D52B, 0x1D55F, 0x1D593,
+        0x1D5C7, 0x1D5FB, 0x1D62F, 0x1D663, 0x1D697, 0x0578, 0x057C, 0xFF2E,
+        0x2115, 0x1D40D, 0x1D441, 0x1D475, 0x1D4A9, 0x1D4DD, 0x1D511, 0x1D579,
+        0x1D5AD, 0x1D5E1, 0x1D615, 0x1D649, 0x1D67D, 0x039D, 0x1D6B4, 0x1D6EE,
+        0x1D728, 0x1D762, 0x1D79C, 0x2C9A, 0xA4E0, 0x10513, 0x1018E, 0x0273,
+        0x019E, 0x03B7, 0x1D6C8, 0x1D702, 0x1D73C, 0x1D776, 0x1D7B0, 0x019D,
+        0x1D70,
+    ),
+    "rn": (
+        0x118E3, 0x006D, 0x217F, 0x1D426, 0x1D45A, 0x1D48E, 0x1D4C2, 0x1D4F6,
+        0x1D52A, 0x1D55E, 0x1D592, 0x1D5C6, 0x1D5FA, 0x1D62E, 0x1D662, 0x1D696,
+        0x11700, 0x20A5, 0x0271, 0x1D6F,
+    ),
+}
+_MULTI_SYMBOL_NAMESPACE_LETTERS = frozenset(("m",))
+_M_SLOT_R_SOURCES = frozenset(_UNICODE_15_1_M_SLOT_CONFUSABLES["r"])
+_M_SLOT_N_SOURCES = frozenset(_UNICODE_15_1_M_SLOT_CONFUSABLES["n"])
+_M_SLOT_RN_SOURCES = frozenset(_UNICODE_15_1_M_SLOT_CONFUSABLES["rn"])
 _SECONDARY_CLINICAL_SOURCE_CONFUSABLES = str.maketrans({
     ord(chr(codepoint)): letter
     for letter, codepoints in _UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES.items()
@@ -281,7 +312,7 @@ def _namespace_skeleton(
     return "".join(character for character in normalized if not _namespace_ignorable(character))
 
 
-_CLINICAL_AUTOMATON_STATE_COUNT = 17
+_CLINICAL_AUTOMATON_STATE_COUNT = 18
 _CLINICAL_AUTOMATON_SEPARATOR = None
 _CLINICAL_AUTOMATON_SUFFIX = "ppointment"
 _CLINICAL_COLLISION_SOURCES = frozenset((0x02DB, 0x037A))
@@ -322,6 +353,14 @@ def _clinical_source_options(character: str) -> tuple[tuple[str | None, ...], ..
         return ((_CLINICAL_AUTOMATON_SEPARATOR,),)
     if codepoint in _CLINICAL_SOURCE_SEPARATOR_OPTIONS:
         return ((_CLINICAL_AUTOMATON_SEPARATOR,),)
+    if codepoint in _M_SLOT_R_SOURCES:
+        return (("r",),)
+    if codepoint in _M_SLOT_N_SOURCES:
+        return (("n",),)
+    if codepoint in _M_SLOT_RN_SOURCES:
+        # ASCII m remains available on its canonical transition; its official
+        # rn skeleton is the only deliberately ambiguous source option.
+        return (("m",), ("r", "n")) if codepoint == ord("m") else (("r", "n"),)
     if codepoint in _SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES:
         return ((_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES[codepoint],),)
     return (_normalized_clinical_symbols(character),)
@@ -341,6 +380,12 @@ def _clinical_automaton_transition(state: int, symbol: str | None) -> int:
         if symbol is _CLINICAL_AUTOMATON_SEPARATOR:
             return 5
         expected = "a"
+    elif state == 12:
+        if symbol == "r":
+            return 17
+        expected = "m"
+    elif state == 17:
+        return 13 if symbol == "n" else 0
     else:
         expected = _CLINICAL_AUTOMATON_SUFFIX[state - 6]
     if symbol == expected:

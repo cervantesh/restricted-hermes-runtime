@@ -64,6 +64,33 @@ UNICODE_15_1_COMPATIBILITY_SEPARATOR_SOURCES = tuple(
     for codepoint in codepoints
 )
 COMBINING_MARK_O_CONFUSABLES = (0x0C02, 0x0C82, 0x0D02, 0x0D82)
+# Frozen from Unicode 15.1.0 confusables.txt.  Targets are reduced using the
+# pinned unicodedata2 15.1 mark-removal/casefold oracle in the test below.
+UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE = {
+    "r": (
+        0x1D42B, 0x1D45F, 0x1D493, 0x1D4C7, 0x1D4FB, 0x1D52F, 0x1D563, 0x1D597,
+        0x1D5CB, 0x1D5FF, 0x1D633, 0x1D667, 0x1D69B, 0xAB47, 0xAB48, 0x1D26,
+        0x2C85, 0x0433, 0xAB81, 0x1D216, 0x211B, 0x211C, 0x211D, 0x1D411,
+        0x1D445, 0x1D479, 0x1D4E1, 0x1D57D, 0x1D5B1, 0x1D5E5, 0x1D619, 0x1D64D,
+        0x1D681, 0x01A6, 0x13A1, 0x13D2, 0x104B4, 0x1587, 0xA4E3, 0x16F35,
+        0x027D, 0x027C, 0x024D, 0x0493, 0x1D72,
+    ),
+    "n": (
+        0x1D427, 0x1D45B, 0x1D48F, 0x1D4C3, 0x1D4F7, 0x1D52B, 0x1D55F, 0x1D593,
+        0x1D5C7, 0x1D5FB, 0x1D62F, 0x1D663, 0x1D697, 0x0578, 0x057C, 0xFF2E,
+        0x2115, 0x1D40D, 0x1D441, 0x1D475, 0x1D4A9, 0x1D4DD, 0x1D511, 0x1D579,
+        0x1D5AD, 0x1D5E1, 0x1D615, 0x1D649, 0x1D67D, 0x039D, 0x1D6B4, 0x1D6EE,
+        0x1D728, 0x1D762, 0x1D79C, 0x2C9A, 0xA4E0, 0x10513, 0x1018E, 0x0273,
+        0x019E, 0x03B7, 0x1D6C8, 0x1D702, 0x1D73C, 0x1D776, 0x1D7B0, 0x019D,
+        0x1D70,
+    ),
+    "rn": (
+        0x118E3, 0x006D, 0x217F, 0x1D426, 0x1D45A, 0x1D48E, 0x1D4C2, 0x1D4F6,
+        0x1D52A, 0x1D55E, 0x1D592, 0x1D5C6, 0x1D5FA, 0x1D62E, 0x1D662, 0x1D696,
+        0x11700, 0x20A5, 0x0271, 0x1D6F,
+    ),
+}
+ROUND15_DIRECT_RN_SIBLINGS = (0x118E3, 0x11700, 0x20A5, 0x0271, 0x1D6F)
 
 
 def _unicode_15_1_mark_codepoints() -> tuple[int, ...]:
@@ -856,7 +883,7 @@ def test_round14_recognizer_bound_is_linear_for_a_megabyte_ambiguous_nonmatch():
     assert len(value.encode("utf-8")) <= mattermost_ingress._MAX_HTTP_BYTES
     assert not mattermost_ingress._clinical_namespace(value, instrumentation=instrumentation)
     assert instrumentation["max_active_states"] >= 3
-    assert instrumentation["max_active_states"] <= 17
+    assert instrumentation["max_active_states"] <= 18
     assert instrumentation["transition_steps"] <= instrumentation["source_tokens"] * 34
 
 
@@ -883,6 +910,93 @@ def test_round14_ambiguous_mark_o_fresh_private_events_have_zero_effects(tmp_pat
     )
 ))
 def test_round14_special_sources_outside_namespace_reach_private_conversation_exactly(tmp_path, source):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot ordinary {chr(source)} text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+def test_round15_frozen_unicode_15_1_m_slot_tables_are_complete():
+    assert unicodedata2.unidata_version == "15.1.0"
+    assert mattermost_ingress._CLINICAL_AUTOMATON_STATE_COUNT == 18
+    assert mattermost_ingress._UNICODE_15_1_M_SLOT_CONFUSABLES == UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE
+    assert tuple(map(len, UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE.values())) == (45, 49, 20)
+    assert set(ROUND15_DIRECT_RN_SIBLINGS) <= set(mattermost_ingress._UNICODE_15_1_M_SLOT_CONFUSABLES["rn"])
+    assert "m" == unicodedata2.normalize("NFKC", "m").casefold()
+    assert {"m"} == {
+        character
+        for character in set("nextappointment")
+        if character in mattermost_ingress._MULTI_SYMBOL_NAMESPACE_LETTERS
+    }
+
+
+@pytest.mark.parametrize("source", (0x006D, *ROUND15_DIRECT_RN_SIBLINGS))
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+def test_round15_direct_rn_sources_are_blocked_before_private_or_durable_delivery(tmp_path, ready, source):
+    service, rest, conversation = ingress(tmp_path / "fresh")
+    namespace = "next-appointrnent" if source == 0x006D else f"next-appoint{chr(source)}ent"
+    message = f"@restricted-bot {namespace} 123e4567-e89b-42d3-a456-426614174000"
+    source = post(message=message)
+    rest.posts[ROOT] = source
+    service.handle(event(source, channel_type="P"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == []
+
+    legacy_service, legacy_rest, legacy_conversation = ingress(tmp_path / "durable")
+    legacy_rest.posts[ROOT] = source
+    legacy, _ = legacy_service.outbox.reserve(
+        legacy_service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    if ready:
+        legacy = legacy_service.outbox.mark_ready(
+            legacy, {**legacy.envelope, "conversation_epoch": "epoch-one", "response": "legacy"},
+        )
+    legacy_service.executor.drain()
+    durable = legacy_service.outbox.get(legacy.record_tag)
+    assert durable is not None and durable.state is DeliveryState.BLOCKED
+    assert legacy_conversation.calls == [] and legacy_rest.created == []
+
+
+@pytest.mark.parametrize("source", UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE["rn"])
+def test_round15_all_direct_rn_sources_reserve_the_m_slot(source):
+    assert mattermost_ingress._clinical_namespace(f"next-appoint{chr(source)}ent"), hex(source)
+
+
+def test_round15_component_rn_product_reserves_the_m_slot():
+    for source_r in (ord("r"), *UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE["r"]):
+        for source_n in (ord("n"), *UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE["n"]):
+            assert mattermost_ingress._clinical_namespace(
+                f"next-appoint{chr(source_r)}{chr(source_n)}ent"
+            ), (hex(source_r), hex(source_n))
+
+
+@pytest.mark.parametrize("namespace", (
+    "next-appointrnent",
+    "next\u2017appo\u02dbnt\U000118e3ent",
+    "next\u02dbappo\u037ant\u20a5ent",
+    "next-app\u0c02int\u0271ent",
+    "NEXT\u2017AP\u200bPOINT\U00011700ENT",
+))
+def test_round15_multi_symbol_m_slot_composes_with_existing_ambiguities(namespace):
+    assert mattermost_ingress._clinical_namespace(namespace), namespace.encode("unicode_escape")
+
+
+@pytest.mark.parametrize("namespace", (
+    "next-appointrent", "next-appointnent", "next-appointr nent", "next-appointrxnent",
+    "next-appointrnnent", "next-apqointrnent", "next-appoint\uE000ent",
+))
+def test_round15_m_slot_near_misses_remain_ordinary(namespace):
+    assert not mattermost_ingress._clinical_namespace(namespace), namespace.encode("unicode_escape")
+
+
+@pytest.mark.parametrize("source", tuple(dict.fromkeys(
+    UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE["r"]
+    + UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE["n"]
+    + UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE["rn"]
+)))
+def test_round15_m_slot_sources_outside_namespace_reach_private_conversation_exactly(tmp_path, source):
     service, rest, conversation = ingress(tmp_path)
     message = f"@restricted-bot ordinary {chr(source)} text"
     candidate = post(message=message)
