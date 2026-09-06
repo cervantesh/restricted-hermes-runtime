@@ -26,7 +26,7 @@ from restricted_runtime.services.gateway_api import create_app as gateway_app
 from restricted_runtime.services.restricted_api import create_app as conversation_app
 from restricted_runtime.storage import PostgresContentStore, PostgresLedger
 
-URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL")
 pytestmark=pytest.mark.skipif(not URL,reason="requires isolated PostgreSQL")
 
 def policy():

@@ -16,7 +16,7 @@ from restricted_runtime.policy import LOCAL_POLICY_SCHEMA, PolicyBundle, SYSTEM_
 from restricted_runtime.storage import PostgresLedger
 
 
-DATABASE_URL = os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not DATABASE_URL, reason="isolated PostgreSQL database unavailable: set RESTRICTED_RUNTIME_TEST_DATABASE_URL; SQLite/mocks are prohibited")
 
 

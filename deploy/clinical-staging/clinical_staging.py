@@ -103,7 +103,12 @@ def validate_project(project: str) -> str:
     return project
 
 
-def validate_state_path(path: Path, project: str) -> Path:
+def validate_state_path(
+    path: Path,
+    project: str,
+    *,
+    forbidden_roots: Iterable[Path] = (),
+) -> Path:
     validate_project(project)
     if not path.is_absolute():
         raise SafetyError("state path must be absolute")
@@ -114,12 +119,12 @@ def validate_state_path(path: Path, project: str) -> Path:
     home = Path.home().resolve()
     if resolved in {resolved.anchor and Path(resolved.anchor), repo, home}:
         raise SafetyError("state path is too broad")
-    try:
-        resolved.relative_to(repo)
-    except ValueError:
-        pass
-    else:
-        raise SafetyError("state path must remain outside the repository")
+    for root in (repo, *(Path(item).resolve() for item in forbidden_roots)):
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        raise SafetyError("state path must remain outside every repository build context")
     return resolved
 
 
@@ -454,7 +459,11 @@ class ClinicalStaging:
         self.runtime = runtime.resolve()
         self.hrh = hrh.resolve()
         self.project = validate_project(project)
-        self.state_dir = validate_state_path(state_dir, project)
+        self.state_dir = validate_state_path(
+            state_dir,
+            project,
+            forbidden_roots=(self.runtime, self.hrh),
+        )
         if not 1024 <= port <= 65535:
             raise SafetyError("Mattermost loopback port must be 1024..65535")
         self.port = port
@@ -784,7 +793,20 @@ class ClinicalStaging:
         socket_status = json.loads(socket_raw)
         if socket_status != {"uid": 10008, "gid": 20006, "mode": 0o660, "socket": True}:
             raise SafetyError("clinical socket metadata is not exact")
-        logs = self.compose("logs", "--no-color", "ingress", check=False).stdout
+        ingress_started_at = all_inspected["ingress"].get("State", {}).get("StartedAt")
+        if not isinstance(ingress_started_at, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z",
+            ingress_started_at,
+        ) or ingress_started_at.startswith("0001-"):
+            raise SafetyError("current Mattermost ingress start time is unavailable")
+        logs = self.compose(
+            "logs",
+            "--no-color",
+            "--since",
+            ingress_started_at,
+            "ingress",
+            check=False,
+        ).stdout
         if "mattermost_ingress_outcome=authenticated_ready" not in logs:
             raise SafetyError("Mattermost ingress is not authenticated-ready")
         current_images = self._built_images()
@@ -802,6 +824,7 @@ class ClinicalStaging:
             "lifecycle": "ready",
             "mattermost": f"https://127.0.0.1:{self.port}",
             "mattermost_publisher": publisher,
+            "ingress_started_at": ingress_started_at,
             "tls_probe": tls_probe,
             "network_exception": "operator-proxy only: operator_access is non-internal",
             "privileged_provisioner_running": False,
