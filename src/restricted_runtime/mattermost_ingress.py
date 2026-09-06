@@ -177,10 +177,12 @@ _UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS = {
         0x00A0, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006,
         0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x205F, 0x3000, 0x00A8,
         0x00AF, 0x00B4, 0x00B8, 0x02D8, 0x02D9, 0x02DA, 0x02DB, 0x02DC,
-        0x02DD, 0x037A, 0x0384, 0x1FBD, 0x1FBF, 0x1FC0, 0x1FFE, 0x2017,
-        0x203E, 0x309B, 0x309C, 0xFC5E, 0xFC5F, 0xFC60, 0xFC61, 0xFC62,
-        0xFC63, 0xFE70, 0xFE72, 0xFE74, 0xFE76, 0xFE78, 0xFE7A, 0xFE7C,
-        0xFE7E,
+        0x02DD, 0x037A, 0x0384, 0x0385, 0x1FBD, 0x1FBF, 0x1FC0, 0x1FC1,
+        0x1FCD, 0x1FCE, 0x1FCF, 0x1FDD, 0x1FDE, 0x1FDF, 0x1FED, 0x1FEE,
+        0x1FFD, 0x1FFE, 0x2017, 0x203E, 0x309B, 0x309C, 0xFC5E, 0xFC5F,
+        0xFC60, 0xFC61, 0xFC62, 0xFC63, 0xFE49, 0xFE4A, 0xFE4B, 0xFE4C,
+        0xFE70, 0xFE72, 0xFE74, 0xFE76, 0xFE78, 0xFE7A, 0xFE7C, 0xFE7E,
+        0xFFE3,
     ),
 }
 _UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES = frozenset(
@@ -190,6 +192,15 @@ _UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES = frozenset(
 )
 _CLINICAL_COMPATIBILITY_SEPARATOR_SKELETONS = str.maketrans({
     codepoint: separator
+    for separator, codepoints in _UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS.items()
+    for codepoint in codepoints
+})
+_CLINICAL_COMPATIBILITY_SECONDARY_COLLISION = "\uE000"
+_CLINICAL_COMPATIBILITY_SECONDARY_SEPARATOR_SKELETONS = str.maketrans({
+    codepoint: (
+        _CLINICAL_COMPATIBILITY_SECONDARY_COLLISION
+        if codepoint in {0x02DB, 0x037A} else separator
+    )
     for separator, codepoints in _UNICODE_15_1_CLINICAL_COMPATIBILITY_SEPARATORS.items()
     for codepoint in codepoints
 })
@@ -235,13 +246,17 @@ def _namespace_ignorable(character: str) -> bool:
 
 def _namespace_skeleton(
     value: str, *, remove_marks: bool = False, secondary: bool = False,
-    compatibility_separators: bool = False,
+    compatibility_separators: bool = False, preserve_compatibility_letter_collisions: bool = False,
 ) -> str:
     if compatibility_separators:
         # Each replacement is the source-local UnicodeData compatibility
         # decomposition after NFKC and mark removal.  Do not strip marks from
         # unrelated characters in the same message.
-        value = value.translate(_CLINICAL_COMPATIBILITY_SEPARATOR_SKELETONS)
+        value = value.translate(
+            _CLINICAL_COMPATIBILITY_SECONDARY_SEPARATOR_SKELETONS
+            if secondary and preserve_compatibility_letter_collisions
+            else _CLINICAL_COMPATIBILITY_SEPARATOR_SKELETONS
+        )
     if secondary:
         value = value.translate(_SECONDARY_CLINICAL_SOURCE_SEPARATORS)
     if remove_marks:
@@ -257,12 +272,20 @@ def _namespace_skeleton(
 
 def _clinical_namespace(
     value: str, *, remove_marks: bool = False, secondary: bool = False,
-    compatibility_separators: bool = False,
+    compatibility_separators: bool = False, preserve_compatibility_letter_collisions: bool = False,
 ) -> bool:
-    return re.search(r"next[-_\s]+appointment", _namespace_skeleton(
+    skeleton = _namespace_skeleton(
         value, remove_marks=remove_marks, secondary=secondary,
         compatibility_separators=compatibility_separators,
-    )) is not None
+        preserve_compatibility_letter_collisions=preserve_compatibility_letter_collisions,
+    )
+    pattern = (
+        rf"next[-_\s{_CLINICAL_COMPATIBILITY_SECONDARY_COLLISION}]+appo"
+        rf"[i{_CLINICAL_COMPATIBILITY_SECONDARY_COLLISION}]ntment"
+        if preserve_compatibility_letter_collisions
+        else r"next[-_\s]+appointment"
+    )
+    return re.search(pattern, skeleton) is not None
 
 
 def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]:
@@ -274,6 +297,9 @@ def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]
             _clinical_namespace(message), _clinical_namespace(message, remove_marks=True),
             _clinical_namespace(message, secondary=True), _clinical_namespace(message, remove_marks=True, secondary=True),
             _clinical_namespace(message, remove_marks=True, compatibility_separators=True),
+            _clinical_namespace(message, remove_marks=True, secondary=True, compatibility_separators=True),
+            _clinical_namespace(message, remove_marks=True, secondary=True, compatibility_separators=True,
+                                preserve_compatibility_letter_collisions=True),
         )) else ("ordinary", None)
     match = matches[0]
     body = (message[:match.start()] + message[match.end():]).strip()
@@ -281,6 +307,9 @@ def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]
         _clinical_namespace(body), _clinical_namespace(body, remove_marks=True),
         _clinical_namespace(body, secondary=True), _clinical_namespace(body, remove_marks=True, secondary=True),
         _clinical_namespace(body, remove_marks=True, compatibility_separators=True),
+        _clinical_namespace(body, remove_marks=True, secondary=True, compatibility_separators=True),
+        _clinical_namespace(body, remove_marks=True, secondary=True, compatibility_separators=True,
+                            preserve_compatibility_letter_collisions=True),
     )):
         return "ordinary", None
     if any(unicodedata.category(character).startswith("M") for character in body):
