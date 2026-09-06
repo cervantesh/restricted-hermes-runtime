@@ -272,9 +272,10 @@ def _namespace_mark(character: str) -> bool:
 
 
 def _secondary_source_confusable_skeleton(value: str) -> str:
-    """Preserve Mark ``o`` sources only at the fixed detection namespace slot."""
+    """Map Mark ``o`` sources after their non-Mark namespace neighbors normalize."""
     value = re.sub(
-        r"(?<=app)[\u0c02\u0c82\u0d02\u0d82](?=intment)", "o", value,
+        rf"(?<=app)[\u0c02\u0c82\u0d02\u0d82](?=[i{_CLINICAL_COMPATIBILITY_SECONDARY_COLLISION}]ntment)",
+        "o", value,
     )
     return value.translate(_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES)
 
@@ -294,6 +295,9 @@ def _namespace_skeleton(
         )
     if secondary:
         value = value.translate(_SECONDARY_CLINICAL_SOURCE_SEPARATORS)
+        value = value.translate(_CONFUSABLES)
+        value = value.translate(_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES)
+        value = value.translate(_SECONDARY_CLINICAL_CONFUSABLES)
         value = _secondary_source_confusable_skeleton(value)
     if remove_marks:
         value = unicodedata.normalize("NFD", value)
