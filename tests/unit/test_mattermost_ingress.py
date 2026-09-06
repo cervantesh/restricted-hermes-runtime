@@ -38,6 +38,12 @@ USER = "user0000000000000000000000"
 BOT = "bot00000000000000000000000"
 ROOT = "root0000000000000000000000"
 
+UNICODE_15_1_DASH_PUNCTUATION = (
+    0x002D, 0x058A, 0x05BE, 0x1400, 0x1806, 0x2010, 0x2011, 0x2012, 0x2013,
+    0x2014, 0x2015, 0x2E17, 0x2E1A, 0x2E3A, 0x2E3B, 0x2E40, 0x2E5D, 0x301C,
+    0x3030, 0x30A0, 0xFE31, 0xFE32, 0xFE58, 0xFE63, 0xFF0D, 0x10EAD,
+)
+
 
 @pytest.fixture(autouse=True)
 def portable_rest_deadline(monkeypatch):
@@ -422,6 +428,57 @@ def test_hyphen_bullet_clinical_lookalike_is_reserved_in_private_channel(tmp_pat
     rest.posts[ROOT] = candidate
     service.handle(event(candidate, channel_type="P"))
     assert conversation.calls == [] and rest.created == []
+
+
+@pytest.mark.parametrize("dash", ["\u2015", "\u2e3a", "\u2e3b"])
+def test_dash_punctuation_clinical_lookalikes_are_reserved_in_private_channel(tmp_path, dash):
+    service, rest, conversation = ingress(tmp_path)
+    candidate = post(message=f"@restricted-bot next{dash}appointment 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_combined_horizontal_bar_and_dotless_i_clinical_lookalike_is_reserved_in_private_channel(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    candidate = post(message="@restricted-bot next\u2015appo\u0131ntment 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert mattermost_ingress._clinical_command(candidate["message"], "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == []
+
+
+@pytest.mark.parametrize("dash", [chr(codepoint) for codepoint in UNICODE_15_1_DASH_PUNCTUATION])
+def test_unrelated_dash_punctuation_text_reaches_private_conversation_codepoint_exact(tmp_path, dash):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot agenda {dash} ordinary text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+@pytest.mark.parametrize("dash", ["\u2015", "\u2e3a", "\u2e3b"])
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+def test_legacy_dash_punctuation_record_is_reclassified_before_delivery(tmp_path, ready, dash):
+    service, rest, conversation = ingress(tmp_path)
+    source = post(message=f"@restricted-bot next{dash}appointment 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = source
+    record, _ = service.outbox.reserve(service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000)
+    if ready:
+        record = service.outbox.mark_ready(record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "legacy"})
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state.name == "BLOCKED"
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_secondary_classifier_exactly_covers_frozen_unicode_15_1_dash_punctuation():
+    assert mattermost_ingress._UNICODE_15_1_DASH_PUNCTUATION == UNICODE_15_1_DASH_PUNCTUATION
+    for codepoint in UNICODE_15_1_DASH_PUNCTUATION:
+        assert mattermost_ingress._namespace_skeleton(f"next{chr(codepoint)}appointment", secondary=True) == "next-appointment"
+    for character in ("\u2043", "\u2212"):
+        assert mattermost_ingress._namespace_skeleton(f"next{character}appointment", secondary=True) == "next-appointment"
 
 
 def test_unrelated_hyphen_bullet_text_reaches_private_conversation_codepoint_exact(tmp_path):
