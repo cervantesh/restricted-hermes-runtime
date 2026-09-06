@@ -50,6 +50,13 @@ LETTER_CONFUSABLE_COMMANDS = (
     ("\u1d0f", "next-app\u1d0fintment"),
 )
 
+UNICODE_15_1_CLINICAL_SEPARATOR_CONFUSABLES = {
+    "-": (0x2010, 0x2011, 0x2012, 0x2013, 0xFE58, 0x06D4, 0x2043, 0x02D7, 0x2212, 0x2796, 0x2CBA, 0x2A29, 0x2E1A, 0xFB29, 0x2238, 0x2A2A, 0xFF5E),
+    "_": (0x07FA, 0xFE4D, 0xFE4E, 0xFE4F),
+    " ": (0x2028, 0x2029, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2008, 0x2009, 0x200A, 0x205F, 0x00A0, 0x2007, 0x202F),
+}
+RESIDUAL_CLINICAL_SEPARATOR_SOURCES = (0x06D4, 0x02D7, 0x2796, 0x2CBA, 0x2A29, 0xFB29, 0x2238, 0x2A2A, 0xFF5E, 0x07FA)
+
 
 @pytest.fixture(autouse=True)
 def portable_rest_deadline(monkeypatch):
@@ -529,6 +536,70 @@ def test_secondary_classifier_exactly_covers_frozen_unicode_15_1_dash_punctuatio
         assert mattermost_ingress._namespace_skeleton(f"next{chr(codepoint)}appointment", secondary=True) == "next-appointment"
     for character in ("\u2043", "\u2212"):
         assert mattermost_ingress._namespace_skeleton(f"next{character}appointment", secondary=True) == "next-appointment"
+
+
+def test_frozen_unicode_15_1_separator_confusable_table_is_complete_and_hermetic():
+    table = mattermost_ingress._UNICODE_15_1_CLINICAL_SEPARATOR_CONFUSABLES
+    assert table == UNICODE_15_1_CLINICAL_SEPARATOR_CONFUSABLES
+    assert sum(len(codepoints) for codepoints in table.values()) == 38
+    for separator, codepoints in table.items():
+        for codepoint in codepoints:
+            assert mattermost_ingress._namespace_skeleton(
+                f"next{chr(codepoint)}appointment", secondary=True
+            ) == f"next{separator}appointment"
+    assert 0xA4FE not in {codepoint for codepoints in table.values() for codepoint in codepoints}
+    assert mattermost_ingress._clinical_command(
+        "@restricted-bot next\ua4feappointment 123e4567-e89b-42d3-a456-426614174000", "restricted-bot"
+    )[0] == "ordinary"
+
+
+@pytest.mark.parametrize("codepoint", RESIDUAL_CLINICAL_SEPARATOR_SOURCES)
+def test_residual_separator_sources_reserve_private_namespace_without_effects(tmp_path, codepoint):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot next{chr(codepoint)}appointment 123e4567-e89b-42d3-a456-426614174000"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == [] and service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize("codepoint", RESIDUAL_CLINICAL_SEPARATOR_SOURCES)
+def test_residual_separator_characters_outside_namespace_reach_private_conversation_exactly(tmp_path, codepoint):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot ordinary {chr(codepoint)} text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+@pytest.mark.parametrize("codepoint", RESIDUAL_CLINICAL_SEPARATOR_SOURCES)
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+def test_legacy_residual_separator_records_are_reclassified_before_delivery(tmp_path, ready, codepoint):
+    service, rest, conversation = ingress(tmp_path)
+    source = post(message=f"@restricted-bot next{chr(codepoint)}appointment 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = source
+    record, _ = service.outbox.reserve(service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000)
+    if ready:
+        record = service.outbox.mark_ready(record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "legacy"})
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.BLOCKED
+    assert conversation.calls == [] and rest.created == []
+
+
+@pytest.mark.parametrize("message", [
+    "@restricted-bot next\u02d7appo\u026antment 123e4567-e89b-42d3-a456-426614174000",
+    "@restricted-bot next\u02d7appo\ufe0fintment 123e4567-e89b-42d3-a456-426614174000",
+])
+def test_residual_separator_composed_with_existing_secondary_forms_is_reserved(tmp_path, message):
+    service, rest, conversation = ingress(tmp_path)
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == [] and service.outbox.candidates(10) == []
 
 
 def test_unrelated_hyphen_bullet_text_reaches_private_conversation_codepoint_exact(tmp_path):

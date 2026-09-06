@@ -20,6 +20,7 @@ from test_mattermost_ingress import (
     post,
     signed_policy,
     LETTER_CONFUSABLE_COMMANDS,
+    RESIDUAL_CLINICAL_SEPARATOR_SOURCES,
 )
 from restricted_runtime.mattermost_outbox import MattermostOutbox
 import os
@@ -154,6 +155,30 @@ def test_dotless_i_clinical_lookalike_is_reserved_in_direct_channel(tmp_path):
     service.handle(event(candidate, channel_type="D"))
     assert conversation.calls == [] and clinical.queries == [] and rest.created == []
     assert service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize("codepoint", RESIDUAL_CLINICAL_SEPARATOR_SOURCES)
+def test_residual_separator_sources_reserve_direct_clinical_namespace_without_effects(tmp_path, codepoint):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    candidate = post(message=f"@restricted-bot next{chr(codepoint)}appointment {PATIENT}")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="D"))
+    assert mattermost_ingress._clinical_command(candidate["message"], "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and clinical.queries == [] and clinical.reauthorizations == []
+    assert rest.created == [] and service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize("message", [
+    f"@restricted-bot next\u02d7appo\u026antment {PATIENT}",
+    f"@restricted-bot next\u02d7appo\ufe0fintment {PATIENT}",
+])
+def test_residual_separator_composed_with_existing_secondary_forms_is_reserved_in_direct_channel(tmp_path, message):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="D"))
+    assert conversation.calls == [] and clinical.queries == [] and clinical.reauthorizations == []
+    assert rest.created == [] and service.outbox.candidates(10) == []
 
 
 @pytest.mark.parametrize(("_character", "command"), LETTER_CONFUSABLE_COMMANDS)

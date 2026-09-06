@@ -144,6 +144,28 @@ _SECONDARY_CLINICAL_CONFUSABLES = str.maketrans({
     **{chr(codepoint): "-" for codepoint in _UNICODE_15_1_DASH_PUNCTUATION},
     "\u0131": "i", "\u2043": "-", "\u2212": "-",
 })
+# Unicode 15.1.0 confusables.txt: single-source mappings whose skeleton
+# resolves to one clinical namespace separator.  This detection-only mapping
+# runs before NFKC/casefold so source identity is not lost.
+# https://www.unicode.org/Public/security/15.1.0/confusables.txt
+_UNICODE_15_1_CLINICAL_SEPARATOR_CONFUSABLES = {
+    "-": (
+        0x2010, 0x2011, 0x2012, 0x2013, 0xFE58, 0x06D4, 0x2043, 0x02D7,
+        0x2212, 0x2796, 0x2CBA, 0x2A29, 0x2E1A, 0xFB29, 0x2238, 0x2A2A,
+        0xFF5E,
+    ),
+    "_": (0x07FA, 0xFE4D, 0xFE4E, 0xFE4F),
+    " ": (
+        0x2028, 0x2029, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004,
+        0x2005, 0x2006, 0x2008, 0x2009, 0x200A, 0x205F, 0x00A0, 0x2007,
+        0x202F,
+    ),
+}
+_SECONDARY_CLINICAL_SOURCE_SEPARATORS = str.maketrans({
+    codepoint: separator
+    for separator, codepoints in _UNICODE_15_1_CLINICAL_SEPARATOR_CONFUSABLES.items()
+    for codepoint in codepoints
+})
 # Unicode 15.1.0 confusables.txt: single-source, single-ASCII-letter mappings
 # for letters in "nextappointment" that remain after NFKC/casefold and the
 # primary namespace maps. This is detection-only, not a general parser.
@@ -185,6 +207,8 @@ def _namespace_ignorable(character: str) -> bool:
 
 
 def _namespace_skeleton(value: str, *, remove_marks: bool = False, secondary: bool = False) -> str:
+    if secondary:
+        value = value.translate(_SECONDARY_CLINICAL_SOURCE_SEPARATORS)
     if remove_marks:
         value = unicodedata.normalize("NFD", value)
         value = "".join(character for character in value if not unicodedata.category(character).startswith("M"))
