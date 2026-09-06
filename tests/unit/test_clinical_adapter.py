@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import ssl
 import stat
+import threading
+import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +23,7 @@ from restricted_runtime.clinical_adapter import (
 )
 from restricted_runtime.contracts import ClinicalAuthorizationDenied
 from restricted_runtime.services import production_clinical_adapter
+from restricted_runtime.services import production_mattermost_ingress
 import restricted_runtime.clinical_adapter as clinical_adapter
 
 
@@ -285,7 +290,13 @@ def config(tmp_path, timezone="America/New_York"):
     return AdapterConfig("https://hrh.internal.example", ca, key, 2.0, 10007, timezone)
 
 
-def test_https_validation_accepts_the_explicit_non_new_york_adapter_timezone(monkeypatch, tmp_path):
+@pytest.fixture
+def no_signal_deadline(monkeypatch):
+    """Keep transport-shape tests portable; deadline behavior has direct tests."""
+    monkeypatch.setattr(clinical_adapter, "_absolute_upstream_deadline", lambda _seconds: nullcontext())
+
+
+def test_https_validation_accepts_the_explicit_non_new_york_adapter_timezone(monkeypatch, tmp_path, no_signal_deadline):
     path = tmp_path / "adapter.json"
     path.write_text(json.dumps({
         "hrh_origin": "https://hrh.internal.example",
@@ -366,7 +377,7 @@ def test_production_boolean_expected_ingress_uid_fails_before_downstream_constru
         production_clinical_adapter.run()
 
 
-def test_adapter_rejects_adapter_config_upstream_timezone_mismatch_at_https_and_uds_surfaces(monkeypatch, tmp_path):
+def test_adapter_rejects_adapter_config_upstream_timezone_mismatch_at_https_and_uds_surfaces(monkeypatch, tmp_path, no_signal_deadline):
     expected = "Europe/Madrid"
     response_body = json.dumps({
         "clinicTimezone": "America/New_York", "appointment": None, "responseDigest": RESPONSE_DIGEST,
@@ -395,6 +406,7 @@ def test_production_entrypoint_threads_configured_timezone_to_https_and_uds_vali
         pass
 
     monkeypatch.setattr(production_clinical_adapter.AdapterConfig, "load", lambda _path: config)
+    monkeypatch.setattr(production_clinical_adapter, "_serial_linux_deadline_supported", lambda: True)
     monkeypatch.setattr(production_clinical_adapter, "load_api_key", lambda *_args, **_kwargs: "secret")
     monkeypatch.setattr(production_clinical_adapter, "HrhHttpsClient", lambda received, *, api_key: captured.setdefault("https", (received, api_key)))
 
@@ -409,9 +421,23 @@ def test_production_entrypoint_threads_configured_timezone_to_https_and_uds_vali
     assert captured["uds"]["expected_clinical_timezone"] == "Europe/Madrid"
 
 
+def test_production_rejects_unsupported_deadline_platform_before_secret_client_or_socket(monkeypatch, tmp_path):
+    config = SimpleNamespace(api_key_path=tmp_path / "key")
+    monkeypatch.setattr(production_clinical_adapter.AdapterConfig, "load", lambda _path: config)
+    monkeypatch.setattr(production_clinical_adapter, "_serial_linux_deadline_supported", lambda: False)
+    monkeypatch.setattr(production_clinical_adapter, "load_api_key", lambda *_args, **_kwargs: pytest.fail("secret loading reached"))
+    monkeypatch.setattr(production_clinical_adapter, "HrhHttpsClient", lambda *_args, **_kwargs: pytest.fail("client construction reached"))
+    monkeypatch.setattr(production_clinical_adapter, "bind_listener", lambda: pytest.fail("socket construction reached"))
+    with pytest.raises(ContractError, match="deadline unavailable"):
+        production_clinical_adapter.run()
+
+
 @pytest.mark.parametrize("origin", [
     "http://hrh.internal.example", "https://user@hrh.internal.example",
     "https://hrh.internal.example/path", "https://hrh.internal.example?x=1",
+    "https://hrh.internal.example:", "https://hrh.internal.example:0",
+    "https://hrh.internal.example:-1", "https://hrh.internal.example:65536",
+    "https://hrh.internal.example:abc", "https://hrh.internal.example:443",
 ])
 def test_adapter_configuration_requires_one_pinned_https_origin(tmp_path, origin):
     path = tmp_path / "adapter.json"
@@ -425,6 +451,28 @@ def test_adapter_configuration_requires_one_pinned_https_origin(tmp_path, origin
     }), encoding="utf-8")
     with pytest.raises(ContractError):
         AdapterConfig.load(path)
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        ("https://hrh.internal.example", "https://hrh.internal.example"),
+        ("https://hrh.internal.example:8443", "https://hrh.internal.example:8443"),
+        ("https://[2001:db8::1]", "https://[2001:db8::1]"),
+        ("https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443"),
+    ],
+)
+def test_adapter_configuration_canonicalizes_closed_https_authorities(tmp_path, origin, expected):
+    path = tmp_path / "adapter.json"
+    path.write_text(json.dumps({
+        "hrh_origin": origin,
+        "ca_path": "/run/secrets/hrh-ca.pem",
+        "api_key_path": "/run/secrets/hrh-clinical-api-key",
+        "timeout_seconds": 5,
+        "expected_ingress_uid": 10007,
+        "expected_clinical_timezone": "America/New_York",
+    }), encoding="utf-8")
+    assert AdapterConfig.load(path).hrh_origin == expected
 
 
 def test_adapter_configuration_schema_is_closed(tmp_path):
@@ -442,7 +490,7 @@ def test_adapter_configuration_schema_is_closed(tmp_path):
         AdapterConfig.load(path)
 
 
-def test_https_client_uses_exact_origin_api_key_and_no_redirect(monkeypatch, tmp_path):
+def test_https_client_uses_exact_origin_api_key_and_no_redirect(monkeypatch, tmp_path, no_signal_deadline):
     response_body = json.dumps({"authorized": True}, separators=(",", ":")).encode()
     connection = Connection(Response(body=response_body))
     monkeypatch.setattr("restricted_runtime.clinical_adapter.ssl.create_default_context", lambda cafile: object())
@@ -461,14 +509,14 @@ def test_https_client_uses_exact_origin_api_key_and_no_redirect(monkeypatch, tmp
     Response(body=b"{}", headers={"Content-Type": "application/json"}),
     Response(body=b"x" * 65_537),
 ])
-def test_https_failures_are_closed(monkeypatch, tmp_path, response):
+def test_https_failures_are_closed(monkeypatch, tmp_path, response, no_signal_deadline):
     monkeypatch.setattr("restricted_runtime.clinical_adapter.ssl.create_default_context", lambda cafile: object())
     monkeypatch.setattr("restricted_runtime.clinical_adapter.http.client.HTTPSConnection", lambda *a, **k: Connection(response))
     with pytest.raises(ContractError):
         HrhHttpsClient(config(tmp_path), api_key="secret").request("/api/restricted-hermes/clinical/next-appointment", BASE)
 
 
-def test_https_403_is_an_authoritative_denial(monkeypatch, tmp_path):
+def test_https_403_is_an_authoritative_denial(monkeypatch, tmp_path, no_signal_deadline):
     monkeypatch.setattr("restricted_runtime.clinical_adapter.ssl.create_default_context", lambda cafile: object())
     monkeypatch.setattr(
         "restricted_runtime.clinical_adapter.http.client.HTTPSConnection",
@@ -481,11 +529,283 @@ def test_https_403_is_an_authoritative_denial(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("failure", [TimeoutError(), socket.gaierror(), OSError(), ssl.SSLError("TLS")])
-def test_transport_dns_tls_timeout_failures_have_no_fallback(monkeypatch, tmp_path, failure):
+def test_transport_dns_tls_timeout_failures_have_no_fallback(monkeypatch, tmp_path, failure, no_signal_deadline):
     monkeypatch.setattr("restricted_runtime.clinical_adapter.ssl.create_default_context", lambda cafile: object())
     monkeypatch.setattr("restricted_runtime.clinical_adapter.http.client.HTTPSConnection", lambda *a, **k: Connection(failure=failure))
     with pytest.raises(ContractError):
         HrhHttpsClient(config(tmp_path), api_key="secret").request("/api/restricted-hermes/clinical/next-appointment", BASE)
+
+
+def test_https_deadline_prevents_upload_after_resolver_exhausts_budget(monkeypatch, tmp_path, no_signal_deadline):
+    clock = {"now": 0.0}
+
+    class Connection:
+        requests = 0
+
+        def __init__(self, *_args, **_kwargs):
+            clock["now"] += 3
+
+        def request(self, *_args, **_kwargs):
+            type(self).requests += 1
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.ssl.create_default_context", lambda cafile: object())
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.http.client.HTTPSConnection", Connection)
+    with pytest.raises(ContractError, match="deadline"):
+        HrhHttpsClient(config(tmp_path), api_key="secret").request("/api/restricted-hermes/clinical/next-appointment", BASE)
+    assert Connection.requests == 0
+
+
+def test_https_deadline_prevents_response_headers_after_upload_exhausts_budget(monkeypatch, tmp_path, no_signal_deadline):
+    clock = {"now": 0.0}
+
+    class Connection:
+        requests = responses = closes = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            type(self).requests += 1
+            clock["now"] += 3
+
+        def getresponse(self):
+            type(self).responses += 1
+            return Response()
+
+        def close(self):
+            type(self).closes += 1
+
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.ssl.create_default_context", lambda cafile: object())
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.http.client.HTTPSConnection", Connection)
+    with pytest.raises(ContractError, match="deadline"):
+        HrhHttpsClient(config(tmp_path), api_key="secret").request("/api/restricted-hermes/clinical/next-appointment", BASE)
+    assert (Connection.requests, Connection.responses, Connection.closes) == (1, 0, 1)
+
+
+def test_https_deadline_prevents_body_read_after_response_headers_exhaust_budget(monkeypatch, tmp_path, no_signal_deadline):
+    clock = {"now": 0.0}
+
+    class Body(Response):
+        reads = 0
+
+        def read(self, amount=None):
+            type(self).reads += 1
+            return super().read(amount)
+
+    class Connection:
+        closes = 0
+
+        def __init__(self, *_args, **_kwargs):
+            self.response = Body(body=json.dumps({
+                "clinicTimezone": "America/New_York", "appointment": None, "responseDigest": RESPONSE_DIGEST,
+            }, separators=(",", ":")).encode())
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            clock["now"] += 3
+            return self.response
+
+        def close(self):
+            type(self).closes += 1
+
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.ssl.create_default_context", lambda cafile: object())
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.http.client.HTTPSConnection", Connection)
+    with pytest.raises(ContractError, match="deadline"):
+        HrhHttpsClient(config(tmp_path), api_key="secret").request("/api/restricted-hermes/clinical/next-appointment", BASE)
+    assert (Body.reads, Connection.closes) == (0, 1)
+
+
+@pytest.mark.skipif(os.name == "posix", reason="SIGALRM is available on the Linux production host")
+def test_https_rejects_unsupported_deadline_platform_before_opening_connection(monkeypatch, tmp_path):
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.ssl.create_default_context", lambda cafile: object())
+    monkeypatch.setattr(
+        "restricted_runtime.clinical_adapter.http.client.HTTPSConnection",
+        lambda *_args, **_kwargs: pytest.fail("connection construction reached"),
+    )
+    with pytest.raises(ContractError, match="deadline unavailable"):
+        HrhHttpsClient(config(tmp_path), api_key="secret").request("/api/restricted-hermes/clinical/next-appointment", BASE)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGALRM bounds the Linux production adapter")
+def test_absolute_upstream_deadline_rejects_non_main_thread():
+    result = []
+
+    def invoke():
+        try:
+            with clinical_adapter._absolute_upstream_deadline(1):
+                pass
+        except ContractError as exc:
+            result.append(str(exc))
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    worker.join()
+    assert result == ["clinical adapter upstream deadline unavailable"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGALRM bounds the Linux production adapter")
+@pytest.mark.parametrize("outer_timer", [(0.05, 0.0), (0.05, 0.05)], ids=["one-shot", "periodic"])
+def test_absolute_upstream_deadline_rejects_armed_outer_timer_without_mutation(monkeypatch, outer_timer):
+    original_handler = object()
+    timer_calls, handler_calls = [], []
+    monkeypatch.setattr(clinical_adapter.signal, "getsignal", lambda _signal: original_handler)
+    monkeypatch.setattr(clinical_adapter.signal, "getitimer", lambda _timer: outer_timer)
+    monkeypatch.setattr(clinical_adapter.signal, "setitimer", lambda *args: timer_calls.append(args))
+    monkeypatch.setattr(clinical_adapter.signal, "signal", lambda *args: handler_calls.append(args))
+
+    with pytest.raises(ContractError, match="deadline unavailable"):
+        with clinical_adapter._absolute_upstream_deadline(2.0):
+            pytest.fail("inner deadline body reached")
+
+    assert timer_calls == []
+    assert handler_calls == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGALRM bounds the Linux production adapter")
+@pytest.mark.parametrize("interval", [0.0, 0.2], ids=["one-shot", "periodic"])
+def test_absolute_upstream_deadline_preserves_real_armed_outer_timer(interval):
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer[0] > 0:
+        pytest.skip("test host already owns ITIMER_REAL")
+    fired = threading.Event()
+
+    def outer_handler(_signum, _frame):
+        fired.set()
+
+    signal.signal(signal.SIGALRM, outer_handler)
+    signal.setitimer(signal.ITIMER_REAL, 0.2, interval)
+    try:
+        before = signal.getitimer(signal.ITIMER_REAL)
+        with pytest.raises(ContractError, match="deadline unavailable"):
+            with clinical_adapter._absolute_upstream_deadline(1.0):
+                pytest.fail("inner deadline body reached")
+        after = signal.getitimer(signal.ITIMER_REAL)
+        assert 0 < after[0] <= before[0] and after[1] == interval
+        assert fired.wait(0.5), "outer SIGALRM was swallowed"
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGALRM bounds the Linux production adapter")
+def test_absolute_upstream_deadline_rejects_masked_sigalrm_without_mutation(monkeypatch):
+    original_handler = object()
+    timer_calls, handler_calls = [], []
+    monkeypatch.setattr(clinical_adapter.signal, "pthread_sigmask", lambda *_args: {signal.SIGALRM})
+    monkeypatch.setattr(clinical_adapter.signal, "getsignal", lambda _signal: original_handler)
+    monkeypatch.setattr(clinical_adapter.signal, "getitimer", lambda _timer: (0.0, 0.0))
+    monkeypatch.setattr(clinical_adapter.signal, "setitimer", lambda *args: timer_calls.append(args))
+    monkeypatch.setattr(clinical_adapter.signal, "signal", lambda *args: handler_calls.append(args))
+
+    with pytest.raises(ContractError, match="deadline unavailable"):
+        with clinical_adapter._absolute_upstream_deadline(2.0):
+            pytest.fail("inner deadline body reached")
+
+    assert timer_calls == []
+    assert handler_calls == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGALRM bounds the Linux production adapter")
+def test_absolute_upstream_deadline_preserves_real_blocked_mask_handler_and_timer():
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer[0] > 0:
+        pytest.skip("test host already owns ITIMER_REAL")
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    try:
+        before_timer = signal.getitimer(signal.ITIMER_REAL)
+        with pytest.raises(ContractError, match="deadline unavailable"):
+            with clinical_adapter._absolute_upstream_deadline(1.0):
+                pytest.fail("inner deadline body reached")
+        assert signal.getsignal(signal.SIGALRM) == previous_handler
+        assert signal.getitimer(signal.ITIMER_REAL) == before_timer
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGALRM bounds the Linux production adapter")
+def test_absolute_upstream_deadline_rejects_when_mask_api_is_unavailable(monkeypatch):
+    timer_calls, handler_calls = [], []
+    monkeypatch.setattr(clinical_adapter.signal, "pthread_sigmask", None)
+    monkeypatch.setattr(clinical_adapter.signal, "getsignal", lambda *_args: pytest.fail("handler inspection reached"))
+    monkeypatch.setattr(clinical_adapter.signal, "getitimer", lambda *_args: pytest.fail("timer inspection reached"))
+    monkeypatch.setattr(clinical_adapter.signal, "setitimer", lambda *args: timer_calls.append(args))
+    monkeypatch.setattr(clinical_adapter.signal, "signal", lambda *args: handler_calls.append(args))
+
+    with pytest.raises(ContractError, match="deadline unavailable"):
+        with clinical_adapter._absolute_upstream_deadline(2.0):
+            pytest.fail("inner deadline body reached")
+
+    assert timer_calls == []
+    assert handler_calls == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGALRM bounds the Linux production adapter")
+def test_absolute_upstream_deadline_restores_handler_and_disabled_timer(monkeypatch):
+    original_handler = object()
+    timer_calls, handler_calls = [], []
+    monkeypatch.setattr(clinical_adapter.signal, "getsignal", lambda _signal: original_handler)
+    monkeypatch.setattr(clinical_adapter.signal, "getitimer", lambda _timer: (0.0, 0.0))
+    monkeypatch.setattr(clinical_adapter.signal, "setitimer", lambda *args: timer_calls.append(args))
+    monkeypatch.setattr(clinical_adapter.signal, "signal", lambda *args: handler_calls.append(args))
+
+    with clinical_adapter._absolute_upstream_deadline(2.0):
+        pass
+
+    assert timer_calls == [(signal.ITIMER_REAL, 2.0), (signal.ITIMER_REAL, 0.0, 0.0)]
+    assert handler_calls[-1] == (signal.SIGALRM, original_handler)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGALRM bounds the Linux production adapter")
+def test_https_stalled_resolver_obeys_the_wall_clock_deadline(monkeypatch, tmp_path):
+    def stalled(*_args, **_kwargs):
+        time.sleep(0.2)
+
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.ssl.create_default_context", lambda cafile: object())
+    monkeypatch.setattr("restricted_runtime.clinical_adapter.http.client.HTTPSConnection", stalled)
+    start = time.monotonic()
+    with pytest.raises(ContractError, match="transport"):
+        HrhHttpsClient(AdapterConfig("https://hrh.internal.example", tmp_path / "ca.pem", tmp_path / "key", 0.05, 10007, "America/New_York"), api_key="secret").request("/api/restricted-hermes/clinical/next-appointment", BASE)
+    assert time.monotonic() - start < 0.15
+
+
+def test_production_scanner_starts_before_websocket_and_survives_one_outage(monkeypatch):
+    events = []
+
+    class Ingress:
+        def start_periodic_recovery(self):
+            events.append("start")
+            return object()
+
+        def stop_periodic_recovery(self, handle):
+            assert handle is not None
+            events.append("stop")
+
+    ingress = Ingress()
+    monkeypatch.setattr(production_mattermost_ingress, "build_ingress", lambda: (ingress, "token", object(), object()))
+    monkeypatch.setattr(production_mattermost_ingress.time, "sleep", lambda _delay: None)
+    attempts = {"count": 0}
+
+    def connect(*_args):
+        attempts["count"] += 1
+        assert events == ["start"]
+        if attempts["count"] == 1:
+            raise OSError
+        raise ContractError("stop")
+
+    monkeypatch.setattr(production_mattermost_ingress, "_authenticated_connection", connect)
+    with pytest.raises(ContractError, match="stop"):
+        production_mattermost_ingress.run()
+    assert attempts["count"] == 2 and events == ["start", "stop"]
 
 
 def test_broken_pipe_does_not_prevent_the_next_connection(monkeypatch):

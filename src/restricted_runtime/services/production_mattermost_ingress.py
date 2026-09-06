@@ -98,30 +98,30 @@ def run() -> None:
         logging.getLogger(name).disabled = True
     ingress, token, policy, context = build_ingress()
     delay = 1.0
-    while True:
-        connection = None
-        periodic_recovery = None
-        try:
-            connection = _authenticated_connection(ingress, token, policy, context)
-            periodic_recovery = ingress.start_periodic_recovery()
-            delay = 1.0
-            for raw in connection:
-                try:
-                    encoded = raw.encode("utf-8") if isinstance(raw, str) else raw
-                    ingress.handle(MattermostEvent.parse(encoded, max_bytes=MAX_EVENT_BYTES))
-                except (ContractError, UnicodeError, TypeError):
-                    logging.getLogger("restricted_mattermost").warning("mattermost_event_outcome=rejected")
-        except ContractError:
-            raise
-        except (OSError, TimeoutError, ConnectionClosed):
-            logging.getLogger("restricted_mattermost").warning("mattermost_connection_outcome=disconnected")
-        finally:
-            if periodic_recovery is not None:
-                ingress.stop_periodic_recovery(periodic_recovery)
-            if connection is not None:
-                connection.close()
-        time.sleep(delay)
-        delay = min(delay * 2, 30.0)
+    periodic_recovery = ingress.start_periodic_recovery()
+    try:
+        while True:
+            connection = None
+            try:
+                connection = _authenticated_connection(ingress, token, policy, context)
+                delay = 1.0
+                for raw in connection:
+                    try:
+                        encoded = raw.encode("utf-8") if isinstance(raw, str) else raw
+                        ingress.handle(MattermostEvent.parse(encoded, max_bytes=MAX_EVENT_BYTES))
+                    except (ContractError, UnicodeError, TypeError):
+                        logging.getLogger("restricted_mattermost").warning("mattermost_event_outcome=rejected")
+            except ContractError:
+                raise
+            except (OSError, TimeoutError, ConnectionClosed):
+                logging.getLogger("restricted_mattermost").warning("mattermost_connection_outcome=disconnected")
+            finally:
+                if connection is not None:
+                    connection.close()
+            time.sleep(delay)
+            delay = min(delay * 2, 30.0)
+    finally:
+        ingress.stop_periodic_recovery(periodic_recovery)
 
 
 def main() -> None:
