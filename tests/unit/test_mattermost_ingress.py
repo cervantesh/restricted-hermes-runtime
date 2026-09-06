@@ -740,6 +740,48 @@ def test_round13_mark_source_confusables_and_every_unicode_15_1_mark_reserve_nam
                 )
 
 
+def test_round13_mark_o_sources_compose_with_every_existing_nonmark_letter_confusable():
+    mappings = {
+        **mattermost_ingress._CONFUSABLES,
+        **mattermost_ingress._SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES,
+        **mattermost_ingress._SECONDARY_CLINICAL_CONFUSABLES,
+    }
+    companions = tuple(
+        (source, letter, index)
+        for source, letter in mappings.items()
+        if letter in "nextappointment" and letter != "o"
+        for index, character in enumerate("next-appointment")
+        if character == letter
+    )
+    assert companions
+    for mark_o_source in COMBINING_MARK_O_CONFUSABLES:
+        for source, letter, index in companions:
+            for separator in ("-", "\u2017"):
+                candidate = list("next-appointment")
+                candidate[4] = separator
+                candidate[8] = chr(mark_o_source)
+                candidate[index] = chr(source)
+                assert mattermost_ingress._clinical_namespace(
+                    "".join(candidate), remove_marks=True, secondary=True,
+                    compatibility_separators=True,
+                    preserve_compatibility_letter_collisions=source in {0x02DB, 0x037A},
+                ), (hex(mark_o_source), hex(source), letter, index, separator)
+
+
+@pytest.mark.parametrize("namespace", (
+    "next-\u0430pp\u0c02intment",
+    "next-app\u0c02i\u0578tment",
+))
+def test_round13_mark_o_nonmark_companions_reserve_private_namespace_without_effects(tmp_path, namespace):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot {namespace} 123e4567-e89b-42d3-a456-426614174000"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == [] and service.outbox.candidates(10) == []
+
+
 @pytest.mark.parametrize("separator", ("-", "\u2017"))
 @pytest.mark.parametrize("source", COMBINING_MARK_O_CONFUSABLES)
 @pytest.mark.parametrize("mark_position", ("letter", "separator"))
@@ -780,9 +822,12 @@ def test_round13_legacy_mark_source_confusable_record_is_reclassified_before_del
     assert conversation.calls == [] and rest.created == []
 
 
-def test_round13_mark_source_confusable_outside_namespace_reaches_private_conversation_exactly(tmp_path):
+@pytest.mark.parametrize("message", (
+    "@restricted-bot ordinary \u2017 app\u0c02\u0301intment text",
+    "@restricted-bot ordinary \u0430 app\u0c02intment text",
+))
+def test_round13_mark_source_confusable_outside_namespace_reaches_private_conversation_exactly(tmp_path, message):
     service, rest, conversation = ingress(tmp_path)
-    message = "@restricted-bot ordinary \u2017 app\u0c02\u0301intment text"
     candidate = post(message=message)
     rest.posts[ROOT] = candidate
     service.handle(event(candidate, channel_type="P"))
