@@ -119,11 +119,25 @@ _CONFUSABLES = str.maketrans({
     "\u0430": "a", "\u0435": "e", "\u0456": "i", "\u043c": "m", "\u043e": "o", "\u0440": "p",
     "\u0442": "t", "\u0445": "x", "\u03b1": "a", "\u03b9": "i", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t", "\u03c7": "x",
 })
+_DEFAULT_IGNORABLE_NONSPACING_RANGES = (
+    (0x034F, 0x034F),  # COMBINING GRAPHEME JOINER
+    (0x17B4, 0x17B5),  # Khmer inherent-vowel modifiers
+    (0x180B, 0x180F),  # Mongolian free variation selectors
+    (0xFE00, 0xFE0F),  # variation selectors, including VS15 and VS16
+    (0xE0100, 0xE01EF),  # variation selectors supplement
+)
+
+
+def _namespace_ignorable(character: str) -> bool:
+    if unicodedata.category(character) == "Cf":
+        return True
+    codepoint = ord(character)
+    return any(start <= codepoint <= end for start, end in _DEFAULT_IGNORABLE_NONSPACING_RANGES)
 
 
 def _namespace_skeleton(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).casefold().translate(_CONFUSABLES).translate(_DASHES)
-    return "".join(character for character in normalized if unicodedata.category(character) != "Cf")
+    return "".join(character for character in normalized if not _namespace_ignorable(character))
 
 
 def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]:
