@@ -6,6 +6,7 @@ import socket
 import ssl
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,7 @@ from restricted_runtime.clinical_adapter import (
 )
 from restricted_runtime.contracts import ClinicalAuthorizationDenied
 from restricted_runtime.services import production_clinical_adapter
+import restricted_runtime.clinical_adapter as clinical_adapter
 
 
 ACTOR = "actor000000000000000000000"
@@ -132,14 +134,34 @@ def test_secret_loader_requires_owned_regular_0400_or_0600_file(tmp_path: Path):
 
 
 class _OwnedSecret:
-    def __init__(self, raw: bytes, *, mode: int = 0o600, uid: int = 10007):
+    def __init__(self, raw: bytes, *, mode: int = 0o600, uid: int = 10007, device: int = 1, inode: int = 2, size: int | None = None):
         self.raw, self.mode, self.uid = raw, mode, uid
+        self.device, self.inode = device, inode
+        self.size = len(raw) if size is None else size
 
     def lstat(self):
-        return type("Metadata", (), {"st_mode": stat.S_IFREG | self.mode, "st_uid": self.uid})()
+        return SimpleNamespace(
+            st_mode=stat.S_IFREG | self.mode, st_uid=self.uid,
+            st_dev=self.device, st_ino=self.inode, st_size=self.size,
+        )
 
-    def read_bytes(self):
-        return self.raw
+def _load_owned_secret(monkeypatch, secret, *, opened=None, raw=None, chunks=None):
+    calls = {"open": [], "read": [], "close": []}
+    responses = iter(chunks if chunks is not None else [secret.raw if raw is None else raw, b""])
+    monkeypatch.setattr(clinical_adapter.os, "O_BINARY", 0x8000, raising=False)
+    monkeypatch.setattr(clinical_adapter.os, "open", lambda path, flags: calls["open"].append((path, flags)) or 37)
+    monkeypatch.setattr(clinical_adapter.os, "fstat", lambda descriptor: opened or secret.lstat())
+
+    def read(descriptor, limit):
+        calls["read"].append((descriptor, limit))
+        response = next(responses, b"")
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    monkeypatch.setattr(clinical_adapter.os, "read", read)
+    monkeypatch.setattr(clinical_adapter.os, "close", lambda descriptor: calls["close"].append(descriptor))
+    return load_api_key(secret, expected_uid=10007), calls
 
 
 @pytest.mark.parametrize(
@@ -150,21 +172,82 @@ class _OwnedSecret:
     ],
     ids=["whitespace-only", "leading-space", "trailing-space", "embedded-space", "tab", "carriage-return", "newline", "vertical-tab", "form-feed", "nul"],
 )
-def test_secret_loader_rejects_noncanonical_ascii_credentials_before_adapter_construction_on_all_hosts(raw: bytes):
+def test_secret_loader_rejects_noncanonical_ascii_credentials_before_adapter_construction_on_all_hosts(monkeypatch, raw: bytes):
     with pytest.raises(ContractError, match="secret rejected"):
-        load_api_key(_OwnedSecret(raw), expected_uid=10007)
+        _load_owned_secret(monkeypatch, _OwnedSecret(raw))
 
 
 @pytest.mark.parametrize("mode", [0o400, 0o600])
-def test_secret_loader_removes_one_terminal_line_ending_and_returns_the_remaining_ascii_token_byte_for_byte(mode: int):
+def test_secret_loader_removes_one_terminal_line_ending_and_returns_the_remaining_ascii_token_byte_for_byte(monkeypatch, mode: int):
     token = b"Abcd1234-_XYZ"
-    assert load_api_key(_OwnedSecret(token + b"\r\n", mode=mode), expected_uid=10007) == token.decode("ascii")
+    secret = _OwnedSecret(token + b"\r\n", mode=mode)
+    value, calls = _load_owned_secret(monkeypatch, secret)
+    assert value == token.decode("ascii")
+    assert calls["open"] == [(secret, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | 0x8000)]
+    assert calls["read"] == [(37, 4099), (37, 4084)] and calls["close"] == [37]
+
+
+@pytest.mark.parametrize("raw", [b"a" * 8, b"a" * 4096, b"a" * 4096 + b"\r\n"])
+def test_secret_loader_accepts_closed_length_boundaries(monkeypatch, raw: bytes):
+    value, _calls = _load_owned_secret(monkeypatch, _OwnedSecret(raw))
+    assert value == raw.rstrip(b"\r\n").decode("ascii")
 
 
 @pytest.mark.parametrize("raw", [b"a" * 7 + b"\n", b"a" * 4097, b"a" * 8 + b"\r\n\r\n"])
-def test_secret_loader_enforces_length_after_removing_at_most_one_terminal_line_ending(raw: bytes):
+def test_secret_loader_enforces_length_after_removing_at_most_one_terminal_line_ending(monkeypatch, raw: bytes):
     with pytest.raises(ContractError, match="secret rejected"):
-        load_api_key(_OwnedSecret(raw), expected_uid=10007)
+        _load_owned_secret(monkeypatch, _OwnedSecret(raw))
+
+
+@pytest.mark.parametrize("field", ["st_dev", "st_ino", "st_mode", "st_uid"])
+def test_secret_loader_rejects_descriptor_metadata_swap(monkeypatch, field):
+    secret = _OwnedSecret(b"Abcd1234-_XYZ")
+    opened = secret.lstat()
+    setattr(opened, field, getattr(opened, field) + 1)
+    with pytest.raises(ContractError, match="changed during open"):
+        _load_owned_secret(monkeypatch, secret, opened=opened)
+
+
+def test_secret_loader_rejects_opened_size_swap(monkeypatch):
+    secret = _OwnedSecret(b"Abcd1234", size=8)
+    opened = secret.lstat()
+    opened.st_size = 9
+    with pytest.raises(ContractError, match="changed during open"):
+        _load_owned_secret(monkeypatch, secret, opened=opened)
+
+
+def test_secret_loader_rejects_early_eof_before_the_verified_opened_size(monkeypatch):
+    secret = _OwnedSecret(b"Abcd1234", size=9)
+    with pytest.raises(ContractError, match="size changed during read"):
+        _load_owned_secret(monkeypatch, secret, chunks=[b"Abcd1234", b""])
+
+
+def test_secret_loader_rejects_sparse_oversize_before_opening(monkeypatch):
+    secret = _OwnedSecret(b"Abcd1234", size=4099)
+    calls = []
+    monkeypatch.setattr(clinical_adapter.os, "open", lambda *_args: calls.append("open"))
+    with pytest.raises(ContractError, match="oversized"):
+        load_api_key(secret, expected_uid=10007)
+    assert calls == []
+
+
+def test_secret_loader_reads_only_one_overflow_sentinel_and_rejects_a_grown_descriptor(monkeypatch):
+    secret = _OwnedSecret(b"Abcd1234", size=8)
+    with pytest.raises(ContractError, match="oversized"):
+        _load_owned_secret(monkeypatch, secret, raw=b"a" * 4099)
+
+
+def test_secret_loader_rejects_a_valid_short_read_prefix_with_unread_suffix(monkeypatch):
+    secret = _OwnedSecret(b"Abcd1234-_XYZ")
+    with pytest.raises(ContractError, match="size changed during read"):
+        _load_owned_secret(monkeypatch, secret, chunks=[b"Abcd1234-_XYZ", b"\x00", b""])
+
+
+def test_secret_loader_retries_interrupted_short_reads_until_eof(monkeypatch):
+    secret = _OwnedSecret(b"Abcd1234-_XYZ")
+    value, calls = _load_owned_secret(monkeypatch, secret, chunks=[InterruptedError(), b"Abcd1234-_XYZ", b""])
+    assert value == "Abcd1234-_XYZ"
+    assert calls["read"] == [(37, 4099), (37, 4099), (37, 4086)]
 
 
 class Response:

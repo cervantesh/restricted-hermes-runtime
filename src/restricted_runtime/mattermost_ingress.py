@@ -152,9 +152,16 @@ def _namespace_ignorable(character: str) -> bool:
     return any(start <= codepoint <= end for start, end in _UNICODE_15_1_DEFAULT_IGNORABLE_RANGES)
 
 
-def _namespace_skeleton(value: str) -> str:
+def _namespace_skeleton(value: str, *, remove_marks: bool = False) -> str:
+    if remove_marks:
+        value = unicodedata.normalize("NFD", value)
+        value = "".join(character for character in value if not unicodedata.category(character).startswith("M"))
     normalized = unicodedata.normalize("NFKC", value).casefold().translate(_CONFUSABLES).translate(_DASHES)
     return "".join(character for character in normalized if not _namespace_ignorable(character))
+
+
+def _clinical_namespace(value: str, *, remove_marks: bool = False) -> bool:
+    return re.search(r"next[-\s]+appointment", _namespace_skeleton(value, remove_marks=remove_marks)) is not None
 
 
 def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]:
@@ -162,13 +169,13 @@ def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]
     mention = re.compile(rf"(?<![A-Za-z0-9._-])@{re.escape(bot_username)}(?![A-Za-z0-9._-])")
     matches = list(mention.finditer(message))
     if len(matches) != 1:
-        skeleton = _namespace_skeleton(message)
-        return ("malformed", None) if re.search(r"next[-\s]+appointment", skeleton) else ("ordinary", None)
+        return ("malformed", None) if _clinical_namespace(message) or _clinical_namespace(message, remove_marks=True) else ("ordinary", None)
     match = matches[0]
     body = (message[:match.start()] + message[match.end():]).strip()
-    skeleton = _namespace_skeleton(body)
-    if re.search(r"next[-\s]+appointment", skeleton) is None:
+    if not _clinical_namespace(body) and not _clinical_namespace(body, remove_marks=True):
         return "ordinary", None
+    if any(unicodedata.category(character).startswith("M") for character in body):
+        return "malformed", None
     exact = re.fullmatch(r"next-appointment ([0-9a-f-]{36})", body)
     if exact is None or not _PATIENT_UUID.fullmatch(exact.group(1)):
         return "malformed", None

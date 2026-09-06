@@ -146,6 +146,40 @@ def test_clinical_namespace_is_reserved_and_malformed_forms_never_fall_to_model(
     assert rest.created == []
 
 
+def test_exact_ascii_clinical_command_is_the_only_valid_grammar():
+    assert mattermost_ingress._clinical_command(
+        f"@restricted-bot next-appointment {PATIENT}", "restricted-bot"
+    ) == ("valid", PATIENT)
+
+
+@pytest.mark.parametrize("mark", ["\u0301", "\u0903", "\u20dd"], ids=["Mn", "Mc", "Me"])
+@pytest.mark.parametrize("channel_type", ["P", "D"])
+def test_mark_variants_of_clinical_namespace_never_reach_any_delivery_path(tmp_path, mark, channel_type):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    candidate = post(message=f"@restricted-bot ne{mark}xt-appointment {PATIENT}")
+    rest.posts[ROOT] = candidate
+    assert mattermost_ingress._clinical_command(candidate["message"], "restricted-bot") == ("malformed", None)
+    service.handle(event(candidate, channel_type=channel_type))
+    assert conversation.calls == [] and clinical.queries == [] and rest.created == []
+    assert service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [f"next-a\u1fe4pointment {PATIENT}", f"next-appo\u0130ntment {PATIENT}"],
+    ids=["rho-with-psili", "latin-capital-i-with-dot"],
+)
+@pytest.mark.parametrize("channel_type", ["P", "D"])
+def test_precomposed_mark_confusable_variants_never_reach_any_delivery_path(tmp_path, command, channel_type):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    candidate = post(message=f"@restricted-bot {command}")
+    rest.posts[ROOT] = candidate
+    assert mattermost_ingress._clinical_command(candidate["message"], "restricted-bot") == ("malformed", None)
+    service.handle(event(candidate, channel_type=channel_type))
+    assert conversation.calls == [] and clinical.queries == [] and rest.created == []
+    assert service.outbox.candidates(10) == []
+
+
 def test_clinical_command_is_root_only_and_never_falls_to_model(tmp_path):
     service, rest, conversation, clinical = clinical_ingress(tmp_path)
     reply = post("reply00000000000000000000000", root_id=ROOT, message=f"next-appointment {PATIENT}")
