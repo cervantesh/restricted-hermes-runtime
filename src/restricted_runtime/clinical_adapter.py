@@ -4,14 +4,11 @@ from __future__ import annotations
 import http.client
 import os
 import re
-import signal
 import socket
 import ssl
 import stat
 import struct
-import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +16,12 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from .contracts import ClinicalAuthorizationDenied, ContractError, jcs_bytes, load_closed_json
+from . import upstream_deadline
+
+# Compatibility aliases keep the existing restricted-adapter signal-state tests
+# aimed at the one shared guard rather than a duplicate implementation.
+_absolute_upstream_deadline = upstream_deadline.absolute_upstream_deadline
+signal = upstream_deadline.signal
 
 MAX_WIRE_BYTES = 65_536
 MAX_API_KEY_BYTES = 4096
@@ -34,36 +37,6 @@ _BASE_FIELDS = {
 }
 _PATIENT = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _TIMEZONE = re.compile(r"^[A-Za-z]+(?:[_-][A-Za-z]+)*(?:/[A-Za-z]+(?:[_-][A-Za-z]+)*)+$")
-
-
-@contextmanager
-def _absolute_upstream_deadline(seconds: float):
-    """Interrupt the serial Linux production attempt without leaving a worker behind."""
-    if os.name != "posix":
-        raise ContractError("clinical adapter upstream deadline unavailable")
-    if threading.current_thread() is not threading.main_thread():
-        raise ContractError("clinical adapter upstream deadline unavailable")
-    try:
-        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    except (AttributeError, OSError, TypeError, ValueError):
-        raise ContractError("clinical adapter upstream deadline unavailable") from None
-    if signal.SIGALRM in blocked:
-        raise ContractError("clinical adapter upstream deadline unavailable")
-    previous_handler = signal.getsignal(signal.SIGALRM)
-    previous_timer = signal.getitimer(signal.ITIMER_REAL)
-    if previous_timer[0] > 0:
-        raise ContractError("clinical adapter upstream deadline unavailable")
-
-    def expired(_signum, _frame):
-        raise TimeoutError
-
-    signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
-        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _valid_request(value: Any, *, delivery: bool) -> bool:

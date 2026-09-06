@@ -146,6 +146,23 @@ def test_clinical_namespace_is_reserved_and_malformed_forms_never_fall_to_model(
     assert rest.created == []
 
 
+def test_dotless_i_clinical_lookalike_is_reserved_in_direct_channel(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    candidate = post(message=f"@restricted-bot next-appo\u0131ntment {PATIENT}")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="D"))
+    assert conversation.calls == [] and clinical.queries == [] and rest.created == []
+    assert service.outbox.candidates(10) == []
+
+
+def test_dotless_i_is_secondary_namespace_only_and_exact_ascii_grammar_stays_valid():
+    dotless = f"@restricted-bot next-appo\u0131ntment {PATIENT}"
+    assert mattermost_ingress._clinical_command(dotless, "restricted-bot") == ("malformed", None)
+    assert mattermost_ingress._clinical_command(
+        f"@restricted-bot next-appointment {PATIENT}", "restricted-bot"
+    ) == ("valid", PATIENT)
+
+
 def test_exact_ascii_clinical_command_is_the_only_valid_grammar():
     assert mattermost_ingress._clinical_command(
         f"@restricted-bot next-appointment {PATIENT}", "restricted-bot"

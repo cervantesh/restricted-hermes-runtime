@@ -778,26 +778,28 @@ def test_https_stalled_resolver_obeys_the_wall_clock_deadline(monkeypatch, tmp_p
     assert time.monotonic() - start < 0.15
 
 
-def test_production_scanner_starts_before_websocket_and_survives_one_outage(monkeypatch):
+def test_production_main_scans_before_websocket_and_survives_one_outage(monkeypatch):
     events = []
+    main_thread = threading.get_ident()
+
+    class Executor:
+        def drain(self):
+            events.append(("drain", threading.get_ident()))
 
     class Ingress:
-        def start_periodic_recovery(self):
-            events.append("start")
-            return object()
+        executor = Executor()
 
-        def stop_periodic_recovery(self, handle):
-            assert handle is not None
-            events.append("stop")
+        def mark_authenticated(self):
+            events.append(("authenticated", threading.get_ident()))
 
     ingress = Ingress()
-    monkeypatch.setattr(production_mattermost_ingress, "build_ingress", lambda: (ingress, "token", object(), object()))
-    monkeypatch.setattr(production_mattermost_ingress.time, "sleep", lambda _delay: None)
+    policy = SimpleNamespace(values={"outbox_scan_interval_seconds": 1, "websocket_timeout_seconds": 1})
+    monkeypatch.setattr(production_mattermost_ingress, "deadline_available", lambda: True)
+    monkeypatch.setattr(production_mattermost_ingress, "build_ingress", lambda: (ingress, "token", policy, object()))
     attempts = {"count": 0}
 
     def connect(*_args):
         attempts["count"] += 1
-        assert events == ["start"]
         if attempts["count"] == 1:
             raise OSError
         raise ContractError("stop")
@@ -805,7 +807,169 @@ def test_production_scanner_starts_before_websocket_and_survives_one_outage(monk
     monkeypatch.setattr(production_mattermost_ingress, "_authenticated_connection", connect)
     with pytest.raises(ContractError, match="stop"):
         production_mattermost_ingress.run()
-    assert attempts["count"] == 2 and events == ["start", "stop"]
+    assert attempts["count"] == 2 and events and {name for name, _thread in events} == {"drain"}
+    assert {thread for _name, thread in events} == {main_thread}
+
+
+def test_mattermost_production_rejects_unavailable_deadline_before_ingress_construction(monkeypatch):
+    monkeypatch.setattr(production_mattermost_ingress, "deadline_available", lambda: False)
+    monkeypatch.setattr(production_mattermost_ingress, "build_ingress", lambda: pytest.fail("ingress construction reached"))
+    with pytest.raises(ContractError, match="deadline unavailable"):
+        production_mattermost_ingress.run()
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_websocket_transient_handshake_status_reconnects_without_terminal(monkeypatch, status):
+    from websockets.exceptions import InvalidStatus
+
+    attempts = {"count": 0}
+    stop, events = threading.Event(), production_mattermost_ingress.queue.Queue()
+
+    def connect(*_args):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise InvalidStatus(SimpleNamespace(status_code=status))
+        stop.wait(1)
+        raise OSError
+
+    monkeypatch.setattr(production_mattermost_ingress, "_authenticated_connection", connect)
+    worker = threading.Thread(
+        target=production_mattermost_ingress._websocket_producer,
+        args=("token", object(), object(), events, stop, {"connection": None}, threading.Lock()),
+    )
+    worker.start()
+    deadline = time.monotonic() + 2
+    while attempts["count"] < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    stop.set()
+    worker.join(2)
+    assert attempts["count"] >= 2 and events.empty() and not worker.is_alive()
+
+
+@pytest.mark.parametrize("failure", [
+    lambda: __import__("websockets.exceptions", fromlist=["InvalidStatus"]).InvalidStatus(SimpleNamespace(status_code=403)),
+    lambda: __import__("websockets.exceptions", fromlist=["InvalidHandshake"]).InvalidHandshake(),
+])
+def test_websocket_authorization_or_protocol_handshake_is_terminal(monkeypatch, failure):
+    events, stop = production_mattermost_ingress.queue.Queue(), threading.Event()
+    monkeypatch.setattr(production_mattermost_ingress, "_authenticated_connection", lambda *_args: (_ for _ in ()).throw(failure()))
+    worker = threading.Thread(
+        target=production_mattermost_ingress._websocket_producer,
+        args=("token", object(), object(), events, stop, {"connection": None}, threading.Lock()),
+    )
+    worker.start()
+    kind, value = events.get(timeout=1)
+    worker.join(1)
+    assert kind == "terminal" and isinstance(value, ContractError) and not worker.is_alive()
+
+
+def test_main_fails_closed_when_websocket_worker_stops_without_terminal_event(monkeypatch):
+    class DeadWorker:
+        def start(self):
+            pass
+
+        def join(self, timeout):
+            pass
+
+        def is_alive(self):
+            return False
+
+    class Ingress:
+        executor = SimpleNamespace(drain=lambda: pytest.fail("scan reached"))
+
+    policy = SimpleNamespace(values={"outbox_scan_interval_seconds": 1, "websocket_timeout_seconds": 1})
+    monkeypatch.setattr(production_mattermost_ingress, "deadline_available", lambda: True)
+    monkeypatch.setattr(production_mattermost_ingress, "build_ingress", lambda: (Ingress(), "token", policy, object()))
+    monkeypatch.setattr(production_mattermost_ingress.threading, "Thread", lambda **_kwargs: DeadWorker())
+    with pytest.raises(ContractError, match="worker stopped"):
+        production_mattermost_ingress.run()
+
+
+def test_websocket_event_queue_backpressure_is_bounded_and_stop_aware():
+    events = production_mattermost_ingress.queue.Queue(maxsize=1)
+    events.put(("raw", b"first"))
+    stop, result = threading.Event(), []
+    worker = threading.Thread(
+        target=lambda: result.append(production_mattermost_ingress._put(stop, events, ("raw", b"second"))),
+    )
+    worker.start()
+    time.sleep(0.05)
+    assert worker.is_alive(), "accepted event was silently dropped instead of backpressured"
+    assert events.get_nowait() == ("raw", b"first")
+    worker.join(1)
+    assert result == [True] and events.get_nowait() == ("raw", b"second")
+
+    events.put(("raw", b"full"))
+    stop.set()
+    assert production_mattermost_ingress._put(stop, events, ("raw", b"ignored")) is False
+
+
+def test_websocket_producer_queues_malformed_event_for_main_rejection_without_terminal(monkeypatch):
+    class Connection:
+        def __iter__(self):
+            yield b"not-json"
+
+        def close(self):
+            pass
+
+    policy = SimpleNamespace(values={"websocket_timeout_seconds": 1})
+    events, stop = production_mattermost_ingress.queue.Queue(maxsize=2), threading.Event()
+    active, lock = {"connection": None}, threading.Lock()
+    monkeypatch.setattr(production_mattermost_ingress, "_authenticated_connection", lambda *_args: Connection())
+    worker = threading.Thread(
+        target=production_mattermost_ingress._websocket_producer,
+        args=("token", policy, object(), events, stop, active, lock),
+    )
+    worker.start()
+    assert events.get(timeout=1) == ("authenticated", None)
+    assert events.get(timeout=1) == ("raw", b"not-json")
+    stop.set()
+    worker.join(2)
+    assert not worker.is_alive() and not any(kind == "terminal" for kind, _value in list(events.queue))
+
+
+def test_production_applies_auth_and_live_event_on_main_thread(monkeypatch):
+    observed = []
+    main_thread = threading.get_ident()
+
+    class Executor:
+        def drain(self):
+            observed.append(("drain", threading.get_ident()))
+
+    class Ingress:
+        executor = Executor()
+
+        def mark_authenticated(self):
+            observed.append(("auth", threading.get_ident()))
+
+        def handle(self, value):
+            observed.append((value, threading.get_ident()))
+
+    class Connection:
+        def __iter__(self):
+            yield b"event-frame"
+
+        def close(self):
+            pass
+
+    ingress = Ingress()
+    policy = SimpleNamespace(values={"outbox_scan_interval_seconds": 1, "websocket_timeout_seconds": 1})
+    attempts = {"count": 0}
+
+    def connect(*_args):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return Connection()
+        raise ContractError("stop")
+
+    monkeypatch.setattr(production_mattermost_ingress, "deadline_available", lambda: True)
+    monkeypatch.setattr(production_mattermost_ingress, "build_ingress", lambda: (ingress, "token", policy, object()))
+    monkeypatch.setattr(production_mattermost_ingress, "_authenticated_connection", connect)
+    monkeypatch.setattr(production_mattermost_ingress.MattermostEvent, "parse", lambda raw, **_kwargs: "event")
+    with pytest.raises(ContractError, match="stop"):
+        production_mattermost_ingress.run()
+    assert ("auth", main_thread) in observed and ("event", main_thread) in observed
+    assert {thread for _name, thread in observed} == {main_thread}
 
 
 def test_broken_pipe_does_not_prevent_the_next_connection(monkeypatch):
