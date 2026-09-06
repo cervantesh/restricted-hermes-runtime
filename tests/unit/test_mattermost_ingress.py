@@ -328,9 +328,43 @@ def test_supported_uppercase_and_lowercase_confusables_reserve_the_clinical_name
         assert rest.created == []
 
 
+@pytest.mark.parametrize(
+    "modifier",
+    ["\u034f", "\u17b4", "\u180b", "\ufe0e", "\ufe0f", "\U000e0100"],
+)
+@pytest.mark.parametrize(
+    ("glyph", "ascii"),
+    [
+        ("\u0430", "a"), ("\u0435", "e"), ("\u0456", "i"), ("\u043c", "m"),
+        ("\u043e", "o"), ("\u0440", "p"), ("\u0442", "t"), ("\u0445", "x"),
+        ("\u03b1", "a"), ("\u03b9", "i"), ("\u03bf", "o"), ("\u03c1", "p"),
+        ("\u03c4", "t"), ("\u03c7", "x"),
+    ],
+)
+def test_default_ignorable_nonspacing_modifiers_around_supported_confusables_reserve_the_clinical_namespace(
+    tmp_path, modifier, glyph, ascii,
+):
+    service, rest, conversation = ingress(tmp_path)
+    command = "next-appointment".replace(ascii, glyph + modifier, 1)
+    candidate = post(message=f"@restricted-bot {command} 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls == []
+    assert rest.created == []
+
+
 def test_ordinary_private_channel_text_still_reaches_the_conversation_path(tmp_path):
     service, rest, conversation = ingress(tmp_path)
     candidate = post(message="@restricted-bot ordinary request")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert len(conversation.calls) == 1
+    assert len(rest.created) == 1
+
+
+def test_ordinary_unicode_private_channel_text_still_reaches_the_conversation_path(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    candidate = post(message="@restricted-bot café 日本語")
     rest.posts[ROOT] = candidate
     service.handle(event(candidate, channel_type="P"))
     assert len(conversation.calls) == 1
