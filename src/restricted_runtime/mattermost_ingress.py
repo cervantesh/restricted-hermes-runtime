@@ -227,6 +227,9 @@ _SECONDARY_CLINICAL_SOURCE_CONFUSABLES = str.maketrans({
 _SECONDARY_CLINICAL_MARK_O_SOURCES = {
     0x0C02: "o", 0x0C82: "o", 0x0D02: "o", 0x0D82: "o",
 }
+_SECONDARY_CLINICAL_MARK_O_REMOVALS = str.maketrans({
+    codepoint: None for codepoint in _SECONDARY_CLINICAL_MARK_O_SOURCES
+})
 _SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES = str.maketrans({
     ord(chr(codepoint)): letter
     for letter, codepoints in _UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES.items()
@@ -280,6 +283,15 @@ def _secondary_source_confusable_skeleton(value: str) -> str:
     return value.translate(_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES)
 
 
+def _late_secondary_mark_o_context(value: str) -> str:
+    """Resolve preserved Mark ``o`` sources only in the normalized namespace slot."""
+    value = re.sub(
+        rf"(?<=app)[\u0c02\u0c82\u0d02\u0d82](?=[i{_CLINICAL_COMPATIBILITY_SECONDARY_COLLISION}]ntment)",
+        "o", value,
+    )
+    return value.translate(_SECONDARY_CLINICAL_MARK_O_REMOVALS)
+
+
 def _namespace_skeleton(
     value: str, *, remove_marks: bool = False, secondary: bool = False,
     compatibility_separators: bool = False, preserve_compatibility_letter_collisions: bool = False,
@@ -295,17 +307,22 @@ def _namespace_skeleton(
         )
     if secondary:
         value = value.translate(_SECONDARY_CLINICAL_SOURCE_SEPARATORS)
-        value = value.translate(_CONFUSABLES)
         value = value.translate(_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES)
-        value = value.translate(_SECONDARY_CLINICAL_CONFUSABLES)
-        value = _secondary_source_confusable_skeleton(value)
+        if not remove_marks:
+            value = value.translate(_CONFUSABLES)
+            value = value.translate(_SECONDARY_CLINICAL_CONFUSABLES)
+            value = _secondary_source_confusable_skeleton(value)
     if remove_marks:
         value = unicodedata.normalize("NFD", value)
-        value = "".join(character for character in value if not _namespace_mark(character))
+        value = "".join(
+            character for character in value
+            if ord(character) in _SECONDARY_CLINICAL_MARK_O_SOURCES or not _namespace_mark(character)
+        )
     normalized = unicodedata.normalize("NFKC", value).casefold().translate(_CONFUSABLES).translate(_DASHES)
     if secondary:
         normalized = normalized.translate(_SECONDARY_CLINICAL_CONFUSABLES)
-    return "".join(character for character in normalized if not _namespace_ignorable(character))
+    normalized = "".join(character for character in normalized if not _namespace_ignorable(character))
+    return _late_secondary_mark_o_context(normalized) if remove_marks and secondary else normalized
 
 
 def _clinical_namespace(
