@@ -127,6 +127,80 @@ ROUND16_RESIDUAL_RAW_TARGETS = {
     for source, target in sources
 }
 ROUND16_RESIDUAL_REPRESENTATIVES = tuple((letter, sources[0]) for letter, sources in ROUND16_RESIDUAL_ORACLE.items())
+ROUND17_POST_NORMALIZATION_ORACLE = {
+    "a": ((0x1D45, 0x0251), (0x2C6D, 0x0251), (0xAB7A, 0x13AA)),
+    "e": ((0x04BC, 0x04BD), (0xAB7C, 0x13AC)),
+    "i": (
+        (0x0196, 0x0269), (0x0197, 0x0268), (0x04C0, 0x04CF),
+        (0x1DA4, 0x0268), (0x1DA5, 0x0269), (0x1DA6, 0x026A),
+        (0x1DA7, 0x1D7B), (0xA646, 0xA647), (0xA7AE, 0x026A),
+        (0x118A3, 0x118C3), (0x1E050, 0x04CF),
+    ),
+    "m": ((0xAB87, 0x13B7),),
+    "n": (
+        (0x0220, 0x019E), (0x0389, 0x03B7), (0x0397, 0x03B7),
+        (0x03AE, 0x03B7), (0x0548, 0x0578), (0x054C, 0x057C),
+        (0x1DAF, 0x0273),
+        *((codepoint, 0x03B7) for codepoint in range(0x1F20, 0x1F30)),
+        (0x1F74, 0x03B7), (0x1F75, 0x03B7),
+        *((codepoint, 0x03B7) for codepoint in range(0x1F90, 0x1FA0)),
+        (0x1FC2, 0x03B7), (0x1FC3, 0x03B7), (0x1FC4, 0x03B7),
+        (0x1FC6, 0x03B7), (0x1FC7, 0x03B7), (0x1FCA, 0x03B7),
+        (0x1FCB, 0x03B7), (0x1FCC, 0x03B7), (0x1D6AE, 0x03B7),
+        (0x1D6E8, 0x03B7), (0x1D722, 0x03B7), (0x1D75C, 0x03B7),
+        (0x1D796, 0x03B7),
+    ),
+    "o": (
+        (0x01FF, 0x00F8), (0x03A3, 0x03C3), (0x03C2, 0x03C3),
+        (0x03DA, 0x03DB), (0x03F2, 0x03C3), (0x03F9, 0x03C3),
+        (0x04EA, 0x04E9), (0x04EB, 0x04E9), (0x06C0, 0x06D5),
+        (0x1CBF, 0x10FF), (0x1DB1, 0x0275), (0x1DBF, 0x03B8),
+        (0x2080, 0x0030), (0x24EA, 0x0030), (0xFB41, 0x05E1),
+        (0xFF10, 0x0030), (0x107A2, 0x00F8), (0x118A8, 0x118C8),
+        (0x118B7, 0x118D7), (0x1D6BA, 0x03C3), (0x1D6F4, 0x03C3),
+        (0x1D72E, 0x03C3), (0x1D768, 0x03C3), (0x1D7A2, 0x03C3),
+        (0x1E04E, 0x04E9),
+    ),
+    "p": ((0x01A4, 0x01A5), (0x2C63, 0x1D7D), (0xABB2, 0x13E2)),
+    "t": ((0x01AC, 0x01AD), (0xAB72, 0x13A2)),
+    "r": (
+        (0x024C, 0x024D), (0x0403, 0x0433), (0x0413, 0x0433),
+        (0x0453, 0x0433), (0x0492, 0x0493), (0x2C64, 0x027D),
+        (0x2C84, 0x2C85), (0xAB71, 0x13A1), (0xABA2, 0x13D2),
+        (0x107A8, 0x027D), (0x1E033, 0x0433), (0x1E054, 0x0433),
+    ),
+    "rn": ((0x1DAC, 0x0271), (0x2C6E, 0x0271)),
+}
+ROUND17_SOURCE_MEANINGS = {
+    source: meaning
+    for meaning, sources in ROUND17_POST_NORMALIZATION_ORACLE.items()
+    for source, _ in sources
+}
+ROUND17_NORMALIZED_IDENTITY_TARGETS = {
+    source: target
+    for sources in ROUND17_POST_NORMALIZATION_ORACLE.values()
+    for source, target in sources
+}
+ROUND17_REPRESENTATIVES = tuple((meaning, sources[0][0]) for meaning, sources in ROUND17_POST_NORMALIZATION_ORACLE.items())
+# Frozen Unicode 15.1 confusables.txt incoming edges into the newly added raw
+# source identities.  Their sources were already reserved by round 16, so the
+# official incoming delta after this closure is empty.  Source file SHA-256:
+# 8289f833e4cf78fde56b2080dc0e42934ef5182c9c3f4dd1fbdf2bced69fd5ed
+ROUND17_OFFICIAL_INCOMING_15_1_TARGETS = {
+    **dict.fromkeys((0x2229, 0x22C2, 0x1D245, 0x1260, 0x144E, 0xA4F5), 0x0548),
+    **dict.fromkeys((0x03DB, 0x1D6D3, 0x1D70D, 0x1D747, 0x1D781, 0x1D7BB), 0x03C2),
+    **dict.fromkeys((0x06C2, 0xFBA5, 0xFBA4), 0x06C0),
+}
+
+
+def _round17_namespace(source: int, meaning: str, index: int | None = None) -> str:
+    if meaning == "r":
+        return f"next-appoint{chr(source)}nent"
+    if meaning == "rn":
+        return f"next-appoint{chr(source)}ent"
+    canonical = "next-appointment"
+    index = canonical.index(meaning) if index is None else index
+    return canonical[:index] + chr(source) + canonical[index + 1:]
 
 
 def _unicode_15_1_mark_codepoints() -> tuple[int, ...]:
@@ -1154,6 +1228,208 @@ def test_round16_residual_lookup_keeps_the_eighteen_state_megabyte_bound():
     prefix = "next-app"
     suffix = "x"
     source = "\u04be"
+    value = prefix + source * (
+        (mattermost_ingress._MAX_HTTP_BYTES - len(prefix.encode("utf-8")) - len(suffix.encode("utf-8")))
+        // len(source.encode("utf-8"))
+    ) + suffix
+    instrumentation: dict[str, int] = {}
+    assert len(value.encode("utf-8")) <= mattermost_ingress._MAX_HTTP_BYTES
+    assert not mattermost_ingress._clinical_namespace(value, instrumentation=instrumentation)
+    assert instrumentation["max_active_states"] <= 18
+    assert instrumentation["transition_steps"] <= instrumentation["source_tokens"] * 18
+
+
+def test_round17_post_normalization_oracle_is_exact_and_auditable():
+    expected = {
+        source: meaning
+        for meaning, sources in ROUND17_POST_NORMALIZATION_ORACLE.items()
+        for source, _ in sources
+    }
+    assert tuple(map(len, ROUND17_POST_NORMALIZATION_ORACLE.values())) == (3, 2, 11, 1, 54, 25, 3, 2, 12, 2)
+    assert len(expected) == len(ROUND17_NORMALIZED_IDENTITY_TARGETS) == 115
+    assert mattermost_ingress._UNICODE_15_1_POST_NORMALIZATION_CONFUSABLES == expected
+    existing = (
+        set(mattermost_ingress._SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES)
+        | set(mattermost_ingress._SECONDARY_CLINICAL_MARK_O_SOURCES)
+        | set(mattermost_ingress._M_SLOT_R_SOURCES)
+        | set(mattermost_ingress._M_SLOT_N_SOURCES)
+        | set(mattermost_ingress._M_SLOT_RN_SOURCES)
+        | set(mattermost_ingress._UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES)
+    )
+    assert not set(expected) & existing
+    assert mattermost_ingress._CLINICAL_AUTOMATON_STATE_COUNT == 18
+
+
+@pytest.mark.parametrize(
+    ("meaning", "source"),
+    tuple((meaning, source) for meaning, sources in ROUND17_POST_NORMALIZATION_ORACLE.items() for source, _ in sources),
+)
+def test_round17_every_source_is_malformed_after_reclassification(meaning, source):
+    namespace = _round17_namespace(source, meaning)
+    assert mattermost_ingress._clinical_command(
+        f"@restricted-bot {namespace} 123e4567-e89b-42d3-a456-426614174000", "restricted-bot",
+    ) == ("malformed", None)
+
+
+def test_round17_complete_substitutions_reserve_every_matching_phrase_slot():
+    canonical = "next-appointment"
+    complete_placements = 0
+    r_components = 0
+    for meaning, sources in ROUND17_POST_NORMALIZATION_ORACLE.items():
+        for source, _ in sources:
+            if meaning in {"r", "rn"}:
+                assert mattermost_ingress._clinical_namespace(_round17_namespace(source, meaning))
+                if meaning == "r":
+                    r_components += 1
+                else:
+                    complete_placements += 1
+                continue
+            for index, current in enumerate(canonical):
+                if current == meaning:
+                    complete_placements += 1
+                    assert mattermost_ingress._clinical_namespace(_round17_namespace(source, meaning, index))
+    assert complete_placements == 220
+    assert r_components == 12
+
+
+def _round17_detection_normalization(codepoint: int) -> str:
+    normalized = unicodedata2.normalize("NFD", chr(codepoint))
+    normalized = "".join(symbol for symbol in normalized if not unicodedata2.category(symbol).startswith("M"))
+    return unicodedata2.normalize("NFKC", normalized).casefold()
+
+
+def test_round17_hermetic_unicode_15_1_scalar_closure_has_no_second_round():
+    assert unicodedata2.unidata_version == "15.1.0"
+    expected_target_meanings = {
+        target: ROUND17_SOURCE_MEANINGS[source]
+        for source, target in ROUND17_NORMALIZED_IDENTITY_TARGETS.items()
+    }
+    established = (
+        set(mattermost_ingress._SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES)
+        | set(mattermost_ingress._SECONDARY_CLINICAL_MARK_O_SOURCES)
+        | set(mattermost_ingress._M_SLOT_R_SOURCES)
+        | set(mattermost_ingress._M_SLOT_N_SOURCES)
+        | set(mattermost_ingress._M_SLOT_RN_SOURCES)
+        | set(mattermost_ingress._UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES)
+    )
+    derived = {}
+    for codepoint in range(0x110000):
+        normalized = _round17_detection_normalization(codepoint)
+        if len(normalized) != 1 or codepoint in established:
+            continue
+        target = ord(normalized)
+        meaning = expected_target_meanings.get(target)
+        if meaning is not None and not (meaning == "rn" and target == ord("m")):
+            derived[codepoint] = (meaning, target)
+    expected = {
+        source: (meaning, target)
+        for source, target in ROUND17_NORMALIZED_IDENTITY_TARGETS.items()
+        for meaning in (ROUND17_SOURCE_MEANINGS[source],)
+    }
+    assert derived == expected
+
+    second_round = {
+        codepoint
+        for codepoint in range(0x110000)
+        if codepoint not in established | set(expected)
+        and len(_round17_detection_normalization(codepoint)) == 1
+        and ord(_round17_detection_normalization(codepoint)) in expected
+    }
+    assert second_round == set()
+
+
+def test_round17_checked_in_official_incoming_targets_add_no_delta():
+    incoming = {
+        source: target[0]
+        for source, target in ROUND16_RESIDUAL_RAW_TARGETS.items()
+        if len(target) == 1 and target[0] in ROUND17_SOURCE_MEANINGS
+    }
+    assert incoming == ROUND17_OFFICIAL_INCOMING_15_1_TARGETS
+    assert len(incoming) == 15
+    assert set(incoming) <= set(mattermost_ingress._UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES)
+
+
+def test_round17_effective_r_n_product_is_complete():
+    generic_r = {codepoint for codepoint in range(0x110000) if _round17_detection_normalization(codepoint) == "r"}
+    generic_n = {codepoint for codepoint in range(0x110000) if _round17_detection_normalization(codepoint) == "n"}
+    effective_r = generic_r | set(UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE["r"]) | {
+        source for source, _ in ROUND17_POST_NORMALIZATION_ORACLE["r"]
+    }
+    effective_n = (
+        generic_n
+        | set(UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE["n"])
+        | set(ROUND16_RESIDUAL_ORACLE["n"])
+        | {source for source, _ in ROUND17_POST_NORMALIZATION_ORACLE["n"]}
+    )
+    assert (len(effective_r), len(effective_n)) == (86, 136)
+    for source_r in effective_r:
+        for source_n in effective_n:
+            assert mattermost_ingress._clinical_namespace(
+                f"next-appoint{chr(source_r)}{chr(source_n)}ent"
+            ), (hex(source_r), hex(source_n))
+
+
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+@pytest.mark.parametrize(("meaning", "source"), ROUND17_REPRESENTATIVES)
+def test_round17_representatives_are_blocked_before_private_and_durable_delivery(tmp_path, ready, meaning, source):
+    namespace = _round17_namespace(source, meaning)
+    message = f"@restricted-bot {namespace} 123e4567-e89b-42d3-a456-426614174000"
+    service, rest, conversation = ingress(tmp_path / "fresh")
+    fresh = post(message=message)
+    rest.posts[ROOT] = fresh
+    service.handle(event(fresh, channel_type="P"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == []
+
+    legacy_service, legacy_rest, legacy_conversation = ingress(tmp_path / "durable")
+    legacy_rest.posts[ROOT] = fresh
+    record, _ = legacy_service.outbox.reserve(
+        legacy_service._envelope(fresh, ROOT), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    if ready:
+        record = legacy_service.outbox.mark_ready(
+            record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "legacy"},
+        )
+    legacy_service.executor.drain()
+    durable = legacy_service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.BLOCKED
+    assert legacy_conversation.calls == [] and legacy_rest.created == []
+
+
+@pytest.mark.parametrize("source", tuple(ROUND17_SOURCE_MEANINGS))
+def test_round17_sources_outside_namespace_reach_private_conversation_exactly(tmp_path, source):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot ordinary {chr(source)} text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+def test_round17_lookup_mutations_bite(monkeypatch):
+    original = mattermost_ingress._UNICODE_15_1_POST_NORMALIZATION_CONFUSABLES
+    for source, meaning in ((0x1D45, "a"), (0x024C, "r"), (0x1DAC, "rn")):
+        mutated = dict(original)
+        del mutated[source]
+        monkeypatch.setattr(mattermost_ingress, "_UNICODE_15_1_POST_NORMALIZATION_CONFUSABLES", mutated)
+        assert not mattermost_ingress._clinical_namespace(_round17_namespace(source, meaning)), hex(source)
+    monkeypatch.setattr(mattermost_ingress, "_UNICODE_15_1_POST_NORMALIZATION_CONFUSABLES", {})
+    assert not mattermost_ingress._clinical_namespace(_round17_namespace(0x0548, "n"))
+
+
+@pytest.mark.parametrize("namespace", (
+    "next-\u0548ppointment",
+    "next-appoint\u024cent",
+    "next-appoint\u1dacnent",
+))
+def test_round17_wrong_meanings_and_near_misses_remain_ordinary(namespace):
+    assert not mattermost_ingress._clinical_namespace(namespace)
+
+
+def test_round17_lookup_keeps_the_eighteen_state_megabyte_bound():
+    prefix = "next-app"
+    suffix = "x"
+    source = "\u0548"
     value = prefix + source * (
         (mattermost_ingress._MAX_HTTP_BYTES - len(prefix.encode("utf-8")) - len(suffix.encode("utf-8")))
         // len(source.encode("utf-8"))

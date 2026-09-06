@@ -278,6 +278,38 @@ _UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES = (
     _UNICODE_15_1_DIRECT_RESIDUAL_LETTER_CONFUSABLES
     | _UNICODE_15_1_COMPOSITION_RESIDUAL_LETTER_CONFUSABLES
 )
+# Unicode 15.1 post-normalization closure for source-specific meanings above.
+# Each source's NFD/mark-removal/NFKC/casefold result is an already frozen
+# identity source; this lookup preserves that deterministic meaning without
+# adding runtime recursion or widening the namespace detector.
+_UNICODE_15_1_POST_NORMALIZATION_CONFUSABLES = {
+    **dict.fromkeys((0x1D45, 0x2C6D, 0xAB7A), "a"),
+    **dict.fromkeys((0x04BC, 0xAB7C), "e"),
+    **dict.fromkeys((
+        0x0196, 0x0197, 0x04C0, 0x1DA4, 0x1DA5, 0x1DA6, 0x1DA7, 0xA646,
+        0xA7AE, 0x118A3, 0x1E050,
+    ), "i"),
+    0xAB87: "m",
+    **dict.fromkeys((
+        0x0220, 0x0389, 0x0397, 0x03AE, 0x0548, 0x054C, 0x1DAF,
+        *range(0x1F20, 0x1F30), 0x1F74, 0x1F75, *range(0x1F90, 0x1FA0),
+        0x1FC2, 0x1FC3, 0x1FC4, 0x1FC6, 0x1FC7, 0x1FCA, 0x1FCB, 0x1FCC,
+        0x1D6AE, 0x1D6E8, 0x1D722, 0x1D75C, 0x1D796,
+    ), "n"),
+    **dict.fromkeys((
+        0x01FF, 0x03A3, 0x03C2, 0x03DA, 0x03F2, 0x03F9, 0x04EA, 0x04EB,
+        0x06C0, 0x1CBF, 0x1DB1, 0x1DBF, 0x2080, 0x24EA, 0xFB41, 0xFF10,
+        0x107A2, 0x118A8, 0x118B7, 0x1D6BA, 0x1D6F4, 0x1D72E, 0x1D768,
+        0x1D7A2, 0x1E04E,
+    ), "o"),
+    **dict.fromkeys((0x01A4, 0x2C63, 0xABB2), "p"),
+    **dict.fromkeys((0x01AC, 0xAB72), "t"),
+    **dict.fromkeys((
+        0x024C, 0x0403, 0x0413, 0x0453, 0x0492, 0x2C64, 0x2C84, 0xAB71,
+        0xABA2, 0x107A8, 0x1E033, 0x1E054,
+    ), "r"),
+    **dict.fromkeys((0x1DAC, 0x2C6E), "rn"),
+}
 _SECONDARY_CLINICAL_SOURCE_CONFUSABLES = str.maketrans({
     ord(chr(codepoint)): letter
     for letter, codepoints in _UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES.items()
@@ -402,6 +434,8 @@ def _clinical_source_options(character: str) -> tuple[tuple[str | None, ...], ..
         return ((_UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES[codepoint],),)
     if codepoint in _SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES:
         return ((_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES[codepoint],),)
+    if codepoint in _UNICODE_15_1_POST_NORMALIZATION_CONFUSABLES:
+        return (tuple(_UNICODE_15_1_POST_NORMALIZATION_CONFUSABLES[codepoint]),)
     return (_normalized_clinical_symbols(character),)
 
 
