@@ -155,6 +155,16 @@ def test_dotless_i_clinical_lookalike_is_reserved_in_direct_channel(tmp_path):
     assert service.outbox.candidates(10) == []
 
 
+def test_hyphen_bullet_clinical_lookalike_is_reserved_in_direct_channel(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    candidate = post(message=f"@restricted-bot next\u2043appointment {PATIENT}")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="D"))
+    assert mattermost_ingress._clinical_command(candidate["message"], "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and clinical.queries == [] and rest.created == []
+    assert service.outbox.candidates(10) == []
+
+
 def test_dotless_i_is_secondary_namespace_only_and_exact_ascii_grammar_stays_valid():
     dotless = f"@restricted-bot next-appo\u0131ntment {PATIENT}"
     assert mattermost_ingress._clinical_command(dotless, "restricted-bot") == ("malformed", None)

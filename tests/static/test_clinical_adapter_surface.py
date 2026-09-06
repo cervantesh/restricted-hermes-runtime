@@ -10,6 +10,20 @@ def test_adapter_image_is_a_separate_principal_with_no_general_runtime():
     assert "production_clinical_adapter" in source
     assert "network_mode: host" not in source
     assert "run_agent.py" not in source and "mattermost_ingress.py" not in source
+    assert "! -name 'upstream_deadline.py'" in source
+
+
+def test_adapter_image_closure_command_imports_every_retained_module():
+    command = ROOT / "tests/deployment/test_clinical_adapter_image.sh"
+    source = command.read_text(encoding="utf-8")
+    assert source.startswith("#!/usr/bin/env bash\n")
+    assert 'docker build -f Dockerfile.clinical-adapter' in source
+    assert 'docker run --rm --network none --entrypoint python' in source
+    for module in (
+        "restricted_runtime.contracts", "restricted_runtime.upstream_deadline",
+        "restricted_runtime.clinical_adapter", "restricted_runtime.services.production_clinical_adapter",
+    ):
+        assert module in source
 
 
 def test_edge_image_and_process_never_receive_the_hrh_credential():

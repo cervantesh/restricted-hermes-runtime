@@ -416,6 +416,37 @@ def test_dotless_i_clinical_lookalike_is_reserved_in_private_channel(tmp_path):
     assert conversation.calls == [] and rest.created == []
 
 
+def test_hyphen_bullet_clinical_lookalike_is_reserved_in_private_channel(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    candidate = post(message="@restricted-bot next\u2043appointment 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_unrelated_hyphen_bullet_text_reaches_private_conversation_codepoint_exact(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    message = "@restricted-bot agenda \u2043 ordinary text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+def test_legacy_hyphen_bullet_record_is_reclassified_before_delivery(tmp_path, ready):
+    service, rest, conversation = ingress(tmp_path)
+    source = post(message="@restricted-bot next\u2043appointment 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = source
+    record, _ = service.outbox.reserve(service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000)
+    if ready:
+        record = service.outbox.mark_ready(record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "legacy"})
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state.name == "BLOCKED"
+    assert conversation.calls == [] and rest.created == []
+
+
 def test_unrelated_dotless_i_text_reaches_private_conversation_codepoint_exact(tmp_path):
     service, rest, conversation = ingress(tmp_path)
     message = "@restricted-bot patient notes: \u0131 is ordinary text"
