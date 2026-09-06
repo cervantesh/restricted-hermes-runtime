@@ -161,7 +161,7 @@ def _namespace_skeleton(value: str, *, remove_marks: bool = False) -> str:
 
 
 def _clinical_namespace(value: str, *, remove_marks: bool = False) -> bool:
-    return re.search(r"next[-\s]+appointment", _namespace_skeleton(value, remove_marks=remove_marks)) is not None
+    return re.search(r"next[-_\s]+appointment", _namespace_skeleton(value, remove_marks=remove_marks)) is not None
 
 
 def _clinical_command(message: str, bot_username: str) -> tuple[str, str | None]:
