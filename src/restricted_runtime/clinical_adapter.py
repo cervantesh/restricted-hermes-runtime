@@ -4,11 +4,14 @@ from __future__ import annotations
 import http.client
 import os
 import re
+import signal
 import socket
 import ssl
 import stat
 import struct
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +34,36 @@ _BASE_FIELDS = {
 }
 _PATIENT = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _TIMEZONE = re.compile(r"^[A-Za-z]+(?:[_-][A-Za-z]+)*(?:/[A-Za-z]+(?:[_-][A-Za-z]+)*)+$")
+
+
+@contextmanager
+def _absolute_upstream_deadline(seconds: float):
+    """Interrupt the serial Linux production attempt without leaving a worker behind."""
+    if os.name != "posix":
+        raise ContractError("clinical adapter upstream deadline unavailable")
+    if threading.current_thread() is not threading.main_thread():
+        raise ContractError("clinical adapter upstream deadline unavailable")
+    try:
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    except (AttributeError, OSError, TypeError, ValueError):
+        raise ContractError("clinical adapter upstream deadline unavailable") from None
+    if signal.SIGALRM in blocked:
+        raise ContractError("clinical adapter upstream deadline unavailable")
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer[0] > 0:
+        raise ContractError("clinical adapter upstream deadline unavailable")
+
+    def expired(_signum, _frame):
+        raise TimeoutError
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _valid_request(value: Any, *, delivery: bool) -> bool:
@@ -93,8 +126,21 @@ class AdapterConfig:
         value = load_closed_json(path.read_bytes())
         if not isinstance(value, dict) or set(value) != {"hrh_origin", "ca_path", "api_key_path", "timeout_seconds", "expected_ingress_uid", "expected_clinical_timezone"}:
             raise ContractError("clinical adapter configuration rejected")
-        origin = urlsplit(value.get("hrh_origin", ""))
-        if origin.scheme != "https" or not origin.hostname or origin.username or origin.password or origin.path not in {"", "/"} or origin.query or origin.fragment:
+        origin_value = value.get("hrh_origin", "")
+        try:
+            origin = urlsplit(origin_value)
+            port = origin.port
+        except ValueError as exc:
+            raise ContractError("clinical adapter HRH origin rejected") from exc
+        if (
+            not isinstance(origin_value, str) or origin.scheme != "https" or not origin.hostname
+            or origin.username or origin.password or origin.path not in {"", "/"} or origin.query or origin.fragment
+            or not origin.hostname.isascii() or port is not None and not 1 <= port <= 65535
+        ):
+            raise ContractError("clinical adapter HRH origin rejected")
+        authority = f"[{origin.hostname}]" if ":" in origin.hostname else origin.hostname
+        canonical = "https://" + authority + (f":{port}" if port is not None and port != 443 else "")
+        if origin_value.rstrip("/") != canonical:
             raise ContractError("clinical adapter HRH origin rejected")
         if not isinstance(value.get("timeout_seconds"), int) or not 1 <= value["timeout_seconds"] <= 10:
             raise ContractError("clinical adapter timeout rejected")
@@ -103,7 +149,7 @@ class AdapterConfig:
         timezone = value.get("expected_clinical_timezone")
         if not isinstance(timezone, str) or len(timezone) > 64 or _TIMEZONE.fullmatch(timezone) is None:
             raise ContractError("clinical adapter timezone rejected")
-        return cls(value["hrh_origin"].rstrip("/"), Path(value["ca_path"]), Path(value["api_key_path"]), float(value["timeout_seconds"]), value["expected_ingress_uid"], timezone)
+        return cls(canonical, Path(value["ca_path"]), Path(value["api_key_path"]), float(value["timeout_seconds"]), value["expected_ingress_uid"], timezone)
 
 
 def load_api_key(path: Path, *, expected_uid: int) -> str:
@@ -185,43 +231,50 @@ class HrhHttpsClient:
                 raise ContractError("clinical adapter HRH deadline exceeded")
             return budget
 
-        connection = http.client.HTTPSConnection(origin.hostname, origin.port or 443, timeout=remaining(), context=self.context)
+        port = origin.port if origin.port is not None else 443
+        connection = None
         raw = jcs_bytes(body)
         try:
-            connection.request("POST", path, body=raw, headers={
-                "Authorization": "Bearer " + self.api_key,
-                "Content-Type": "application/json",
-                "Content-Length": str(len(raw)),
-                "Accept": "application/json",
-            })
-            if getattr(connection, "sock", None) is not None:
-                connection.sock.settimeout(remaining())
-            response = connection.getresponse()
-            length = response.getheader("Content-Length")
-            content_type = response.getheader("Content-Type")
-            if response.status == 403:
-                raise ClinicalAuthorizationDenied("clinical adapter HRH authorization denied")
-            if response.status != 200 or content_type not in {"application/json", "application/json; charset=utf-8"} or length is None or not length.isascii() or not length.isdigit():
-                raise ContractError("clinical adapter HRH response rejected")
-            declared = int(length)
-            if declared > MAX_WIRE_BYTES:
-                raise ContractError("clinical adapter HRH response oversized")
-            if getattr(connection, "sock", None) is not None:
-                connection.sock.settimeout(remaining())
-            payload = response.read(declared + 1)
-            if len(payload) != declared:
-                raise ContractError("clinical adapter HRH response framing rejected")
-            value = load_closed_json(payload)
-            if not _valid_upstream_response(path, value, expected_clinical_timezone=self.config.expected_clinical_timezone):
-                raise ContractError("clinical adapter HRH response schema rejected")
-            remaining()
-            return value
+            with _absolute_upstream_deadline(self.config.timeout_seconds):
+                connection = http.client.HTTPSConnection(origin.hostname, port, timeout=remaining(), context=self.context)
+                remaining()
+                connection.request("POST", path, body=raw, headers={
+                    "Authorization": "Bearer " + self.api_key,
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(raw)),
+                    "Accept": "application/json",
+                })
+                if getattr(connection, "sock", None) is not None:
+                    connection.sock.settimeout(remaining())
+                remaining()
+                response = connection.getresponse()
+                length = response.getheader("Content-Length")
+                content_type = response.getheader("Content-Type")
+                if response.status == 403:
+                    raise ClinicalAuthorizationDenied("clinical adapter HRH authorization denied")
+                if response.status != 200 or content_type not in {"application/json", "application/json; charset=utf-8"} or length is None or not length.isascii() or not length.isdigit():
+                    raise ContractError("clinical adapter HRH response rejected")
+                declared = int(length)
+                if declared > MAX_WIRE_BYTES:
+                    raise ContractError("clinical adapter HRH response oversized")
+                if getattr(connection, "sock", None) is not None:
+                    connection.sock.settimeout(remaining())
+                remaining()
+                payload = response.read(declared + 1)
+                if len(payload) != declared:
+                    raise ContractError("clinical adapter HRH response framing rejected")
+                value = load_closed_json(payload)
+                if not _valid_upstream_response(path, value, expected_clinical_timezone=self.config.expected_clinical_timezone):
+                    raise ContractError("clinical adapter HRH response schema rejected")
+                remaining()
+                return value
         except ContractError:
             raise
         except (OSError, TimeoutError, http.client.HTTPException, ssl.SSLError) as exc:
             raise ContractError("clinical adapter HRH transport failed") from exc
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
 
 
 def _reply(status: bytes, body: dict[str, Any] | None = None) -> bytes:

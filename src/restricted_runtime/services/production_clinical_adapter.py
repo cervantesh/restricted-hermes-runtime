@@ -8,6 +8,11 @@ from ..clinical_adapter import AdapterConfig, ClinicalAdapter, HrhHttpsClient, S
 from ..contracts import ContractError
 
 
+def _serial_linux_deadline_supported() -> bool:
+    """The upstream wall-clock guard relies on Linux/POSIX SIGALRM semantics."""
+    return os.name == "posix"
+
+
 def serve_connection(service: ClinicalAdapter, connection, *, timeout_seconds: float) -> None:
     try:
         raw = receive_one(connection, timeout_seconds=timeout_seconds)
@@ -23,6 +28,8 @@ def serve_connection(service: ClinicalAdapter, connection, *, timeout_seconds: f
 def run() -> None:
     config_path = Path(os.environ.get("RESTRICTED_CLINICAL_ADAPTER_CONFIG_PATH", "/app/config/clinical-adapter.json"))
     config = AdapterConfig.load(config_path)
+    if not _serial_linux_deadline_supported():
+        raise ContractError("clinical adapter upstream deadline unavailable")
     effective_uid = getattr(os, "geteuid", lambda: config.api_key_path.stat().st_uid)()
     api_key = load_api_key(config.api_key_path, expected_uid=effective_uid)
     service = ClinicalAdapter(
