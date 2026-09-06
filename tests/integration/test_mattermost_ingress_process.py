@@ -857,3 +857,25 @@ def test_installed_ingress_residual_separator_never_reaches_uds_or_outbox(
     finally:
         _stop(process)
         harness.close()
+
+
+@pytest.mark.parametrize("codepoint", (0x2017, 0x02DB, 0x037A))
+def test_installed_ingress_compatibility_separator_never_reaches_uds_or_outbox(
+    tmp_path, installed_mattermost_ingress, codepoint,
+):
+    """The installed entrypoint applies the source-local compatibility branch."""
+    harness = _InstalledProcessHarness(tmp_path)
+    reserved = {
+        "id": ROOT_POST, "root_id": "", "channel_id": CHANNEL, "user_id": USER,
+        "message": f"@restricted-bot next{chr(codepoint)}appointment 123e4567-e89b-42d3-a456-426614174000",
+        "type": "", "file_ids": [], "edit_at": 0, "delete_at": 0,
+    }
+    PeerHandler.event_posts = [reserved]
+    process = harness.start(installed_mattermost_ingress)
+    try:
+        _wait_for(lambda: PeerHandler.websocket_connections >= 1, timeout=15)
+        time.sleep(0.25)
+        assert (ConversationHandler.turns, PeerHandler.posts, _outbox_states()) == (0, [], [])
+    finally:
+        _stop(process)
+        harness.close()

@@ -453,7 +453,7 @@ def test_production_entrypoint_threads_configured_timezone_to_https_and_uds_vali
         pass
 
     monkeypatch.setattr(production_clinical_adapter.AdapterConfig, "load", lambda _path: config)
-    monkeypatch.setattr(production_clinical_adapter, "_serial_linux_deadline_supported", lambda: True)
+    monkeypatch.setattr(production_clinical_adapter, "deadline_available", lambda: True)
     monkeypatch.setattr(production_clinical_adapter, "load_api_key", lambda *_args, **_kwargs: "secret")
     monkeypatch.setattr(production_clinical_adapter, "HrhHttpsClient", lambda received, *, api_key: captured.setdefault("https", (received, api_key)))
 
@@ -471,11 +471,21 @@ def test_production_entrypoint_threads_configured_timezone_to_https_and_uds_vali
 def test_production_rejects_unsupported_deadline_platform_before_secret_client_or_socket(monkeypatch, tmp_path):
     config = SimpleNamespace(api_key_path=tmp_path / "key")
     monkeypatch.setattr(production_clinical_adapter.AdapterConfig, "load", lambda _path: config)
-    monkeypatch.setattr(production_clinical_adapter, "_serial_linux_deadline_supported", lambda: False)
+    monkeypatch.setattr(production_clinical_adapter, "deadline_available", lambda: False)
     monkeypatch.setattr(production_clinical_adapter, "load_api_key", lambda *_args, **_kwargs: pytest.fail("secret loading reached"))
     monkeypatch.setattr(production_clinical_adapter, "HrhHttpsClient", lambda *_args, **_kwargs: pytest.fail("client construction reached"))
     monkeypatch.setattr(production_clinical_adapter, "bind_listener", lambda: pytest.fail("socket construction reached"))
     with pytest.raises(ContractError, match="deadline unavailable"):
+        production_clinical_adapter.run()
+
+
+def test_production_invalid_config_fails_before_deadline_capability_check(monkeypatch):
+    monkeypatch.setattr(
+        production_clinical_adapter.AdapterConfig, "load",
+        lambda _path: (_ for _ in ()).throw(ContractError("invalid adapter config")),
+    )
+    monkeypatch.setattr(production_clinical_adapter, "deadline_available", lambda: pytest.fail("deadline check reached"))
+    with pytest.raises(ContractError, match="invalid adapter config"):
         production_clinical_adapter.run()
 
 
