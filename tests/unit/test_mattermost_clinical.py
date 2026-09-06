@@ -247,6 +247,21 @@ def test_round13_mark_o_nonmark_companions_reserve_direct_clinical_namespace(tmp
     assert rest.created == [] and service.outbox.candidates(10) == []
 
 
+@pytest.mark.parametrize("namespace", (
+    "NEXT-APP\u0c02INTMENT",
+    "next\u2017ap\u200bp\u0c02i\u0578tment",
+    "ne\u0c02xt-app\u0c02intment",
+))
+def test_round13_late_context_mark_o_sources_reserve_direct_clinical_namespace(tmp_path, namespace):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    candidate = post(message=f"@restricted-bot {namespace} {PATIENT}")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="D"))
+    assert mattermost_ingress._clinical_command(candidate["message"], "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and clinical.queries == [] and clinical.reauthorizations == []
+    assert rest.created == [] and service.outbox.candidates(10) == []
+
+
 @pytest.mark.parametrize("codepoint", RESIDUAL_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES)
 @pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
 def test_legacy_compatibility_separator_records_are_reclassified_in_direct_channel(tmp_path, ready, codepoint):
