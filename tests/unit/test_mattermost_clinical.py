@@ -180,6 +180,16 @@ def test_precomposed_mark_confusable_variants_never_reach_any_delivery_path(tmp_
     assert service.outbox.candidates(10) == []
 
 
+def test_underscore_separated_clinical_namespace_in_an_allowed_private_event_has_zero_effects(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    candidate = post(message=f"@restricted-bot next_appointment {PATIENT}")
+    rest.posts[ROOT] = candidate
+    assert mattermost_ingress._clinical_command(candidate["message"], "restricted-bot") == ("malformed", None)
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls == [] and clinical.queries == [] and rest.created == []
+    assert service.outbox.candidates(10) == []
+
+
 def test_clinical_command_is_root_only_and_never_falls_to_model(tmp_path):
     service, rest, conversation, clinical = clinical_ingress(tmp_path)
     reply = post("reply00000000000000000000000", root_id=ROOT, message=f"next-appointment {PATIENT}")

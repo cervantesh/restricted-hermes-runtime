@@ -319,6 +319,53 @@ def test_adapter_configuration_requires_the_expected_clinical_timezone(tmp_path)
         AdapterConfig.load(path)
 
 
+@pytest.mark.parametrize("uid", [True, False])
+def test_adapter_configuration_rejects_boolean_expected_ingress_uid(tmp_path, uid):
+    path = tmp_path / "adapter.json"
+    path.write_text(json.dumps({
+        "hrh_origin": "https://hrh.internal.example",
+        "ca_path": "/run/secrets/hrh-ca.pem",
+        "api_key_path": "/run/secrets/hrh-clinical-api-key",
+        "timeout_seconds": 5,
+        "expected_ingress_uid": uid,
+        "expected_clinical_timezone": "America/New_York",
+    }), encoding="utf-8")
+    with pytest.raises(ContractError, match="principal"):
+        AdapterConfig.load(path)
+
+
+@pytest.mark.parametrize("uid", [1, 10007])
+def test_adapter_configuration_accepts_numeric_positive_expected_ingress_uid(tmp_path, uid):
+    path = tmp_path / "adapter.json"
+    path.write_text(json.dumps({
+        "hrh_origin": "https://hrh.internal.example",
+        "ca_path": "/run/secrets/hrh-ca.pem",
+        "api_key_path": "/run/secrets/hrh-clinical-api-key",
+        "timeout_seconds": 5,
+        "expected_ingress_uid": uid,
+        "expected_clinical_timezone": "America/New_York",
+    }), encoding="utf-8")
+    assert AdapterConfig.load(path).expected_ingress_uid == uid
+
+
+def test_production_boolean_expected_ingress_uid_fails_before_downstream_construction(monkeypatch, tmp_path):
+    path = tmp_path / "adapter.json"
+    path.write_text(json.dumps({
+        "hrh_origin": "https://hrh.internal.example",
+        "ca_path": "/run/secrets/hrh-ca.pem",
+        "api_key_path": "/run/secrets/hrh-clinical-api-key",
+        "timeout_seconds": 5,
+        "expected_ingress_uid": True,
+        "expected_clinical_timezone": "America/New_York",
+    }), encoding="utf-8")
+    monkeypatch.setenv("RESTRICTED_CLINICAL_ADAPTER_CONFIG_PATH", str(path))
+    monkeypatch.setattr(production_clinical_adapter, "load_api_key", lambda *_args, **_kwargs: pytest.fail("secret loading reached"))
+    monkeypatch.setattr(production_clinical_adapter, "HrhHttpsClient", lambda *_args, **_kwargs: pytest.fail("client construction reached"))
+    monkeypatch.setattr(production_clinical_adapter, "ClinicalAdapter", lambda *_args, **_kwargs: pytest.fail("adapter construction reached"))
+    with pytest.raises(ContractError, match="principal"):
+        production_clinical_adapter.run()
+
+
 def test_adapter_rejects_adapter_config_upstream_timezone_mismatch_at_https_and_uds_surfaces(monkeypatch, tmp_path):
     expected = "Europe/Madrid"
     response_body = json.dumps({

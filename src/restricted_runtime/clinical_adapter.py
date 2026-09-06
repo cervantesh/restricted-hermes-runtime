@@ -98,7 +98,7 @@ class AdapterConfig:
             raise ContractError("clinical adapter HRH origin rejected")
         if not isinstance(value.get("timeout_seconds"), int) or not 1 <= value["timeout_seconds"] <= 10:
             raise ContractError("clinical adapter timeout rejected")
-        if not isinstance(value.get("expected_ingress_uid"), int) or value["expected_ingress_uid"] < 1:
+        if not isinstance(value.get("expected_ingress_uid"), int) or isinstance(value["expected_ingress_uid"], bool) or value["expected_ingress_uid"] < 1:
             raise ContractError("clinical adapter principal rejected")
         timezone = value.get("expected_clinical_timezone")
         if not isinstance(timezone, str) or len(timezone) > 64 or _TIMEZONE.fullmatch(timezone) is None:
