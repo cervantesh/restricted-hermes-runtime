@@ -29,6 +29,7 @@ _BASE_FIELDS = {
     "clinicalPolicyId", "policyEpoch", "policyDigest",
 }
 _PATIENT = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_TIMEZONE = re.compile(r"^[A-Za-z]+(?:[_-][A-Za-z]+)*(?:/[A-Za-z]+(?:[_-][A-Za-z]+)*)+$")
 
 
 def _valid_request(value: Any, *, delivery: bool) -> bool:
@@ -46,13 +47,13 @@ def _valid_request(value: Any, *, delivery: bool) -> bool:
     )
 
 
-def _valid_upstream_response(path: str, value: Any) -> bool:
+def _valid_upstream_response(path: str, value: Any, *, expected_clinical_timezone: str) -> bool:
     if path == REAUTHORIZE_HRH:
         return isinstance(value, dict) and set(value) == {"authorized"} and value["authorized"] is True
     if not isinstance(value, dict) or set(value) != {"clinicTimezone", "appointment", "responseDigest"}:
         return False
     return (
-        value.get("clinicTimezone") == "America/New_York"
+        value.get("clinicTimezone") == expected_clinical_timezone
         and isinstance(value.get("responseDigest"), str)
         and re.fullmatch(r"[a-f0-9]{64}", value["responseDigest"]) is not None
         and (value.get("appointment") is None or _valid_appointment(value["appointment"]))
@@ -84,11 +85,12 @@ class AdapterConfig:
     api_key_path: Path
     timeout_seconds: float
     expected_ingress_uid: int
+    expected_clinical_timezone: str
 
     @classmethod
     def load(cls, path: Path) -> "AdapterConfig":
         value = load_closed_json(path.read_bytes())
-        if not isinstance(value, dict) or set(value) != {"hrh_origin", "ca_path", "api_key_path", "timeout_seconds", "expected_ingress_uid"}:
+        if not isinstance(value, dict) or set(value) != {"hrh_origin", "ca_path", "api_key_path", "timeout_seconds", "expected_ingress_uid", "expected_clinical_timezone"}:
             raise ContractError("clinical adapter configuration rejected")
         origin = urlsplit(value.get("hrh_origin", ""))
         if origin.scheme != "https" or not origin.hostname or origin.username or origin.password or origin.path not in {"", "/"} or origin.query or origin.fragment:
@@ -97,7 +99,10 @@ class AdapterConfig:
             raise ContractError("clinical adapter timeout rejected")
         if not isinstance(value.get("expected_ingress_uid"), int) or value["expected_ingress_uid"] < 1:
             raise ContractError("clinical adapter principal rejected")
-        return cls(value["hrh_origin"].rstrip("/"), Path(value["ca_path"]), Path(value["api_key_path"]), float(value["timeout_seconds"]), value["expected_ingress_uid"])
+        timezone = value.get("expected_clinical_timezone")
+        if not isinstance(timezone, str) or len(timezone) > 64 or _TIMEZONE.fullmatch(timezone) is None:
+            raise ContractError("clinical adapter timezone rejected")
+        return cls(value["hrh_origin"].rstrip("/"), Path(value["ca_path"]), Path(value["api_key_path"]), float(value["timeout_seconds"]), value["expected_ingress_uid"], timezone)
 
 
 def load_api_key(path: Path, *, expected_uid: int) -> str:
@@ -172,7 +177,7 @@ class HrhHttpsClient:
             if len(payload) != declared:
                 raise ContractError("clinical adapter HRH response framing rejected")
             value = load_closed_json(payload)
-            if not _valid_upstream_response(path, value):
+            if not _valid_upstream_response(path, value, expected_clinical_timezone=self.config.expected_clinical_timezone):
                 raise ContractError("clinical adapter HRH response schema rejected")
             remaining()
             return value
@@ -190,8 +195,8 @@ def _reply(status: bytes, body: dict[str, Any] | None = None) -> bytes:
 
 
 class ClinicalAdapter:
-    def __init__(self, *, expected_ingress_uid: int, upstream: Upstream):
-        self.expected_ingress_uid, self.upstream = expected_ingress_uid, upstream
+    def __init__(self, *, expected_ingress_uid: int, expected_clinical_timezone: str, upstream: Upstream):
+        self.expected_ingress_uid, self.expected_clinical_timezone, self.upstream = expected_ingress_uid, expected_clinical_timezone, upstream
 
     def handle(self, peer_uid: int, raw: bytes) -> bytes:
         if peer_uid != self.expected_ingress_uid:
@@ -224,7 +229,7 @@ class ClinicalAdapter:
                 raise ContractError("clinical adapter request schema rejected")
             upstream_path = REAUTHORIZE_HRH if delivery else QUERY_HRH
             result = self.upstream.request(upstream_path, body)
-            if not _valid_upstream_response(upstream_path, result):
+            if not _valid_upstream_response(upstream_path, result, expected_clinical_timezone=self.expected_clinical_timezone):
                 raise ContractError("clinical adapter upstream shape rejected")
             return _reply(b"200 OK", result)
         except ClinicalAuthorizationDenied:

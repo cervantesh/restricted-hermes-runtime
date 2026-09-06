@@ -2,6 +2,7 @@
   "api_key_path": "/run/secrets/hrh-clinical-api-key",
   "ca_path": "/run/secrets/hrh-ca.pem",
   "expected_ingress_uid": 10007,
+  "expected_clinical_timezone": "America/New_York",
   "hrh_origin": "https://hrh.internal.example",
   "timeout_seconds": 5
 }

@@ -86,6 +86,12 @@ internal routes to the two closed HRH endpoints with an API key scoped exactly t
 - `POST /api/restricted-hermes/clinical/next-appointment`
 - `POST /api/restricted-hermes/clinical/reauthorize-delivery`
 
+Its closed adapter configuration includes `expected_clinical_timezone`, the
+exact IANA-style timezone the upstream response must carry. The adapter applies
+that configured value when validating both its HTTPS upstream response and its
+UDS response to ingress; ingress independently continues to require that the
+signed policy's `clinical_timezone` matches before disclosure.
+
 The adapter is built separately by `Dockerfile.clinical-adapter`; it has no
 Hermes agent, conversation, provider, Mattermost credential, or general HRH
 proxy. It reads the HRH key from an owned regular secret file with mode 0400 or

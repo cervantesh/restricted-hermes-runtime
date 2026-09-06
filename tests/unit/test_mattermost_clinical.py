@@ -235,6 +235,17 @@ def test_unknown_clinical_response_fields_fail_closed(tmp_path):
     assert conversation.calls == [] and rest.created == []
 
 
+def test_ingress_rejects_adapter_config_timezone_that_does_not_match_the_signed_policy(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    adapter_config_timezone = "Europe/Madrid"
+    result = {"clinicTimezone": adapter_config_timezone, "appointment": None}
+    clinical.query = lambda _request: {**result, "responseDigest": _clinical_response_digest(result)}
+    service.handle(event(rest.posts[ROOT], channel_type="D"))
+    assert conversation.calls == []
+    assert rest.created == []
+    assert clinical.reauthorizations == []
+
+
 def test_impossible_calendar_date_from_clinical_service_fails_closed(tmp_path):
     service, rest, conversation, clinical = clinical_ingress(tmp_path)
     original = clinical.query

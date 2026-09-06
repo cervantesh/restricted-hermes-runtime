@@ -25,7 +25,11 @@ def run() -> None:
     config = AdapterConfig.load(config_path)
     effective_uid = getattr(os, "geteuid", lambda: config.api_key_path.stat().st_uid)()
     api_key = load_api_key(config.api_key_path, expected_uid=effective_uid)
-    service = ClinicalAdapter(expected_ingress_uid=config.expected_ingress_uid, upstream=HrhHttpsClient(config, api_key=api_key))
+    service = ClinicalAdapter(
+        expected_ingress_uid=config.expected_ingress_uid,
+        expected_clinical_timezone=config.expected_clinical_timezone,
+        upstream=HrhHttpsClient(config, api_key=api_key),
+    )
     listener = bind_listener()
     identity = (Path(SOCKET_PATH).lstat().st_dev, Path(SOCKET_PATH).lstat().st_ino)
     try:
