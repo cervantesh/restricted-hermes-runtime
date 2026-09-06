@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import ssl
+import stat
 from pathlib import Path
 
 import pytest
@@ -116,6 +117,8 @@ def test_secret_loader_requires_owned_regular_0400_or_0600_file(tmp_path: Path):
     os.chmod(secret, 0o600)
     expected_uid = secret.stat().st_uid
     assert load_api_key(secret, expected_uid=expected_uid) == "secret-value"
+    os.chmod(secret, 0o400)
+    assert load_api_key(secret, expected_uid=expected_uid) == "secret-value"
     os.chmod(secret, 0o640)
     with pytest.raises(ContractError):
         load_api_key(secret, expected_uid=expected_uid)
@@ -126,6 +129,42 @@ def test_secret_loader_requires_owned_regular_0400_or_0600_file(tmp_path: Path):
         pytest.skip("symlinks unavailable")
     with pytest.raises(ContractError):
         load_api_key(link, expected_uid=expected_uid)
+
+
+class _OwnedSecret:
+    def __init__(self, raw: bytes, *, mode: int = 0o600, uid: int = 10007):
+        self.raw, self.mode, self.uid = raw, mode, uid
+
+    def lstat(self):
+        return type("Metadata", (), {"st_mode": stat.S_IFREG | self.mode, "st_uid": self.uid})()
+
+    def read_bytes(self):
+        return self.raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"        ", b" secret-value", b"secret-value ", b"secret value", b"secret\tvalue",
+        b"secret\rvalue", b"secret\nvalue", b"secret\vvalue", b"secret\fvalue", b"secret\x00value",
+    ],
+    ids=["whitespace-only", "leading-space", "trailing-space", "embedded-space", "tab", "carriage-return", "newline", "vertical-tab", "form-feed", "nul"],
+)
+def test_secret_loader_rejects_noncanonical_ascii_credentials_before_adapter_construction_on_all_hosts(raw: bytes):
+    with pytest.raises(ContractError, match="secret rejected"):
+        load_api_key(_OwnedSecret(raw), expected_uid=10007)
+
+
+@pytest.mark.parametrize("mode", [0o400, 0o600])
+def test_secret_loader_removes_one_terminal_line_ending_and_returns_the_remaining_ascii_token_byte_for_byte(mode: int):
+    token = b"Abcd1234-_XYZ"
+    assert load_api_key(_OwnedSecret(token + b"\r\n", mode=mode), expected_uid=10007) == token.decode("ascii")
+
+
+@pytest.mark.parametrize("raw", [b"a" * 7 + b"\n", b"a" * 4097, b"a" * 8 + b"\r\n\r\n"])
+def test_secret_loader_enforces_length_after_removing_at_most_one_terminal_line_ending(raw: bytes):
+    with pytest.raises(ContractError, match="secret rejected"):
+        load_api_key(_OwnedSecret(raw), expected_uid=10007)
 
 
 class Response:

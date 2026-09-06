@@ -19,8 +19,8 @@ from restricted_runtime.contracts import ContractError, jcs_bytes
 import restricted_runtime.mattermost_ingress as mattermost_ingress
 from restricted_runtime.mattermost_ingress import (
     ConversationUdsClient,
-    DefinitiveMattermostError,
     MattermostRestClient,
+    TransientMattermostError,
     Ingress,
     MattermostEvent,
     conversation_identity,
@@ -511,7 +511,7 @@ def test_rest_transport_rejects_redirect_error_malformed_and_oversize_without_pr
         (b"x" * 1_048_577, {"Content-Type": "application/json"}),
     ],
 )
-def test_recovery_resource_http_200_shape_rejection_is_definitive(monkeypatch, tmp_path, response):
+def test_recovery_resource_http_200_shape_rejection_is_retryable(monkeypatch, tmp_path, response):
     policy = signed_policy(tmp_path)
 
     class Response:
@@ -546,7 +546,7 @@ def test_recovery_resource_http_200_shape_rejection_is_definitive(monkeypatch, t
             pass
 
     monkeypatch.setattr(http.client, "HTTPSConnection", Connection)
-    with pytest.raises(DefinitiveMattermostError, match="response"):
+    with pytest.raises(TransientMattermostError, match="response"):
         MattermostRestClient(policy, "secret").get_me(definitive=True)
 
 
@@ -727,17 +727,29 @@ def test_recovery_current_bot_channel_and_root_mismatches_are_definitive_blocks(
     assert conversation.calls == [] and rest.created == []
 
 
-def test_recovery_http_200_array_then_valid_resource_is_blocked_without_release(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        (b"not-json", {"Content-Type": "application/json"}),
+        (b'{"id":', {"Content-Type": "application/json"}),
+        (b"x" * 1_048_577, {"Content-Type": "application/json"}),
+        (b"{}", {"Content-Type": "text/plain"}),
+        (b"[]", {"Content-Type": "application/json"}),
+        (b"{}", {"Content-Type": "application/json"}),
+    ],
+    ids=["malformed", "truncated", "oversized", "wrong-content-type", "wrong-shape", "incomplete"],
+)
+@pytest.mark.parametrize("state", [DeliveryState.WAITING_COMMIT, DeliveryState.READY])
+def test_recovery_http_200_unusable_resource_retries_then_delivers_once(monkeypatch, tmp_path, malformed, state):
     policy = signed_policy(tmp_path)
 
     class Response:
-        status = 200
-
-        def __init__(self, body):
-            self.body, self.offset = body, 0
+        def __init__(self, body, *, status=200, headers=None):
+            self.status, self.body, self.offset = status, body, 0
+            self.headers = headers or {"Content-Type": "application/json"}
 
         def getheader(self, name, default=None):
-            return "application/json" if name == "Content-Type" else default
+            return self.headers.get(name, default)
 
         def read(self, size=-1):
             if size < 0:
@@ -747,17 +759,102 @@ def test_recovery_http_200_array_then_valid_resource_is_blocked_without_release(
             return result
 
     class Connection:
-        responses = [Response(b"[]"), Response(jcs_bytes({"id": BOT, "username": "restricted-bot"}))]
-        requests = 0
+        malformed_response = None
+        bad_once = True
+        requests = []
+        last_request = None
 
         def __init__(self, *_args, **_kwargs):
             pass
 
-        def request(self, *_args, **_kwargs):
-            type(self).requests += 1
+        def request(self, method, path, body=None, **_kwargs):
+            type(self).requests.append((method, path))
+            type(self).last_request = (method, path, body)
 
         def getresponse(self):
-            return type(self).responses.pop(0)
+            if type(self).bad_once:
+                type(self).bad_once = False
+                return type(self).malformed_response
+            method, path, body = type(self).last_request
+            if path == "/api/v4/users/me":
+                value = {"id": BOT, "username": "restricted-bot"}
+            elif path == "/api/v4/posts/" + ROOT:
+                value = post()
+            elif path == "/api/v4/channels/" + CHANNEL:
+                value = {"id": CHANNEL, "team_id": TEAM, "type": "P"}
+            elif path.startswith("/api/v4/channels/" + CHANNEL + "/members/"):
+                value = {"channel_id": CHANNEL, "user_id": path.rsplit("/", 1)[1]}
+            elif (method, path) == ("POST", "/api/v4/posts"):
+                value = {"id": "reply000000000000000000000", **json.loads(body)}
+            else:
+                raise AssertionError((method, path))
+            return Response(jcs_bytes(value))
+
+        def close(self):
+            pass
+
+    Connection.malformed_response = Response(malformed[0], headers=malformed[1])
+    monkeypatch.setattr(http.client, "HTTPSConnection", Connection)
+    key = tmp_path / "outbox.key"
+    key.write_bytes(OUTBOX_KEY)
+    os.chmod(key, 0o600)
+    outbox = MattermostOutbox.initialize(
+        tmp_path / "outbox", key, expected_fingerprint=policy.values["outbox_key_fingerprint"]
+    )
+    conversation = Conversation()
+    service = Ingress(policy, MattermostRestClient(policy, "secret"), conversation, outbox)
+    source = post()
+    record, _ = outbox.reserve(
+        service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    if state is DeliveryState.READY:
+        record = outbox.mark_ready(record, {
+            **record.envelope, "conversation_epoch": "epoch-one", "response": "synthetic response",
+        })
+    try:
+        service.executor.drain()
+        retryable = outbox.get(record.record_tag)
+        assert retryable is not None and retryable.state is state
+        assert retryable.generation == record.generation and retryable.envelope == record.envelope
+        assert Connection.requests == [("GET", "/api/v4/users/me")]
+        assert conversation.calls == []
+        service.executor.drain()
+        delivered = outbox.get(record.record_tag)
+        assert delivered is not None and delivered.state is DeliveryState.DELIVERED
+        assert len(conversation.calls) == (1 if state is DeliveryState.WAITING_COMMIT else 0)
+        request_count = len(Connection.requests)
+        service.executor.drain()
+        assert len(Connection.requests) == request_count
+        assert len(conversation.calls) == (1 if state is DeliveryState.WAITING_COMMIT else 0)
+    finally:
+        outbox.close()
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_recovery_http_authorization_rejection_blocks_without_inference(monkeypatch, tmp_path, status):
+    policy = signed_policy(tmp_path)
+
+    class Response:
+        def __init__(self):
+            self.status = status
+
+        def getheader(self, _name, default=None):
+            return default
+
+        def read(self, _size=-1):
+            return b""
+
+    class Connection:
+        requests = []
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, method, path, **_kwargs):
+            type(self).requests.append((method, path))
+
+        def getresponse(self):
+            return Response()
 
         def close(self):
             pass
@@ -779,8 +876,7 @@ def test_recovery_http_200_array_then_valid_resource_is_blocked_without_release(
         service.executor.drain()
         blocked = outbox.get(record.record_tag)
         assert blocked is not None and blocked.state is DeliveryState.BLOCKED
-        service.executor.drain()
-        assert Connection.requests == 1
+        assert Connection.requests == [("GET", "/api/v4/users/me")]
         assert conversation.calls == []
     finally:
         outbox.close()

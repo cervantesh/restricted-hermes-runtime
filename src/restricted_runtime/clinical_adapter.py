@@ -115,12 +115,14 @@ def load_api_key(path: Path, *, expected_uid: int) -> str:
         raise
     except OSError as exc:
         raise ContractError("clinical adapter secret unavailable") from exc
-    if not 8 <= len(raw.rstrip(b"\r\n")) <= 4096 or b"\x00" in raw:
-        raise ContractError("clinical adapter secret rejected")
     try:
-        return raw.decode("ascii").strip()
+        token = raw[:-2] if raw.endswith(b"\r\n") else raw[:-1] if raw.endswith(b"\n") else raw
+        value = token.decode("ascii")
     except UnicodeError as exc:
         raise ContractError("clinical adapter secret rejected") from exc
+    if not 8 <= len(value) <= 4096 or "\x00" in value or any(character.isspace() for character in value):
+        raise ContractError("clinical adapter secret rejected")
+    return value
 
 
 class Upstream(Protocol):

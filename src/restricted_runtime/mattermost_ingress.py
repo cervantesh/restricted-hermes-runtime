@@ -113,6 +113,19 @@ def _ordinary(post: dict[str, Any], *, policy: MattermostPolicy, require_mention
         return False
 
 
+def _complete_post_response(value: Any) -> bool:
+    return (
+        isinstance(value, dict) and _POST_REQUIRED_FIELDS <= set(value)
+        and all(isinstance(value.get(name), str) for name in ("id", "root_id", "channel_id", "user_id", "message", "type"))
+        and isinstance(value.get("edit_at"), int) and not isinstance(value.get("edit_at"), bool)
+        and isinstance(value.get("delete_at"), int) and not isinstance(value.get("delete_at"), bool)
+    )
+
+
+def _incomplete_resource_error(definitive: bool, message: str) -> ContractError:
+    return TransientMattermostError(message) if definitive else ContractError(message)
+
+
 _PATIENT_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _DASHES = str.maketrans({"\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2212": "-"})
 _CONFUSABLES = str.maketrans({
@@ -275,7 +288,9 @@ class Ingress:
 
     def _bot_identity(self, *, definitive: bool = False) -> None:
         me = self.rest.get_me(definitive=definitive)
-        if not isinstance(me, dict) or me.get("id") != self.policy.values["bot_user_id"] or me.get("username") != self.policy.values["bot_username"]:
+        if not isinstance(me, dict) or not all(isinstance(me.get(name), str) for name in ("id", "username")):
+            raise _incomplete_resource_error(definitive, "Mattermost bot identity response incomplete")
+        if me["id"] != self.policy.values["bot_user_id"] or me["username"] != self.policy.values["bot_username"]:
             error = DefinitiveMattermostError if definitive else ContractError
             raise error("Mattermost bot identity rejected")
 
@@ -284,10 +299,11 @@ class Ingress:
 
     def _private_channel(self, channel_id: str, *, definitive: bool = False) -> dict[str, Any]:
         channel = self.rest.get_channel(channel_id, definitive=definitive)
+        if not isinstance(channel, dict) or not all(isinstance(channel.get(name), str) for name in ("id", "team_id", "type")):
+            raise _incomplete_resource_error(definitive, "Mattermost private channel response incomplete")
         if (
-            not isinstance(channel, dict) or channel.get("id") != channel_id
-            or channel.get("team_id") != self.policy.values["team_id"] or channel.get("type") != "P"
-            or channel_id not in self.policy.values["allowed_channel_ids"]
+            channel["id"] != channel_id or channel["team_id"] != self.policy.values["team_id"]
+            or channel["type"] != "P" or channel_id not in self.policy.values["allowed_channel_ids"]
         ):
             error = DefinitiveMattermostError if definitive else ContractError
             raise error("Mattermost private channel binding rejected")
@@ -295,14 +311,18 @@ class Ingress:
 
     def _member(self, channel_id: str, user_id: str, *, definitive: bool = False) -> dict[str, Any]:
         member = self.rest.get_channel_member(channel_id, user_id, definitive=definitive)
-        if not isinstance(member, dict) or member.get("channel_id") != channel_id or member.get("user_id") != user_id:
+        if not isinstance(member, dict) or not all(isinstance(member.get(name), str) for name in ("channel_id", "user_id")):
+            raise _incomplete_resource_error(definitive, "Mattermost channel membership response incomplete")
+        if member["channel_id"] != channel_id or member["user_id"] != user_id:
             error = DefinitiveMattermostError if definitive else ContractError
             raise error("Mattermost channel membership rejected")
         return member
 
     def _direct_channel(self, channel_id: str, *, definitive: bool = False) -> dict[str, Any]:
         channel = self.rest.get_channel(channel_id, definitive=definitive)
-        if not isinstance(channel, dict) or channel.get("id") != channel_id or channel.get("type") != "D":
+        if not isinstance(channel, dict) or not all(isinstance(channel.get(name), str) for name in ("id", "type")):
+            raise _incomplete_resource_error(definitive, "Mattermost direct channel response incomplete")
+        if channel["id"] != channel_id or channel["type"] != "D":
             error = DefinitiveMattermostError if definitive else ContractError
             raise error("Mattermost direct channel binding rejected")
         return channel
@@ -310,9 +330,12 @@ class Ingress:
     def _exact_direct_roster(self, channel_id: str, actor_id: str, *, definitive: bool = False) -> None:
         members = self.rest.get_channel_members(channel_id, definitive=definitive)
         expected = {actor_id, self.policy.values["bot_user_id"]}
-        if not isinstance(members, list) or len(members) != 2 or {
-            item.get("user_id") for item in members if isinstance(item, dict) and item.get("channel_id") == channel_id
-        } != expected:
+        if not isinstance(members, list) or not all(
+            isinstance(item, dict) and all(isinstance(item.get(name), str) for name in ("channel_id", "user_id"))
+            for item in members
+        ):
+            raise _incomplete_resource_error(definitive, "Mattermost direct channel roster response incomplete")
+        if len(members) != 2 or {item["user_id"] for item in members if item["channel_id"] == channel_id} != expected:
             error = DefinitiveMattermostError if definitive else ContractError
             raise error("Mattermost direct channel roster rejected")
 
@@ -335,6 +358,8 @@ class Ingress:
         root = self.rest.get_post(root_id, definitive=definitive)
         if isinstance(root, dict) and "file_ids" not in root:
             root = {**root, "file_ids": []}
+        if not _complete_post_response(root) or not isinstance(root.get("file_ids"), list):
+            raise _incomplete_resource_error(definitive, "Mattermost root response incomplete")
         if (
             not _ordinary(root, policy=self.policy, require_mention=True)
             or root.get("id") != root_id or root.get("root_id") not in {"", root_id}
@@ -414,8 +439,10 @@ class Ingress:
         source = self.rest.get_post(envelope["source_id"], definitive=True)
         if isinstance(source, dict) and "file_ids" not in source:
             source = {**source, "file_ids": []}
+        if not _complete_post_response(source) or not isinstance(source.get("file_ids"), list):
+            raise TransientMattermostError("Mattermost clinical source response incomplete")
         if (
-            not isinstance(source, dict) or source.get("id") != envelope["source_id"]
+            source.get("id") != envelope["source_id"]
             or source.get("root_id") != "" or envelope["root_id"] != envelope["source_id"]
             or source.get("channel_id") != envelope["channel_id"] or source.get("user_id") != envelope["actor_id"]
             or source.get("message") != envelope["source_message"]
@@ -437,7 +464,9 @@ class Ingress:
         source = self.rest.get_post(envelope["source_id"], definitive=True)
         if isinstance(source, dict) and "file_ids" not in source:
             source = {**source, "file_ids": []}
-        if not isinstance(source, dict) or source.get("id") != envelope["source_id"] or source.get("channel_id") != envelope["channel_id"] or source.get("user_id") != envelope["actor_id"]:
+        if not _complete_post_response(source) or not isinstance(source.get("file_ids"), list):
+            raise TransientMattermostError("Mattermost source response incomplete")
+        if source.get("id") != envelope["source_id"] or source.get("channel_id") != envelope["channel_id"] or source.get("user_id") != envelope["actor_id"]:
             raise DefinitiveMattermostError("Mattermost source replay binding rejected")
         root_id = self._authorize_source(source, definitive=True)
         if root_id != envelope["root_id"] or source.get("message") != envelope["message"]:
@@ -744,7 +773,7 @@ class MattermostRestClient:
         self._host, self._port = split.hostname or "", split.port or 443
         self._context = ssl.create_default_context(cafile=str(ca_path) if ca_path else None)
 
-    def _request(self, method: str, path: str, body: dict[str, Any] | None = None, *, definitive_shape: bool = False, list_response: bool = False) -> Any:
+    def _request(self, method: str, path: str, body: dict[str, Any] | None = None, *, list_response: bool = False) -> Any:
         member_page = path.endswith("/members?page=0&per_page=3")
         if not path.startswith("/api/v4/") or "//" in path or "#" in path or ("?" in path and not member_page):
             raise ContractError("Mattermost REST path rejected")
@@ -772,9 +801,7 @@ class MattermostRestClient:
                 if not isinstance(value, list if list_response else dict):
                     raise ContractError("Mattermost REST response JSON rejected")
             except ContractError as exc:
-                if definitive_shape:
-                    raise DefinitiveMattermostError("Mattermost REST current resource response rejected") from exc
-                raise
+                raise TransientMattermostError("Mattermost REST response rejected") from exc
             return value
         except ContractError:
             raise
@@ -783,11 +810,11 @@ class MattermostRestClient:
         finally:
             connection.close()
 
-    def get_me(self, *, definitive: bool = False): return self._request("GET", "/api/v4/users/me", definitive_shape=definitive)
-    def get_channel(self, channel_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe=""), definitive_shape=definitive)
-    def get_channel_member(self, channel_id, user_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe="") + "/members/" + quote(user_id, safe=""), definitive_shape=definitive)
-    def get_channel_members(self, channel_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe="") + "/members?page=0&per_page=3", definitive_shape=definitive, list_response=True)
-    def get_post(self, post_id, *, definitive: bool = False): return self._request("GET", "/api/v4/posts/" + quote(post_id, safe=""), definitive_shape=definitive)
+    def get_me(self, *, definitive: bool = False): return self._request("GET", "/api/v4/users/me")
+    def get_channel(self, channel_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe=""))
+    def get_channel_member(self, channel_id, user_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe="") + "/members/" + quote(user_id, safe=""))
+    def get_channel_members(self, channel_id, *, definitive: bool = False): return self._request("GET", "/api/v4/channels/" + quote(channel_id, safe="") + "/members?page=0&per_page=3", list_response=True)
+    def get_post(self, post_id, *, definitive: bool = False): return self._request("GET", "/api/v4/posts/" + quote(post_id, safe=""))
     def create_post(self, body): return self._request("POST", "/api/v4/posts", body)
 
 
