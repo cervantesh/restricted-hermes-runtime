@@ -37,6 +37,15 @@ USER = "user0000000000000000000000"
 BOT = "bot00000000000000000000000"
 ROOT = "root0000000000000000000000"
 OUTBOX_KEY = b"m" * 32
+UNICODE_15_1_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160),
+    (0x17B4, 0x17B5), (0x180B, 0x180D), (0x180E, 0x180E), (0x180F, 0x180F),
+    (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2065, 0x2065),
+    (0x2066, 0x206F), (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0000), (0xE0001, 0xE0001), (0xE0002, 0xE001F), (0xE0020, 0xE007F),
+    (0xE0080, 0xE00FF), (0xE0100, 0xE01EF), (0xE01F0, 0xE0FFF),
+)
 
 
 def policy_values(now: datetime | None = None) -> dict:
@@ -351,6 +360,26 @@ def test_default_ignorable_nonspacing_modifiers_around_supported_confusables_res
     service.handle(event(candidate, channel_type="P"))
     assert conversation.calls == []
     assert rest.created == []
+
+
+@pytest.mark.parametrize("filler", ["\u115f", "\u1160", "\u3164", "\uffa0"])
+def test_default_ignorable_hangul_fillers_around_supported_confusables_reserve_the_clinical_namespace(
+    tmp_path, filler,
+):
+    service, rest, conversation = ingress(tmp_path)
+    candidate = post(message=f"@restricted-bot n\u0435{filler}xt-appointment 123e4567-e89b-42d3-a456-426614174000")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls == []
+    assert rest.created == []
+
+
+@pytest.mark.parametrize("start, end", UNICODE_15_1_DEFAULT_IGNORABLE_RANGES)
+def test_every_unicode_15_1_default_ignorable_range_boundary_is_removed_from_the_namespace_skeleton(start, end):
+    assert mattermost_ingress._UNICODE_15_1_DEFAULT_IGNORABLE_RANGES == UNICODE_15_1_DEFAULT_IGNORABLE_RANGES
+    for codepoint in (start, end):
+        assert mattermost_ingress._namespace_ignorable(chr(codepoint))
+        assert mattermost_ingress._namespace_skeleton(f"n\u0435{chr(codepoint)}xt-appointment") == "next-appointment"
 
 
 def test_ordinary_private_channel_text_still_reaches_the_conversation_path(tmp_path):

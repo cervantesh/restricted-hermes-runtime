@@ -119,12 +119,16 @@ _CONFUSABLES = str.maketrans({
     "\u0430": "a", "\u0435": "e", "\u0456": "i", "\u043c": "m", "\u043e": "o", "\u0440": "p",
     "\u0442": "t", "\u0445": "x", "\u03b1": "a", "\u03b9": "i", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t", "\u03c7": "x",
 })
-_DEFAULT_IGNORABLE_NONSPACING_RANGES = (
-    (0x034F, 0x034F),  # COMBINING GRAPHEME JOINER
-    (0x17B4, 0x17B5),  # Khmer inherent-vowel modifiers
-    (0x180B, 0x180F),  # Mongolian free variation selectors
-    (0xFE00, 0xFE0F),  # variation selectors, including VS15 and VS16
-    (0xE0100, 0xE01EF),  # variation selectors supplement
+# Unicode 15.1.0 DerivedCoreProperties.txt, Default_Ignorable_Code_Point:
+# https://www.unicode.org/Public/15.1.0/ucd/DerivedCoreProperties.txt
+_UNICODE_15_1_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160),
+    (0x17B4, 0x17B5), (0x180B, 0x180D), (0x180E, 0x180E), (0x180F, 0x180F),
+    (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2065, 0x2065),
+    (0x2066, 0x206F), (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0000), (0xE0001, 0xE0001), (0xE0002, 0xE001F), (0xE0020, 0xE007F),
+    (0xE0080, 0xE00FF), (0xE0100, 0xE01EF), (0xE01F0, 0xE0FFF),
 )
 
 
@@ -132,7 +136,7 @@ def _namespace_ignorable(character: str) -> bool:
     if unicodedata.category(character) == "Cf":
         return True
     codepoint = ord(character)
-    return any(start <= codepoint <= end for start, end in _DEFAULT_IGNORABLE_NONSPACING_RANGES)
+    return any(start <= codepoint <= end for start, end in _UNICODE_15_1_DEFAULT_IGNORABLE_RANGES)
 
 
 def _namespace_skeleton(value: str) -> str:
