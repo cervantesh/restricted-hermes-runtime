@@ -25,6 +25,7 @@ from test_mattermost_ingress import (
     RESIDUAL_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES,
     UNICODE_15_1_COMPATIBILITY_SEPARATOR_SOURCES,
     ROUND15_DIRECT_RN_SIBLINGS,
+    ROUND16_RESIDUAL_REPRESENTATIVES,
 )
 from restricted_runtime.mattermost_outbox import DeliveryState, MattermostOutbox
 import os
@@ -283,6 +284,19 @@ def test_round14_ambiguous_sources_reserve_direct_clinical_namespace(tmp_path, n
 def test_round15_direct_rn_sources_are_malformed_in_direct_channel(tmp_path, source):
     service, rest, conversation, clinical = clinical_ingress(tmp_path)
     namespace = "next-appointrnent" if source == 0x006D else f"next-appoint{chr(source)}ent"
+    message = f"@restricted-bot {namespace} {PATIENT}"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="D"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and clinical.queries == []
+    assert rest.created == [] and service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize(("letter", "source"), ROUND16_RESIDUAL_REPRESENTATIVES)
+def test_round16_residual_sources_are_malformed_in_direct_channel(tmp_path, letter, source):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    namespace = "next-appointment".replace(letter, chr(source), 1)
     message = f"@restricted-bot {namespace} {PATIENT}"
     candidate = post(message=message)
     rest.posts[ROOT] = candidate

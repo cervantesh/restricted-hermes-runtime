@@ -241,6 +241,43 @@ _MULTI_SYMBOL_NAMESPACE_LETTERS = frozenset(("m",))
 _M_SLOT_R_SOURCES = frozenset(_UNICODE_15_1_M_SLOT_CONFUSABLES["r"])
 _M_SLOT_N_SOURCES = frozenset(_UNICODE_15_1_M_SLOT_CONFUSABLES["n"])
 _M_SLOT_RN_SOURCES = frozenset(_UNICODE_15_1_M_SLOT_CONFUSABLES["rn"])
+
+# Unicode 15.1 confusables.txt single-source entries which become one of the
+# exact ``next-appointment`` letters under this detector's existing, bounded
+# NFD/mark/NFKC/casefold and primary-map semantics.  The composition entries
+# are intentionally separate: their official raw target needs one existing
+# deterministic source mapping before it reaches the letter below.
+_UNICODE_15_1_DIRECT_RESIDUAL_LETTER_CONFUSABLES = {
+    **dict.fromkeys((0x2376, 0x1E9A), "a"),
+    **dict.fromkeys((0x0247, 0x0246, 0x04BF), "e"),
+    **dict.fromkeys((0x24DB, 0x2378, 0x0268, 0x1D7B, 0x1D7C), "i"),
+    0x04CD: "m",
+    **dict.fromkeys((
+        0x2070, 0x06FF, 0x00F8, 0xAB3E, 0x00D8, 0x2D41, 0x01FE, 0x0275,
+        0xA74B, 0x04E9, 0x0473, 0xAB8E, 0xABBB, 0x2296, 0x229D, 0x236C,
+        0x1D21A, 0x1F714, 0x019F, 0xA74A, 0x03B8, 0x03D1, 0x1D6C9, 0x1D6DD,
+        0x1D703, 0x1D717, 0x1D73D, 0x1D751, 0x1D777, 0x1D78B, 0x1D7B1,
+        0x1D7C5, 0x0398, 0x03F4, 0x1D6AF, 0x1D6B9, 0x1D6E9, 0x1D6F3,
+        0x1D723, 0x1D72D, 0x1D75D, 0x1D767, 0x1D797, 0x1D7A1, 0x04E8,
+        0x0472, 0x2D31, 0x13BE, 0x13EB, 0xAB74, 0xFCD9, 0x1010,
+    ), "o"),
+    **dict.fromkeys((0x01A5, 0x1D7D), "p"),
+    **dict.fromkeys((0x01AD, 0x2361, 0x023E, 0x01AE, 0x04AC, 0x20AE, 0x0167, 0x0166, 0x1D75), "t"),
+    **dict.fromkeys((0x2A30, 0x04B2, 0x10196), "x"),
+}
+_UNICODE_15_1_COMPOSITION_RESIDUAL_LETTER_CONFUSABLES = {
+    0x04BE: "e",
+    **dict.fromkeys((0x2229, 0x22C2, 0x1D245, 0x1260, 0x144E, 0xA4F5), "n"),
+    **dict.fromkeys((
+        0x03DB, 0x1D6D3, 0x1D70D, 0x1D747, 0x1D781, 0x1D7BB, 0x06C2,
+        0xFBA5, 0xFBA4,
+    ), "o"),
+    **dict.fromkeys((0xAB53, 0xAB55, 0x2CAD), "x"),
+}
+_UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES = (
+    _UNICODE_15_1_DIRECT_RESIDUAL_LETTER_CONFUSABLES
+    | _UNICODE_15_1_COMPOSITION_RESIDUAL_LETTER_CONFUSABLES
+)
 _SECONDARY_CLINICAL_SOURCE_CONFUSABLES = str.maketrans({
     ord(chr(codepoint)): letter
     for letter, codepoints in _UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES.items()
@@ -361,6 +398,8 @@ def _clinical_source_options(character: str) -> tuple[tuple[str | None, ...], ..
         # ASCII m remains available on its canonical transition; its official
         # rn skeleton is the only deliberately ambiguous source option.
         return (("m",), ("r", "n")) if codepoint == ord("m") else (("r", "n"),)
+    if codepoint in _UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES:
+        return ((_UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES[codepoint],),)
     if codepoint in _SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES:
         return ((_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES[codepoint],),)
     return (_normalized_clinical_symbols(character),)

@@ -91,6 +91,42 @@ UNICODE_15_1_M_SLOT_CONFUSABLE_ORACLE = {
     ),
 }
 ROUND15_DIRECT_RN_SIBLINGS = (0x118E3, 0x11700, 0x20A5, 0x0271, 0x1D6F)
+ROUND16_DIRECT_RESIDUAL_ORACLE = {
+    "a": ((0x2376, (0x0061, 0x0332)), (0x1E9A, (0x1EA3,))),
+    "e": ((0x0247, (0x0065, 0x0338)), (0x0246, (0x0045, 0x0338)), (0x04BF, (0x0065, 0x0328))),
+    "i": ((0x24DB, (0x24BE,)), (0x2378, (0x0069, 0x0332)), (0x0268, (0x0069, 0x0335)), (0x1D7B, (0x0069, 0x0335)), (0x1D7C, (0x0069, 0x0335))),
+    "m": ((0x04CD, (0x004D, 0x0326)),),
+    "o": (
+        (0x2070, (0x00BA,)), (0x06FF, (0x006F, 0x0302)), (0x00F8, (0x006F, 0x0338)), (0xAB3E, (0x006F, 0x0338)), (0x00D8, (0x004F, 0x0338)), (0x2D41, (0x004F, 0x0338)), (0x01FE, (0x004F, 0x0338, 0x0301)), (0x0275, (0x006F, 0x0335)),
+        (0xA74B, (0x006F, 0x0335)), (0x04E9, (0x006F, 0x0335)), (0x0473, (0x006F, 0x0335)), (0xAB8E, (0x006F, 0x0335)), (0xABBB, (0x006F, 0x0335)), (0x2296, (0x004F, 0x0335)), (0x229D, (0x004F, 0x0335)), (0x236C, (0x004F, 0x0335)),
+        (0x1D21A, (0x004F, 0x0335)), (0x1F714, (0x004F, 0x0335)), (0x019F, (0x004F, 0x0335)), (0xA74A, (0x004F, 0x0335)), (0x03B8, (0x004F, 0x0335)), (0x03D1, (0x004F, 0x0335)), (0x1D6C9, (0x004F, 0x0335)), (0x1D6DD, (0x004F, 0x0335)),
+        (0x1D703, (0x004F, 0x0335)), (0x1D717, (0x004F, 0x0335)), (0x1D73D, (0x004F, 0x0335)), (0x1D751, (0x004F, 0x0335)), (0x1D777, (0x004F, 0x0335)), (0x1D78B, (0x004F, 0x0335)), (0x1D7B1, (0x004F, 0x0335)), (0x1D7C5, (0x004F, 0x0335)),
+        (0x0398, (0x004F, 0x0335)), (0x03F4, (0x004F, 0x0335)), (0x1D6AF, (0x004F, 0x0335)), (0x1D6B9, (0x004F, 0x0335)), (0x1D6E9, (0x004F, 0x0335)), (0x1D6F3, (0x004F, 0x0335)), (0x1D723, (0x004F, 0x0335)), (0x1D72D, (0x004F, 0x0335)),
+        (0x1D75D, (0x004F, 0x0335)), (0x1D767, (0x004F, 0x0335)), (0x1D797, (0x004F, 0x0335)), (0x1D7A1, (0x004F, 0x0335)), (0x04E8, (0x004F, 0x0335)), (0x0472, (0x004F, 0x0335)), (0x2D31, (0x004F, 0x0335)), (0x13BE, (0x004F, 0x0335)),
+        (0x13EB, (0x004F, 0x0335)), (0xAB74, (0x006F, 0x031B)), (0xFCD9, (0x006F, 0x0670)), (0x1010, (0x006F, 0x102C)),
+    ),
+    "p": ((0x01A5, (0x0070, 0x0314)), (0x1D7D, (0x0070, 0x0335))),
+    "t": ((0x01AD, (0x0074, 0x0314)), (0x2361, (0x0054, 0x0308)), (0x023E, (0x0054, 0x0338)), (0x01AE, (0x0054, 0x0328)), (0x04AC, (0x0054, 0x0329)), (0x20AE, (0x0054, 0x20EB)), (0x0167, (0x0074, 0x0335)), (0x0166, (0x0054, 0x0335)), (0x1D75, (0x0074, 0x0334))),
+    "x": ((0x2A30, (0x0078, 0x0307)), (0x04B2, (0x0058, 0x0329)), (0x10196, (0x0058, 0x0335))),
+}
+ROUND16_COMPOSITION_RESIDUAL_ORACLE = {
+    "e": ((0x04BE, (0x04BC, 0x0328)),),
+    "n": ((0x2229, (0x0548,)), (0x22C2, (0x0548,)), (0x1D245, (0x0548,)), (0x1260, (0x0548,)), (0x144E, (0x0548,)), (0xA4F5, (0x0548,))),
+    "o": ((0x03DB, (0x03C2,)), (0x1D6D3, (0x03C2,)), (0x1D70D, (0x03C2,)), (0x1D747, (0x03C2,)), (0x1D781, (0x03C2,)), (0x1D7BB, (0x03C2,)), (0x06C2, (0x06C0,)), (0xFBA5, (0x06C0,)), (0xFBA4, (0x06C0,))),
+    "x": ((0xAB53, (0x03C7,)), (0xAB55, (0x03C7,)), (0x2CAD, (0x03C7,))),
+}
+ROUND16_RESIDUAL_ORACLE = {
+    letter: tuple(source for source, _ in ROUND16_DIRECT_RESIDUAL_ORACLE.get(letter, ()) + ROUND16_COMPOSITION_RESIDUAL_ORACLE.get(letter, ()))
+    for letter in "aeimnop tx".replace(" ", "")
+    if ROUND16_DIRECT_RESIDUAL_ORACLE.get(letter) or ROUND16_COMPOSITION_RESIDUAL_ORACLE.get(letter)
+}
+ROUND16_RESIDUAL_RAW_TARGETS = {
+    source: target
+    for oracle in (ROUND16_DIRECT_RESIDUAL_ORACLE, ROUND16_COMPOSITION_RESIDUAL_ORACLE)
+    for sources in oracle.values()
+    for source, target in sources
+}
+ROUND16_RESIDUAL_REPRESENTATIVES = tuple((letter, sources[0]) for letter, sources in ROUND16_RESIDUAL_ORACLE.items())
 
 
 def _unicode_15_1_mark_codepoints() -> tuple[int, ...]:
@@ -1003,6 +1039,130 @@ def test_round15_m_slot_sources_outside_namespace_reach_private_conversation_exa
     rest.posts[ROOT] = candidate
     service.handle(event(candidate, channel_type="P"))
     assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+def test_round16_frozen_unicode_15_1_residual_table_is_complete_and_disjoint():
+    expected = {
+        source: letter
+        for letter, sources in ROUND16_RESIDUAL_ORACLE.items()
+        for source in sources
+    }
+    assert mattermost_ingress._UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES == expected
+    assert tuple(map(len, ROUND16_RESIDUAL_ORACLE.values())) == (2, 4, 5, 1, 6, 61, 2, 9, 6)
+    assert sum(map(len, ROUND16_DIRECT_RESIDUAL_ORACLE.values())) == 77
+    assert sum(map(len, ROUND16_COMPOSITION_RESIDUAL_ORACLE.values())) == 19
+    assert len(expected) == len(ROUND16_RESIDUAL_RAW_TARGETS) == 96
+    existing = (
+        set(mattermost_ingress._CONFUSABLES)
+        | set(mattermost_ingress._SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES)
+        | set(mattermost_ingress._SECONDARY_CLINICAL_MARK_O_SOURCES)
+        | set(mattermost_ingress._CLINICAL_COMPATIBILITY_SEPARATOR_OPTIONS)
+        | set(mattermost_ingress._CLINICAL_SOURCE_SEPARATOR_OPTIONS)
+        | set(mattermost_ingress._M_SLOT_R_SOURCES)
+        | set(mattermost_ingress._M_SLOT_N_SOURCES)
+        | set(mattermost_ingress._M_SLOT_RN_SOURCES)
+    )
+    assert not set(expected) & existing
+
+
+def test_round16_composition_fixture_reaches_existing_single_source_meaning_once():
+    """The 19 fixed-point members need one pre-existing source mapping only."""
+    for letter, sources in ROUND16_COMPOSITION_RESIDUAL_ORACLE.items():
+        for _, raw_target in sources:
+            normalized = unicodedata2.normalize("NFD", "".join(map(chr, raw_target)))
+            normalized = "".join(symbol for symbol in normalized if not mattermost_ingress._namespace_mark(symbol))
+            normalized = unicodedata2.normalize("NFKC", normalized).casefold()
+            assert mattermost_ingress._clinical_source_options(normalized) == ((letter,),)
+
+
+def test_round16_all_residual_sources_reserve_their_target_slot():
+    canonical = "next-appointment"
+    for letter, sources in ROUND16_RESIDUAL_ORACLE.items():
+        for source in sources:
+            for index, current in enumerate(canonical):
+                if current != letter:
+                    continue
+                namespace = canonical[:index] + chr(source) + canonical[index + 1:]
+                assert mattermost_ingress._clinical_namespace(namespace), (letter, index, hex(source))
+                assert mattermost_ingress._clinical_command(
+                    f"@restricted-bot {namespace} 123e4567-e89b-42d3-a456-426614174000", "restricted-bot",
+                ) == ("malformed", None)
+
+
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+@pytest.mark.parametrize(("letter", "source"), ROUND16_RESIDUAL_REPRESENTATIVES)
+def test_round16_residual_sources_are_blocked_before_private_and_durable_delivery(tmp_path, ready, letter, source):
+    namespace = "next-appointment".replace(letter, chr(source), 1)
+    message = f"@restricted-bot {namespace} 123e4567-e89b-42d3-a456-426614174000"
+    service, rest, conversation = ingress(tmp_path / "fresh")
+    fresh = post(message=message)
+    rest.posts[ROOT] = fresh
+    service.handle(event(fresh, channel_type="P"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == []
+
+    legacy_service, legacy_rest, legacy_conversation = ingress(tmp_path / "durable")
+    legacy_rest.posts[ROOT] = fresh
+    record, _ = legacy_service.outbox.reserve(
+        legacy_service._envelope(fresh, ROOT), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    if ready:
+        record = legacy_service.outbox.mark_ready(
+            record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "legacy"},
+        )
+    legacy_service.executor.drain()
+    durable = legacy_service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.BLOCKED
+    assert legacy_conversation.calls == [] and legacy_rest.created == []
+
+
+@pytest.mark.parametrize("source", tuple(
+    source for sources in ROUND16_RESIDUAL_ORACLE.values() for source in sources
+))
+def test_round16_residual_sources_outside_namespace_reach_private_conversation_exactly(tmp_path, source):
+    service, rest, conversation = ingress(tmp_path)
+    message = f"@restricted-bot ordinary {chr(source)} text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+@pytest.mark.parametrize("namespace", (
+    "next\u2017app\u0c02int\u04cdent",
+    "next\u02db\u2376pp\u0c02\u037ant\u04cdent",
+    "next\u2017appo\u24db\u200bnt\u04cdent",
+    "\u2229ext\u2017app\u03dbint\u04cdent",
+))
+def test_round16_residual_sources_compose_with_existing_namespace_ambiguities(namespace):
+    assert mattermost_ingress._clinical_namespace(namespace), namespace.encode("unicode_escape")
+
+
+def test_round16_residual_lookup_mutations_bite(monkeypatch):
+    original = mattermost_ingress._UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES
+    for source, letter in ((0x04CD, "m"), (0x04BE, "e")):
+        mutated = dict(original)
+        del mutated[source]
+        monkeypatch.setattr(mattermost_ingress, "_UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES", mutated)
+        namespace = "next-appointment".replace(letter, chr(source), 1)
+        assert not mattermost_ingress._clinical_namespace(namespace), hex(source)
+    monkeypatch.setattr(mattermost_ingress, "_UNICODE_15_1_RESIDUAL_LETTER_CONFUSABLES", {})
+    assert not mattermost_ingress._clinical_namespace("next-\u2376ppointment")
+
+
+def test_round16_residual_lookup_keeps_the_eighteen_state_megabyte_bound():
+    prefix = "next-app"
+    suffix = "x"
+    source = "\u04be"
+    value = prefix + source * (
+        (mattermost_ingress._MAX_HTTP_BYTES - len(prefix.encode("utf-8")) - len(suffix.encode("utf-8")))
+        // len(source.encode("utf-8"))
+    ) + suffix
+    instrumentation: dict[str, int] = {}
+    assert len(value.encode("utf-8")) <= mattermost_ingress._MAX_HTTP_BYTES
+    assert not mattermost_ingress._clinical_namespace(value, instrumentation=instrumentation)
+    assert instrumentation["max_active_states"] <= 18
+    assert instrumentation["transition_steps"] <= instrumentation["source_tokens"] * 18
 
 
 @pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
