@@ -833,3 +833,27 @@ def test_installed_process_ambiguous_root_fences_later_reply_but_not_other_root(
     finally:
         _stop(process)
         harness.close()
+
+
+@pytest.mark.parametrize(
+    "codepoint", (0x06D4, 0x02D7, 0x2796, 0x2CBA, 0x2A29, 0xFB29, 0x2238, 0x2A2A, 0xFF5E, 0x07FA),
+)
+def test_installed_ingress_residual_separator_never_reaches_uds_or_outbox(
+    tmp_path, installed_mattermost_ingress, codepoint,
+):
+    """The installed production entrypoint reserves every residual source."""
+    harness = _InstalledProcessHarness(tmp_path)
+    reserved = {
+        "id": ROOT_POST, "root_id": "", "channel_id": CHANNEL, "user_id": USER,
+        "message": f"@restricted-bot next{chr(codepoint)}appointment 123e4567-e89b-42d3-a456-426614174000",
+        "type": "", "file_ids": [], "edit_at": 0, "delete_at": 0,
+    }
+    PeerHandler.event_posts = [reserved]
+    process = harness.start(installed_mattermost_ingress)
+    try:
+        _wait_for(lambda: PeerHandler.websocket_connections >= 1, timeout=15)
+        time.sleep(0.25)
+        assert (ConversationHandler.turns, PeerHandler.posts, _outbox_states()) == (0, [], [])
+    finally:
+        _stop(process)
+        harness.close()
