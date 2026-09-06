@@ -64,6 +64,14 @@ UNICODE_15_1_COMPATIBILITY_SEPARATOR_SOURCES = tuple(
     for codepoint in codepoints
 )
 COMBINING_MARK_O_CONFUSABLES = (0x0C02, 0x0C82, 0x0D02, 0x0D82)
+
+
+def _unicode_15_1_mark_codepoints() -> tuple[int, ...]:
+    assert unicodedata2.unidata_version == "15.1.0"
+    return tuple(
+        codepoint for codepoint in range(0x110000)
+        if unicodedata2.category(chr(codepoint)).startswith("M")
+    )
 @pytest.fixture(autouse=True)
 def portable_rest_deadline(monkeypatch):
     """HTTP shape tests run on Windows; POSIX alarm behavior is tested directly."""
@@ -699,6 +707,82 @@ def test_round12_legacy_combining_o_records_are_reclassified_before_delivery(
 def test_round12_combining_o_outside_namespace_reaches_private_conversation_exactly(tmp_path):
     service, rest, conversation = ingress(tmp_path)
     message = "@restricted-bot ordinary \u2017 app\u0c02intment text"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert conversation.calls[0][2] == message and len(rest.created) == 1
+
+
+def test_round13_mark_source_confusables_and_every_unicode_15_1_mark_reserve_namespace():
+    mark_sources = {
+        letter: marked
+        for letter, codepoints in mattermost_ingress._UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES.items()
+        if (marked := tuple(
+            codepoint for codepoint in codepoints if unicodedata2.category(chr(codepoint)).startswith("M")
+        ))
+    }
+    assert mark_sources == {"o": COMBINING_MARK_O_CONFUSABLES}
+    marks = _unicode_15_1_mark_codepoints()
+    assert tuple(
+        codepoint for codepoint in range(0x110000)
+        if mattermost_ingress._namespace_mark(chr(codepoint))
+    ) == marks
+    for source in COMBINING_MARK_O_CONFUSABLES:
+        for mark in marks:
+            for separator in ("-", "\u2017"):
+                assert mattermost_ingress._clinical_namespace(
+                    f"ne{chr(mark)}xt{separator}app{chr(source)}intment",
+                    remove_marks=True, secondary=True, compatibility_separators=True,
+                )
+                assert mattermost_ingress._clinical_namespace(
+                    f"next{separator}{chr(mark)}app{chr(source)}intment",
+                    remove_marks=True, secondary=True, compatibility_separators=True,
+                )
+
+
+@pytest.mark.parametrize("separator", ("-", "\u2017"))
+@pytest.mark.parametrize("source", COMBINING_MARK_O_CONFUSABLES)
+@pytest.mark.parametrize("mark_position", ("letter", "separator"))
+def test_round13_mark_source_confusables_reserve_private_namespace_without_effects(
+    tmp_path, separator, source, mark_position,
+):
+    service, rest, conversation = ingress(tmp_path)
+    namespace = (
+        f"ne\u0301xt{separator}app{chr(source)}intment"
+        if mark_position == "letter" else f"next{separator}\u0301app{chr(source)}intment"
+    )
+    message = f"@restricted-bot {namespace} 123e4567-e89b-42d3-a456-426614174000"
+    candidate = post(message=message)
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="P"))
+    assert mattermost_ingress._clinical_command(message, "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and rest.created == [] and service.outbox.candidates(10) == []
+
+
+@pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
+def test_round13_legacy_mark_source_confusable_record_is_reclassified_before_delivery(tmp_path, ready):
+    service, rest, conversation = ingress(tmp_path)
+    source = post(message=(
+        "@restricted-bot next\u2017\u0301app\u0c02intment "
+        "123e4567-e89b-42d3-a456-426614174000"
+    ))
+    rest.posts[ROOT] = source
+    record, _ = service.outbox.reserve(
+        service._envelope(source, ROOT), payload_capacity=1000, tombstone_capacity=1000,
+    )
+    if ready:
+        record = service.outbox.mark_ready(
+            record, {**record.envelope, "conversation_epoch": "epoch-one", "response": "legacy"},
+        )
+    service.executor.drain()
+    durable = service.outbox.get(record.record_tag)
+    assert durable is not None and durable.state is DeliveryState.BLOCKED
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_round13_mark_source_confusable_outside_namespace_reaches_private_conversation_exactly(tmp_path):
+    service, rest, conversation = ingress(tmp_path)
+    message = "@restricted-bot ordinary \u2017 app\u0c02\u0301intment text"
     candidate = post(message=message)
     rest.posts[ROOT] = candidate
     service.handle(event(candidate, channel_type="P"))

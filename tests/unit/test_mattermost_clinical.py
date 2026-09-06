@@ -214,6 +214,25 @@ def test_round12_compatibility_separator_and_combining_o_reserve_direct_clinical
     assert rest.created == [] and service.outbox.candidates(10) == []
 
 
+@pytest.mark.parametrize("separator", ("-", "\u2017"))
+@pytest.mark.parametrize("source", COMBINING_MARK_O_CONFUSABLES)
+@pytest.mark.parametrize("mark_position", ("letter", "separator"))
+def test_round13_mark_source_confusables_reserve_direct_clinical_namespace(
+    tmp_path, separator, source, mark_position,
+):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    namespace = (
+        f"ne\u0301xt{separator}app{chr(source)}intment"
+        if mark_position == "letter" else f"next{separator}\u0301app{chr(source)}intment"
+    )
+    candidate = post(message=f"@restricted-bot {namespace} {PATIENT}")
+    rest.posts[ROOT] = candidate
+    service.handle(event(candidate, channel_type="D"))
+    assert mattermost_ingress._clinical_command(candidate["message"], "restricted-bot") == ("malformed", None)
+    assert conversation.calls == [] and clinical.queries == [] and clinical.reauthorizations == []
+    assert rest.created == [] and service.outbox.candidates(10) == []
+
+
 @pytest.mark.parametrize("codepoint", RESIDUAL_CLINICAL_COMPATIBILITY_SEPARATOR_SOURCES)
 @pytest.mark.parametrize("ready", [False, True], ids=["waiting-commit", "ready"])
 def test_legacy_compatibility_separator_records_are_reclassified_in_direct_channel(tmp_path, ready, codepoint):

@@ -224,6 +224,15 @@ _SECONDARY_CLINICAL_SOURCE_CONFUSABLES = str.maketrans({
     for letter, codepoints in _UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES.items()
     for codepoint in codepoints
 })
+_SECONDARY_CLINICAL_MARK_O_SOURCES = {
+    0x0C02: "o", 0x0C82: "o", 0x0D02: "o", 0x0D82: "o",
+}
+_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES = str.maketrans({
+    ord(chr(codepoint)): letter
+    for letter, codepoints in _UNICODE_15_1_NEXTAPPOINTMENT_CONFUSABLES.items()
+    for codepoint in codepoints
+    if codepoint not in _SECONDARY_CLINICAL_MARK_O_SOURCES
+})
 # Unicode 15.1.0 DerivedCoreProperties.txt, Default_Ignorable_Code_Point:
 # https://www.unicode.org/Public/15.1.0/ucd/DerivedCoreProperties.txt
 _UNICODE_15_1_DEFAULT_IGNORABLE_RANGES = (
@@ -235,6 +244,18 @@ _UNICODE_15_1_DEFAULT_IGNORABLE_RANGES = (
     (0xE0000, 0xE0000), (0xE0001, 0xE0001), (0xE0002, 0xE001F), (0xE0020, 0xE007F),
     (0xE0080, 0xE00FF), (0xE0100, 0xE01EF), (0xE01F0, 0xE0FFF),
 )
+# Unicode 15.1.0 UnicodeData.txt: Mark additions after CPython 3.11's
+# Unicode 14.0.0 database.  Python 3.11 is the minimum supported runtime.
+_UNICODE_15_1_MARK_ADDITIONS = (
+    (0x0CF3, 0x0CF3), (0x0ECE, 0x0ECE), (0x10EFD, 0x10EFF), (0x11241, 0x11241),
+    (0x11F00, 0x11F01), (0x11F03, 0x11F03), (0x11F34, 0x11F3A), (0x11F3E, 0x11F42),
+    (0x13440, 0x13440), (0x13447, 0x13455), (0x1E08F, 0x1E08F), (0x1E4EC, 0x1E4EF),
+)
+_UNICODE_15_1_MARK_ADDITION_CODEPOINTS = frozenset(
+    codepoint
+    for start, end in _UNICODE_15_1_MARK_ADDITIONS
+    for codepoint in range(start, end + 1)
+)
 
 
 def _namespace_ignorable(character: str) -> bool:
@@ -242,6 +263,20 @@ def _namespace_ignorable(character: str) -> bool:
         return True
     codepoint = ord(character)
     return any(start <= codepoint <= end for start, end in _UNICODE_15_1_DEFAULT_IGNORABLE_RANGES)
+
+
+def _namespace_mark(character: str) -> bool:
+    if unicodedata.category(character).startswith("M"):
+        return True
+    return ord(character) in _UNICODE_15_1_MARK_ADDITION_CODEPOINTS
+
+
+def _secondary_source_confusable_skeleton(value: str) -> str:
+    """Preserve Mark ``o`` sources only at the fixed detection namespace slot."""
+    value = re.sub(
+        r"(?<=app)[\u0c02\u0c82\u0d02\u0d82](?=intment)", "o", value,
+    )
+    return value.translate(_SECONDARY_CLINICAL_NONMARK_SOURCE_CONFUSABLES)
 
 
 def _namespace_skeleton(
@@ -259,11 +294,10 @@ def _namespace_skeleton(
         )
     if secondary:
         value = value.translate(_SECONDARY_CLINICAL_SOURCE_SEPARATORS)
+        value = _secondary_source_confusable_skeleton(value)
     if remove_marks:
         value = unicodedata.normalize("NFD", value)
-        value = "".join(character for character in value if not unicodedata.category(character).startswith("M"))
-    if secondary:
-        value = value.translate(_SECONDARY_CLINICAL_SOURCE_CONFUSABLES)
+        value = "".join(character for character in value if not _namespace_mark(character))
     normalized = unicodedata.normalize("NFKC", value).casefold().translate(_CONFUSABLES).translate(_DASHES)
     if secondary:
         normalized = normalized.translate(_SECONDARY_CLINICAL_CONFUSABLES)
