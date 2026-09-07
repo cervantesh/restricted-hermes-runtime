@@ -57,7 +57,9 @@ def test_clinical_e2e_uses_current_hrh_build_provenance_and_atomic_policy_refres
     assert "BUILD_SHA: ${CLINICAL_HRH_BUILD_SHA:?required}" in compose
     assert 'HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"' in runner
     assert 'HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"' in runner
-    assert 'C:\\dev\\Health-Record-Hub-wt-restricted-hermes-clinical-current' in runner
+    assert 'CLINICAL_E2E_HRH_ROOT' in runner
+    assert 'CLINICAL_E2E_HRH_ROOT must name a clean HRH checkout' in runner
+    assert r'C:\dev' not in runner
     assert '"CLINICAL_HRH_BUILD_SHA": HRH_SHA' in runner
     assert "no published HRH registry digest, SBOM, provenance attestation, or no-rebuild verification" in runner
     assert "os.replace" in control
