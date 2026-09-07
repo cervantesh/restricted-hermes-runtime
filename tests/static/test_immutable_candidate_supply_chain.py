@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -214,20 +215,23 @@ def test_candidate_workflow_exports_published_digests_before_consuming_them_and_
     assert '--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/immutable-candidate.yml"' in consumer
     assert "verify_published_attestations.py" in consumer
     assert "inspect_published_subject.py" in consumer
+    assert 'glob("restricted-*.json")' not in source
+    assert source.count('root / f"{name}.json"') >= 3
     builder = (ROOT / "tools" / "build_immutable_candidate_manifest.py").read_text(encoding="utf-8")
     assert '"verified": True' not in builder
 
 
 def test_published_mode_fails_before_any_docker_fallback_when_digest_is_absent():
-    bash = Path("C:/Program Files/Git/bin/bash.exe")
-    if not bash.exists():
+    candidates = [shutil.which("bash"), "C:/Program Files/Git/bin/bash.exe"]
+    bash = next((candidate for candidate in candidates if candidate and Path(candidate).exists() and subprocess.run([candidate, "--version"], capture_output=True, text=True).returncode == 0), None)
+    if bash is None:
         pytest.skip("Git Bash unavailable")
     for script, variable in (
         (ROOT / "tests" / "deployment" / "test_mattermost_ingress_image.sh", "RESTRICTED_MATTERMOST_IMAGE_DIGEST"),
         (ROOT / "tests" / "deployment" / "test_clinical_adapter_image.sh", "RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST"),
     ):
         result = subprocess.run(
-            [str(bash), str(script)], cwd=ROOT,
+            [bash, str(script)], cwd=ROOT,
             env={**os.environ, "RESTRICTED_PUBLISHED_CANDIDATE": "1", variable: ""},
             capture_output=True, text=True,
         )
@@ -328,7 +332,9 @@ def test_actual_candidate_layout_receipts_build_and_verify_from_repo_root(tmp_pa
         assert generated.returncode == 0, generated.stderr
         platform = {"schema_version": "restricted-runtime-subject-receipt.v1", "image": image, "subject_digest": digest, "source_revision": revision, "workflow_run_url": run_url, "resolved_platform": "linux/amd64", "subject_kind": "manifest", "linux_amd64_child_digest": digest, "source": "https://github.com/cervantesh/restricted-hermes-runtime", "labels": {"org.opencontainers.image.source": "https://github.com/cervantesh/restricted-hermes-runtime", "org.opencontainers.image.revision": revision}}
         (verification / f"{name}.platform.json").write_text(json.dumps(platform), encoding="utf-8")
-    assert json.loads((verification / "restricted-mattermost-ingress.attestations.json").read_text())["provenance"]["raw_artifact"].startswith("candidate-subjects/")
+        (candidate / f"{name}.spdx.json").write_text(json.dumps({"not": "a subject receipt"}), encoding="utf-8")
+    attestation_receipt = json.loads((verification / "restricted-mattermost-ingress.attestations.json").read_text())
+    assert attestation_receipt["provenance"]["raw_artifact"].startswith("candidate-subjects/")
     test_receipts = {name: [{"name": "closure", "outcome": "passed", "subject_digest": item["digest"], "receipt": run_url}] for name, item in subjects.items()}
     (candidate / "test-receipts.json").write_text(json.dumps(test_receipts), encoding="utf-8")
     command_ids = ["mattermost-role-closure", "clinical-role-closure", "subject-platform-source-inspection", "provenance-predicate-verification", "spdx-sbom-predicate-verification", "clinical-protocol", "mattermost-esr"]

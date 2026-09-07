@@ -29,18 +29,18 @@ jobs:
             dockerfile: Dockerfile.clinical-adapter
     steps:
       - name: Check out the candidate revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.0.0
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.0.0
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Build once and publish the immutable linux/amd64 subject
         id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.0.0
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -52,7 +52,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           provenance: mode=max
       - name: Attach GitHub build provenance to the final OCI subject
-        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3.0.0
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -91,7 +91,7 @@ jobs:
           Path(f"candidate-subjects/{record['name']}.json").write_text(json.dumps(record), encoding="utf-8")
           PY
       - name: Upload immutable subject receipt
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.0.0
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: immutable-subject-${{ matrix.subject }}
           path: |
@@ -108,21 +108,21 @@ jobs:
       packages: read
     steps:
       - name: Check out the candidate revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Log in to GHCR for private subject consumption
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.0.0
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.11"
       - name: Install bounded test dependencies
         run: python -m pip install --disable-pip-version-check -e ".[test,google]"
       - name: Download immutable subject receipts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.0.0
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: candidate-subjects
           pattern: immutable-subject-*
@@ -132,7 +132,8 @@ jobs:
           python - <<'PY' >> "$GITHUB_ENV"
           import json
           from pathlib import Path
-          records = {p.stem: json.loads(p.read_text()) for p in Path("candidate-subjects").glob("restricted-*.json")}
+          root = Path("candidate-subjects")
+          records = {name: json.loads((root / f"{name}.json").read_text()) for name in ("restricted-mattermost-ingress", "restricted-clinical-adapter")}
           for name, env in (("restricted-mattermost-ingress", "RESTRICTED_MATTERMOST_IMAGE_DIGEST"), ("restricted-clinical-adapter", "RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST")):
               image = records.get(name, {}).get("image", "")
               if not image.startswith(f"ghcr.io/cervantesh/{name}@sha256:"):
@@ -174,7 +175,7 @@ jobs:
           import json
           from pathlib import Path
           root = Path("candidate-subjects")
-          subjects = [json.loads(path.read_text()) for path in root.glob("restricted-*.json")]
+          subjects = [json.loads((root / f"{name}.json").read_text()) for name in ("restricted-mattermost-ingress", "restricted-clinical-adapter")]
           manifest = {"schema_version": "restricted-runtime-immutable-candidate.v1", "source_revision": "${{ github.sha }}", "platform": "linux/amd64", "workflow": {"repository": "cervantesh/restricted-hermes-runtime", "path": ".github/workflows/immutable-candidate.yml", "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}, "subjects": subjects}
           (root / "published-subjects.json").write_text(json.dumps(manifest))
           PY
@@ -186,7 +187,7 @@ jobs:
           from pathlib import Path
           root = Path("candidate-subjects")
           url = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          records = {p.stem: json.loads(p.read_text()) for p in root.glob("restricted-*.json")}
+          records = {name: json.loads((root / f"{name}.json").read_text()) for name in ("restricted-mattermost-ingress", "restricted-clinical-adapter")}
           tests = {name: [{"name": "published-role-and-path-closure", "outcome": "passed", "subject_digest": item["digest"], "receipt": url}] for name, item in records.items()}
           (root / "test-receipts.json").write_text(json.dumps(tests))
           commands = [
@@ -204,7 +205,7 @@ jobs:
           python tools/build_immutable_candidate_manifest.py --repo-root . --source-revision "$GITHUB_SHA" --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --subject-dir candidate-subjects --test-receipts candidate-subjects/test-receipts.json --verification-dir candidate-subjects/candidate-verification --evidence candidate-subjects/candidate-evidence.json --output candidate-subjects/candidate.manifest.json
           python tools/verify_immutable_candidate.py candidate-subjects/candidate.manifest.json --repo-root . --closed-subjects-only
       - name: Upload immutable candidate evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.0.0
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: immutable-candidate-evidence
           path: candidate-subjects/
