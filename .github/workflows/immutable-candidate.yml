@@ -143,8 +143,8 @@ jobs:
           mkdir -p candidate-subjects/candidate-verification
           for name in restricted-mattermost-ingress restricted-clinical-adapter; do
             if [[ "$name" == "restricted-mattermost-ingress" ]]; then image="$RESTRICTED_MATTERMOST_IMAGE_DIGEST"; else image="$RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST"; fi
-            gh attestation verify "oci://$image" --repo "$GITHUB_REPOSITORY" --bundle-from-oci --source-digest "$GITHUB_SHA" --predicate-type https://slsa.dev/provenance/v1 --format=json > "candidate-subjects/candidate-verification/$name.provenance.json"
-            gh attestation verify "oci://$image" --repo "$GITHUB_REPOSITORY" --bundle-from-oci --source-digest "$GITHUB_SHA" --predicate-type https://spdx.dev/Document --format=json > "candidate-subjects/candidate-verification/$name.sbom.json"
+            gh attestation verify "oci://$image" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/immutable-candidate.yml" --bundle-from-oci --source-digest "$GITHUB_SHA" --predicate-type https://slsa.dev/provenance/v1 --format=json > "candidate-subjects/candidate-verification/$name.provenance.json"
+            gh attestation verify "oci://$image" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/immutable-candidate.yml" --bundle-from-oci --source-digest "$GITHUB_SHA" --predicate-type https://spdx.dev/Document --format=json > "candidate-subjects/candidate-verification/$name.sbom.json"
             python tools/verify_published_attestations.py --image "$image" --source-revision "$GITHUB_SHA" --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --provenance "candidate-subjects/candidate-verification/$name.provenance.json" --sbom "candidate-subjects/candidate-verification/$name.sbom.json" --output "candidate-subjects/candidate-verification/$name.attestations.json"
           done
       - name: Prove the bounded clinical adapter protocol remains closed
@@ -172,10 +172,19 @@ jobs:
           records = {p.stem: json.loads(p.read_text()) for p in root.glob("restricted-*.json")}
           tests = {name: [{"name": "published-role-and-path-closure", "outcome": "passed", "subject_digest": item["digest"], "receipt": url}] for name, item in records.items()}
           (root / "test-receipts.json").write_text(json.dumps(tests))
-          evidence = {"source_revision": "${{ github.sha }}", "workflow_run_url": url, "phi_authorized": False, "deployment_conformant": False, "commands": [{"name": "published-role-closure", "outcome": "passed"}, {"name": "clinical-protocol", "outcome": "passed"}, {"name": "mattermost-esr", "outcome": "passed"}], "results": {"published_role_closure": "passed", "clinical_protocol": "passed", "mattermost_esr": "passed"}, "summary": {"passed": 3, "skipped": 0, "failed": 0}, "subject_digests": {name: item["digest"] for name, item in records.items()}}
+          commands = [
+              {"id": "mattermost-role-closure", "command": "bash tests/deployment/test_mattermost_ingress_image.sh", "outcome": "passed", "exit_code": 0},
+              {"id": "clinical-role-closure", "command": "bash tests/deployment/test_clinical_adapter_image.sh", "outcome": "passed", "exit_code": 0},
+              {"id": "subject-platform-source-inspection", "command": "python tools/inspect_published_subject.py (two digest-pinned subjects)", "outcome": "passed", "exit_code": 0},
+              {"id": "provenance-predicate-verification", "command": "gh attestation verify --predicate-type https://slsa.dev/provenance/v1 (two exact OCI subjects)", "outcome": "passed", "exit_code": 0},
+              {"id": "spdx-sbom-predicate-verification", "command": "gh attestation verify --predicate-type https://spdx.dev/Document (two exact OCI subjects)", "outcome": "passed", "exit_code": 0},
+              {"id": "clinical-protocol", "command": "python -m pytest tests/unit/test_clinical_adapter.py tests/integration/test_clinical_adapter_process.py", "outcome": "passed", "exit_code": 0},
+              {"id": "mattermost-esr", "command": "python tests/deployment/test_mattermost_esr_staging.py", "outcome": "passed", "exit_code": 0},
+          ]
+          evidence = {"source_revision": "${{ github.sha }}", "workflow_run_url": url, "phi_authorized": False, "deployment_conformant": False, "commands": commands, "results": {item["id"]: item["outcome"] for item in commands}, "summary": {"passed": len(commands), "skipped": 0, "failed": 0}, "subject_digests": {name: item["digest"] for name, item in records.items()}}
           (root / "candidate-evidence.json").write_text(json.dumps(evidence))
           PY
-          python tools/build_immutable_candidate_manifest.py --source-revision "$GITHUB_SHA" --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --subject-dir candidate-subjects --test-receipts candidate-subjects/test-receipts.json --verification-dir candidate-subjects/candidate-verification --evidence candidate-subjects/candidate-evidence.json --output candidate-subjects/candidate.manifest.json
+          python tools/build_immutable_candidate_manifest.py --repo-root . --source-revision "$GITHUB_SHA" --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --subject-dir candidate-subjects --test-receipts candidate-subjects/test-receipts.json --verification-dir candidate-subjects/candidate-verification --evidence candidate-subjects/candidate-evidence.json --output candidate-subjects/candidate.manifest.json
           python tools/verify_immutable_candidate.py candidate-subjects/candidate.manifest.json --repo-root . --closed-subjects-only
       - name: Upload immutable candidate evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.0.0
