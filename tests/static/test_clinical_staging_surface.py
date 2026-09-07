@@ -53,7 +53,7 @@ def test_staging_volumes_are_external_exactly_named_and_label_verified_by_wrappe
 def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     script = (STAGING / "clinical_staging.py").read_text(encoding="utf-8")
     runbook = (STAGING / "README.md").read_text(encoding="utf-8")
-    for command in ("init", "up", "status", "refresh-policy", "stop", "reset", "destroy"):
+    for command in ("init", "up", "status", "refresh-policy", "stop", "backup", "restore", "reset", "destroy"):
         assert command in script
     assert "docker system prune" not in script
     assert '"--remove-orphans"' not in script
@@ -61,6 +61,10 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert "verify_destructive_resources" in script
     assert "expected_images" in script
     assert "fsync_directory" in script
+    assert "validate_backup_bundle" in script
+    assert "expected_manifest_sha256" in script
+    assert "EXCLUDED_RECOVERY_VOLUME" in script
+    assert "ownership_sha256" in script
     assert "synthetic-only" in runbook
     assert "not HIPAA" in runbook
     assert "not production" in runbook
@@ -73,6 +77,8 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert "Dockerfile.web.clinical-candidate" in script
     assert "Dockerfile.migrate.clinical-candidate" in script
     assert "verify_hrh_candidate_build_inputs(self.hrh)" in script
+    assert "Cold backup and restore" in runbook
+    assert "not a scheduled backup" in runbook
 
 
 def test_egress_failure_packet_is_content_safe_and_outside_disposable_state():

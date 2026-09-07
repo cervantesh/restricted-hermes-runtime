@@ -21,8 +21,8 @@ generated synthetic fixtures.
 - A clean runtime checkout descending from
   `41464aee8748f857153ba2b47377515d4847d210`.
 - A clean Health-Record-Hub checkout at exactly
-  `ad13735e9881a48580a9e138daac137f8c865dea`, with tree
-  `f217b0b1cf7f438422528dfe178d81b78212c68b`.
+  `e30a4f968de6727519f49c08369f561fdf269ec5`, with tree
+  `7fb2543a2ceb1649f05c467b38708d1404106659`.
 - A fresh absolute state directory outside either repository. Its basename must
   be `<project>.synthetic-clinical-staging`.
 - A project matching `clinicalstaging[a-z0-9]{1,32}`.
@@ -92,3 +92,65 @@ If initialization stops before `status` succeeds, do not hand-edit the marker,
 environment file or Docker labels. Diagnose the failing bounded command, then
 use `destroy` only after its label/path/project checks succeed. A failed safety
 check is intentionally not bypassable through this wrapper.
+
+## Cold backup and restore
+
+`backup` and `restore` are a deliberately bounded cold-recovery witness. This
+is not a scheduled backup: it does not provide encrypted storage, retention
+policy, support a hot restore, or make a production/PHI claim.
+
+Stop a healthy candidate first. Choose a **new, absolute** backup directory
+outside the runtime checkout, Health-Record-Hub checkout and private staging
+state. The operator must record the printed manifest SHA-256 independently of
+the backup directory; `restore` refuses a bundle without that external value.
+
+```bash
+backup=/absolute/operator-backups/clinicalstagingdemo-cold-001
+
+python "$tool" --hrh-root "$hrh" --state-dir "$state" --project "$project" stop
+python "$tool" --hrh-root "$hrh" --state-dir "$state" --project "$project" \
+  backup --backup-dir "$backup"
+# Record manifest_sha256 from the JSON result outside "$backup".
+
+python "$tool" --hrh-root "$hrh" --state-dir "$state" --project "$project" destroy
+python "$tool" --hrh-root "$hrh" --state-dir "$state" --project "$project" \
+  restore --backup-dir "$backup" --expected-manifest-sha256 '<externally-recorded-sha256>'
+```
+
+The backup contains the private state directory and ten explicitly named
+persistent volumes. `clinical_socket` is intentionally not exported; the
+restore creates it empty and `clinical-socket-init` reconstructs the transport
+socket during the ordered startup. Before reading any volume, `backup` removes
+the stopped Compose containers and refuses every remaining container mount of
+an exact staging volume, including an unlabeled debug or orphan container. Each
+archive is fsynced before the manifest is written; the manifest is fsynced
+before `COMPLETE`, and `COMPLETE` is fsynced before the temporary directory is
+atomically published. A partial directory is never a restore input.
+
+The one-shot archive helper has no network, a read-only root filesystem,
+`no-new-privileges`, no Docker socket, and only its two exact mounts. Backup
+gets only `DAC_OVERRIDE`, which is required to read persisted service-owned
+files and write the private `0700` bundle bind. Restore gets exactly
+`DAC_OVERRIDE`, `CHOWN`, and `FOWNER`: the real cold-restore witness proved
+that tar cannot restore PostgreSQL's archived numeric UID/GID without `CHOWN`,
+then cannot restore the archived mode without `FOWNER`. A fixed per-volume UID
+would not be safe or sufficient: existing data may have arbitrary persisted
+service ownership, so it cannot universally traverse the source tree or
+preserve the numeric owner and mode metadata required by this cold format. The
+helper is always root only for that bounded transfer; it receives only one
+named source/destination volume and the bundle bind for that invocation.
+
+Before Docker state or the destination state directory is changed, `restore`
+requires the exact member allowlist, completion marker, external manifest hash,
+safe non-link tar members, marker/source identity, every member hash and an
+empty destination with no conflicting named or labeled Docker resource. It
+first copies the complete input bundle into a private snapshot, validates that
+snapshot, and consumes only that snapshot; a mutable operator directory is
+never read after validation. It then starts databases/migration,
+Mattermost/proxy, HRH/socket/adapter and ingress in that order, and runs the
+normal status/identity/confinement/policy checks. The immediate receipt records
+only a mechanical restore. The separate `causal_e2e_verified` receipt is
+published only by the synthetic drill after its causal controls and artifact
+scan pass. If an error occurs after the temporary recovery state is published,
+it remains in a non-operational `recovering` lifecycle; use `destroy` before
+retrying instead of attempting to start or hand-edit it.

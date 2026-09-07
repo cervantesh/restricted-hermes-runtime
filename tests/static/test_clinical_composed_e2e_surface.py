@@ -82,6 +82,9 @@ def test_clinical_e2e_uses_current_hrh_build_provenance_and_atomic_policy_refres
     assert 'CLINICAL_E2E_HRH_ROOT must name a clean HRH checkout' in runner
     assert r'C:\dev' not in runner
     assert '"CLINICAL_HRH_BUILD_SHA": HRH_SHA' in runner
+    assert "sealed_compose_environment" in runner
+    assert "SAFE_COMPOSE_PROCESS_ENV" in runner
+    assert "env=sealed_compose_environment()" in runner
     assert "no published HRH registry digest, SBOM, provenance attestation, or no-rebuild verification" in runner
     assert "os.replace" in control
     assert 'command == "policy-digest"' in control

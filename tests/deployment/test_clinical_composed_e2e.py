@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import subprocess
@@ -34,6 +35,11 @@ NGINX_IMAGE = "nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e
 RUNTIME_PRODUCT_SHA = "8049dd7612176b33e65ef19f61f5699aef7e0a28"
 HRH_SHA = "e30a4f968de6727519f49c08369f561fdf269ec5"
 HRH_TREE = "7fb2543a2ceb1649f05c467b38708d1404106659"
+COMPOSE_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+SAFE_COMPOSE_PROCESS_ENV = (
+    "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG",
+    "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR",
+)
 PROJECT = f"clinicale2e{os.getpid()}_{int(time.time())}"
 STATE = Path(tempfile.mkdtemp(prefix="clinical-composed-e2e-"))
 SEED = STATE / "seed"
@@ -65,16 +71,52 @@ CREATED = False
 SOURCE_FRAME: dict[str, str] = {}
 
 
-def run(*args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(args, cwd=ROOT, text=True, capture_output=True, timeout=timeout, check=False, encoding="utf-8", errors="replace")
+def run(
+    *args: str,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+    timeout: int = 300,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        args, cwd=ROOT, env=env, text=True, capture_output=True, timeout=timeout,
+        check=False, encoding="utf-8", errors="replace",
+    )
     if check and result.returncode:
         command = Path(args[0]).name if args and Path(args[0]).name in {"docker", "git"} else "child"
         raise RuntimeError(f"command failed: {command} exit={result.returncode}")
     return result
 
 
+def sealed_compose_environment() -> dict[str, str]:
+    """Return only Docker transport variables plus the generated E2E contract.
+
+    Docker Compose resolves shell variables before values from ``--env-file``.
+    Passing the inherited process environment would therefore let a caller's
+    ``CLINICAL_*`` setting silently replace this run's pinned HRH frame.
+    """
+    try:
+        lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise RuntimeError("clinical composed E2E environment is unavailable") from exc
+    sealed: dict[str, str] = {}
+    for line in lines:
+        key, delimiter, value = line.partition("=")
+        if not delimiter or not COMPOSE_ENV_RE.fullmatch(key) or key in sealed:
+            raise RuntimeError("clinical composed E2E environment is malformed")
+        sealed[key] = value
+    if not sealed:
+        raise RuntimeError("clinical composed E2E environment is empty")
+    process = {key: os.environ[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in os.environ}
+    process.update(sealed)
+    return process
+
+
 def compose(*args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[str]:
-    return run("docker", "compose", "--env-file", str(ENV_FILE), "--project-name", PROJECT, "--file", str(COMPOSE_FILE), *args, check=check, timeout=timeout)
+    return run(
+        "docker", "compose", "--env-file", str(ENV_FILE), "--project-name", PROJECT,
+        "--file", str(COMPOSE_FILE), *args, env=sealed_compose_environment(),
+        check=check, timeout=timeout,
+    )
 
 
 def cleanup() -> None:
@@ -508,6 +550,9 @@ def main() -> None:
         compose("stop", "ingress", check=False)
         emit_public_debug("valid-command")
         raise
+    known_success = json.loads(control("grant-evidence", "success").stdout)
+    if known_success["audits"].get("restricted_hermes_delivery_reauthorized", 0) != 1:
+        raise RuntimeError("known delivery did not obtain exactly one authorization")
     boundaries = network_and_surface_controls()
     phase("identity-controls")
     control("send", "denied", "denied_dm", "018f22bb-414d-7cc4-b5a4-83cc8ec92cb1", "actor-cross")
@@ -533,12 +578,12 @@ def main() -> None:
     control("send", "actor", "actor_dm", "018f22bb-414d-7cc4-b5a4-83cc8ec92cb1", "source-deleted")
     wait_grants(before)
     wait_delivery_delay()
-    ready_records = [row for row in paused_outbox_snapshot() if row.get("state") == "READY"]
-    if len(ready_records) != 1:
-        raise RuntimeError("source-deletion barrier did not isolate exactly one READY outbox record")
-    source_before = ready_records[0]
+    in_flight_records = [row for row in paused_outbox_snapshot() if row.get("state") == "IN_FLIGHT"]
+    if len(in_flight_records) != 1:
+        raise RuntimeError("source-deletion barrier did not isolate exactly one IN_FLIGHT outbox record")
+    source_before = in_flight_records[0]
     if source_before.get("reason") != "" or source_before.get("nonce_erased") or source_before.get("ciphertext_erased"):
-        raise RuntimeError("source-deletion READY record did not retain its encrypted payload")
+        raise RuntimeError("source-deletion IN_FLIGHT record did not retain its encrypted payload")
     source_record_tag = source_before.get("record_tag")
     if not isinstance(source_record_tag, str) or len(source_record_tag) != 64:
         raise RuntimeError("source-deletion READY record tag was invalid")
@@ -552,8 +597,8 @@ def main() -> None:
     source_after = terminal_records[0]
     expected_after = {
         "record_tag": source_record_tag,
-        "state": "BLOCKED",
-        "reason": "current_authorization_rejected",
+        "state": "AMBIGUOUS",
+        "reason": "delivery_authorization_unknown",
         "generation": int(source_before["generation"]) + 1,
         "nonce_erased": True,
         "ciphertext_erased": True,
@@ -563,6 +608,9 @@ def main() -> None:
             "source deletion did not produce the observed terminal contract: "
             + json.dumps(source_after, sort_keys=True)
         )
+    source_delivery = json.loads(control("grant-evidence", "source-deleted").stdout)
+    if source_delivery["audits"].get("restricted_hermes_delivery_reauthorized", 0) != 1:
+        raise RuntimeError("source-deletion unknown delivery did not obtain exactly one authorization")
     phase("crash-retry")
     control("mutate", "reset")
     before = int(control("grant-count").stdout.strip())
@@ -574,15 +622,38 @@ def main() -> None:
         compose("stop", "ingress", check=False)
         emit_public_debug("crash-retry")
         raise
+    wait_delivery_delay()
     before_crash = json.loads(control("grant-evidence", "crash-retry").stdout)
     if before_crash["audits"].get("restricted_hermes_next_appointment_read_authorized") != 1 or before_crash["audits"].get("restricted_hermes_next_appointment_read_completed") != 1:
         raise RuntimeError("crash window did not follow exactly one durable clinical read")
+    crash_records = [row for row in paused_outbox_snapshot() if row.get("state") == "IN_FLIGHT"]
+    if len(crash_records) != 1:
+        raise RuntimeError("crash window did not isolate exactly one IN_FLIGHT outbox record")
+    crash_before = crash_records[0]
+    crash_record_tag = crash_before.get("record_tag")
+    if not isinstance(crash_record_tag, str) or len(crash_record_tag) != 64:
+        raise RuntimeError("crash IN_FLIGHT record tag was invalid")
     compose("kill", "ingress")
     control("mutate", "drop-crash-delay", timeout=60)
     compose("up", "--detach", "ingress")
     wait_ingress()
-    control("expect", "crash-retry", "reply", timeout=60)
+    wait_delivery_reauthorized("crash-retry")
+    control("expect", "crash-retry", "no-reply", timeout=60)
     after_recovery = json.loads(control("grant-evidence", "crash-retry").stdout)
+    crash_after_rows = paused_outbox_snapshot(crash_record_tag)
+    if len(crash_after_rows) != 1:
+        raise RuntimeError("crash terminal record was not found by exact tag")
+    crash_after = crash_after_rows[0]
+    expected_crash_after = {
+        "record_tag": crash_record_tag,
+        "state": "AMBIGUOUS",
+        "reason": "restart_in_flight",
+        "generation": int(crash_before["generation"]) + 1,
+        "nonce_erased": True,
+        "ciphertext_erased": True,
+    }
+    if crash_after != expected_crash_after:
+        raise RuntimeError("crash recovery did not erase the unknown delivery: " + json.dumps(crash_after, sort_keys=True))
     crash_invariants = {
         "response_digest_equal": after_recovery["response_digest"] == before_crash["response_digest"],
         "read_authorized": after_recovery["audits"].get("restricted_hermes_next_appointment_read_authorized", 0),
@@ -594,9 +665,9 @@ def main() -> None:
         "response_digest_equal": True,
         "read_authorized": 1,
         "read_completed": 1,
-        # The first server-side reauthorization commits after the client is
-        # killed; recovery must obtain a second fresh authorization before post.
-        "delivery_reauthorized": 2,
+        # The server-side authorization can commit after the client crashes,
+        # but the durable claim fences recovery from asking a second time.
+        "delivery_reauthorized": 1,
     }:
         raise RuntimeError(
             "crash recovery invariant mismatch: " + json.dumps(crash_invariants, sort_keys=True)
@@ -616,6 +687,8 @@ def main() -> None:
         "source_deleted": int(control("post-count", "source-deleted").stdout.strip()),
         **{label: int(control("post-count", label).stdout.strip()) for label in denied_labels},
     }
+    if post_counts["valid"] != 1 or post_counts["recovered"] != 0 or post_counts["source_deleted"] != 0:
+        raise RuntimeError("known/unknown delivery post-count contract failed: " + json.dumps(post_counts, sort_keys=True))
     phase("evidence")
     logs = scan_logs(_known_secret_canaries())
     evidence = {
@@ -636,8 +709,10 @@ def main() -> None:
             "before": source_before,
             "after": source_after,
         },
+        "known_success": known_success,
+        "crash_unknown": {"before": crash_before, "after": crash_after},
         "post_counts": post_counts,
-        "scenarios": {"valid": "pass", "actor_cross": "deny", "channel_cross": "deny", "patient_cross": "deny", "unbound": "deny", "disabled": "deny", "missing_each_permission": "deny", "revoked_before_delivery": "zero-post", "source_deleted_before_delivery": "blocked-zero-post", "swapped_digest": "deny", "crash_retry": "stable-result", "logs": "no synthetic identifiers or secret canaries"},
+        "scenarios": {"valid": "one-authorization-one-post", "actor_cross": "deny", "channel_cross": "deny", "patient_cross": "deny", "unbound": "deny", "disabled": "deny", "missing_each_permission": "deny", "revoked_before_delivery": "zero-post", "source_deleted_before_delivery": "ambiguous-zero-post", "swapped_digest": "deny", "crash_retry": "ambiguous-zero-post", "logs": "no synthetic identifiers or secret canaries"},
         "retained_output_secret_canaries_absent": sorted(_known_secret_canaries()),
         "residual_limitations": [
             "Synthetic data and a test CA were used; this is technical conformance evidence, not a compliance certification.",
