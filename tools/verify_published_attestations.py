@@ -84,11 +84,12 @@ def main() -> int:
     _, digest = args.image.rsplit("@", 1)
     if not DIGEST.fullmatch(digest):
         raise SystemExit("image digest is invalid")
-    if not _contains_subject(_load(provenance_path), digest, "https://slsa.dev/provenance/v1"):
-        raise SystemExit("provenance verification does not name the exact subject")
-    if not _contains_subject(_load(sbom_path), digest, "https://spdx.dev/Document/v2.3"):
-        raise SystemExit("SPDX verification does not name the exact subject")
     provenance = _load(provenance_path)
+    sbom = _load(sbom_path)
+    if not _contains_subject(provenance, digest, "https://slsa.dev/provenance/v1"):
+        raise SystemExit("provenance verification does not name the exact subject")
+    if not _contains_subject(sbom, digest, "https://spdx.dev/Document/v2.3"):
+        raise SystemExit("SPDX verification does not name the exact subject")
     if not _contains_revision(provenance, args.source_revision):
         raise SystemExit("provenance verification does not name the expected source revision")
     result: dict[str, Any] = {"schema_version": "restricted-runtime-attestation-receipt.v1", "image": args.image, "digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.workflow_run_url, "provenance": {"predicate_type": "https://slsa.dev/provenance/v1", **_raw_ref(provenance_path, repo_root)}, "sbom": {"predicate_type": "https://spdx.dev/Document/v2.3", **_raw_ref(sbom_path, repo_root)}}
