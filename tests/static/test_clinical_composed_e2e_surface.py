@@ -59,5 +59,6 @@ def test_clinical_e2e_uses_current_hrh_build_provenance_and_atomic_policy_refres
     assert 'HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"' in runner
     assert 'C:\\dev\\Health-Record-Hub-wt-restricted-hermes-clinical-current' in runner
     assert '"CLINICAL_HRH_BUILD_SHA": HRH_SHA' in runner
+    assert "no published HRH registry digest, SBOM, provenance attestation, or no-rebuild verification" in runner
     assert "os.replace" in control
     assert 'command == "policy-digest"' in control
