@@ -65,3 +65,8 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert "not HIPAA" in runbook
     assert "not production" in runbook
     assert "privileged provisioner" in runbook
+    assert "dropped capabilities" in runbook
+    assert "no-new-privileges" in runbook
+    assert 'RUNTIME_BASE_SHA = "41464aee8748f857153ba2b47377515d4847d210"' in script
+    assert 'REQUIRED_HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"' in script
+    assert 'REQUIRED_HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"' in script

@@ -314,7 +314,7 @@ def _publisher_inspections(module, port: str = "18443"):
     def expected():
         return {"18444/tcp": [{"HostIp": "127.0.0.1", "HostPort": port}]}
 
-    return {
+    result = {
         service: {
             "Id": f"id-{service}",
             "State": {"StartedAt": "2026-09-06T15:00:00.000000000Z"},
@@ -323,6 +323,11 @@ def _publisher_inspections(module, port: str = "18443"):
         }
         for service in module.LONG_RUNNING_SERVICES
     }
+    for service, controls in _restricted_control_inspections().items():
+        result[service]["Config"] = controls["Config"]
+        result[service]["HostConfig"].update(controls["HostConfig"])
+        result[service]["Mounts"] = controls["Mounts"]
+    return result
 
 
 def _compose_rows(module):
@@ -426,6 +431,98 @@ def test_network_guard_requires_internal_core_and_proxy_only_access():
     inspected["ingress"]["NetworkSettings"]["Networks"]["bridge"] = {}
     with pytest.raises(module.SafetyError, match="ingress.*network membership"):
         module.verify_network_topology(project, inspected, networks)
+
+
+def _restricted_control_inspections():
+    return {
+        "clinical-adapter": {
+            "Config": {"User": "restricted-clinical-adapter"},
+            "HostConfig": {
+                "Privileged": False,
+                "ReadonlyRootfs": True,
+                "CapDrop": ["ALL"],
+                "SecurityOpt": ["no-new-privileges=true"],
+                "Tmpfs": {
+                    "/tmp": "rw,noexec,nosuid,size=16m,mode=0700,uid=10008,gid=20007",
+                },
+            },
+            "Mounts": [
+                {"Destination": "/run/restricted-clinical", "RW": True},
+                {"Destination": "/run/clinical-config", "RW": False},
+                {"Destination": "/run/hrh-secret", "RW": False},
+                {"Destination": "/run/hrh-tls", "RW": False},
+            ],
+        },
+        "ingress": {
+            "Config": {"User": "restricted-mattermost-ingress"},
+            "HostConfig": {
+                "Privileged": False,
+                "ReadonlyRootfs": True,
+                "CapDrop": ["ALL"],
+                "SecurityOpt": ["no-new-privileges=true"],
+                "Tmpfs": {
+                    "/tmp": "rw,noexec,nosuid,size=16m,mode=0700,uid=10007,gid=20005",
+                },
+            },
+            "Mounts": [
+                {"Destination": "/run/restricted-clinical", "RW": True},
+                {"Destination": "/run/ingress", "RW": False},
+                {"Destination": "/var/lib/restricted-mattermost-outbox", "RW": True},
+            ],
+        },
+    }
+
+
+def test_restricted_container_guard_requires_exact_effective_confinement():
+    module = load_module()
+    inspected = _restricted_control_inspections()
+    evidence = module.verify_restricted_container_controls(inspected)
+    assert evidence["ingress"] == {
+        "user": "restricted-mattermost-ingress",
+        "privileged": False,
+        "read_only_rootfs": True,
+        "cap_drop": ["ALL"],
+        "no_new_privileges": True,
+        "tmpfs": ["/tmp"],
+        "read_only_mounts": ["/run/ingress"],
+        "writable_mounts": [
+            "/run/restricted-clinical",
+            "/var/lib/restricted-mattermost-outbox",
+        ],
+    }
+
+    mutations = (
+        ("ingress", "Config", "User", "root"),
+        ("ingress", "HostConfig", "Privileged", True),
+        ("ingress", "HostConfig", "ReadonlyRootfs", False),
+        ("ingress", "HostConfig", "CapDrop", []),
+        ("ingress", "HostConfig", "CapAdd", ["NET_ADMIN"]),
+        ("ingress", "HostConfig", "SecurityOpt", []),
+        ("ingress", "HostConfig", "Tmpfs", {
+            "/tmp": "rw,noexec,nosuid,size=16m,size=1g,mode=0700,uid=10007,gid=20005",
+        }),
+    )
+    for service, section, key, value in mutations:
+        changed = json.loads(json.dumps(inspected))
+        changed[service][section][key] = value
+        with pytest.raises(module.SafetyError, match=service):
+            module.verify_restricted_container_controls(changed)
+
+    changed = json.loads(json.dumps(inspected))
+    changed["clinical-adapter"]["Mounts"][2]["RW"] = True
+    with pytest.raises(module.SafetyError, match="clinical-adapter"):
+        module.verify_restricted_container_controls(changed)
+
+    for tmpfs in (
+        "rw,noexec,exec,nosuid,size=16m,mode=0700,uid=10007,gid=20005",
+        "rw,noexec,nosuid,suid,size=16m,mode=0700,uid=10007,gid=20005",
+        "rw,noexec,nosuid,size=16m,size=1g,mode=0700,uid=10007,gid=20005",
+        "rw,noexec,nosuid,size=16m,mode=0700,mode=0777,uid=10007,gid=20005",
+    ):
+        changed = json.loads(json.dumps(inspected))
+        changed["ingress"]["HostConfig"]["Tmpfs"] = {"/tmp": tmpfs}
+        with pytest.raises(module.SafetyError, match="ingress"):
+            module.verify_restricted_container_controls(changed)
 
 
 def test_generated_mattermost_certificate_covers_dns_and_advertised_loopback_ip(tmp_path: Path):
@@ -666,6 +763,7 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
     }
     assert result["tls_probe"] == tls_probe
     assert result["network_exception"] == "operator-proxy only: operator_access is non-internal"
+    assert result["restricted_container_controls"]["clinical-adapter"]["read_only_rootfs"] is True
     assert result["ingress_started_at"] == "2026-09-06T15:00:00.000000000Z"
     assert ingress_log_calls == [
         (

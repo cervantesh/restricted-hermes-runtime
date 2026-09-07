@@ -15,9 +15,10 @@ generated synthetic fixtures.
 
 - Linux with Docker Engine and Compose v2.
 - A clean runtime checkout descending from
-  `c6c41a0980ed21de95d324c828ee9c5bb50cb8dd`.
+  `41464aee8748f857153ba2b47377515d4847d210`.
 - A clean Health-Record-Hub checkout at exactly
-  `89fea476ef95a0dfd3cd60a587ec6cb9e1d3aa1f`.
+  `ad13735e9881a48580a9e138daac137f8c865dea`, with tree
+  `f217b0b1cf7f438422528dfe178d81b78212c68b`.
 - A fresh absolute state directory outside either repository. Its basename must
   be `<project>.synthetic-clinical-staging`.
 - A project matching `clinicalstaging[a-z0-9]{1,32}`.
@@ -77,7 +78,10 @@ synthetic environment; `destroy` removes the bounded state directory.
 `status` writes `evidence/status.json`, binding the runtime and HRH heads and
 trees, built image IDs, current policy digest, requested and effective loopback
 publisher tuples, the CA-verified TLS probe, the narrow network exception,
-lifecycle state and nonclaims. `evidence/last-transition.json` records a normal stop.
+the effective non-root identity, read-only root filesystem, dropped capabilities,
+`no-new-privileges`, bounded tmpfs and exact mount modes of the restricted
+ingress and clinical-adapter containers, lifecycle state and nonclaims.
+`evidence/last-transition.json` records a normal stop.
 These are technical staging receipts, not compliance artifacts.
 
 If initialization stops before `status` succeeds, do not hand-edit the marker,

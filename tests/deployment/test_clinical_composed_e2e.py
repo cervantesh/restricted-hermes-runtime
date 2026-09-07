@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import importlib.util
 import json
 import os
 import platform
@@ -271,6 +272,38 @@ def built_image_evidence() -> dict[str, object]:
     return result
 
 
+def restricted_container_control_evidence() -> dict[str, object]:
+    module_path = ROOT / "deploy" / "clinical-staging" / "clinical_staging.py"
+    spec = importlib.util.spec_from_file_location("clinical_staging_controls", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("clinical staging control verifier is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    inspected: dict[str, object] = {}
+    identities: dict[str, dict[str, object]] = {}
+    expected = {
+        "clinical-adapter": {"uid": 10008, "gid": 20007, "groups": [20006, 20007]},
+        "ingress": {"uid": 10007, "gid": 20005, "groups": [20000, 20001, 20005, 20006]},
+    }
+    identity_probe = (
+        "import json,os; "
+        "print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'groups':sorted(os.getgroups())}))"
+    )
+    for service, expected_identity in expected.items():
+        container = compose("ps", "--quiet", service).stdout.strip()
+        if not container:
+            raise RuntimeError(f"restricted container unavailable: {service}")
+        inspected[service] = json.loads(run("docker", "container", "inspect", container).stdout)[0]
+        identity = json.loads(
+            compose("exec", "--no-TTY", service, "python", "-c", identity_probe).stdout
+        )
+        if identity != expected_identity:
+            raise RuntimeError(f"{service} effective runtime identity rejected")
+        identities[service] = identity
+    controls = module.verify_restricted_container_controls(inspected)
+    return {"effective_identity": identities, "confinement": controls}
+
+
 def network_and_surface_controls() -> dict[str, bool]:
     ingress_env = compose("exec", "--no-TTY", "ingress", "python", "-c", "import os,json; print(json.dumps(sorted(os.environ)))").stdout
     if "HRH" in ingress_env or "api-key" in ingress_env.lower():
@@ -353,6 +386,7 @@ def main() -> None:
     control("wait-hrh", timeout=300)
     compose("up", "--detach", "ingress", timeout=180)
     wait_ingress()
+    restricted_controls = restricted_container_control_evidence()
     control("hrh-route-control")
     control("uds-controls")
     phase("valid-clinical-command")
@@ -481,6 +515,7 @@ def main() -> None:
         "runtime_product_sha": RUNTIME_PRODUCT_SHA,
         "images": image_evidence()["images"], "boundaries": boundaries,
         "built_images": built_image_evidence(),
+        "restricted_container_controls": restricted_controls,
         "commands": [
             "python tests/deployment/test_clinical_composed_e2e.py",
             "pytest tests/static/test_clinical_composed_e2e_surface.py tests/unit/test_clinical_adapter.py tests/unit/test_mattermost_clinical.py",
