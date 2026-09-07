@@ -68,7 +68,8 @@ SOURCE_FRAME: dict[str, str] = {}
 def run(*args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(args, cwd=ROOT, text=True, capture_output=True, timeout=timeout, check=False, encoding="utf-8", errors="replace")
     if check and result.returncode:
-        raise RuntimeError(f"command failed: {args[0]} exit={result.returncode}; {(result.stdout + result.stderr)[-1200:]}")
+        command = Path(args[0]).name if args and Path(args[0]).name in {"docker", "git"} else "child"
+        raise RuntimeError(f"command failed: {command} exit={result.returncode}")
     return result
 
 
@@ -336,12 +337,7 @@ def main() -> None:
     phase("servers")
     compose("up", "--detach", "mattermost", timeout=300)
     control("wait-mm")
-    password = (SEED / "admin_password").read_text(encoding="ascii")
-    created = compose("exec", "--no-TTY", "mattermost", "/mattermost/bin/mmctl", "--local", "user", "create",
-                      "--email", "admin@clinical.invalid", "--username", "clinicaladmin", "--password", password,
-                      "--system-admin", "--email-verified", "--disable-welcome-email", "--quiet", check=False)
-    if created.returncode and "already exists" not in (created.stdout + created.stderr).lower():
-        raise RuntimeError("Mattermost temporary administrator creation failed: " + (created.stdout + created.stderr)[-800:])
+    control("create-initial-admin")
     control("bootstrap-mm")
     control("seed-hrh")
     control("policy")

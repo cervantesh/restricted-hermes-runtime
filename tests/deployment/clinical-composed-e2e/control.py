@@ -158,6 +158,31 @@ def ensure_user(username: str, email: str, password: str, admin_token: str) -> d
     return user
 
 
+def provision_initial_mattermost_admin() -> None:
+    """Create the initial Mattermost account without exposing its password.
+
+    The controller is the only process that reads the mode-0600 seed file. It
+    sends the password in the TLS request body to Mattermost; it never passes
+    it to an argv or environment boundary.  A prior successful creation is a
+    normal resume case for an interrupted synthetic initialization.
+    """
+    password = (SEED / "admin_password").read_text(encoding="ascii").strip()
+    try:
+        user = request(MM_BASE, _mm_context(), "POST", "/users", {
+            "username": "clinicaladmin",
+            "email": "admin@clinical.invalid",
+            "password": password,
+            "email_verified": True,
+        })[0]
+    except ApiError as exc:
+        existing = exc.status in {400, 409} and "already" in exc.message.lower() and "exist" in exc.message.lower()
+        if existing:
+            return
+        raise RuntimeError("Mattermost initial administrator bootstrap failed") from None
+    if not isinstance(user, dict) or not isinstance(user.get("id"), str):
+        raise RuntimeError("Mattermost initial administrator bootstrap failed")
+
+
 def bootstrap_mattermost() -> None:
     admin, admin_token = login("admin@clinical.invalid", (SEED / "admin_password").read_text().strip())
     actor = ensure_user("clinicalactor", "actor@clinical.invalid", (SEED / "actor_password").read_text().strip(), admin_token)
@@ -639,6 +664,8 @@ def main() -> None:
         wait_https(MM_BASE, _mm_context(), "/system/ping")
     elif command == "wait-hrh":
         wait_https(HRH_BASE, _hrh_context(), "/api/health")
+    elif command == "create-initial-admin":
+        provision_initial_mattermost_admin()
     elif command == "bootstrap-mm":
         bootstrap_mattermost()
     elif command == "seed-hrh":
