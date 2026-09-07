@@ -10,6 +10,10 @@ receipt="${2:?usage: $0 /absolute/path/to/Health-Record-Hub /absolute/path/to/re
 [[ "$hrh_root" = /* && -d "$hrh_root/.git" ]] || { echo "representative-clinical-egress: DENIED" >&2; exit 2; }
 [[ "$receipt" = /* && ! -e "$receipt" && -d "$(dirname "$receipt")" ]] || { echo "representative-clinical-egress: DENIED" >&2; exit 2; }
 docker info >/dev/null 2>&1 || { echo "representative-clinical-egress: SKIP docker-unavailable"; exit 77; }
+if command -v python3 >/dev/null 2>&1; then python_bin=python3
+elif command -v python >/dev/null 2>&1; then python_bin=python
+else echo "representative-clinical-egress: DENIED" >&2; exit 2
+fi
 
 head="$(git -C "$runtime" rev-parse HEAD)"
 tree="$(git -C "$runtime" rev-parse HEAD^{tree})"
@@ -28,14 +32,14 @@ cleanup() {
   docker container rm --force "$sink" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   if [[ -f "$state/staging-state.json" ]]; then
-    python "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" destroy >/dev/null 2>&1 || true
+    "$python_bin" "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" destroy >/dev/null 2>&1 || true
   fi
   if [[ "$passed" != 1 ]]; then rm -f "$receipt"; fi
   rmdir "$scratch" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-python "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" init >/dev/null 2>&1
+"$python_bin" "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" init >/dev/null 2>&1
 compose=(docker compose --env-file "$state/compose.env" --project-name "$project" --file "$runtime/tests/deployment/clinical-composed-e2e/compose.yaml" --file "$runtime/deploy/clinical-staging/compose.yaml")
 if ! docker network create --ipv6 "$network" >/dev/null; then
   echo "representative-clinical-egress: SKIP controlled-ipv6-network-unavailable"
@@ -53,7 +57,7 @@ for service in ingress clinical-adapter; do
   docker network connect "$network" "$target"
   proof="$scratch/red-$service.json"
   set +e
-  outcome="$(python "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --red-service "$service" --red-network "$network" --red-sink "$sink" --red-proof "$proof" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>/dev/null)"
+  outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --red-service "$service" --red-network "$network" --red-sink "$sink" --red-proof "$proof" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>/dev/null)"
   status=$?
   set -e
   if [[ "$status" != 3 || ! "$outcome" =~ ^representative-clinical-egress:\ RED-DETECTED\ proof_sha256=[a-f0-9]{64}$ || ! -f "$proof" ]]; then
@@ -69,7 +73,7 @@ if docker container inspect "$sink" >/dev/null 2>&1 || docker network inspect "$
   echo "representative-clinical-egress: DENIED" >&2
   exit 2
 fi
-python "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --red-ingress-proof "$scratch/red-ingress.json" --red-clinical-adapter-proof "$scratch/red-clinical-adapter.json" --cleanup-network "$network" --cleanup-sink "$sink" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 --output "$receipt" >/dev/null
-python "$collector" --verify "$receipt" --expected-head "$head" --expected-tree "$tree" >/dev/null
+"$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --red-ingress-proof "$scratch/red-ingress.json" --red-clinical-adapter-proof "$scratch/red-clinical-adapter.json" --cleanup-network "$network" --cleanup-sink "$sink" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 --output "$receipt" >/dev/null
+"$python_bin" "$collector" --verify "$receipt" --expected-head "$head" --expected-tree "$tree" >/dev/null
 passed=1
 printf 'representative-clinical-egress: PASS receipt_sha256=%s\n' "$(sha256sum "$receipt" | awk '{print $1}')"
