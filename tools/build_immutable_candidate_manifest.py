@@ -78,17 +78,22 @@ def main() -> int:
         platform_path = verification_dir / f"{name}.platform.json"
         attestation = _load(attestation_path)
         platform = _load(platform_path)
+        provenance = attestation.get("provenance") if isinstance(attestation.get("provenance"), dict) else {}
+        sbom = attestation.get("sbom") if isinstance(attestation.get("sbom"), dict) else {}
         if (attestation.get("image") != image or attestation.get("digest") != digest
                 or attestation.get("source_revision") != args.source_revision or attestation.get("workflow_run_url") != args.run_url
                 or platform.get("image") != image or platform.get("subject_digest") != digest
-                or platform.get("source_revision") != args.source_revision or platform.get("workflow_run_url") != args.run_url):
+                or platform.get("source_revision") != args.source_revision or platform.get("workflow_run_url") != args.run_url
+                or provenance.get("predicate_type") != "https://slsa.dev/provenance/v1"
+                or sbom.get("predicate_type") != "https://spdx.dev/Document/v2.3"
+                or provenance.get("raw_artifact") == sbom.get("raw_artifact")):
             raise SystemExit(f"{name}: verification receipt is not bound to the published subject")
         attestation_ref = _reference(attestation_path, repo_root)
         platform_ref = _reference(platform_path, repo_root)
         subjects.append({
             "name": name, "image": image, "digest": digest, "platform": "linux/amd64",
             "base_materials": source["base_materials"], "dependency_lock": lock_record(name, repo_root),
-            "sbom": {"format": "spdxjson", "subject_digest": digest, "verification": {**attestation_ref, "subject_digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.run_url, "predicate_type": "https://spdx.dev/Document"}},
+            "sbom": {"format": "spdxjson", "subject_digest": digest, "verification": {**attestation_ref, "subject_digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.run_url, "predicate_type": "https://spdx.dev/Document/v2.3"}},
             "provenance": {"subject_digest": digest, "verification": {**attestation_ref, "subject_digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.run_url, "predicate_type": "https://slsa.dev/provenance/v1"}},
             "platform_receipt": platform_ref, "tests": receipts.get(name, []),
         })

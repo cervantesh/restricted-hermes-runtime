@@ -77,6 +77,8 @@ def main() -> int:
     output_path = (repo_root / args.output).resolve() if not args.output.is_absolute() else args.output.resolve()
     for path in (provenance_path, sbom_path, output_path):
         _repo_relative(path, repo_root)
+    if provenance_path == sbom_path:
+        raise SystemExit("provenance and SBOM verification artifacts must be distinct")
     if "@" not in args.image:
         raise SystemExit("image must be digest-pinned")
     _, digest = args.image.rsplit("@", 1)
@@ -84,12 +86,12 @@ def main() -> int:
         raise SystemExit("image digest is invalid")
     if not _contains_subject(_load(provenance_path), digest, "https://slsa.dev/provenance/v1"):
         raise SystemExit("provenance verification does not name the exact subject")
-    if not _contains_subject(_load(sbom_path), digest, "https://spdx.dev/Document"):
+    if not _contains_subject(_load(sbom_path), digest, "https://spdx.dev/Document/v2.3"):
         raise SystemExit("SPDX verification does not name the exact subject")
     provenance = _load(provenance_path)
     if not _contains_revision(provenance, args.source_revision):
         raise SystemExit("provenance verification does not name the expected source revision")
-    result: dict[str, Any] = {"schema_version": "restricted-runtime-attestation-receipt.v1", "image": args.image, "digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.workflow_run_url, "provenance": {"predicate_type": "https://slsa.dev/provenance/v1", **_raw_ref(provenance_path, repo_root)}, "sbom": {"predicate_type": "https://spdx.dev/Document", **_raw_ref(sbom_path, repo_root)}}
+    result: dict[str, Any] = {"schema_version": "restricted-runtime-attestation-receipt.v1", "image": args.image, "digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.workflow_run_url, "provenance": {"predicate_type": "https://slsa.dev/provenance/v1", **_raw_ref(provenance_path, repo_root)}, "sbom": {"predicate_type": "https://spdx.dev/Document/v2.3", **_raw_ref(sbom_path, repo_root)}}
     output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0
 
