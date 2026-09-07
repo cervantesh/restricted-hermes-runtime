@@ -40,6 +40,7 @@ SPECIAL_FILES = frozenset({"README.md", "assessment.manifest.json", "verify_asse
 PROFILE = "restricted-clinical-candidate.v1"
 REQUIRED_SOURCES = frozenset({"health-record-hub-contract", "health-record-hub-publication", "restricted-edge", "restricted-runtime"})
 REQUIRED_SUBJECTS = frozenset({"health-record-hub-migration", "health-record-hub-web", "restricted-clinical-adapter", "restricted-mattermost-ingress"})
+REQUIRED_DEPENDENCIES = frozenset({"immutable-images", "representative-host-input"})
 REQUIRED_GATES = frozenset({"clinical-composition", "cold-recovery", "governance-decision", "hrh-publication", "immutable-application-subjects", "independent-review", "representative-host"})
 GATE_EVIDENCE = {
     "clinical-composition": ("contracts/clinical-composition.json", "evidence/clinical-receipt.json"),
@@ -49,6 +50,15 @@ GATE_EVIDENCE = {
     "immutable-application-subjects": ("subjects/images.json",),
     "independent-review": ("independent-review/findings.json",),
     "representative-host": ("evidence/representative-host.json",),
+}
+GATE_DEPENDENCIES = {
+    "clinical-composition": ("immutable-images",),
+    "cold-recovery": (),
+    "governance-decision": (),
+    "hrh-publication": (),
+    "immutable-application-subjects": ("immutable-images",),
+    "independent-review": (),
+    "representative-host": ("representative-host-input",),
 }
 PROFILE_FILES = frozenset({path for paths in GATE_EVIDENCE.values() for path in paths})
 HOST_OBSERVATIONS = ("backup-recovery", "dns", "effective-host-runtime", "ingress-ports", "ipv4", "ipv6", "logging-audit-sinks", "metadata-endpoints", "mounts", "patch-baseline", "principals-iam-denials", "proxy-env", "secret-mounts-rotation", "time-source", "trust-roots")
@@ -181,7 +191,10 @@ def _verify_metadata(manifest: dict[str, Any], errors: list[str]) -> dict[str, s
         _error(errors, "policy: epoch and sha256 digest required")
 
     dependency_statuses: dict[str, str] = {}
-    for record in _ordered_records(manifest.get("dependencies"), field="id", errors=errors, context="dependencies"):
+    dependency_records = _ordered_records(manifest.get("dependencies"), field="id", errors=errors, context="dependencies")
+    if {record.get("id") for record in dependency_records} != REQUIRED_DEPENDENCIES:
+        _error(errors, "dependencies: closed dependency inventory mismatch")
+    for record in dependency_records:
         status_value = record.get("status")
         allowed = {"id", "status"}
         if status_value == "EXTERNALLY_ACCEPTED":
@@ -216,7 +229,7 @@ def _verify_metadata(manifest: dict[str, Any], errors: list[str]) -> dict[str, s
             _error(errors, f"control {record.get('id')!r}: external acceptance needs owner, authority, evidence, and non-PASS technical status")
             continue
         evidence_paths = record.get("evidence_paths")
-        if set(record) != allowed or status_value not in STATUS_VALUES or not isinstance(dependencies, list) or any(not isinstance(item, str) or item not in dependency_statuses for item in dependencies) or not isinstance(evidence_paths, list) or tuple(evidence_paths) != GATE_EVIDENCE.get(record.get("id")):
+        if set(record) != allowed or status_value not in STATUS_VALUES or not isinstance(dependencies, list) or tuple(dependencies) != GATE_DEPENDENCIES.get(record.get("id")) or not isinstance(evidence_paths, list) or tuple(evidence_paths) != GATE_EVIDENCE.get(record.get("id")):
             _error(errors, f"control {record.get('id')!r}: invalid status or dependency")
             continue
         if dependencies != sorted(dependencies) or len(set(dependencies)) != len(dependencies):
@@ -234,6 +247,21 @@ def _verify_metadata(manifest: dict[str, Any], errors: list[str]) -> dict[str, s
     return statuses
 
 
+def _aggregate_outcomes(outcomes: list[object]) -> str | None:
+    """Return the only valid closed aggregate for a non-empty outcome set."""
+    if not outcomes or any(outcome not in {"PASS", "FAIL", "NOT_VERIFIED", "NOT_APPLICABLE"} for outcome in outcomes):
+        return None
+    if "FAIL" in outcomes:
+        return "FAIL"
+    if "NOT_VERIFIED" in outcomes:
+        return "NOT_VERIFIED"
+    if all(outcome == "NOT_APPLICABLE" for outcome in outcomes):
+        return "NOT_APPLICABLE"
+    if "PASS" in outcomes:
+        return "PASS"
+    return None
+
+
 def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, dict[str, Any]], declared: set[str], errors: list[str]) -> None:
     if declared != PROFILE_FILES | {"README.md", "verify_assessment_bundle.py"}:
         _error(errors, "evidence: closed profile file inventory mismatch")
@@ -246,7 +274,7 @@ def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, d
         "contracts/clinical-composition.json": core | {"claim_id"},
         "evidence/clinical-receipt.json": core | {"negative_controls"},
         "evidence/cold-recovery.json": core | {"manifest_sha256"},
-        "evidence/hrh-publication.json": core,
+        "evidence/hrh-publication.json": core | {"publication_receipt_sha256", "verification_receipt_sha256"},
         "evidence/representative-host.json": core | {"observations"},
         "governance/risk-map.json": core | {"risk_owner", "risks"},
         "independent-review/findings.json": core | {"reviewer_id", "authority", "conflict_statement", "findings", "technical_go_no_go"},
@@ -254,37 +282,89 @@ def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, d
     }
     for path, required in required_fields.items():
         evidence = json_records.get(path)
-        if evidence is None or set(evidence) != required or evidence.get("scope") != SCOPE or evidence.get("outcome") not in STATUS_VALUES or evidence.get("sources") != sources or evidence.get("subjects") != subjects or evidence.get("producer") != producer or evidence.get("policy") != policy:
+        if not isinstance(evidence, dict):
             _error(errors, f"evidence {path}: profile content binding is incomplete")
+            continue
+        outcome = evidence.get("outcome")
+        common_is_bound = (
+            evidence.get("scope") == SCOPE
+            and evidence.get("sources") == sources
+            and evidence.get("subjects") == subjects
+            and evidence.get("producer") == producer
+            and evidence.get("policy") == policy
+        )
+        if outcome == "NOT_VERIFIED":
+            expected = core | ({"observations"} if path == "evidence/representative-host.json" else {"reason"})
+            if set(evidence) != expected or not common_is_bound:
+                _error(errors, f"evidence {path}: NOT_VERIFIED must contain only the closed binding")
+            if path != "evidence/representative-host.json" and (
+                not isinstance(evidence.get("reason"), str)
+                or not IDENTIFIER.fullmatch(evidence["reason"])
+            ):
+                _error(errors, f"evidence {path}: NOT_VERIFIED needs a closed reason")
+        elif outcome == "NOT_APPLICABLE":
+            expected = core | ({"observations"} if path == "evidence/representative-host.json" else {"rationale"})
+            rationale_is_closed = path == "evidence/representative-host.json" or (isinstance(evidence.get("rationale"), str) and IDENTIFIER.fullmatch(evidence["rationale"]))
+            if set(evidence) != expected or not common_is_bound or not rationale_is_closed:
+                _error(errors, f"evidence {path}: NOT_APPLICABLE needs only a closed rationale")
+        elif outcome in {"PASS", "FAIL"}:
+            if set(evidence) != required or not common_is_bound:
+                _error(errors, f"evidence {path}: {outcome} proof binding is incomplete")
+        else:
+            _error(errors, f"evidence {path}: technical outcome must be PASS, FAIL, NOT_APPLICABLE, or NOT_VERIFIED")
     clinical = json_records.get("evidence/clinical-receipt.json", {})
-    if not isinstance(clinical.get("negative_controls"), list) or not clinical["negative_controls"]:
+    if clinical.get("outcome") in {"PASS", "FAIL"} and (not isinstance(clinical.get("negative_controls"), list) or not clinical["negative_controls"]):
         _error(errors, "evidence clinical receipt: exact source/subject/negative-control binding required")
     images = json_records.get("subjects/images.json", {})
-    if images.get("subjects") != subjects:
+    if images.get("outcome") in {"PASS", "FAIL"} and images.get("subjects") != subjects:
         _error(errors, "evidence subject inventory: exact four-subject binding required")
-    hrh = json_records.get("evidence/hrh-publication.json", {})
     host = json_records.get("evidence/representative-host.json", {})
     observations = host.get("observations")
-    if not isinstance(observations, list) or [item.get("id") if isinstance(item, dict) else None for item in observations] != list(HOST_OBSERVATIONS) or any(not isinstance(item, dict) or set(item) != {"id", "outcome", "witness_sha256"} or item.get("outcome") not in STATUS_VALUES or not isinstance(item.get("witness_sha256"), str) or not SHA256.fullmatch(item["witness_sha256"]) for item in observations):
-        _error(errors, "evidence representative host: producer host/control binding required")
-    if host.get("outcome") == "PASS" and any(not isinstance(item, dict) or item.get("outcome") != "PASS" for item in observations or []):
-        _error(errors, "evidence representative host: PASS requires every required observation PASS")
+    exact_host_inventory = (
+        isinstance(observations, list)
+        and [item.get("id") if isinstance(item, dict) else None for item in observations] == list(HOST_OBSERVATIONS)
+    )
+    observation_shapes_valid = exact_host_inventory
+    observation_outcomes: list[object] = []
+    for item in observations if isinstance(observations, list) else []:
+        if not isinstance(item, dict):
+            observation_shapes_valid = False
+            continue
+        item_outcome = item.get("outcome")
+        observation_outcomes.append(item_outcome)
+        if item_outcome in {"PASS", "FAIL"}:
+            valid = set(item) == {"id", "outcome", "witness_sha256"} and isinstance(item.get("witness_sha256"), str) and SHA256.fullmatch(item["witness_sha256"])
+        elif item_outcome == "NOT_VERIFIED":
+            valid = set(item) == {"id", "outcome", "reason"} and isinstance(item.get("reason"), str) and IDENTIFIER.fullmatch(item["reason"])
+        elif item_outcome == "NOT_APPLICABLE":
+            valid = set(item) == {"id", "outcome", "rationale"} and isinstance(item.get("rationale"), str) and IDENTIFIER.fullmatch(item["rationale"])
+        else:
+            valid = False
+        observation_shapes_valid = observation_shapes_valid and bool(valid)
+    host_aggregate = _aggregate_outcomes(observation_outcomes)
+    if not observation_shapes_valid:
+        _error(errors, "evidence representative host: exact conditional observation shapes required")
+    if host.get("outcome") in {"PASS", "FAIL", "NOT_VERIFIED", "NOT_APPLICABLE"} and host_aggregate != host.get("outcome"):
+        _error(errors, "evidence representative host: outcome does not match the observation lattice")
+    publication = json_records.get("evidence/hrh-publication.json", {})
+    if publication.get("outcome") in {"PASS", "FAIL"} and any(not isinstance(publication.get(field), str) or not SHA256.fullmatch(publication[field]) for field in ("publication_receipt_sha256", "verification_receipt_sha256")):
+        _error(errors, "evidence HRH publication: external publication and verification receipt sha256 bindings required")
     recovery = json_records.get("evidence/cold-recovery.json", {})
-    if not isinstance(recovery.get("manifest_sha256"), str) or not SHA256.fullmatch(recovery["manifest_sha256"]):
+    if recovery.get("outcome") in {"PASS", "FAIL"} and (not isinstance(recovery.get("manifest_sha256"), str) or not SHA256.fullmatch(recovery["manifest_sha256"])):
         _error(errors, "evidence cold recovery: immutable manifest sha256 required")
     review = json_records.get("independent-review/findings.json", {})
-    if any(not isinstance(review.get(key), str) or not IDENTIFIER.fullmatch(review[key]) for key in ("reviewer_id", "authority", "conflict_statement")) or not isinstance(review.get("findings"), list) or not review["findings"] or any(not isinstance(item, str) or not IDENTIFIER.fullmatch(item) for item in review["findings"]) or review.get("technical_go_no_go") not in {"GO", "NO_GO"}:
+    if review.get("outcome") in {"PASS", "FAIL"} and (any(not isinstance(review.get(key), str) or not IDENTIFIER.fullmatch(review[key]) for key in ("reviewer_id", "authority", "conflict_statement")) or not isinstance(review.get("findings"), list) or not review["findings"] or any(not isinstance(item, str) or not IDENTIFIER.fullmatch(item) for item in review["findings"]) or review.get("technical_go_no_go") != ("GO" if review.get("outcome") == "PASS" else "NO_GO")):
         _error(errors, "evidence independent review: identity/authority/conflict/findings/go-no-go required")
     contract = json_records.get("contracts/clinical-composition.json", {})
-    if not isinstance(contract.get("claim_id"), str) or not IDENTIFIER.fullmatch(contract["claim_id"]):
+    if contract.get("outcome") in {"PASS", "FAIL"} and (not isinstance(contract.get("claim_id"), str) or not IDENTIFIER.fullmatch(contract["claim_id"])):
         _error(errors, "evidence clinical contract: closed claim identifier required")
-    if not all(isinstance(item, str) and IDENTIFIER.fullmatch(item) for item in clinical.get("negative_controls", [])):
+    if clinical.get("outcome") in {"PASS", "FAIL"} and not all(isinstance(item, str) and IDENTIFIER.fullmatch(item) for item in clinical.get("negative_controls", [])):
         _error(errors, "evidence clinical receipt: closed negative-control identifiers required")
     risk_map = json_records.get("governance/risk-map.json", {})
     risks = risk_map.get("risks")
-    if not isinstance(risk_map.get("risk_owner"), str) or not IDENTIFIER.fullmatch(risk_map["risk_owner"]) or not isinstance(risks, list):
+    if risk_map.get("outcome") in {"PASS", "FAIL"} and (not isinstance(risk_map.get("risk_owner"), str) or not IDENTIFIER.fullmatch(risk_map["risk_owner"]) or not isinstance(risks, list)):
         _error(errors, "evidence governance: closed risk disposition required")
-    else:
+    elif risk_map.get("outcome") in {"PASS", "FAIL"}:
         for risk in risks:
             item = _mapping(risk)
             if item is None or item.get("severity") not in {"P1", "P2"} or item.get("disposition") not in {"CLOSED", "EXTERNALLY_ACCEPTED"} or not isinstance(item.get("id"), str) or not IDENTIFIER.fullmatch(item["id"]):
@@ -298,10 +378,18 @@ def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, d
                 _error(errors, "evidence governance: closed risk record has extra content")
     controls = manifest.get("controls") if isinstance(manifest.get("controls"), list) else []
     for control in controls:
-        if isinstance(control, dict) and control.get("status") == "PASS":
-            for path in control.get("evidence_paths", []):
-                if json_records.get(path, {}).get("outcome") != "PASS":
-                    _error(errors, f"control {control.get('id')!r}: PASS requires PASS bundled evidence")
+        if not isinstance(control, dict):
+            continue
+        outcomes = [json_records.get(path, {}).get("outcome") for path in control.get("evidence_paths", [])]
+        status_value = control.get("status")
+        aggregate = _aggregate_outcomes(outcomes)
+        if status_value in {"PASS", "FAIL", "NOT_VERIFIED", "NOT_APPLICABLE"} and aggregate != status_value:
+            _error(errors, f"control {control.get('id')!r}: status does not match the evidence lattice")
+        elif status_value == "EXTERNALLY_ACCEPTED":
+            acceptance = _mapping(control.get("acceptance")) or {}
+            technical_status = acceptance.get("technical_status")
+            if technical_status not in {"FAIL", "NOT_VERIFIED"} or aggregate != technical_status:
+                _error(errors, f"control {control.get('id')!r}: external acceptance must retain its non-PASS technical evidence")
         if isinstance(control, dict) and control.get("id") == "immutable-application-subjects" and control.get("status") == "PASS" and any(isinstance(subject, dict) and subject.get("status") != "PASS" for subject in subjects):
             _error(errors, "control immutable-application-subjects: PASS requires all four immutable subjects PASS")
 
@@ -446,6 +534,7 @@ def verify(bundle_dir: Path, *, expected_manifest_sha256: str) -> VerificationRe
                     _error(errors, f"status {status_record.get('id')!r}: acceptance evidence is not a bundled hash")
     blockers = {"FAIL", "NOT_VERIFIED", "EXTERNALLY_ACCEPTED"}
     ready = (not errors and not any(status in blockers for status in statuses.values())
+             and all(statuses.get(dependency) == "PASS" for dependency in REQUIRED_DEPENDENCIES)
              and all(statuses.get(gate) == "PASS" for gate in REQUIRED_GATES)
              and json_records.get("independent-review/findings.json", {}).get("technical_go_no_go") == "GO")
     return VerificationResult(errors, statuses, ready)
