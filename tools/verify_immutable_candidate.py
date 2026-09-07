@@ -74,7 +74,7 @@ def _verify_attestation(errors: list[str], name: str, kind: str, value: object, 
         _error(errors, f"{name}: {kind} subject digest does not match image subject")
         return
     verification = _mapping(record.get("verification"))
-    expected_predicate = "https://spdx.dev/Document" if kind == "SBOM" else "https://slsa.dev/provenance/v1"
+    expected_predicate = "https://spdx.dev/Document/v2.3" if kind == "SBOM" else "https://slsa.dev/provenance/v1"
     if verification is None:
         _error(errors, f"{name}: {kind} verification is missing")
         return
@@ -113,6 +113,22 @@ def _verify_platform(errors: list[str], name: str, item: dict[str, Any], image: 
             or _mapping(receipt.get("labels")).get("org.opencontainers.image.source") != SOURCE
             or _mapping(receipt.get("labels")).get("org.opencontainers.image.revision") != source_revision):
         _error(errors, f"{name}: platform receipt does not prove linux/amd64 exact subject")
+
+
+def _verify_distinct_attestation_artifacts(errors: list[str], name: str, item: dict[str, Any], repo_root: Path) -> None:
+    sbom = _mapping(item.get("sbom"))
+    verification = _mapping(sbom.get("verification")) if sbom else None
+    if verification is None:
+        return
+    receipt = _read_hashed_json(repo_root, verification.get("receipt"), verification.get("receipt_sha256"), errors, f"{name}: attestation pair")
+    if receipt is None:
+        return
+    provenance = _mapping(receipt.get("provenance"))
+    sbom_part = _mapping(receipt.get("sbom"))
+    if (provenance is None or sbom_part is None or provenance.get("predicate_type") != "https://slsa.dev/provenance/v1"
+            or sbom_part.get("predicate_type") != "https://spdx.dev/Document/v2.3"
+            or provenance.get("raw_artifact") == sbom_part.get("raw_artifact")):
+        _error(errors, f"{name}: provenance and SBOM must be distinct predicate artifacts")
 
 
 def _verify_subject(errors: list[str], subject: object, source_revision: str, run_url: str, repo_root: Path) -> str | None:
@@ -154,6 +170,7 @@ def _verify_subject(errors: list[str], subject: object, source_revision: str, ru
                     _error(errors, f"{name}: dependency lock hash does not match repo content")
     _verify_attestation(errors, name, "SBOM", item.get("sbom"), str(image), str(digest), source_revision, run_url, repo_root)
     _verify_attestation(errors, name, "provenance", item.get("provenance"), str(image), str(digest), source_revision, run_url, repo_root)
+    _verify_distinct_attestation_artifacts(errors, name, item, repo_root)
     _verify_platform(errors, name, item, str(image), str(digest), source_revision, run_url, repo_root)
     tests = item.get("tests")
     if not isinstance(tests, list) or not tests or any(_mapping(x) is None or _mapping(x).get("outcome") != "passed" or _mapping(x).get("subject_digest") != digest or _mapping(x).get("receipt") != run_url for x in tests):
@@ -186,6 +203,8 @@ def _verify_evidence(errors: list[str], value: object, source_revision: str, run
             _error(errors, "AC10 evidence command lacks id/text/passed exit_code=0")
             continue
         command_names.add(item["id"])
+    if len(command_names) != len(commands):
+        _error(errors, "AC10 evidence command ids must be unique")
     summary = _mapping(evidence.get("summary"))
     if summary is None or any(not isinstance(summary.get(key), int) or summary[key] < 0 for key in ("passed", "skipped", "failed")):
         _error(errors, "AC10 evidence must include pass/skip/failure counts")
