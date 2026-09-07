@@ -53,7 +53,7 @@ def test_staging_volumes_are_external_exactly_named_and_label_verified_by_wrappe
 def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     script = (STAGING / "clinical_staging.py").read_text(encoding="utf-8")
     runbook = (STAGING / "README.md").read_text(encoding="utf-8")
-    for command in ("init", "up", "status", "refresh-policy", "stop", "reset", "destroy"):
+    for command in ("init", "up", "status", "refresh-policy", "stop", "backup", "restore", "reset", "destroy"):
         assert command in script
     assert "docker system prune" not in script
     assert '"--remove-orphans"' not in script
@@ -61,6 +61,10 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert "verify_destructive_resources" in script
     assert "expected_images" in script
     assert "fsync_directory" in script
+    assert "validate_backup_bundle" in script
+    assert "expected_manifest_sha256" in script
+    assert "EXCLUDED_RECOVERY_VOLUME" in script
+    assert "ownership_sha256" in script
     assert "synthetic-only" in runbook
     assert "not HIPAA" in runbook
     assert "not production" in runbook
@@ -70,3 +74,5 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert 'RUNTIME_BASE_SHA = "41464aee8748f857153ba2b47377515d4847d210"' in script
     assert 'REQUIRED_HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"' in script
     assert 'REQUIRED_HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"' in script
+    assert "Cold backup and restore" in runbook
+    assert "not a scheduled backup" in runbook
