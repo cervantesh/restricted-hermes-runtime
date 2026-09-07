@@ -49,6 +49,21 @@ def snapshot(staging, record_tag: str | None = None) -> list[dict[str, object]]:
     return value
 
 
+def hard_kill_delayed_ingress(staging) -> None:
+    """Freeze the observed IN_FLIGHT record without its client catch path."""
+    killed = staging.compose("kill", "--signal", "SIGKILL", "ingress", check=False)
+    if killed.returncode:
+        raise RuntimeError("could not SIGKILL delayed ingress for the cold-fence witness")
+
+    def ingress_is_stopped() -> bool:
+        rows = [row for row in staging._containers(all_containers=True) if row.get("Service") == "ingress"]
+        if len(rows) != 1:
+            raise RuntimeError("could not identify the exact ingress process after SIGKILL")
+        return str(rows[0].get("State", "")).lower() in {"exited", "dead"}
+
+    wait_until(ingress_is_stopped, "ingress did not stop after SIGKILL")
+
+
 def ambiguous_source_record(staging) -> tuple[dict[str, object], dict[str, object]]:
     """Persist an unknown delivery result before the cold fence."""
     staging.control("mutate", "reset")
@@ -135,6 +150,11 @@ def main() -> None:
             if not isinstance(unknown_tag, str) or len(unknown_tag) != 64:
                 raise RuntimeError("unknown fixture record tag is invalid")
 
+            # A graceful stop can let the delayed client catch the disconnect
+            # and terminalize before backup.  SIGKILL is intentionally limited
+            # to ingress, after both audit and IN_FLIGHT barriers, so restore
+            # must classify this durable stale claim as restart_in_flight.
+            hard_kill_delayed_ingress(staging)
             staging.stop()
             backup_receipt = staging.backup(backup)
             external_manifest_hash = backup_receipt["manifest_sha256"]

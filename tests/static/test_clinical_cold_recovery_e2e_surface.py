@@ -32,3 +32,18 @@ def test_cold_recovery_drill_only_reports_success_after_verified_teardown():
     assert "teardown._assert_destroyed_absent()" in script
     assert "ignore_errors=True" not in script
     assert script.index("teardown._assert_destroyed_absent()") < script.rindex("print(json.dumps(report, sort_keys=True))")
+
+
+def test_cold_fence_hard_kills_the_delayed_ingress_after_barriers_before_backup():
+    script = (ROOT / "tests" / "deployment" / "test_clinical_cold_recovery_e2e.py").read_text(encoding="utf-8")
+    helper_start = script.index("def hard_kill_delayed_ingress")
+    helper_end = script.index("\ndef main()", helper_start)
+    helper = script[helper_start:helper_end]
+    assert 'staging.compose("kill", "--signal", "SIGKILL", "ingress", check=False)' in helper
+    assert "ingress did not stop after SIGKILL" in helper
+    assert '"stop", "ingress"' not in helper
+    unknown_start = script.index('grants_before_unknown =')
+    hard_kill = script.index("hard_kill_delayed_ingress(staging)", unknown_start)
+    graceful_stop = script.index("staging.stop()", unknown_start)
+    cold_backup = script.index("staging.backup(backup)", unknown_start)
+    assert unknown_start < hard_kill < graceful_stop < cold_backup
