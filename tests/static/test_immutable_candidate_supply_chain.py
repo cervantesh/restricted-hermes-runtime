@@ -48,7 +48,7 @@ def _subject(name: str, image: str, lock: str, marker: str, repo_root: Path) -> 
         "source_revision": "d" * 40,
         "workflow_run_url": run_url,
         "provenance": {"predicate_type": "https://slsa.dev/provenance/v1", "raw_artifact": provenance_path, "raw_sha256": hashlib.sha256((repo_root / provenance_path).read_bytes()).hexdigest()},
-        "sbom": {"predicate_type": "https://spdx.dev/Document", "raw_artifact": sbom_path, "raw_sha256": hashlib.sha256((repo_root / sbom_path).read_bytes()).hexdigest()},
+        "sbom": {"predicate_type": "https://spdx.dev/Document/v2.3", "raw_artifact": sbom_path, "raw_sha256": hashlib.sha256((repo_root / sbom_path).read_bytes()).hexdigest()},
     }
     platform = {
         "schema_version": "restricted-runtime-subject-receipt.v1",
@@ -91,7 +91,7 @@ def _subject(name: str, image: str, lock: str, marker: str, repo_root: Path) -> 
                 "subject_digest": digest,
                 "source_revision": "d" * 40,
                 "workflow_run_url": run_url,
-                "predicate_type": "https://spdx.dev/Document",
+                "predicate_type": "https://spdx.dev/Document/v2.3",
                 "receipt": verification_path,
                 "receipt_sha256": hashlib.sha256((repo_root / verification_path).read_bytes()).hexdigest(),
             },
@@ -185,8 +185,13 @@ def test_candidate_workflow_is_same_repository_build_once_and_attests_each_final
     assert "github.event_name != 'pull_request'" in source
     assert "platforms: linux/amd64" in source
     assert "push: true" in source
-    assert "sbom: true" in source and "provenance: mode=max" in source
+    assert "sbom: true" not in source and "provenance: mode=max" in source
     assert "actions/attest-build-provenance@" in source
+    assert "anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26" in source
+    assert "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6" in source
+    assert "image: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}" in source
+    assert "sbom-path: candidate-subjects/${{ matrix.subject }}.spdx.json" in source
+    assert "upload-artifact: false" in source
     assert "verify_immutable_candidate.py" in source
     assert "test_mattermost_esr_staging.py" in source
     assert "test_clinical_adapter_process.py" in source
@@ -204,7 +209,7 @@ def test_candidate_workflow_exports_published_digests_before_consuming_them_and_
     consumer = source[source.index("exercise-published-subjects:"):]
     assert "GH_TOKEN: ${{ github.token }}" in consumer
     assert "--predicate-type https://slsa.dev/provenance/v1" in consumer
-    assert "--predicate-type https://spdx.dev/Document" in consumer
+    assert "--predicate-type https://spdx.dev/Document/v2.3" in consumer
     assert '--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/immutable-candidate.yml"' in consumer
     assert "verify_published_attestations.py" in consumer
     assert "inspect_published_subject.py" in consumer
@@ -278,6 +283,11 @@ def test_candidate_verifier_accepts_matching_subjects_and_rejects_relational_fai
     wrong_summary["evidence"]["summary"]["passed"] = 2
     assert any("summary is inconsistent" in error for error in verifier.verify(wrong_summary, repo_root=tmp_path))
 
+    duplicate_command = copy.deepcopy(manifest)
+    duplicate_command["evidence"]["commands"].append(copy.deepcopy(duplicate_command["evidence"]["commands"][0]))
+    duplicate_command["evidence"]["summary"]["passed"] = 2
+    assert any("ids must be unique" in error for error in verifier.verify(duplicate_command, repo_root=tmp_path))
+
     wrong_run = copy.deepcopy(manifest)
     wrong_run["subjects"][0]["tests"][0]["receipt"] = "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/2"
     assert any("exact subject and run" in error for error in verifier.verify(wrong_run, repo_root=tmp_path))
@@ -308,7 +318,7 @@ def test_actual_candidate_layout_receipts_build_and_verify_from_repo_root(tmp_pa
         subjects[name] = {"digest": digest, "image": image}
         (candidate / f"{name}.json").write_text(json.dumps({"name": name, "image": image, "digest": digest, "base_materials": [{"image": "docker.io/library/python", "digest": _digest("a"), "platform": "linux/amd64"}]}), encoding="utf-8")
         provenance = [{"verificationResult": {"statement": {"predicateType": "https://slsa.dev/provenance/v1", "subject": [{"digest": {"sha256": digest.removeprefix("sha256:")}}], "predicate": {"buildDefinition": {"resolvedDependencies": [{"digest": {"gitCommit": revision}}]}}}}}]
-        sbom = [{"verificationResult": {"statement": {"predicateType": "https://spdx.dev/Document", "subject": [{"digest": {"sha256": digest.removeprefix("sha256:")}}]}}}]
+        sbom = [{"verificationResult": {"statement": {"predicateType": "https://spdx.dev/Document/v2.3", "subject": [{"digest": {"sha256": digest.removeprefix("sha256:")}}]}}}]
         prov_path = verification / f"{name}.provenance.json"
         sbom_path = verification / f"{name}.sbom.json"
         prov_path.write_text(json.dumps(provenance), encoding="utf-8")

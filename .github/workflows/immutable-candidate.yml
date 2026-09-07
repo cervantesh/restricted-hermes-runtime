@@ -51,12 +51,25 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
           provenance: mode=max
-          sbom: true
       - name: Attach GitHub build provenance to the final OCI subject
         uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3.0.0
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Generate an SPDX SBOM from the final immutable OCI subject
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          image: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: candidate-subjects/${{ matrix.subject }}.spdx.json
+          upload-artifact: false
+      - name: Attach the signed final-image SPDX SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: candidate-subjects/${{ matrix.subject }}.spdx.json
           push-to-registry: true
       - name: Record the immutable published subject
         env:
@@ -79,7 +92,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.0.0
         with:
           name: immutable-subject-${{ matrix.subject }}
-          path: candidate-subjects/${{ matrix.subject }}.json
+          path: |
+            candidate-subjects/${{ matrix.subject }}.json
+            candidate-subjects/${{ matrix.subject }}.spdx.json
           if-no-files-found: error
 
   exercise-published-subjects:
@@ -144,7 +159,7 @@ jobs:
           for name in restricted-mattermost-ingress restricted-clinical-adapter; do
             if [[ "$name" == "restricted-mattermost-ingress" ]]; then image="$RESTRICTED_MATTERMOST_IMAGE_DIGEST"; else image="$RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST"; fi
             gh attestation verify "oci://$image" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/immutable-candidate.yml" --bundle-from-oci --source-digest "$GITHUB_SHA" --predicate-type https://slsa.dev/provenance/v1 --format=json > "candidate-subjects/candidate-verification/$name.provenance.json"
-            gh attestation verify "oci://$image" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/immutable-candidate.yml" --bundle-from-oci --source-digest "$GITHUB_SHA" --predicate-type https://spdx.dev/Document --format=json > "candidate-subjects/candidate-verification/$name.sbom.json"
+            gh attestation verify "oci://$image" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/immutable-candidate.yml" --bundle-from-oci --source-digest "$GITHUB_SHA" --predicate-type https://spdx.dev/Document/v2.3 --format=json > "candidate-subjects/candidate-verification/$name.sbom.json"
             python tools/verify_published_attestations.py --image "$image" --source-revision "$GITHUB_SHA" --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --provenance "candidate-subjects/candidate-verification/$name.provenance.json" --sbom "candidate-subjects/candidate-verification/$name.sbom.json" --output "candidate-subjects/candidate-verification/$name.attestations.json"
           done
       - name: Prove the bounded clinical adapter protocol remains closed
@@ -177,7 +192,7 @@ jobs:
               {"id": "clinical-role-closure", "command": "bash tests/deployment/test_clinical_adapter_image.sh", "outcome": "passed", "exit_code": 0},
               {"id": "subject-platform-source-inspection", "command": "python tools/inspect_published_subject.py (two digest-pinned subjects)", "outcome": "passed", "exit_code": 0},
               {"id": "provenance-predicate-verification", "command": "gh attestation verify --predicate-type https://slsa.dev/provenance/v1 (two exact OCI subjects)", "outcome": "passed", "exit_code": 0},
-              {"id": "spdx-sbom-predicate-verification", "command": "gh attestation verify --predicate-type https://spdx.dev/Document (two exact OCI subjects)", "outcome": "passed", "exit_code": 0},
+              {"id": "spdx-sbom-predicate-verification", "command": "gh attestation verify --predicate-type https://spdx.dev/Document/v2.3 (two exact OCI subjects)", "outcome": "passed", "exit_code": 0},
               {"id": "clinical-protocol", "command": "python -m pytest tests/unit/test_clinical_adapter.py tests/integration/test_clinical_adapter_process.py", "outcome": "passed", "exit_code": 0},
               {"id": "mattermost-esr", "command": "python tests/deployment/test_mattermost_esr_staging.py", "outcome": "passed", "exit_code": 0},
           ]
