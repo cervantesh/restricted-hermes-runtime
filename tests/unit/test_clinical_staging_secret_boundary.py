@@ -321,11 +321,15 @@ def test_atomic_marker_write_recovers_a_killed_legacy_temp_and_rejects_symlink(
     stale = marker.with_name(marker.name + ".tmp")
     stale.write_text('{"incomplete": true}\n', encoding="utf-8")
     stale.chmod(0o600)
+    current_stale = marker.with_name(f".{marker.name}.tmp-0123456789abcdef0123456789abcdef")
+    current_stale.write_text('{"incomplete": true}\n', encoding="utf-8")
+    current_stale.chmod(0o600)
     staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingsecret", 18443)
     lifecycle = {"lifecycle": "finalizing"}
 
     staging._finalize_initialization(lifecycle)
     assert not stale.exists()
+    assert not current_stale.exists()
     assert lifecycle["lifecycle"] == "ready"
 
     sentinel = tmp_path / "unrelated-sentinel"

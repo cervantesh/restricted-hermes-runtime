@@ -36,6 +36,7 @@ SCHEMA = "restricted-synthetic-clinical-staging.v1"
 MARKER_NAME = "staging-state.json"
 INIT_ORPHAN_RE_TEMPLATE = r"^\.{state}\.init-[a-f0-9]{{16}}$"
 MAX_INITIALIZATION_ORPHANS = 8
+MAX_ABANDONED_ATOMIC_TEMPS = 8
 PROJECT_LABEL = "io.cervantesh.restricted-runtime.project"
 STATE_LABEL = "io.cervantesh.restricted-runtime.state-id"
 SYNTHETIC_LABEL = "io.cervantesh.restricted-runtime.synthetic-clinical"
@@ -253,25 +254,35 @@ def _exclusive_operator_lock(path: Path) -> Iterator[None]:
         os.close(fd)
 
 
-def _discard_abandoned_atomic_temp(path: Path, *, mode: int) -> None:
-    """Remove only the old deterministic temp left by a dead earlier wrapper."""
-    try:
-        _assert_owned_regular(path, mode=mode, label="abandoned atomic temporary")
-    except FileNotFoundError:
-        return
-    path.unlink()
-    fsync_directory(path.parent)
+def _discard_abandoned_atomic_temps(path: Path, *, mode: int) -> None:
+    """Remove bounded wrapper-owned atomic temps only while their writer lock is held."""
+    legacy = path.with_name(path.name + ".tmp")
+    current_expression = re.compile(rf"^\.{re.escape(path.name)}\.tmp-[a-f0-9]{{32}}$")
+    candidates = [legacy]
+    candidates.extend(entry for entry in path.parent.iterdir() if current_expression.fullmatch(entry.name))
+    present: list[Path] = []
+    for candidate in candidates:
+        try:
+            _assert_owned_regular(candidate, mode=mode, label="abandoned atomic temporary")
+        except FileNotFoundError:
+            continue
+        present.append(candidate)
+    if len(present) > MAX_ABANDONED_ATOMIC_TEMPS:
+        raise SafetyError("too many abandoned atomic temporaries; refusing unsafe cleanup")
+    for candidate in present:
+        candidate.unlink()
+    if present:
+        fsync_directory(path.parent)
 
 
 def write_json_atomic(path: Path, value: Mapping[str, Any], *, mode: int) -> None:
     raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    legacy_tmp = path.with_name(path.name + ".tmp")
     lock_path = path.with_name(f".{path.name}.lock")
     with _exclusive_operator_lock(lock_path):
         # Releases before this change could leave this fixed name behind after
         # SIGKILL.  The lock makes cleanup non-racy; ownership/type checks make
         # a planted link or foreign file fail closed instead of being removed.
-        _discard_abandoned_atomic_temp(legacy_tmp, mode=mode)
+        _discard_abandoned_atomic_temps(path, mode=mode)
         tmp = path.with_name(f".{path.name}.tmp-{secrets.token_hex(16)}")
         fd = os.open(
             tmp,
