@@ -79,6 +79,48 @@ interruption can leave ingress stopped with a fail-closed mismatched pair;
 rerunning `refresh-policy` safely replaces and verifies both files before the
 restart.
 
+### Cold synthetic TLS renewal
+
+The synthetic CA and both server certificates last 30 days. The CA signing key
+is not retained. `renew-tls` therefore replaces the complete CA/leaf generation,
+not only a leaf certificate, and deliberately leaves the candidate **stopped**:
+
+```bash
+python deploy/clinical-staging/clinical_staging.py \
+  --hrh-root "$hrh" --state-dir "$state" --project "$project" renew-tls
+# Then run the normal `up` command and require its authenticated status checks.
+```
+
+Use it on an initialized ready/stopped stack with its exact Compose resources.
+It can repair expiration but rejects missing, malformed, mismatched, or linked
+certificate material. It holds the existing project operator lock, durably
+records `renewing_tls`, stops all workload services and verifies cold quiescence
+before preparing a new generation. `tls_prepared` fixes the candidate bytes
+before the one-shot controller updates both TLS volumes and the ingress CA.
+The controller verifies installed bytes/ownership/modes; host publication and
+the content-safe `evidence/tls-renewal.json` receipt precede the final atomic
+`stopped` marker. No workload is restarted by renewal.
+
+This is **operational atomicity while cold**, not a cross-volume filesystem
+transaction or zero-downtime CA rollover. During incomplete renewal, `up`,
+`status`, and `backup` reject the non-operational marker. Repeating `renew-tls`
+retries the same validated prepared generation; corruption of that generation
+fails closed rather than silently replacing it. An unexpected running/root
+controller or unprovable quiescence is not automatically bypassed. Do not edit
+markers; use bounded `destroy` if safe recovery cannot be established.
+
+To restore a backup whose certificates have expired, use the existing restore
+arguments plus `--renew-tls`. It restores all volumes, proves they are unmounted,
+and completes renewal **before** `_start_restored_stack` can start any workload.
+Default restore behavior is unchanged. An interrupted restore still remains
+`recovering` and requires its existing destroy-before-retry procedure. TLS
+renewal does not refresh expired clinical policies or change identities,
+credentials, outbox keys, application images, or source/published-HRH selection.
+Backups contain private key material and remain private synthetic artifacts.
+
+The bounded [verification record](../../docs/evidence/clinical-staging-tls-renewal.md)
+distinguishes real Linux/TLS witnesses from simulated application startup.
+
 `reset` and `destroy` are destructive. Both reread the closed state marker,
 recheck the current source frame, discover volumes by both the staging and
 Compose project labels, reject any unexpected or mislabeled volume, and remove

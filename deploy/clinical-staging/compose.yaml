@@ -43,6 +43,8 @@ services:
     profiles: ["provision"]
     restart: "no"
     entrypoint: ["python", "/harness/control.py"]
+    volumes:
+      - ../../../deploy/clinical-staging/clinical_tls.py:/harness/clinical_tls.py:ro
     labels: *staging-labels
 
 networks:

@@ -22,21 +22,20 @@ import subprocess
 import sys
 import tarfile
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
 
 
 _STAGING_MODULE_DIR = str(Path(__file__).resolve().parent)
 if _STAGING_MODULE_DIR not in sys.path:
     sys.path.insert(0, _STAGING_MODULE_DIR)
 from clinical_operator_lock import OperatorLockError, operator_lock_path, persistent_operator_lock
+from clinical_tls import TlsError, generate_material as _certificate_material, renew as _renew_tls
 
 
 RUNTIME_BASE_SHA = "41464aee8748f857153ba2b47377515d4847d210"
@@ -436,7 +435,7 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         or value["volumes"] != volume_names(project)
         or not re.fullmatch(r"[a-f0-9]{32}", value["state_id"])
         or not re.fullmatch(r"[a-f0-9]{64}", value["compose_env_sha256"])
-        or value["lifecycle"] not in {"initializing", "finalizing", "recovering", "ready", "stopped"}
+        or value["lifecycle"] not in {"initializing", "finalizing", "recovering", "ready", "stopped", "renewing_tls", "tls_prepared"}
         or not isinstance(value["expected_images"], dict)
     ):
         raise SafetyError("staging marker does not match the requested synthetic target")
@@ -631,7 +630,7 @@ def verify_destructive_volumes(
             raise SafetyError(f"volume label mismatch: {name}")
     if lifecycle in {"finalizing", "ready", "stopped"} and set(discovered) != expected:
         raise SafetyError("finalizing/ready/stopped staging requires the exact volume set")
-    if lifecycle not in {"initializing", "finalizing", "recovering", "ready", "stopped"}:
+    if lifecycle not in {"initializing", "finalizing", "recovering", "ready", "stopped", "renewing_tls", "tls_prepared"}:
         raise SafetyError("unknown lifecycle for destructive volume verification")
     return sorted(discovered)
 
@@ -682,7 +681,7 @@ def verify_destructive_resources(
                 raise SafetyError("stopped staging requires the exact service set or no resources")
             if set(networks) != allowed_networks:
                 raise SafetyError("stopped staging requires the exact network set or no resources")
-    elif lifecycle == "recovering":
+    elif lifecycle in {"recovering", "renewing_tls", "tls_prepared"}:
         # A failed restore is deliberately non-operational and may have only a
         # bounded partial stack.  It remains eligible solely for controlled
         # destroy; `up` never accepts this lifecycle.
@@ -864,58 +863,6 @@ def verify_restricted_container_controls(
             "writable_mounts": sorted(expected["writable_mounts"]),
         }
     return evidence
-
-
-def _certificate_material(seed: Path) -> None:
-    now = datetime.now(UTC)
-    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic clinical staging CA")])
-    ca = (
-        x509.CertificateBuilder()
-        .subject_name(ca_name)
-        .issuer_name(ca_name)
-        .public_key(ca_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(minutes=5))
-        .not_valid_after(now + timedelta(days=30))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
-        .sign(ca_key, hashes.SHA256())
-    )
-
-    def server(host: str, *, include_loopback_ip: bool = False) -> tuple[bytes, bytes]:
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        names: list[x509.GeneralName] = [x509.DNSName(host)]
-        if include_loopback_ip:
-            names.append(x509.IPAddress(ipaddress.ip_address("127.0.0.1")))
-        cert = (
-            x509.CertificateBuilder()
-            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
-            .issuer_name(ca.subject)
-            .public_key(key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(now - timedelta(minutes=5))
-            .not_valid_after(now + timedelta(days=30))
-            .add_extension(x509.SubjectAlternativeName(names), critical=False)
-            .sign(ca_key, hashes.SHA256())
-        )
-        return (
-            cert.public_bytes(serialization.Encoding.PEM),
-            key.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption(),
-            ),
-        )
-
-    material = {"ca.crt": ca.public_bytes(serialization.Encoding.PEM)}
-    for host, prefix in (("mattermost", "mattermost"), ("hrh-tls", "hrh-tls")):
-        material[f"{prefix}.crt"], material[f"{prefix}.key"] = server(
-            host, include_loopback_ip=host == "mattermost"
-        )
-    for name, raw in material.items():
-        path = seed / name
-        path.write_bytes(raw)
-        path.chmod(0o600)
 
 
 class ClinicalStaging:
@@ -1423,6 +1370,21 @@ class ClinicalStaging:
         return evidence
 
     @_serialized_mutator
+    def renew_tls(self) -> dict[str, Any]:
+        self._require_linux()
+        marker = self._verify_marker_and_source()
+        self._require_lifecycle(marker, "renew-tls", {"ready", "stopped", "renewing_tls", "tls_prepared"})
+        return self._renew_tls_material(marker)
+
+    def _renew_tls_material(self, marker: dict[str, Any], *, restoring: bool = False) -> dict[str, Any]:
+        try:
+            return _renew_tls(self, marker, LONG_RUNNING_SERVICES, restoring=restoring)
+        except TlsError as exc:
+            raise SafetyError(str(exc)) from exc
+        except (OSError, ValueError) as exc:
+            raise SafetyError("TLS renewal failed with incomplete state") from exc
+
+    @_serialized_mutator
     def refresh_policy(self, epoch: str) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
@@ -1539,6 +1501,7 @@ class ClinicalStaging:
         """Create an atomically published, cold-only backup.  No overwrite exists."""
         self._require_linux()
         marker = self._verify_marker_and_source()
+        self._require_lifecycle(marker, "backup", {"stopped"})
         self._verify_cold_quiescence(marker)
         backup_dir = validate_backup_path(
             backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime, self.hrh),
@@ -1676,7 +1639,7 @@ class ClinicalStaging:
         self.compose("up", "--detach", "ingress", timeout=600)
 
     @_serialized_mutator
-    def restore(self, backup_dir: Path, expected_manifest_sha256: str) -> dict[str, Any]:
+    def restore(self, backup_dir: Path, expected_manifest_sha256: str, *, renew_tls: bool = False) -> dict[str, Any]:
         """Restore only a fully validated cold bundle into a clean destination."""
         self._require_linux()
         backup_dir = validate_backup_path(
@@ -1716,6 +1679,8 @@ class ClinicalStaging:
             self._create_volumes(marker)
             for key in BACKED_UP_VOLUME_KEYS:
                 self._restore_volume(key, marker["volumes"][key], snapshot)
+            if renew_tls:
+                self._renew_tls_material(marker, restoring=True)
             # The excluded transport socket is recreated empty by _create_volumes;
             # clinical-socket-init rebuilds its socket during the ordered startup.
             self._start_restored_stack()
@@ -1904,7 +1869,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--project", required=True)
     parser.add_argument("--port", type=int, default=18443)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("init", "up", "status", "stop", "reset", "destroy"):
+    for name in ("init", "up", "status", "stop", "reset", "destroy", "renew-tls"):
         sub.add_parser(name)
     refresh = sub.add_parser("refresh-policy")
     refresh.add_argument("--epoch", required=True)
@@ -1913,6 +1878,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     restore = sub.add_parser("restore")
     restore.add_argument("--backup-dir", type=Path, required=True)
     restore.add_argument("--expected-manifest-sha256", required=True)
+    restore.add_argument("--renew-tls", action="store_true", help="renew synthetic TLS while restored workloads are still stopped")
     return parser.parse_args(argv)
 
 
@@ -1925,7 +1891,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "backup":
             result = staging.backup(args.backup_dir)
         elif args.command == "restore":
-            result = staging.restore(args.backup_dir, args.expected_manifest_sha256)
+            result = staging.restore(args.backup_dir, args.expected_manifest_sha256, renew_tls=args.renew_tls)
+        elif args.command == "renew-tls":
+            result = staging.renew_tls()
         else:
             result = getattr(staging, args.command)()
     except CommandError:
