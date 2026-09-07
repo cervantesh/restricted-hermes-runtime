@@ -1091,7 +1091,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             result = staging.refresh_policy(args.epoch)
         else:
             result = getattr(staging, args.command)()
-    except (SafetyError, CommandError) as exc:
+    except CommandError:
+        # CommandError is a boundary type: never let a future child-output
+        # regression become public just because this CLI renders its message.
+        print("clinical_staging outcome=denied reason=command_failed", file=sys.stderr)
+        return 2
+    except SafetyError as exc:
         print(f"clinical_staging outcome=denied reason={exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, sort_keys=True))
