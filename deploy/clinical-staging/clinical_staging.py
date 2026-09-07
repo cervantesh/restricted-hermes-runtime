@@ -1659,15 +1659,15 @@ class ClinicalStaging:
         if key not in BACKED_UP_VOLUME_KEYS or volume != volume_names(self.project)[key]:
             raise SafetyError("restore volume is outside the exact allowlist")
         archive = f"/backup/{BACKUP_VOLUME_DIR}/{key}.tar"
-        # CHOWN is required only here: --numeric-owner must restore archived
-        # service UIDs/GIDs (for example PostgreSQL's 999:999) into the exact
-        # named destination volume.  The command boundary rejects every third
-        # capability and every extra mount.
+        # CHOWN/FOWNER are required only here: --numeric-owner must restore
+        # archived service UIDs/GIDs (for example PostgreSQL's 999:999) and
+        # their archived modes into the exact named destination volume.  The
+        # command boundary rejects every fourth capability and every extra mount.
         source_mount = f"type=volume,src={volume},dst=/destination"
         backup_mount = f"type=bind,src={backup_dir},dst=/backup,readonly"
         command = (
             "docker", "run", "--rm", "--network", "none", "--read-only",
-            "--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE", "--cap-add", "CHOWN",
+            "--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE", "--cap-add", "CHOWN", "--cap-add", "FOWNER",
             "--security-opt", "no-new-privileges:true", "--user", "0:0",
             "--entrypoint", "sh",
             "--mount", source_mount,
@@ -1677,7 +1677,7 @@ class ClinicalStaging:
         )
         verify_recovery_helper_boundary(
             command, source_mount=source_mount, backup_mount=backup_mount,
-            capabilities=frozenset({"DAC_OVERRIDE", "CHOWN"}),
+            capabilities=frozenset({"DAC_OVERRIDE", "CHOWN", "FOWNER"}),
         )
         self.shell.run(*command, cwd=self.runtime, timeout=1200)
 

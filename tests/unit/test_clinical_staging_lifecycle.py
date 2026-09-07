@@ -1160,7 +1160,7 @@ def test_volume_transfer_helper_is_pinned_networkless_and_never_uses_socket(tmp_
     backup_caps = [call[index + 1] for index, value in enumerate(shell.calls[0][:-1]) if value == "--cap-add"]
     restore_caps = [call[index + 1] for index, value in enumerate(shell.calls[1][:-1]) if value == "--cap-add"]
     assert backup_caps == ["DAC_OVERRIDE"]
-    assert restore_caps == ["DAC_OVERRIDE", "CHOWN"]
+    assert restore_caps == ["DAC_OVERRIDE", "CHOWN", "FOWNER"]
     assert shell.calls[0][-1] == "tar --numeric-owner -C /source -cf /backup/volumes/hrh_secret.tar ."
     assert shell.calls[1][-1] == "tar --numeric-owner -C /destination -xf /backup/volumes/hrh_secret.tar"
     mounts = [shell.calls[0][index + 1] for index, value in enumerate(shell.calls[0][:-1]) if value == "--mount"]
@@ -1194,16 +1194,24 @@ def test_volume_transfer_helper_is_pinned_networkless_and_never_uses_socket(tmp_
     restore_mounts = [shell.calls[1][index + 1] for index, value in enumerate(shell.calls[1][:-1]) if value == "--mount"]
     module.verify_recovery_helper_boundary(
         shell.calls[1], source_mount=restore_mounts[0], backup_mount=restore_mounts[1],
-        capabilities=frozenset({"DAC_OVERRIDE", "CHOWN"}),
+        capabilities=frozenset({"DAC_OVERRIDE", "CHOWN", "FOWNER"}),
     )
-    restore_third_cap = list(shell.calls[1])
-    restore_third_cap[restore_third_cap.index(module.RECOVERY_HELPER_IMAGE):restore_third_cap.index(module.RECOVERY_HELPER_IMAGE)] = [
+    backup_with_fowner = list(shell.calls[0])
+    backup_with_fowner[backup_with_fowner.index(module.RECOVERY_HELPER_IMAGE):backup_with_fowner.index(module.RECOVERY_HELPER_IMAGE)] = [
+        "--cap-add", "FOWNER",
+    ]
+    with pytest.raises(module.SafetyError, match="security authority"):
+        module.verify_recovery_helper_boundary(
+            tuple(backup_with_fowner), source_mount=mounts[0], backup_mount=mounts[1], capabilities=frozenset({"DAC_OVERRIDE"}),
+        )
+    restore_fourth_cap = list(shell.calls[1])
+    restore_fourth_cap[restore_fourth_cap.index(module.RECOVERY_HELPER_IMAGE):restore_fourth_cap.index(module.RECOVERY_HELPER_IMAGE)] = [
         "--cap-add", "NET_ADMIN",
     ]
     with pytest.raises(module.SafetyError, match="security authority"):
         module.verify_recovery_helper_boundary(
-            tuple(restore_third_cap), source_mount=restore_mounts[0], backup_mount=restore_mounts[1],
-            capabilities=frozenset({"DAC_OVERRIDE", "CHOWN"}),
+            tuple(restore_fourth_cap), source_mount=restore_mounts[0], backup_mount=restore_mounts[1],
+            capabilities=frozenset({"DAC_OVERRIDE", "CHOWN", "FOWNER"}),
         )
     with pytest.raises(module.SafetyError, match="allowlist"):
         staging._backup_volume("clinical_socket", module.volume_names(project)["clinical_socket"], backup)
