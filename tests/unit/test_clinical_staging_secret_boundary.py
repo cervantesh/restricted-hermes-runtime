@@ -299,6 +299,11 @@ def test_next_init_invocation_resumes_finalizing_before_operational_lifecycle(
 
     monkeypatch.setattr(Path, "stat", fake_stat)
     monkeypatch.setattr(module.os, "getuid", lambda: operator_uid, raising=False)
+    # ``init`` is wrapped by the shared persistent operator lock before it
+    # reaches the initialization-specific lock below.  This fixture models the
+    # latter resume path rather than the lock implementation, so replace the
+    # reachable outer boundary explicitly.
+    monkeypatch.setattr(module, "persistent_operator_lock", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(module, "_exclusive_operator_lock", lambda _path: nullcontext())
     monkeypatch.setattr(staging, "_require_linux", lambda: None)
     monkeypatch.setattr(module, "verify_source_frame", lambda *_args: {})
