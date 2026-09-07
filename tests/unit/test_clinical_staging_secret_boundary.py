@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+from contextlib import nullcontext
 import importlib.util
 import os
 import stat
@@ -289,6 +290,7 @@ def test_next_init_invocation_resumes_finalizing_before_operational_lifecycle(
 
     monkeypatch.setattr(Path, "stat", fake_stat)
     monkeypatch.setattr(module.os, "getuid", lambda: operator_uid, raising=False)
+    monkeypatch.setattr(module, "_exclusive_operator_lock", lambda _path: nullcontext())
     monkeypatch.setattr(staging, "_require_linux", lambda: None)
     monkeypatch.setattr(module, "verify_source_frame", lambda *_args: {})
     monkeypatch.setattr(module, "read_marker", lambda *_args: marker)
