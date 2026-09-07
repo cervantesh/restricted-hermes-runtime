@@ -472,6 +472,7 @@ def main() -> None:
         print("clinical_composed_e2e crash_outbox=" + control("outbox-summary", check=False).stdout.strip(), file=sys.stderr)
         print(compose("logs", "--no-color", "ingress", "clinical-adapter", "hrh", check=False).stdout[-2400:], file=sys.stderr)
         raise
+    wait_delivery_delay()
     before_crash = json.loads(control("grant-evidence", "crash-retry").stdout)
     if before_crash["audits"].get("restricted_hermes_next_appointment_read_authorized") != 1 or before_crash["audits"].get("restricted_hermes_next_appointment_read_completed") != 1:
         raise RuntimeError("crash window did not follow exactly one durable clinical read")
