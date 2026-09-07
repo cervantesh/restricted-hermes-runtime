@@ -38,6 +38,9 @@ SECRET_PATTERNS = (
 ROOT_KEYS = frozenset({"schema_version", "scope", "candidate_id", "sources", "subjects", "producer", "policy", "controls", "dependencies", "nonclaims", "files"})
 SPECIAL_FILES = frozenset({"README.md", "assessment.manifest.json", "verify_assessment_bundle.py"})
 PROFILE = "restricted-clinical-candidate.v1"
+BOUND_REVIEW_PROFILE = "restricted-clinical-candidate.v2"
+PREREVIEW_MANIFEST_PATH = "independent-review/prereview.manifest.json"
+REVIEW_PATH = "independent-review/findings.json"
 REQUIRED_SOURCES = frozenset({"governance-contract", "health-record-hub-contract", "health-record-hub-publication", "restricted-edge", "restricted-runtime"})
 REQUIRED_SUBJECTS = frozenset({"health-record-hub-migration", "health-record-hub-web", "restricted-clinical-adapter", "restricted-mattermost-ingress"})
 REQUIRED_DEPENDENCIES = frozenset({"immutable-images", "representative-host-input"})
@@ -63,6 +66,20 @@ GATE_DEPENDENCIES = {
     "representative-host": ("representative-host-input",),
 }
 PROFILE_FILES = frozenset({path for paths in GATE_EVIDENCE.values() for path in paths})
+
+
+def profile_files(manifest: dict[str, Any]) -> frozenset[str]:
+    """v2 retains A10P only for a completed technical review (including FAIL)."""
+    controls = manifest.get("controls")
+    review = next((item for item in controls if isinstance(item, dict) and item.get("id") == "independent-review"), {}) if isinstance(controls, list) else {}
+    status = review.get("status")
+    if status == "EXTERNALLY_ACCEPTED" and isinstance(review.get("acceptance"), dict):
+        status = review["acceptance"].get("technical_status")
+    if manifest.get("profile") == BOUND_REVIEW_PROFILE and status in {"PASS", "FAIL"}:
+        return PROFILE_FILES | {PREREVIEW_MANIFEST_PATH}
+    return PROFILE_FILES
+
+
 HOST_OBSERVATIONS = ("backup-recovery", "dns", "effective-host-runtime", "ingress-ports", "ipv4", "ipv6", "logging-audit-sinks", "metadata-endpoints", "mounts", "patch-baseline", "principals-iam-denials", "proxy-env", "secret-mounts-rotation", "time-source", "trust-roots")
 BOUNDED_INPUT_CLASSIFICATIONS = {
     "delivery-reauthorization-pr18": "bounded-delivery-reauthorization",
@@ -166,8 +183,8 @@ def _verify_metadata(manifest: dict[str, Any], errors: list[str]) -> dict[str, s
         _error(errors, "manifest: closed schema keys mismatch")
     if manifest.get("schema_version") != SCHEMA or manifest.get("scope") != SCOPE:
         _error(errors, "manifest: schema or synthetic non-PHI scope mismatch")
-    if manifest.get("profile") != PROFILE:
-        _error(errors, f"manifest: required profile is {PROFILE}")
+    if manifest.get("profile") not in {PROFILE, BOUND_REVIEW_PROFILE}:
+        _error(errors, f"manifest: required profile is {PROFILE} or {BOUND_REVIEW_PROFILE}")
     candidate_id = manifest.get("candidate_id")
     payload = dict(manifest)
     payload.pop("candidate_id", None)
@@ -275,7 +292,7 @@ def _aggregate_outcomes(outcomes: list[object]) -> str | None:
 
 
 def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, dict[str, Any]], declared: set[str], errors: list[str]) -> None:
-    if declared != PROFILE_FILES | {"README.md", "verify_assessment_bundle.py"}:
+    if declared != profile_files(manifest) | {"README.md", "verify_assessment_bundle.py"}:
         _error(errors, "evidence: closed profile file inventory mismatch")
     sources = manifest.get("sources") if isinstance(manifest.get("sources"), list) else []
     subjects = manifest.get("subjects") if isinstance(manifest.get("subjects"), list) else []
@@ -293,6 +310,8 @@ def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, d
         "independent-review/findings.json": core | {"reviewer_id", "authority", "conflict_statement", "findings", "technical_go_no_go"},
         "subjects/images.json": core | {"edge_candidate_manifest_sha256"},
     }
+    if manifest.get("profile") == BOUND_REVIEW_PROFILE:
+        required_fields[REVIEW_PATH] = required_fields[REVIEW_PATH] | {"reviewed_manifest_sha256"}
     for path, required in required_fields.items():
         evidence = json_records.get(path)
         if not isinstance(evidence, dict):
@@ -451,6 +470,62 @@ def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, d
             _error(errors, "control immutable-application-subjects: PASS requires all four immutable subjects PASS")
 
 
+def _verify_prereview_binding(manifest: dict[str, Any], json_records: dict[str, dict[str, Any]], raw_records: dict[str, bytes], errors: list[str]) -> None:
+    """Bind a v2 verdict to retained A10P bytes and unchanged non-review inputs.
+
+    A10P remains separately frozen. A10F hashes its retained manifest and A9;
+    neither A9 nor A10P contains the hash of the enclosing A10F manifest.
+    This verifies evidence identity, not the reviewer's authority or sincerity.
+    """
+    review = json_records.get(REVIEW_PATH, {})
+    if manifest.get("profile") != BOUND_REVIEW_PROFILE or review.get("outcome") not in {"PASS", "FAIL"}:
+        return
+    raw = raw_records.get(PREREVIEW_MANIFEST_PATH)
+    pre = json_records.get(PREREVIEW_MANIFEST_PATH)
+    expected = review.get("reviewed_manifest_sha256")
+    if raw is None or pre is None:
+        _error(errors, "pre-review: exact retained manifest required for PASS/FAIL findings")
+        return
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected) or hashlib.sha256(raw).hexdigest() != expected:
+        _error(errors, "pre-review: reviewed_manifest_sha256 does not bind retained bytes")
+    if raw != canonical_json(pre):
+        _error(errors, "pre-review: canonical manifest bytes required")
+    metadata_errors: list[str] = []
+    _verify_metadata(pre, metadata_errors)
+    errors.extend("pre-review: " + error for error in metadata_errors)
+    if pre.get("profile") != BOUND_REVIEW_PROFILE:
+        _error(errors, "pre-review: v2 input profile required")
+    for key in ROOT_KEYS - {"candidate_id", "files", "controls"}:
+        if pre.get(key) != manifest.get(key):
+            _error(errors, f"pre-review: final {key} differs from reviewed input")
+    pre_controls = pre.get("controls")
+    final_controls = manifest.get("controls")
+    if not isinstance(pre_controls, list) or not isinstance(final_controls, list):
+        _error(errors, "pre-review: control inventory required")
+        return
+    pre_review = [item for item in pre_controls if isinstance(item, dict) and item.get("id") == "independent-review"]
+    if pre_review != [{"id": "independent-review", "status": "NOT_VERIFIED", "dependencies": [], "evidence_paths": [REVIEW_PATH]}]:
+        _error(errors, "pre-review: input review gate must be the NOT_VERIFIED placeholder")
+    if [item for item in pre_controls if isinstance(item, dict) and item.get("id") != "independent-review"] != [item for item in final_controls if isinstance(item, dict) and item.get("id") != "independent-review"]:
+        _error(errors, "pre-review: final non-review controls changed")
+    pre_files = pre.get("files")
+    if not isinstance(pre_files, list) or not all(isinstance(item, dict) and set(item) == {"path", "size", "media_type", "sha256"} for item in pre_files):
+        _error(errors, "pre-review: closed file inventory required")
+        return
+    paths = [item.get("path") for item in pre_files]
+    expected_paths = PROFILE_FILES | {"README.md", "verify_assessment_bundle.py"}
+    if any(not isinstance(path, str) for path in paths) or paths != sorted(expected_paths):
+        _error(errors, "pre-review: input file inventory must exclude retained/final manifests")
+    for item in pre_files:
+        if (not isinstance(item.get("size"), int) or not 0 <= item["size"] <= MAX_FILE_BYTES
+                or item.get("media_type") != MEDIA_TYPES.get(Path(str(item.get("path"))).suffix)
+                or not isinstance(item.get("sha256"), str) or not SHA256.fullmatch(item["sha256"])):
+            _error(errors, "pre-review: invalid file metadata")
+    final_files = manifest.get("files", [])
+    if [item for item in pre_files if item.get("path") != REVIEW_PATH] != [item for item in final_files if isinstance(item, dict) and item.get("path") not in {REVIEW_PATH, PREREVIEW_MANIFEST_PATH}]:
+        _error(errors, "pre-review: final non-review evidence bytes differ from reviewed input")
+
+
 def verify(bundle_dir: Path, *, expected_manifest_sha256: str) -> VerificationResult:
     """Verify only bundle content; no checkout, source tree, or network is used."""
     errors: list[str] = []
@@ -549,6 +624,7 @@ def verify(bundle_dir: Path, *, expected_manifest_sha256: str) -> VerificationRe
         _error(errors, "bundle: unexpected directory content")
     total = len(manifest_raw)
     json_records: dict[str, dict[str, Any]] = {}
+    raw_records: dict[str, bytes] = {}
     for relative, metadata in declared.items():
         path = bundle_dir / relative
         if not _regular(path, errors, relative):
@@ -557,6 +633,7 @@ def verify(bundle_dir: Path, *, expected_manifest_sha256: str) -> VerificationRe
         if raw is None:
             continue
         total += len(raw)
+        raw_records[relative] = raw
         if len(raw) != metadata["size"] or hashlib.sha256(raw).hexdigest() != metadata["sha256"].removeprefix("sha256:"):
             _error(errors, f"{relative}: size or hash mismatch")
         if _secret_bearing(raw):
@@ -579,6 +656,7 @@ def verify(bundle_dir: Path, *, expected_manifest_sha256: str) -> VerificationRe
     if total > MAX_TOTAL_BYTES:
         _error(errors, "bundle: total content limit exceeded")
     _verify_profile_evidence(record, json_records, set(declared), errors)
+    _verify_prereview_binding(record, json_records, raw_records, errors)
     evidence_paths = set(declared)
     for key in ("dependencies", "controls"):
         status_records = record.get(key)
