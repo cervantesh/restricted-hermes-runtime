@@ -2,10 +2,17 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
-tag="${RESTRICTED_CLINICAL_ADAPTER_IMAGE_TAG:-restricted-clinical-adapter-closure:sg-clinical-005}"
-
-docker build -f Dockerfile.clinical-adapter -t "$tag" .
-docker run --rm --network none --entrypoint python "$tag" -c '
+image="${RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST:-${RESTRICTED_CLINICAL_ADAPTER_IMAGE_TAG:-restricted-clinical-adapter-closure:sg-clinical-005}}"
+if [[ -n "${RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST:-}" ]]; then
+  if [[ "$image" != *@sha256:* ]]; then
+    printf '%s\n' 'published clinical adapter subject must be immutable' >&2
+    exit 64
+  fi
+  docker pull "$image"
+else
+  docker build -f Dockerfile.clinical-adapter -t "$image" .
+fi
+docker run --rm --network none --entrypoint python "$image" -c '
 import importlib
 import importlib.util
 from pathlib import Path
