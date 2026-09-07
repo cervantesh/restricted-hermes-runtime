@@ -127,7 +127,10 @@ The one-shot archive helper has no network, a read-only root filesystem and
 all capabilities dropped except `DAC_OVERRIDE`. It runs as root only because
 the exact source volumes and the private `0700` bind require controlled access
 to preserve numeric ownership; it receives only one named source/destination
-volume and the bundle bind for that invocation.
+volume and the bundle bind for that invocation. A fixed per-volume UID would
+not be safe or sufficient: existing data may have arbitrary persisted service
+ownership, so it cannot universally traverse the source tree or preserve the
+numeric owner metadata required by this cold format.
 
 Before Docker state or the destination state directory is changed, `restore`
 requires the exact member allowlist, completion marker, external manifest hash,

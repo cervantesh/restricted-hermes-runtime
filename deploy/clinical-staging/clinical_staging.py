@@ -704,6 +704,30 @@ def materialize_backup_snapshot(backup_dir: Path, snapshot_parent: Path, *, snap
         raise
 
 
+def verify_recovery_helper_boundary(
+    command: tuple[str, ...], *, source_mount: str, backup_mount: str,
+) -> None:
+    """Fail closed if the one-shot archive helper gains any authority."""
+    if command[:3] != ("docker", "run", "--rm") or command.count("--read-only") != 1:
+        raise SafetyError("recovery helper command is not ephemeral and read-only")
+    expected_single = {
+        "--network": "none",
+        "--cap-drop": "ALL",
+        "--cap-add": "DAC_OVERRIDE",
+        "--security-opt": "no-new-privileges:true",
+        "--user": "0:0",
+        "--entrypoint": "sh",
+    }
+    for flag, value in expected_single.items():
+        if command.count(flag) != 1 or command[command.index(flag) + 1] != value:
+            raise SafetyError("recovery helper command has an unexpected security authority")
+    mounts = [command[index + 1] for index, item in enumerate(command[:-1]) if item == "--mount"]
+    if len(mounts) != 2 or set(mounts) != {source_mount, backup_mount}:
+        raise SafetyError("recovery helper command has an unexpected mount")
+    if "--privileged" in command or "-v" in command or "--volume" in command:
+        raise SafetyError("recovery helper command has an unexpected authority")
+
+
 def verify_effective_env(state_dir: Path, marker: Mapping[str, Any]) -> None:
     if file_sha256(state_dir / "compose.env") != marker["compose_env_sha256"]:
         raise SafetyError("compose.env differs from the initialized exact content")
@@ -1494,17 +1518,20 @@ class ClinicalStaging:
         # service UID.  Root plus this single DAC capability is the minimum
         # needed for both endpoints; network, writable rootfs and every other
         # capability remain unavailable.
-        self.shell.run(
+        source_mount = f"type=volume,src={volume},dst=/source,readonly"
+        backup_mount = f"type=bind,src={backup_dir},dst=/backup"
+        command = (
             "docker", "run", "--rm", "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE",
             "--security-opt", "no-new-privileges:true", "--user", "0:0",
             "--entrypoint", "sh",
-            "--mount", f"type=volume,src={volume},dst=/source,readonly",
-            "--mount", f"type=bind,src={backup_dir},dst=/backup",
+            "--mount", source_mount,
+            "--mount", backup_mount,
             RECOVERY_HELPER_IMAGE,
             "-ec", f"tar --numeric-owner -C /source -cf {archive} .",
-            cwd=self.runtime, timeout=1200,
         )
+        verify_recovery_helper_boundary(command, source_mount=source_mount, backup_mount=backup_mount)
+        self.shell.run(*command, cwd=self.runtime, timeout=1200)
         inspect_safe_tar(backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar", require_regular_file=True)
         fsync_file(backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar")
 
@@ -1614,17 +1641,20 @@ class ClinicalStaging:
         if key not in BACKED_UP_VOLUME_KEYS or volume != volume_names(self.project)[key]:
             raise SafetyError("restore volume is outside the exact allowlist")
         archive = f"/backup/{BACKUP_VOLUME_DIR}/{key}.tar"
-        self.shell.run(
+        source_mount = f"type=volume,src={volume},dst=/destination"
+        backup_mount = f"type=bind,src={backup_dir},dst=/backup,readonly"
+        command = (
             "docker", "run", "--rm", "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE",
             "--security-opt", "no-new-privileges:true", "--user", "0:0",
             "--entrypoint", "sh",
-            "--mount", f"type=volume,src={volume},dst=/destination",
-            "--mount", f"type=bind,src={backup_dir},dst=/backup,readonly",
+            "--mount", source_mount,
+            "--mount", backup_mount,
             RECOVERY_HELPER_IMAGE,
             "-ec", f"tar --numeric-owner -C /destination -xf {archive}",
-            cwd=self.runtime, timeout=1200,
         )
+        verify_recovery_helper_boundary(command, source_mount=source_mount, backup_mount=backup_mount)
+        self.shell.run(*command, cwd=self.runtime, timeout=1200)
 
     def _start_restored_stack(self) -> None:
         """The explicit dependency order is part of the cold-restore witness."""
