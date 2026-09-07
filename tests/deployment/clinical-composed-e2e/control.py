@@ -263,14 +263,18 @@ def policy_private() -> Ed25519PrivateKey:
     return private
 
 
-def verify_policy_pair(directory: Path, public_key: Any) -> str:
+def verified_policy_bytes(directory: Path, public_key: Any) -> tuple[bytes, str]:
     raw = (directory / "policy.json").read_bytes()
     try:
         signature = base64.b64decode((directory / "policy.sig").read_bytes(), validate=True)
         public_key.verify(signature, raw)
     except Exception as exc:
         raise RuntimeError("policy/signature mismatch") from exc
-    return hashlib.sha256(raw).hexdigest()
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
+def verify_policy_pair(directory: Path, public_key: Any) -> str:
+    return verified_policy_bytes(directory, public_key)[1]
 
 
 def install_policy_pair(
@@ -356,6 +360,17 @@ def activate_policy(epoch: str = "clinical-e1", validity_seconds: int = 3600) ->
 
 def policy_digest() -> str:
     return verify_policy_pair(INGRESS, policy_private().public_key())
+
+
+def active_policy_binding() -> dict[str, str]:
+    raw, digest = verified_policy_bytes(INGRESS, policy_private().public_key())
+    try:
+        epoch = json.loads(raw)["policy_epoch"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError("active policy binding is malformed") from exc
+    if not isinstance(epoch, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", epoch) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise RuntimeError("active policy binding is malformed")
+    return {"epoch": epoch, "digest": "sha256:" + digest}
 
 
 def initialize_outbox() -> None:
@@ -713,6 +728,8 @@ def main() -> None:
         print(json.dumps(clinical_db_summary(), sort_keys=True))
     elif command == "grant-evidence":
         print(json.dumps(grant_evidence(sys.argv[2]), sort_keys=True))
+    elif command == "active-policy-binding":
+        print(json.dumps(active_policy_binding(), sort_keys=True))
     elif command == "post-count":
         print(post_count(sys.argv[2]))
     elif command == "outbox-summary":
