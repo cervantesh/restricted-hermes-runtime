@@ -192,6 +192,7 @@ def test_candidate_workflow_is_same_repository_build_once_and_attests_each_final
     assert "image: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}" in source
     assert "sbom-path: candidate-subjects/${{ matrix.subject }}.spdx.json" in source
     assert "upload-artifact: false" in source
+    assert source.index("name: Prepare retained SBOM evidence directory") < source.index("name: Generate an SPDX SBOM from the final immutable OCI subject")
     assert "verify_immutable_candidate.py" in source
     assert "test_mattermost_esr_staging.py" in source
     assert "test_clinical_adapter_process.py" in source
