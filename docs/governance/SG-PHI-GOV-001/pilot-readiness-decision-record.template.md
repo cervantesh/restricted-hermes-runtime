@@ -33,7 +33,8 @@
 
 `GO WITH CONDITIONS` cannot authorize PHI while any mandatory technical,
 independent, operator, privacy/legal, or clinical/product item remains open. It
-may authorize only a separately described non-PHI staging step. A recorded `GO`
+may record/document an external decision permitting a separately described
+non-PHI staging step. A recorded `GO`
 is valid only when it references verifiable external decisions whose authority
 and scope cover this candidate, environment, purpose, and data class; this
 record registers those decisions but does not make them.
