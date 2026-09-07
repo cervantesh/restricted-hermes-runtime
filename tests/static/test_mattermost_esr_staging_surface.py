@@ -26,3 +26,11 @@ def test_exact_esr_harness_pins_native_tls_and_internal_networks():
     assert 'if "mattermost_delivery_outcome=rejected_binding" in continuation_logs' in runner
     assert "def compose_ps(" in runner
     assert "pytest" not in runner.lower()
+
+
+def test_authorization_mutation_removes_only_allowlists_and_preserves_private_channel_type_check():
+    mutation = (ROOT / "tests/deployment/mattermost-esr-staging/Dockerfile.authorization-mutation").read_text(encoding="utf-8")
+    assert 'post_allowlist_guard = \'            or post["channel_id"] not in policy.values["allowed_channel_ids"]\\n\'' in mutation
+    assert 'private_channel_guard = \'            or channel["type"] != "P" or channel_id not in self.policy.values["allowed_channel_ids"]\\n\'' in mutation
+    assert 'source = source.replace(private_channel_guard, \'            or channel["type"] != "P"\\n\')' in mutation
+    assert 'source.count(post_allowlist_guard) != 1 or source.count(private_channel_guard) != 1' in mutation
