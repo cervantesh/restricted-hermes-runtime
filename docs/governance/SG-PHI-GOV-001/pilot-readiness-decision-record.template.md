@@ -1,8 +1,10 @@
 # SG-PHI-GOV-001 — Pilot-readiness decision record
 
-**Tracker:** [#6](https://github.com/cervantesh/restricted-hermes-runtime/issues/6)  
-**Template status:** `UNRESOLVED — NO-GO BY DEFAULT`  
-**Record version:** `0.1`  
+**Tracker:** [#6](https://github.com/cervantesh/restricted-hermes-runtime/issues/6)
+
+**Template status:** `UNRESOLVED — NO-GO BY DEFAULT`
+
+**Record version:** `0.1`
 **Decision scope:** one exact candidate and one bounded pilot
 
 > This is a governance record, not a certification, legal opinion, provider
@@ -171,13 +173,18 @@ untested rollback is not evidence of recovery.
 
 ## 8. Independent decision
 
-**Reviewer:** `UNRESOLVED`  
-**Organization / conflict statement:** `UNRESOLVED`  
-**Exact candidate reviewed:** `UNRESOLVED`  
-**Report:** `UNRESOLVED`  
+**Reviewer:** `UNRESOLVED`
+
+**Organization / conflict statement:** `UNRESOLVED`
+
+**Exact candidate reviewed:** `UNRESOLVED`
+
+**Report:** `UNRESOLVED`
+
 **Reviewer disposition:** `UNRESOLVED`
 
-**Conditions:** `UNRESOLVED`  
+**Conditions:** `UNRESOLVED`
+
 **Decision rationale:** `UNRESOLVED`
 
 ## 9. Fail-closed gate
@@ -208,6 +215,8 @@ a compatible independent-review disposition.
 | Independent reviewer | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
 | Pilot approver | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
 
-**Effective decision:** `NO-GO`  
-**Reason:** mandatory evidence and sign-offs are unresolved.  
+**Effective decision:** `NO-GO`
+
+**Reason:** mandatory evidence and sign-offs are unresolved.
+
 **Next review trigger:** `UNRESOLVED`
