@@ -140,7 +140,10 @@ def main() -> None:
             # crash-retry contract allows that pair), but must never retry it
             # beyond that bounded window.
             if reauthorization_delta not in {1, 2}:
-                raise RuntimeError("restored READY item had an unexpected reauthorization count")
+                raise RuntimeError(
+                    "restored READY item had an unexpected reauthorization count: "
+                    f"before={reauthorized_before} after={reauthorized_after}"
+                )
             if int(restored.control("post-count", "cold-ready")) != 1:
                 raise RuntimeError("restored READY item was not delivered exactly once")
 
