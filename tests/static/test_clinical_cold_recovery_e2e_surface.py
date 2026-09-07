@@ -9,10 +9,11 @@ def test_cold_recovery_drill_exercises_real_wrapper_and_causal_controls():
     for command in ("staging.init()", "staging.stop()", "staging.backup(backup)", "staging.destroy()", "restored.restore("):
         assert command in script
     for invariant in (
-        "source deletion did not produce the erased terminal record",
+        "source deletion did not preserve the erased unknown result",
         "already delivered work was delivered again after restore",
-        "unexpected reauthorization count",
-        "not delivered exactly once",
+        "ordinary known-success delivery did not authorize exactly once",
+        "restore did not erase the unknown delivery result",
+        "restored unknown delivery produced a post",
         "cold-isolation",
         "cold-expired",
         "restored Compose logs or exported evidence leaked synthetic fixture content",

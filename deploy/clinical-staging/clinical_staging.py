@@ -54,7 +54,7 @@ BACKUP_STATE_ARCHIVE = "state.tar"
 BACKUP_VOLUME_DIR = "volumes"
 CAUSAL_RECOVERY_CHECKS = frozenset({
     "source_deletion_persisted",
-    "ready_delivery_continues_once",
+    "unknown_delivery_is_ambiguous_once",
     "already_delivered_not_redelivered",
     "isolation_preserved",
     "expired_policy_fails_closed",

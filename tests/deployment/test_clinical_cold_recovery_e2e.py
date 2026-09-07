@@ -49,23 +49,29 @@ def snapshot(staging, record_tag: str | None = None) -> list[dict[str, object]]:
     return value
 
 
-def blocked_source_record(staging) -> tuple[dict[str, object], dict[str, object]]:
-    """Persist a deleted-source outcome before the cold fence."""
+def ambiguous_source_record(staging) -> tuple[dict[str, object], dict[str, object]]:
+    """Persist an unknown delivery result before the cold fence."""
     staging.control("mutate", "reset")
     before_grants = int(staging.control("grant-count"))
     staging.control("mutate", "crash-delay")
     staging.control("send", "actor", "actor_dm", PATIENT, "cold-source-deleted")
     wait_until(lambda: int(staging.control("grant-count")) > before_grants, "clinical read was not granted")
     wait_until(lambda: int(staging.control("delivery-delay-active")) == 1, "delivery did not enter pause")
-    ready = [row for row in snapshot(staging) if row.get("state") == "READY"]
-    if len(ready) != 1:
-        raise RuntimeError("source-deletion fixture did not isolate one READY record")
-    before = ready[0]
+    in_flight = [row for row in snapshot(staging) if row.get("state") == "IN_FLIGHT"]
+    if len(in_flight) != 1:
+        raise RuntimeError("source-deletion fixture did not isolate one IN_FLIGHT record")
+    before = in_flight[0]
     tag = before.get("record_tag")
     if not isinstance(tag, str) or len(tag) != 64:
         raise RuntimeError("source-deletion record tag is invalid")
     staging.control("delete-source", "cold-source-deleted")
     staging.control("mutate", "drop-crash-delay")
+    wait_until(
+        lambda: json.loads(staging.control("grant-evidence", "cold-source-deleted"))["audits"].get(
+            "restricted_hermes_delivery_reauthorized", 0
+        ) == 1,
+        "source-deletion unknown authorization did not commit exactly once",
+    )
     staging.control("expect", "cold-source-deleted", "no-reply")
     after_rows = snapshot(staging, tag)
     if len(after_rows) != 1:
@@ -73,14 +79,14 @@ def blocked_source_record(staging) -> tuple[dict[str, object], dict[str, object]
     after = after_rows[0]
     expected = {
         "record_tag": tag,
-        "state": "BLOCKED",
-        "reason": "current_authorization_rejected",
+        "state": "AMBIGUOUS",
+        "reason": "delivery_authorization_unknown",
         "generation": int(before["generation"]) + 1,
         "nonce_erased": True,
         "ciphertext_erased": True,
     }
     if after != expected:
-        raise RuntimeError("source deletion did not produce the erased terminal record")
+        raise RuntimeError("source deletion did not preserve the erased unknown result")
     return before, after
 
 
@@ -99,23 +105,34 @@ def main() -> None:
         staging = module.ClinicalStaging(ROOT, HRH_ROOT, state, project, 18473)
         try:
             staging.init()
-            # A delivered work item must remain terminal across the restore.
+            # A separate ordinary success proves the normal one-authorization,
+            # one-post path before the cold fence.
             staging.control("send", "actor", "actor_dm", PATIENT, "cold-already-delivered")
             staging.control("expect", "cold-already-delivered", "reply")
             delivered_before = int(staging.control("post-count", "cold-already-delivered"))
             if delivered_before != 1:
                 raise RuntimeError("baseline delivery count was not exactly one")
-            source_before, source_after = blocked_source_record(staging)
+            delivered_evidence = json.loads(staging.control("grant-evidence", "cold-already-delivered"))
+            if delivered_evidence["audits"].get("restricted_hermes_delivery_reauthorized", 0) != 1:
+                raise RuntimeError("ordinary known-success delivery did not authorize exactly once")
+            source_before, source_after = ambiguous_source_record(staging)
 
-            # This item is READY at the cold fence.  The recovery may grant it
-            # once after restart, never repeatedly or before the fresh check.
+            # This item is IN_FLIGHT at the cold fence with a deliberately
+            # unknown authorization outcome. #17 requires restore to classify
+            # it ambiguous and erase it, never reauthorize or post it.
             staging.control("mutate", "reset")
-            grants_before_ready = int(staging.control("grant-count"))
+            grants_before_unknown = int(staging.control("grant-count"))
             staging.control("mutate", "crash-delay")
-            staging.control("send", "actor", "actor_dm", PATIENT, "cold-ready")
-            wait_until(lambda: int(staging.control("grant-count")) > grants_before_ready, "READY fixture was not authorized")
-            wait_until(lambda: int(staging.control("delivery-delay-active")) == 1, "READY fixture did not pause")
-            ready_evidence_before = json.loads(staging.control("grant-evidence", "cold-ready"))
+            staging.control("send", "actor", "actor_dm", PATIENT, "cold-unknown")
+            wait_until(lambda: int(staging.control("grant-count")) > grants_before_unknown, "unknown fixture was not authorized")
+            wait_until(lambda: int(staging.control("delivery-delay-active")) == 1, "unknown fixture did not pause")
+            unknown_before_rows = [row for row in snapshot(staging) if row.get("state") == "IN_FLIGHT"]
+            if len(unknown_before_rows) != 1:
+                raise RuntimeError("unknown fixture did not isolate one IN_FLIGHT record")
+            unknown_before = unknown_before_rows[0]
+            unknown_tag = unknown_before.get("record_tag")
+            if not isinstance(unknown_tag, str) or len(unknown_tag) != 64:
+                raise RuntimeError("unknown fixture record tag is invalid")
 
             staging.stop()
             backup_receipt = staging.backup(backup)
@@ -129,23 +146,29 @@ def main() -> None:
             if receipt["manifest_sha256"] != external_manifest_hash:
                 raise RuntimeError("restore receipt did not bind the external manifest hash")
             restored.control("mutate", "drop-crash-delay")
-            restored.control("expect", "cold-ready", "reply")
-            ready_evidence_after = json.loads(restored.control("grant-evidence", "cold-ready"))
-            reauthorized_before = ready_evidence_before["audits"].get("restricted_hermes_delivery_reauthorized", 0)
-            reauthorized_after = ready_evidence_after["audits"].get("restricted_hermes_delivery_reauthorized", 0)
-            reauthorization_delta = reauthorized_after - reauthorized_before
-            # The source generation can commit its in-flight authorization
-            # immediately before the cold fence.  Recovery deliberately gets a
-            # second fresh authorization before its one post (the established
-            # crash-retry contract allows that pair), but must never retry it
-            # beyond that bounded window.
-            if reauthorization_delta not in {1, 2}:
-                raise RuntimeError(
-                    "restored READY item had an unexpected reauthorization count: "
-                    f"before={reauthorized_before} after={reauthorized_after}"
-                )
-            if int(restored.control("post-count", "cold-ready")) != 1:
-                raise RuntimeError("restored READY item was not delivered exactly once")
+            wait_until(
+                lambda: json.loads(restored.control("grant-evidence", "cold-unknown"))["audits"].get(
+                    "restricted_hermes_delivery_reauthorized", 0
+                ) == 1,
+                "restored unknown authorization did not commit exactly once",
+            )
+            restored.control("expect", "cold-unknown", "no-reply")
+            unknown_after_rows = snapshot(restored, unknown_tag)
+            if len(unknown_after_rows) != 1:
+                raise RuntimeError("restored unknown terminal record is missing")
+            unknown_after = unknown_after_rows[0]
+            expected_unknown_after = {
+                "record_tag": unknown_tag,
+                "state": "AMBIGUOUS",
+                "reason": "restart_in_flight",
+                "generation": int(unknown_before["generation"]) + 1,
+                "nonce_erased": True,
+                "ciphertext_erased": True,
+            }
+            if unknown_after != expected_unknown_after:
+                raise RuntimeError("restore did not erase the unknown delivery result")
+            if int(restored.control("post-count", "cold-unknown")) != 0:
+                raise RuntimeError("restored unknown delivery produced a post")
 
             if int(restored.control("post-count", "cold-already-delivered")) != delivered_before:
                 raise RuntimeError("already delivered work was delivered again after restore")
@@ -165,7 +188,7 @@ def main() -> None:
             restored.control("send", "actor", "actor_dm", PATIENT, "cold-expired")
             restored.control("expect", "cold-expired", "no-reply")
 
-            fixture_tokens = ("cold-source-deleted", "cold-ready", "cold-allowed", PATIENT)
+            fixture_tokens = ("cold-source-deleted", "cold-unknown", "cold-allowed", PATIENT)
             evidence_text = "\n".join(
                 path.read_text(encoding="utf-8", errors="replace")
                 for path in (state / "evidence").rglob("*")
@@ -177,7 +200,7 @@ def main() -> None:
 
             causal_checks = {
                 "source_deletion_persisted": True,
-                "ready_delivery_continues_once": True,
+                "unknown_delivery_is_ambiguous_once": True,
                 "already_delivered_not_redelivered": True,
                 "isolation_preserved": True,
                 "expired_policy_fails_closed": True,
@@ -195,7 +218,11 @@ def main() -> None:
                 "source_deletion_before": source_before,
                 "source_deletion_after": source_after,
                 "delivered_count_before_after": delivered_before,
-                "ready_reauthorization_delta": reauthorization_delta,
+                "ordinary_delivery_authorizations": delivered_evidence["audits"].get(
+                    "restricted_hermes_delivery_reauthorized", 0
+                ),
+                "unknown_delivery_before": unknown_before,
+                "unknown_delivery_after": unknown_after,
                 "elapsed_seconds": round(time.monotonic() - started, 3),
                 "nonclaims": ["not PHI", "not production", "not a compliance certification"],
             }
