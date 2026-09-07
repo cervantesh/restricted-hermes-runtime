@@ -116,18 +116,24 @@ python "$tool" --hrh-root "$hrh" --state-dir "$state" --project "$project" \
 The backup contains the private state directory and ten explicitly named
 persistent volumes. `clinical_socket` is intentionally not exported; the
 restore creates it empty and `clinical-socket-init` reconstructs the transport
-socket during the ordered startup. The manifest contains names, sizes, hashes,
-source frame and image identities, but no fixture payload values. A `COMPLETE`
-marker is written and fsynced before the temporary directory is atomically
-published. A partial directory is never a restore input.
+socket during the ordered startup. Before reading any volume, `backup` removes
+the stopped Compose containers and refuses every remaining container mount of
+an exact staging volume, including an unlabeled debug or orphan container. Each
+archive is fsynced before the manifest is written; the manifest is fsynced
+before `COMPLETE`, and `COMPLETE` is fsynced before the temporary directory is
+atomically published. A partial directory is never a restore input.
 
 Before Docker state or the destination state directory is changed, `restore`
 requires the exact member allowlist, completion marker, external manifest hash,
 safe non-link tar members, marker/source identity, every member hash and an
 empty destination with no conflicting named or labeled Docker resource. It
-then starts databases/migration, Mattermost/proxy, HRH/socket/adapter and
-ingress in that order, and runs the normal status/identity/confinement/policy
-checks before writing its content-safe receipt. If an error occurs after the
-temporary recovery state is published, it remains in a non-operational
-`recovering` lifecycle; use `destroy` before retrying instead of attempting to
-start or hand-edit it.
+first copies the complete input bundle into a private snapshot, validates that
+snapshot, and consumes only that snapshot; a mutable operator directory is
+never read after validation. It then starts databases/migration,
+Mattermost/proxy, HRH/socket/adapter and ingress in that order, and runs the
+normal status/identity/confinement/policy checks. The immediate receipt records
+only a mechanical restore. The separate `causal_e2e_verified` receipt is
+published only by the synthetic drill after its causal controls and artifact
+scan pass. If an error occurs after the temporary recovery state is published,
+it remains in a non-operational `recovering` lifecycle; use `destroy` before
+retrying instead of attempting to start or hand-edit it.

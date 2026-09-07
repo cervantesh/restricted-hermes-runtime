@@ -14,7 +14,9 @@ def test_cold_recovery_drill_exercises_real_wrapper_and_causal_controls():
         "reauthorized more than once",
         "cold-isolation",
         "cold-expired",
-        "restore evidence leaked synthetic fixture content",
+        "restored Compose logs or exported evidence leaked synthetic fixture content",
+        "finalize_cold_recovery_verification",
+        "causal_e2e_verified",
         "1200-second bound",
     ):
         assert invariant in script

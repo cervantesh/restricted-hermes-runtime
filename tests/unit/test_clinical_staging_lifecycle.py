@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -171,6 +172,7 @@ def test_partial_volume_set_is_cleanable_but_never_widens_the_allowlist():
         for name in present
     }
     assert module.verify_destructive_volumes(project, state_id, expected, labels, "initializing") == sorted(present)
+    assert module.verify_destructive_volumes(project, state_id, expected, labels, "recovering") == sorted(present)
     for lifecycle in ("ready", "stopped"):
         with pytest.raises(module.SafetyError, match="exact volume set"):
             module.verify_destructive_volumes(project, state_id, expected, labels, lifecycle)
@@ -952,6 +954,44 @@ def test_cold_backup_bundle_rejects_path_traversal_before_any_restore_mutation(t
         module.validate_backup_bundle(backup, expected_hash, "clinicalstagingdemo", state)
 
 
+@pytest.mark.parametrize("member", ("state.tar", "volumes/hrh_secret.tar"))
+def test_restore_snapshot_rejects_mid_copy_input_replacement_before_destination_mutation(
+    member: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    shutil.rmtree(state)
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    original_copy = module._copy_regular_file
+    replaced = False
+
+    def replace_while_snapshotting(source: Path, destination: Path) -> None:
+        nonlocal replaced
+        if source == backup / member and not replaced:
+            replaced = True
+            source.write_bytes(b"different-generation")
+        original_copy(source, destination)
+
+    monkeypatch.setattr(module, "_copy_regular_file", replace_while_snapshotting)
+    monkeypatch.setattr(
+        staging,
+        "_require_empty_restore_destination",
+        lambda: pytest.fail("destination checks must not follow a failed snapshot validation"),
+    )
+
+    with pytest.raises(module.SafetyError, match="hash or size"):
+        staging.restore(backup, expected_hash)
+    assert replaced
+    assert not state.exists()
+    assert not list(tmp_path.glob(".clinicalstagingdemo.synthetic-clinical-staging.bundle-*"))
+
+
 def test_backup_manifest_binds_content_safe_ownership_metadata(tmp_path: Path):
     module = load_module()
     state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
@@ -990,6 +1030,39 @@ def test_recovery_lifecycle_is_destroyable_but_never_operational(tmp_path: Path,
     for command in ("up", "status", "stop"):
         with pytest.raises(module.SafetyError, match="lifecycle"):
             getattr(staging, command)()
+
+
+def test_verified_recovery_receipt_requires_all_causal_controls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / "evidence" / "recovery").mkdir(parents=True)
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32, env_sha256="2" * 64,
+        runtime_head="a" * 40, runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA,
+        hrh_tree=module.REQUIRED_HRH_TREE, lifecycle="ready",
+    )
+    manifest_hash = "d" * 64
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    module.write_json_atomic(
+        state / "evidence" / "recovery" / f"restore-{manifest_hash}.json",
+        {"manifest_sha256": manifest_hash, "verification": "mechanical_restore_only"}, mode=0o600,
+    )
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
+    with pytest.raises(module.SafetyError, match="incomplete"):
+        staging.finalize_cold_recovery_verification(manifest_hash, {})
+    receipt = staging.finalize_cold_recovery_verification(
+        manifest_hash, {key: True for key in module.CAUSAL_RECOVERY_CHECKS},
+    )
+    assert receipt["verification"] == "causal_e2e_verified"
+    assert "cold-ready" not in json.dumps(receipt)
 
 
 def test_restore_destination_rejects_preexisting_named_or_labeled_resources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1080,5 +1153,268 @@ def test_volume_transfer_helper_is_pinned_networkless_and_never_uses_socket(tmp_
         assert "--cap-drop" in call and call[call.index("--cap-drop") + 1] == "ALL"
         assert "--entrypoint" in call and call[call.index("--entrypoint") + 1] == "sh"
         assert module.RECOVERY_HELPER_IMAGE in call
+    assert shell.calls[0][-1] == "tar --numeric-owner -C /source -cf /backup/volumes/hrh_secret.tar ."
+    assert shell.calls[1][-1] == "tar --numeric-owner -C /destination -xf /backup/volumes/hrh_secret.tar"
     with pytest.raises(module.SafetyError, match="allowlist"):
         staging._backup_volume("clinical_socket", module.volume_names(project)["clinical_socket"], backup)
+
+
+def test_cold_backup_rejects_even_unlabeled_container_mounting_an_exact_volume(tmp_path: Path):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+
+    class FakeShell:
+        def run(self, *args, **_kwargs):
+            if args[:4] == ("docker", "container", "ls", "--all"):
+                if args[-1] == f"volume={module.volume_names(project)['hrh_secret']}":
+                    return SimpleNamespace(returncode=0, stdout="unlabeled-debugger\n", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if args[:3] == ("docker", "container", "inspect"):
+                return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                    "Mounts": [{
+                        "Type": "volume", "Name": module.volume_names(project)["hrh_secret"], "RW": True,
+                    }],
+                }]), stderr="")
+            raise AssertionError(args)
+
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, shell=FakeShell())
+    with pytest.raises(module.SafetyError, match="unlabeled-debugger.*hrh_secret.*rw"):
+        staging._assert_unmounted_backup_volumes(module.volume_names(project))
+
+
+def test_backup_durably_flushes_archives_before_manifest_and_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / "seed").mkdir()
+    (state / "evidence").mkdir()
+    (state / "compose.env").write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32,
+        env_sha256=module.file_sha256(state / "compose.env"), runtime_head="a" * 40,
+        runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA, hrh_tree=module.REQUIRED_HRH_TREE,
+        lifecycle="stopped", expected_images={"ingress": "sha256:" + "c" * 64},
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+
+    class FakeShell:
+        def run(self, *args, **_kwargs):
+            if args[:3] == ("docker", "run", "--rm"):
+                command = args[-1]
+                key = command.split("/backup/volumes/", 1)[1].split(".tar", 1)[0]
+                archive = current_backup / module.BACKUP_VOLUME_DIR / f"{key}.tar"
+                with tarfile.open(archive, "w") as opened:
+                    info = tarfile.TarInfo("fixture")
+                    info.size = 1
+                    opened.addfile(info, __import__("io").BytesIO(b"x"))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(args)
+
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, shell=FakeShell())
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
+    monkeypatch.setattr(staging, "_verify_cold_quiescence", lambda _marker: None)
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(staging, "_assert_unmounted_backup_volumes", lambda _volumes: None)
+    events: list[str] = []
+    original_fsync_file = module.fsync_file
+    original_fsync_directory = module.fsync_directory
+    original_write_manifest = module.write_backup_manifest
+    original_write_completion = module.write_backup_completion
+    current_backup = tmp_path / "unused"
+
+    def record_fsync(path: Path) -> None:
+        events.append(path.relative_to(current_backup).as_posix())
+        original_fsync_file(path)
+
+    def record_manifest(directory: Path, value: dict) -> None:
+        events.append("manifest")
+        original_write_manifest(directory, value)
+
+    def record_completion(directory: Path) -> None:
+        events.append("complete")
+        original_write_completion(directory)
+
+    def record_directory(path: Path) -> None:
+        if path.name == module.BACKUP_VOLUME_DIR:
+            events.append("dir:volumes")
+        elif path == current_backup:
+            events.append("dir:bundle")
+        elif path == backup.parent:
+            events.append("dir:parent")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(module, "fsync_file", record_fsync)
+    monkeypatch.setattr(module, "fsync_directory", record_directory)
+    monkeypatch.setattr(module, "write_backup_manifest", record_manifest)
+    monkeypatch.setattr(module, "write_backup_completion", record_completion)
+    backup = tmp_path / "published-backup"
+    current_backup = backup.parent / f".{backup.name}.partial-placeholder"
+
+    # The exact randomized temporary name is not observable; bind the recorder
+    # lazily to its first archive parent instead.
+    def flexible_fsync(path: Path) -> None:
+        nonlocal current_backup
+        if current_backup.name.endswith("placeholder"):
+            current_backup = path.parent.parent if path.parent.name == module.BACKUP_VOLUME_DIR else path.parent
+        events.append(path.relative_to(current_backup).as_posix())
+        original_fsync_file(path)
+
+    monkeypatch.setattr(module, "fsync_file", flexible_fsync)
+    receipt = staging.backup(backup)
+    assert receipt["manifest_sha256"] == module.file_sha256(backup / module.BACKUP_MANIFEST_NAME)
+    assert events[0] == module.BACKUP_STATE_ARCHIVE
+    volume_events = [f"volumes/{key}.tar" for key in module.BACKED_UP_VOLUME_KEYS]
+    assert events[1:1 + len(volume_events)] == volume_events
+    assert events.index("dir:volumes") > events.index(volume_events[-1])
+    assert events.index("manifest") > events.index("dir:volumes")
+    assert events.index("dir:bundle") > events.index("manifest")
+    assert events.index("complete") > events.index("dir:bundle")
+    assert events[-1] == "dir:parent"
+    assert (backup / module.BACKUP_COMPLETE_NAME).read_bytes() == b"complete\n"
+
+
+def test_backup_interruption_never_publishes_a_complete_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / "seed").mkdir()
+    (state / "evidence").mkdir()
+    (state / "compose.env").write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32,
+        env_sha256=module.file_sha256(state / "compose.env"), runtime_head="a" * 40,
+        runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA, hrh_tree=module.REQUIRED_HRH_TREE,
+        lifecycle="stopped", expected_images={"ingress": "sha256:" + "c" * 64},
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
+    monkeypatch.setattr(staging, "_verify_cold_quiescence", lambda _marker: None)
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(staging, "_assert_unmounted_backup_volumes", lambda _volumes: None)
+    monkeypatch.setattr(staging, "_backup_volume", lambda *_args: (_ for _ in ()).throw(module.CommandError("interrupted")))
+    backup = tmp_path / "interrupted-backup"
+
+    with pytest.raises(module.CommandError, match="interrupted"):
+        staging.backup(backup)
+    assert not backup.exists()
+    assert not list(tmp_path.glob(".interrupted-backup.partial-*"))
+
+
+def test_restore_post_start_failure_returns_to_non_operational_recovering_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    shutil.rmtree(state)
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    manifest = module.validate_backup_bundle(backup, expected_hash, project, state)
+    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: manifest["source"])
+    monkeypatch.setattr(staging, "_require_empty_restore_destination", lambda: None)
+    monkeypatch.setattr(staging, "_create_volumes", lambda _marker: None)
+    monkeypatch.setattr(staging, "_restore_volume", lambda *_args: None)
+    monkeypatch.setattr(staging, "_start_restored_stack", lambda: None)
+    monkeypatch.setattr(
+        staging,
+        "status",
+        lambda *, _allow_recovering=False: (
+            (_ for _ in ()).throw(module.SafetyError("post-start readiness failed"))
+            if _allow_recovering else pytest.fail("recovery verification must opt in explicitly")
+        ),
+    )
+    compose_calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        staging,
+        "compose",
+        lambda *args, **_kwargs: (compose_calls.append(args), SimpleNamespace(returncode=0, stdout="", stderr=""))[1],
+    )
+
+    with pytest.raises(module.SafetyError, match="controlled recovery"):
+        staging.restore(backup, expected_hash)
+    assert module.read_marker(state, project)["lifecycle"] == "recovering"
+    assert compose_calls == [("stop", *module.LONG_RUNNING_SERVICES)]
+    assert not (state / "evidence" / "recovery" / f"restore-{expected_hash}.json").exists()
+
+
+@pytest.mark.parametrize("interruption", ("before-start", "during-start"))
+def test_restore_interruption_never_publishes_stopped_or_ready_and_blocks_normal_up(
+    interruption: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    shutil.rmtree(state)
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    manifest = module.validate_backup_bundle(backup, expected_hash, project, state)
+    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: manifest["source"])
+    monkeypatch.setattr(staging, "_require_empty_restore_destination", lambda: None)
+    monkeypatch.setattr(staging, "_create_volumes", lambda _marker: None)
+    monkeypatch.setattr(staging, "_restore_volume", lambda *_args: None)
+    if interruption == "before-start":
+        monkeypatch.setattr(
+            staging,
+            "_restore_volume",
+            lambda *_args: (_ for _ in ()).throw(module.CommandError("interrupted before startup")),
+        )
+    else:
+        monkeypatch.setattr(
+            staging,
+            "_start_restored_stack",
+            lambda: (_ for _ in ()).throw(module.CommandError("interrupted during startup")),
+        )
+    writes: list[str] = []
+    original_write = staging._write_marker
+    monkeypatch.setattr(
+        staging,
+        "_write_marker",
+        lambda marker: (writes.append(str(marker["lifecycle"])), original_write(marker))[1],
+    )
+    compose_calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        staging,
+        "compose",
+        lambda *args, **_kwargs: (compose_calls.append(args), SimpleNamespace(returncode=0, stdout="", stderr=""))[1],
+    )
+
+    with pytest.raises(module.SafetyError, match="controlled recovery"):
+        staging.restore(backup, expected_hash)
+    assert module.read_marker(state, project)["lifecycle"] == "recovering"
+    assert "stopped" not in writes and "ready" not in writes
+    assert compose_calls == [("stop", *module.LONG_RUNNING_SERVICES)]
+    monkeypatch.setattr(
+        staging,
+        "compose",
+        lambda *_args, **_kwargs: pytest.fail("ordinary up must not run from recovering state"),
+    )
+    with pytest.raises(module.SafetyError, match="lifecycle"):
+        staging.up()

@@ -51,6 +51,15 @@ BACKUP_MANIFEST_NAME = "backup-manifest.json"
 BACKUP_COMPLETE_NAME = "COMPLETE"
 BACKUP_STATE_ARCHIVE = "state.tar"
 BACKUP_VOLUME_DIR = "volumes"
+CAUSAL_RECOVERY_CHECKS = frozenset({
+    "source_deletion_persisted",
+    "ready_delivery_continues_once",
+    "already_delivered_not_redelivered",
+    "isolation_preserved",
+    "expired_policy_fails_closed",
+    "artifacts_clean",
+    "duration_bounded",
+})
 # This is also the pinned PostgreSQL image used by the composed witness. It
 # supplies GNU tar inside a networkless, ephemeral helper for volume exports.
 RECOVERY_HELPER_IMAGE = (
@@ -225,6 +234,24 @@ def fsync_directory(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def fsync_file(path: Path) -> None:
+    """Durably flush an already-created regular recovery artifact."""
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise SafetyError(f"could not fsync recovery artifact: {path.name}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SafetyError(f"recovery artifact is not a regular file: {path.name}")
+        os.fsync(fd)
+    except OSError as exc:
+        raise SafetyError(f"could not fsync recovery artifact: {path.name}") from exc
     finally:
         os.close(fd)
 
@@ -404,6 +431,7 @@ def create_state_archive(state_dir: Path, archive_path: Path) -> None:
     except OSError as exc:
         raise SafetyError("could not write private state archive") from exc
     inspect_safe_tar(archive_path, require_regular_file=True)
+    fsync_file(archive_path)
 
 
 def _manifest_members(backup_dir: Path) -> dict[str, dict[str, Any]]:
@@ -603,6 +631,77 @@ def validate_backup_bundle(
     for key in BACKED_UP_VOLUME_KEYS:
         inspect_safe_tar(backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar", require_regular_file=True)
     return manifest
+
+
+def _copy_regular_file(source: Path, destination: Path) -> None:
+    """Copy one archive input through a no-follow descriptor into private storage."""
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_fd = os.open(source, os.O_RDONLY | no_follow)
+    except OSError as exc:
+        raise SafetyError(f"backup input is unavailable or unsafe: {source.name}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+            raise SafetyError(f"backup input is not a regular file: {source.name}")
+        try:
+            destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as exc:
+            raise SafetyError(f"could not create private backup snapshot: {destination.name}") from exc
+        try:
+            with os.fdopen(source_fd, "rb", closefd=False) as input_stream, os.fdopen(destination_fd, "wb") as output_stream:
+                shutil.copyfileobj(input_stream, output_stream)
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+        except OSError as exc:
+            raise SafetyError(f"could not copy backup input: {source.name}") from exc
+    finally:
+        os.close(source_fd)
+
+
+def materialize_backup_snapshot(backup_dir: Path, snapshot_parent: Path, *, snapshot_stem: str) -> Path:
+    """Copy the complete bundle before validation so later restore reads are immutable.
+
+    The external directory is deliberately never consumed after this function
+    returns.  The externally supplied manifest digest binds the snapshot's
+    manifest; member digests then bind its archives before any destination or
+    Docker mutation is allowed.
+    """
+    backup_dir = backup_dir.resolve()
+    if not backup_dir.is_dir():
+        raise SafetyError("backup directory is unavailable")
+    if not snapshot_parent.is_dir():
+        raise SafetyError("restore state parent directory must already exist")
+    expected_root_files = {BACKUP_MANIFEST_NAME, BACKUP_COMPLETE_NAME, BACKUP_STATE_ARCHIVE}
+    try:
+        root_entries = {item.name: item for item in backup_dir.iterdir()}
+    except OSError as exc:
+        raise SafetyError("backup directory is unreadable") from exc
+    if set(root_entries) != expected_root_files | {BACKUP_VOLUME_DIR}:
+        raise SafetyError("backup directory has unexpected or missing members")
+    if any(item.is_symlink() for item in root_entries.values()) or not root_entries[BACKUP_VOLUME_DIR].is_dir():
+        raise SafetyError("backup directory contains an unsafe member")
+    try:
+        volume_entries = {item.name: item for item in root_entries[BACKUP_VOLUME_DIR].iterdir()}
+    except OSError as exc:
+        raise SafetyError("backup volume directory is unreadable") from exc
+    expected_volume_files = {f"{key}.tar" for key in BACKED_UP_VOLUME_KEYS}
+    if set(volume_entries) != expected_volume_files or any(item.is_symlink() for item in volume_entries.values()):
+        raise SafetyError("backup directory has unexpected or missing members")
+    snapshot = snapshot_parent / f".{snapshot_stem}.bundle-{secrets.token_hex(8)}"
+    try:
+        snapshot.mkdir(mode=0o700)
+        (snapshot / BACKUP_VOLUME_DIR).mkdir(mode=0o700)
+        for name in sorted(expected_root_files):
+            _copy_regular_file(root_entries[name], snapshot / name)
+        for name in sorted(expected_volume_files):
+            _copy_regular_file(volume_entries[name], snapshot / BACKUP_VOLUME_DIR / name)
+        fsync_directory(snapshot / BACKUP_VOLUME_DIR)
+        fsync_directory(snapshot)
+        return snapshot
+    except Exception:
+        if snapshot.exists():
+            shutil.rmtree(snapshot)
+        raise
 
 
 def verify_effective_env(state_dir: Path, marker: Mapping[str, Any]) -> None:
@@ -1236,10 +1335,11 @@ class ClinicalStaging:
         if any(labels.get("com.docker.compose.service") == "controller" for labels in containers.values()):
             raise SafetyError("privileged provisioner must not remain after initialization")
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, _allow_recovering: bool = False) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
-        self._require_lifecycle(marker, "status", {"ready"})
+        allowed_lifecycles = {"ready", "recovering"} if _allow_recovering else {"ready"}
+        self._require_lifecycle(marker, "status", allowed_lifecycles)
         rows = self._containers(all_containers=True)
         verify_compose_rows(rows)
         self._assert_no_controller()
@@ -1289,7 +1389,7 @@ class ClinicalStaging:
             "built_images": current_images,
             "compose_env_sha256": marker["compose_env_sha256"],
             "policy_digest": self.control("policy-digest"),
-            "lifecycle": "ready",
+            "lifecycle": marker["lifecycle"],
             "mattermost": f"https://127.0.0.1:{self.port}",
             "mattermost_publisher": publisher,
             "ingress_started_at": ingress_started_at,
@@ -1353,10 +1453,43 @@ class ClinicalStaging:
         if running:
             raise SafetyError("backup requires fully stopped staging services: " + ", ".join(running))
 
+    def _assert_unmounted_backup_volumes(self, volumes: Mapping[str, str]) -> None:
+        """Refuse archival while *any* container retains an in-scope volume mount.
+
+        Compose labels are not sufficient: a manually-created or orphaned
+        container can be unlabeled yet still write an exact project volume.
+        This check runs after Compose has removed its stopped containers and
+        immediately before every archive read.
+        """
+        expected = set(volumes.values())
+        if expected != set(volume_names(self.project).values()):
+            raise SafetyError("backup volume fence does not cover the exact volume set")
+        for volume in sorted(expected):
+            raw = self.shell.run(
+                "docker", "container", "ls", "--all", "--quiet", "--filter", f"volume={volume}",
+            ).stdout
+            for container_id in (line.strip() for line in raw.splitlines() if line.strip()):
+                inspected = self.shell.run("docker", "container", "inspect", container_id)
+                try:
+                    item = json.loads(inspected.stdout)[0]
+                    mounts = item["Mounts"]
+                except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                    raise SafetyError("could not verify backup volume mount fence") from exc
+                matching = [
+                    mount for mount in mounts
+                    if isinstance(mount, Mapping) and mount.get("Type") == "volume" and mount.get("Name") == volume
+                ]
+                if not matching:
+                    raise SafetyError("volume-filtered container inspection is inconsistent")
+                modes = {"rw" if mount.get("RW") is True else "ro" if mount.get("RW") is False else "unknown" for mount in matching}
+                raise SafetyError(
+                    f"backup volume remains mounted by container {container_id}: {volume} ({', '.join(sorted(modes))})"
+                )
+
     def _backup_volume(self, key: str, volume: str, backup_dir: Path) -> None:
         if key not in BACKED_UP_VOLUME_KEYS or volume != volume_names(self.project)[key]:
             raise SafetyError("backup volume is outside the exact allowlist")
-        archive = f"/{BACKUP_VOLUME_DIR}/{key}.tar"
+        archive = f"/backup/{BACKUP_VOLUME_DIR}/{key}.tar"
         self.shell.run(
             "docker", "run", "--rm", "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
@@ -1368,6 +1501,7 @@ class ClinicalStaging:
             cwd=self.runtime, timeout=1200,
         )
         inspect_safe_tar(backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar", require_regular_file=True)
+        fsync_file(backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar")
 
     def backup(self, backup_dir: Path) -> dict[str, Any]:
         """Create an atomically published, cold-only backup.  No overwrite exists."""
@@ -1386,8 +1520,15 @@ class ClinicalStaging:
             temporary.mkdir(mode=0o700)
             (temporary / BACKUP_VOLUME_DIR).mkdir(mode=0o700)
             create_state_archive(self.state_dir, temporary / BACKUP_STATE_ARCHIVE)
+            # Stop leaves Compose containers present.  Remove only the exact
+            # already-validated stack, then reject every remaining mount,
+            # including unlabeled debug/orphan containers, before each read.
+            self.compose("down", timeout=600)
+            self._assert_unmounted_backup_volumes(marker["volumes"])
             for key in BACKED_UP_VOLUME_KEYS:
+                self._assert_unmounted_backup_volumes(marker["volumes"])
                 self._backup_volume(key, marker["volumes"][key], temporary)
+            fsync_directory(temporary / BACKUP_VOLUME_DIR)
             manifest = build_backup_manifest(marker, self.state_dir, temporary)
             write_backup_manifest(temporary, manifest)
             write_backup_completion(temporary)
@@ -1467,7 +1608,7 @@ class ClinicalStaging:
     def _restore_volume(self, key: str, volume: str, backup_dir: Path) -> None:
         if key not in BACKED_UP_VOLUME_KEYS or volume != volume_names(self.project)[key]:
             raise SafetyError("restore volume is outside the exact allowlist")
-        archive = f"/{BACKUP_VOLUME_DIR}/{key}.tar"
+        archive = f"/backup/{BACKUP_VOLUME_DIR}/{key}.tar"
         self.shell.run(
             "docker", "run", "--rm", "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
@@ -1497,18 +1638,20 @@ class ClinicalStaging:
         backup_dir = validate_backup_path(
             backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime, self.hrh),
         )
-        manifest = validate_backup_bundle(backup_dir, expected_manifest_sha256, self.project, self.state_dir)
-        frame = verify_source_frame(self.runtime, self.hrh, self.shell)
-        if frame != manifest["source"]:
-            raise SafetyError("current source frame differs from the validated backup source frame")
-        self._require_empty_restore_destination()
-
+        snapshot = materialize_backup_snapshot(
+            backup_dir, self.state_dir.parent, snapshot_stem=self.state_dir.name,
+        )
         temporary = self.state_dir.parent / f".{self.state_dir.name}.recovering-{secrets.token_hex(8)}"
         published_state = False
         try:
+            manifest = validate_backup_bundle(snapshot, expected_manifest_sha256, self.project, self.state_dir)
+            frame = verify_source_frame(self.runtime, self.hrh, self.shell)
+            if frame != manifest["source"]:
+                raise SafetyError("current source frame differs from the validated backup source frame")
+            self._require_empty_restore_destination()
             temporary.mkdir(mode=0o700)
-            self._extract_safe_state_archive(backup_dir / BACKUP_STATE_ARCHIVE, temporary)
-            marker = _read_backup_manifest(backup_dir)  # manifest bytes were validated before mutation
+            self._extract_safe_state_archive(snapshot / BACKUP_STATE_ARCHIVE, temporary)
+            marker = _read_backup_manifest(snapshot)  # manifest bytes were validated before mutation
             del marker  # make accidental use of untrusted backup metadata impossible below
             restored_marker = json.loads((temporary / MARKER_NAME).read_text(encoding="utf-8"))
             if not isinstance(restored_marker, dict):
@@ -1528,15 +1671,13 @@ class ClinicalStaging:
             marker = read_marker(self.state_dir, self.project)
             self._create_volumes(marker)
             for key in BACKED_UP_VOLUME_KEYS:
-                self._restore_volume(key, marker["volumes"][key], backup_dir)
+                self._restore_volume(key, marker["volumes"][key], snapshot)
             # The excluded transport socket is recreated empty by _create_volumes;
             # clinical-socket-init rebuilds its socket during the ordered startup.
-            marker["lifecycle"] = "stopped"
-            self._write_marker(marker)
             self._start_restored_stack()
+            status = self.status(_allow_recovering=True)
             marker["lifecycle"] = "ready"
             self._write_marker(marker)
-            status = self.status()
             receipt = {
                 "schema": BACKUP_SCHEMA,
                 "synthetic_only": True,
@@ -1546,8 +1687,11 @@ class ClinicalStaging:
                 "excluded_volume": EXCLUDED_RECOVERY_VOLUME,
                 "source": manifest["source"],
                 "status_observed_at": status["observed_at"],
+                "verification": "mechanical_restore_only",
                 "restored_at": datetime.now(UTC).isoformat(),
-                "nonclaims": ["not a hot restore", "not encrypted", "not production"],
+                "nonclaims": [
+                    "not a causal recovery verification", "not a hot restore", "not encrypted", "not production",
+                ],
             }
             receipt_dir = self.state_dir / "evidence" / "recovery"
             receipt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1555,6 +1699,16 @@ class ClinicalStaging:
             return receipt
         except Exception as exc:
             if published_state:
+                # A failed post-start verification must remain non-operational.
+                # `destroy` accepts recovering state and reuses the exact
+                # resource allowlists for bounded cleanup.
+                try:
+                    failed_marker = read_marker(self.state_dir, self.project)
+                    failed_marker["lifecycle"] = "recovering"
+                    self._write_marker(failed_marker)
+                    self.compose("stop", *LONG_RUNNING_SERVICES, check=False)
+                except Exception:
+                    pass
                 raise SafetyError(
                     "restore failed after controlled recovery state was published; run destroy before retrying"
                 ) from exc
@@ -1562,6 +1716,44 @@ class ClinicalStaging:
         finally:
             if temporary.exists():
                 shutil.rmtree(temporary)
+            if snapshot.exists():
+                shutil.rmtree(snapshot)
+
+    def finalize_cold_recovery_verification(
+        self, expected_manifest_sha256: str, causal_checks: Mapping[str, bool],
+    ) -> dict[str, Any]:
+        """Publish a verified receipt only after the external causal drill passes."""
+        self._require_linux()
+        _require_sha256(expected_manifest_sha256, name="external manifest hash")
+        marker = self._verify_marker_and_source()
+        self._require_lifecycle(marker, "finalize-cold-recovery-verification", {"ready"})
+        if set(causal_checks) != CAUSAL_RECOVERY_CHECKS or any(value is not True for value in causal_checks.values()):
+            raise SafetyError("causal recovery verification is incomplete or invalid")
+        receipt_dir = self.state_dir / "evidence" / "recovery"
+        mechanical_path = receipt_dir / f"restore-{expected_manifest_sha256}.json"
+        try:
+            mechanical = json.loads(mechanical_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SafetyError("mechanical restore receipt is unavailable") from exc
+        if (
+            not isinstance(mechanical, dict)
+            or mechanical.get("manifest_sha256") != expected_manifest_sha256
+            or mechanical.get("verification") != "mechanical_restore_only"
+        ):
+            raise SafetyError("mechanical restore receipt does not bind this verification")
+        receipt = {
+            "schema": BACKUP_SCHEMA,
+            "synthetic_only": True,
+            "project": self.project,
+            "state_id": marker["state_id"],
+            "manifest_sha256": expected_manifest_sha256,
+            "verification": "causal_e2e_verified",
+            "causal_checks": {key: True for key in sorted(CAUSAL_RECOVERY_CHECKS)},
+            "verified_at": datetime.now(UTC).isoformat(),
+            "nonclaims": ["not PHI", "not production", "not a compliance certification"],
+        }
+        write_json_atomic(receipt_dir / f"verified-restore-{expected_manifest_sha256}.json", receipt, mode=0o600)
+        return receipt
 
     def _volume_labels(self) -> dict[str, dict[str, str]]:
         names: set[str] = set(volume_names(self.project).values())

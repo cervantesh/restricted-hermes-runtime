@@ -154,6 +154,29 @@ def main() -> None:
             restored.control("send", "actor", "actor_dm", PATIENT, "cold-expired")
             restored.control("expect", "cold-expired", "no-reply")
 
+            fixture_tokens = ("cold-source-deleted", "cold-ready", "cold-allowed", PATIENT)
+            evidence_text = "\n".join(
+                path.read_text(encoding="utf-8", errors="replace")
+                for path in (state / "evidence").rglob("*")
+                if path.is_file()
+            )
+            compose_logs = restored.compose("logs", "--no-color", check=False).stdout
+            if any(value in evidence_text or value in compose_logs for value in fixture_tokens):
+                raise RuntimeError("restored Compose logs or exported evidence leaked synthetic fixture content")
+
+            causal_checks = {
+                "source_deletion_persisted": True,
+                "ready_delivery_continues_once": True,
+                "already_delivered_not_redelivered": True,
+                "isolation_preserved": True,
+                "expired_policy_fails_closed": True,
+                "artifacts_clean": True,
+                "duration_bounded": time.monotonic() - started <= 1200,
+            }
+            verified_receipt = restored.finalize_cold_recovery_verification(external_manifest_hash, causal_checks)
+            if verified_receipt["verification"] != "causal_e2e_verified":
+                raise RuntimeError("causal recovery verification receipt was not published")
+
             report = {
                 "schema": module.BACKUP_SCHEMA,
                 "synthetic_only": True,
@@ -167,10 +190,6 @@ def main() -> None:
             }
             if report["elapsed_seconds"] > 1200:
                 raise RuntimeError("synthetic cold recovery exceeded the 1200-second bound")
-            # Only controlled receipts, never fixture messages, are exportable.
-            exported = (state / "evidence" / "recovery" / f"restore-{external_manifest_hash}.json").read_text(encoding="utf-8")
-            if any(value in exported for value in ("cold-source-deleted", "cold-ready", "cold-allowed", PATIENT)):
-                raise RuntimeError("restore evidence leaked synthetic fixture content")
             print(json.dumps(report, sort_keys=True))
         finally:
             if state.exists():
