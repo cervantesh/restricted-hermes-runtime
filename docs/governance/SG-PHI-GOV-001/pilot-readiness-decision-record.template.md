@@ -8,7 +8,9 @@
 **Decision scope:** one exact candidate and one bounded pilot
 
 > This is a governance record, not a certification, legal opinion, provider
-> attestation, security warranty, or authorization to process PHI. Every blank,
+> attestation, security warranty, or authorization to process PHI. This record
+> may register an external decision after it has been made, but it never grants
+> authority. Every blank,
 > `TBD`, `UNRESOLVED`, stale, or unbound value is a failed gate. Until all
 > mandatory evidence and sign-offs are present, use synthetic/non-PHI data only.
 
@@ -23,10 +25,15 @@
 | Requested decision | `NO-GO` / `GO WITH CONDITIONS` / `GO` |
 | Effective decision | `NO-GO` |
 | Decision owner | `UNRESOLVED` |
+| External decision references and scope | `UNRESOLVED` — attributable records required; this document cannot create them |
+| Evidence manifest digest | `UNRESOLVED` |
 
 `GO WITH CONDITIONS` cannot authorize PHI while any mandatory technical,
 independent, operator, privacy/legal, or clinical/product item remains open. It
-may authorize only a separately described non-PHI staging step.
+may authorize only a separately described non-PHI staging step. A recorded `GO`
+is valid only when it references verifiable external decisions whose authority
+and scope cover this candidate, environment, purpose, and data class; this
+record registers those decisions but does not make them.
 
 ## 2. Exact candidate and external subjects
 
@@ -67,6 +74,12 @@ authorization claim:
 6. The response is posted only to the original approved source/root under the
    documented ambiguity, retention, and recovery rules.
 
+Before the pilot gate is closed, every identifier, patient identifier, user,
+channel, message, fixture, and test record must be synthetic and must have no
+correspondence with a real person, patient, workforce member, tenant, or
+production record. Record the synthetic-data generator/fixture revision and
+verification reference here: `UNRESOLVED`.
+
 ### Disabled unless separately reviewed
 
 Normal Hermes agent prompting; tools, plugins, MCP, skills, shell, browser,
@@ -82,14 +95,14 @@ permitted before an effective `GO`.
 Names and authority must be supplied; they cannot be inferred from repository
 ownership, code authorship, GitHub identity, or a contract with another party.
 
-| Role | Person / organization | Authority / scope | Signature or record | Status |
-|---|---|---|---|---|
-| Technical deployment operator | `UNRESOLVED` | Runs and maintains exact deployment | `UNRESOLVED` | `UNRESOLVED` |
-| Security / risk owner | `UNRESOLVED` | Accepts residual operational/security risk | `UNRESOLVED` | `UNRESOLVED` |
-| Privacy / legal decision owner | `UNRESOLVED` | Decides privacy, contractual, and legal prerequisites | `UNRESOLVED` | `UNRESOLVED` |
-| Clinical / product decision owner | `UNRESOLVED` | Approves purpose, users, and clinical boundary | `UNRESOLVED` | `UNRESOLVED` |
-| Independent technical reviewer | `UNRESOLVED` | Reviews exact candidate independently | `UNRESOLVED` | `UNRESOLVED` |
-| Pilot approver | `UNRESOLVED` | Signs final bounded pilot decision | `UNRESOLVED` | `UNRESOLVED` |
+| Role | Person / organization | Authority / scope | Delegation evidence | Signature or record | Status |
+|---|---|---|---|---|---|
+| Technical deployment operator | `UNRESOLVED` | Runs and maintains exact deployment | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
+| Security / risk owner | `UNRESOLVED` | Accepts residual operational/security risk | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
+| Privacy / legal decision owner | `UNRESOLVED` | Decides privacy, contractual, and legal prerequisites | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
+| Clinical / product decision owner | `UNRESOLVED` | Approves purpose, users, and clinical boundary | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
+| Independent technical reviewer | `UNRESOLVED` | Reviews exact candidate independently | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
+| Pilot approver | `UNRESOLVED` | Signs final bounded pilot decision | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
 
 ## 5. Evidence register
 
@@ -112,13 +125,16 @@ are separate evidence classes. One cannot substitute for another.
 
 | Required item | Evidence | Status |
 |---|---|---|
-| Reviewer identity, independence, and conflict statement | `UNRESOLVED` | `UNRESOLVED` |
+| Reviewer identity, authority/delegation, independence, and conflict statement | `UNRESOLVED` | `UNRESOLVED` |
 | Review against every exact subject in section 2 | SHA/digest comparison | `UNRESOLVED` |
 | Real reachable paths exercised, not helper-only fixtures | commands/report | `UNRESOLVED` |
 | Findings, objections, residual risks, and unverified claims recorded | report | `UNRESOLVED` |
 | Reviewer disposition | `ACCEPT` / `ACCEPT WITH CONDITIONS` / `REQUEST CHANGES` | `UNRESOLVED` |
 
-A review of an older SHA is historical context and cannot close this gate.
+A review of an older SHA is historical context and cannot close this gate. The
+reviewer must be independent of the author, technical operator, security/risk
+owner, and pilot approver. `ACCEPT WITH CONDITIONS` cannot close a blocker and
+is not compatible with `GO` while any condition remains open.
 
 ### 5.3 External/operator acceptance
 
@@ -127,7 +143,7 @@ A review of an older SHA is historical context and cannot close this gate.
 | IAM principals, least privilege, and denial tests | `UNRESOLVED` | `UNRESOLVED` |
 | IPv4/IPv6/DNS/proxy/literal/metadata/media egress enforcement | `UNRESOLVED` | `UNRESOLVED` |
 | Provider/model region, retention, logging, and training posture | `UNRESOLVED` | `UNRESOLVED` |
-| Contract/BAA or equivalent organizational decision | `UNRESOLVED` | `UNRESOLVED` |
+| Applicable contract/BAA evidence, or attributable privacy/legal determination that no such contract is required | `UNRESOLVED` | `UNRESOLVED` |
 | Secret creation, custody, rotation, revocation, backup, destruction | `UNRESOLVED` | `UNRESOLVED` |
 | Mattermost and HRH backup/restore evidence | `UNRESOLVED` | `UNRESOLVED` |
 | Audit collection, review, retention, and deletion | `UNRESOLVED` | `UNRESOLVED` |
@@ -177,6 +193,10 @@ untested rollback is not evidence of recovery.
 
 **Organization / conflict statement:** `UNRESOLVED`
 
+**Reviewer authority/delegation evidence:** `UNRESOLVED`
+
+**Reviewer independence statement (not author, operator, or approver):** `UNRESOLVED`
+
 **Exact candidate reviewed:** `UNRESOLVED`
 
 **Report:** `UNRESOLVED`
@@ -193,27 +213,37 @@ untested rollback is not evidence of recovery.
 |---|---|---|
 | Candidate binding | All subjects and evidence match section 2 exactly | `UNRESOLVED` |
 | Technical hardening | Mandatory reachable-path controls pass | `UNRESOLVED` |
-| Independent review | Named reviewer closes or explicitly accepts blockers | `UNRESOLVED` |
+| Independent review | Named reviewer has a disposition compatible with the requested decision and no open blocker for `GO` | `UNRESOLVED` |
 | Ownership and sign-off | All roles in section 4 are named and signed | `UNRESOLVED` |
 | External controls | All section 5.3 evidence is attributable and current | `UNRESOLVED` |
 | Pilot containment | Scope, monitoring, stop, rollback, and retention are tested | `UNRESOLVED` |
 | Nonclaims | No unsupported authorization or compliance claim appears | `UNRESOLVED` |
 
-If any mandatory row is `UNRESOLVED`, `MISSING`, `FAILED`, or bound to another
-candidate, the effective decision is `NO-GO` for PHI. `GO WITH CONDITIONS` cannot
-waive a mandatory row. `GO` requires every row to be `PASS`, all signatures, and
-a compatible independent-review disposition.
+If any mandatory row is `UNRESOLVED`, `MISSING`, `FAILED`, rejected, `NO-GO`, or
+has a pending condition, or is bound to another candidate, the effective
+decision is `NO-GO` for PHI. `ACCEPT WITH CONDITIONS` cannot close a blocker and
+cannot be compatible with `GO` while conditions remain. `GO WITH CONDITIONS`
+cannot waive a mandatory row. `GO` requires every row to be `PASS`, affirmative
+and unanimous compatible approvals from every required role, verifiable external
+decision references with matching scope, and an independent-review disposition
+of `ACCEPT` with no open condition.
 
 ## 10. Final sign-off
 
-| Signatory | Name / organization | Decision | Signature / record | Date |
-|---|---|---|---|---|
-| Technical deployment operator | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
-| Security / risk owner | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
-| Privacy / legal decision owner | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
-| Clinical / product decision owner | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
-| Independent reviewer | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
-| Pilot approver | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
+Every signatory must attest to the same final candidate ID, final record digest,
+evidence-manifest digest, and verified role authority/delegation. A change to
+any of those values invalidates every signature and requires a new decision
+record and re-review. The independent reviewer must additionally attest to
+independence from the author, operator, security/risk owner, and pilot approver.
+
+| Signatory | Name / organization | Decision | Candidate ID | Record digest | Evidence manifest digest | Signature / record | Date |
+|---|---|---|---|---|---|---|---|
+| Technical deployment operator | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
+| Security / risk owner | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
+| Privacy / legal decision owner | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
+| Clinical / product decision owner | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
+| Independent reviewer | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
+| Pilot approver | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
 
 **Effective decision:** `NO-GO`
 
