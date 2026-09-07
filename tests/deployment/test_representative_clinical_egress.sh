@@ -35,7 +35,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" init >/dev/null
+python "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" init >/dev/null 2>&1
 compose=(docker compose --env-file "$state/compose.env" --project-name "$project" --file "$runtime/tests/deployment/clinical-composed-e2e/compose.yaml" --file "$runtime/deploy/clinical-staging/compose.yaml")
 if ! docker network create --ipv6 "$network" >/dev/null; then
   echo "representative-clinical-egress: SKIP controlled-ipv6-network-unavailable"
