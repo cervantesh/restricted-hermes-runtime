@@ -42,7 +42,7 @@ def _error(errors: list[str], message: str) -> None:
     errors.append(message)
 
 
-def _read_hashed_json(repo_root: Path, relative: object, expected_hash: object, errors: list[str], context: str) -> dict[str, Any] | None:
+def _read_hashed_json(repo_root: Path, relative: object, expected_hash: object, errors: list[str], context: str, *, object_required: bool = True) -> dict[str, Any] | object | None:
     if not isinstance(relative, str) or not _raw_hash(expected_hash):
         _error(errors, f"{context}: receipt reference and sha256 are required")
         return None
@@ -60,6 +60,8 @@ def _read_hashed_json(repo_root: Path, relative: object, expected_hash: object, 
     if hashlib.sha256(raw).hexdigest() != expected_hash:
         _error(errors, f"{context}: receipt hash does not match")
         return None
+    if not object_required:
+        return value
     record = _mapping(value)
     if record is None:
         _error(errors, f"{context}: receipt is not an object")
@@ -90,7 +92,7 @@ def _verify_attestation(errors: list[str], name: str, kind: str, value: object, 
             or not _raw_hash(part.get("raw_sha256"))):
         _error(errors, f"{name}: {kind} receipt does not prove the exact OCI subject")
         return
-    raw = _read_hashed_json(repo_root, part.get("raw_artifact"), part.get("raw_sha256"), errors, f"{name}: {kind} raw verification")
+    raw = _read_hashed_json(repo_root, part.get("raw_artifact"), part.get("raw_sha256"), errors, f"{name}: {kind} raw verification", object_required=False)
     if raw is None:
         return
 
@@ -170,11 +172,27 @@ def _verify_evidence(errors: list[str], value: object, source_revision: str, run
         _error(errors, "AC10 evidence must state phi_authorized=false")
     if evidence.get("deployment_conformant") is not False:
         _error(errors, "AC10 evidence must state deployment_conformant=false")
-    if not isinstance(evidence.get("commands"), list) or not evidence["commands"] or not isinstance(evidence.get("results"), dict):
+    commands = evidence.get("commands")
+    results = _mapping(evidence.get("results"))
+    if not isinstance(commands, list) or not commands or results is None:
         _error(errors, "AC10 evidence must include commands and results")
+        return
+    command_names: set[str] = set()
+    for command in commands:
+        item = _mapping(command)
+        if (item is None or not isinstance(item.get("id"), str) or not item["id"]
+                or not isinstance(item.get("command"), str) or not item["command"]
+                or item.get("outcome") != "passed" or item.get("exit_code") != 0):
+            _error(errors, "AC10 evidence command lacks id/text/passed exit_code=0")
+            continue
+        command_names.add(item["id"])
     summary = _mapping(evidence.get("summary"))
     if summary is None or any(not isinstance(summary.get(key), int) or summary[key] < 0 for key in ("passed", "skipped", "failed")):
         _error(errors, "AC10 evidence must include pass/skip/failure counts")
+    elif summary["passed"] != len(commands) or summary["skipped"] != 0 or summary["failed"] != 0:
+        _error(errors, "AC10 evidence summary is inconsistent with passed command receipts")
+    if set(results) != command_names or any(value != "passed" for value in results.values()):
+        _error(errors, "AC10 results are inconsistent with command receipts")
     if evidence.get("subject_digests") != subject_digests:
         _error(errors, "AC10 evidence must bind the exact published subject digests")
 
