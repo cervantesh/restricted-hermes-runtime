@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import os
+import stat
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +29,19 @@ def load_control():
     if source not in sys.path:
         sys.path.insert(0, source)
     spec = importlib.util.spec_from_file_location("clinical_control_secret_boundary", CONTROL_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_composed_e2e(monkeypatch: pytest.MonkeyPatch):
+    """Load the executable harness without registering its process cleanup."""
+    monkeypatch.setattr(atexit, "register", lambda *_args, **_kwargs: None)
+    spec = importlib.util.spec_from_file_location(
+        "clinical_composed_e2e_secret_boundary",
+        ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py",
+    )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -195,6 +210,115 @@ def test_cli_never_renders_command_error_text(monkeypatch: pytest.MonkeyPatch, c
         "status",
     ]) == 2
     assert capsys.readouterr().err == "clinical_staging outcome=denied reason=command_failed\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mode/ownership contract is Linux-only")
+def test_finalization_recovers_before_and_after_secret_erase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The durable finalizing state must survive either cleanup interruption."""
+    module = load_staging()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / "clinicalstagingsecret.synthetic-clinical-staging"
+    password = state / "seed" / "admin_password"
+    runtime.mkdir()
+    hrh.mkdir()
+    password.parent.mkdir(parents=True)
+    password.write_text("PASSWORD_SECRET_CANARY_9159\n", encoding="ascii")
+    password.chmod(0o600)
+    monkeypatch.setattr(module, "fsync_directory", lambda _path: None)
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingsecret", 18443)
+    marker = {"lifecycle": "finalizing"}
+    writes: list[str] = []
+    staging._write_marker = lambda value: writes.append(value["lifecycle"])  # type: ignore[method-assign]
+
+    original_erase = staging._erase_initial_admin_password
+    staging._erase_initial_admin_password = lambda: (_ for _ in ()).throw(KeyboardInterrupt())  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        staging._finalize_initialization(marker)
+    assert marker["lifecycle"] == "finalizing"
+    assert password.exists()
+    assert writes == []
+
+    staging._erase_initial_admin_password = original_erase  # type: ignore[method-assign]
+    staging._finalize_initialization(marker)
+    assert marker["lifecycle"] == "ready"
+    assert not password.exists()
+    assert writes == ["ready"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mode/ownership contract is Linux-only")
+def test_next_init_invocation_resumes_finalizing_before_operational_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_staging()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / "clinicalstagingsecret.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / module.MARKER_NAME).write_text("synthetic", encoding="ascii")
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingsecret", 18443)
+    marker = {"lifecycle": "finalizing"}
+    resumed: list[str] = []
+    original_stat = Path.stat
+
+    def fake_stat(path: Path, *args: object, **kwargs: object):
+        if path == state:
+            return SimpleNamespace(st_uid=os.getuid(), st_mode=stat.S_IFDIR | 0o700)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: {})
+    monkeypatch.setattr(module, "read_marker", lambda *_args: marker)
+    monkeypatch.setattr(module, "verify_effective_env", lambda *_args: None)
+    monkeypatch.setattr(
+        staging,
+        "_finalize_initialization",
+        lambda value: (resumed.append(value["lifecycle"]), value.update(lifecycle="ready")),
+    )
+    monkeypatch.setattr(staging, "up", lambda: {"lifecycle": "ready"})
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: pytest.fail("finalizing resume must not reprovision"))
+
+    assert staging.init() == {"lifecycle": "ready"}
+    assert resumed == ["finalizing"]
+
+    password.write_text("PASSWORD_SECRET_CANARY_9159\n", encoding="ascii")
+    password.chmod(0o600)
+    marker["lifecycle"] = "finalizing"
+    writes.clear()
+    staging._write_marker = lambda _value: (_ for _ in ()).throw(KeyboardInterrupt())  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        staging._finalize_initialization(marker)
+    assert marker["lifecycle"] == "ready"
+    assert not password.exists()
+
+    marker["lifecycle"] = "finalizing"  # persisted marker after the interrupted atomic write
+    staging._write_marker = lambda value: writes.append(value["lifecycle"])  # type: ignore[method-assign]
+    staging._finalize_initialization(marker)
+    assert marker["lifecycle"] == "ready"
+    assert writes == ["ready"]
+
+
+def test_composed_e2e_public_failure_paths_discard_child_output(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+):
+    module = load_composed_e2e(monkeypatch)
+    canaries = "PASSWORD_SECRET_CANARY_9159 API_KEY_SECRET_CANARY_9159 TOKEN_SECRET_CANARY_9159"
+    failed = SimpleNamespace(returncode=29, stdout=canaries, stderr=canaries)
+
+    with pytest.raises(RuntimeError) as migration:
+        module.require_success(failed, "hrh-migrate")
+    assert str(migration.value) == "clinical composed E2E failed: hrh-migrate exit=29"
+    assert canaries not in str(migration.value)
+
+    module.emit_public_debug("crash-retry", failed, failed)
+    public_stderr = capsys.readouterr().err
+    assert public_stderr == "clinical_composed_e2e debug=crash-retry details=omitted\n"
+    assert canaries not in public_stderr
 
 
 @pytest.mark.skipif(os.name != "posix", reason="mode/ownership contract is Linux-only")
