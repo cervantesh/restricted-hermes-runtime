@@ -28,9 +28,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 
-RUNTIME_BASE_SHA = "c6c41a0980ed21de95d324c828ee9c5bb50cb8dd"
-REQUIRED_HRH_SHA = "89fea476ef95a0dfd3cd60a587ec6cb9e1d3aa1f"
-REQUIRED_HRH_TREE = "363cfe56bd6757ff0c98c098f468cb0e86dc2e4f"
+RUNTIME_BASE_SHA = "41464aee8748f857153ba2b47377515d4847d210"
+REQUIRED_HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"
+REQUIRED_HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"
 SCHEMA = "restricted-synthetic-clinical-staging.v1"
 MARKER_NAME = "staging-state.json"
 PROJECT_LABEL = "io.cervantesh.restricted-runtime.project"
@@ -59,6 +59,25 @@ EXPECTED_NETWORK_KEYS_BY_SERVICE = {
     "clinical-adapter": {"clinical_upstream"},
     "ingress": {"mattermost_edge"},
     "operator-proxy": {"operator_access", "mattermost_edge"},
+}
+RESTRICTED_CONTAINER_CONTROLS = {
+    "clinical-adapter": {
+        "user": "restricted-clinical-adapter",
+        "uid": 10008,
+        "gid": 20007,
+        "read_only_mounts": {"/run/clinical-config", "/run/hrh-secret", "/run/hrh-tls"},
+        "writable_mounts": {"/run/restricted-clinical"},
+    },
+    "ingress": {
+        "user": "restricted-mattermost-ingress",
+        "uid": 10007,
+        "gid": 20005,
+        "read_only_mounts": {"/run/ingress"},
+        "writable_mounts": {
+            "/run/restricted-clinical",
+            "/var/lib/restricted-mattermost-outbox",
+        },
+    },
 }
 
 
@@ -400,6 +419,73 @@ def verify_network_topology(
         expected_memberships = {f"{project}_{key}" for key in expected_keys}
         if memberships != expected_memberships:
             raise SafetyError(f"{service} has unexpected network membership")
+
+
+def _tmpfs_is_confined(value: Any, *, uid: int, gid: int) -> bool:
+    if not isinstance(value, str):
+        return False
+    options = set(value.split(","))
+    size_values = {item for item in options if item.startswith("size=")}
+    size_is_16m = bool(size_values & {"size=16m", "size=16384k", "size=16777216"})
+    mode_is_0700 = bool(options & {"mode=0700", "mode=700"})
+    return (
+        {"rw", "noexec", "nosuid", f"uid={uid}", f"gid={gid}"} <= options
+        and size_is_16m
+        and mode_is_0700
+    )
+
+
+def verify_restricted_container_controls(
+    inspected: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Reject effective runtime drift for the two restricted long-lived services."""
+    evidence: dict[str, dict[str, Any]] = {}
+    for service, expected in RESTRICTED_CONTAINER_CONTROLS.items():
+        info = inspected.get(service)
+        if not isinstance(info, Mapping):
+            raise SafetyError(f"{service} container inspection is unavailable")
+        config = info.get("Config") or {}
+        host = info.get("HostConfig") or {}
+        security = {
+            str(value).replace(":", "=")
+            for value in (host.get("SecurityOpt") or [])
+        }
+        tmpfs = host.get("Tmpfs") or {}
+        mounts = info.get("Mounts") or []
+        mount_modes: dict[str, bool] = {}
+        for mount in mounts:
+            if not isinstance(mount, Mapping) or not isinstance(mount.get("Destination"), str):
+                raise SafetyError(f"{service} mount inspection is malformed")
+            destination = str(mount["Destination"])
+            if destination in mount_modes or not isinstance(mount.get("RW"), bool):
+                raise SafetyError(f"{service} mount inspection is ambiguous")
+            mount_modes[destination] = bool(mount["RW"])
+        expected_modes = {
+            **{path: False for path in expected["read_only_mounts"]},
+            **{path: True for path in expected["writable_mounts"]},
+        }
+        if (
+            config.get("User") != expected["user"]
+            or host.get("ReadonlyRootfs") is not True
+            or {str(value).upper() for value in (host.get("CapDrop") or [])} != {"ALL"}
+            or security != {"no-new-privileges=true"}
+            or set(tmpfs) != {"/tmp"}
+            or not _tmpfs_is_confined(
+                tmpfs.get("/tmp"), uid=expected["uid"], gid=expected["gid"]
+            )
+            or mount_modes != expected_modes
+        ):
+            raise SafetyError(f"{service} effective container confinement rejected")
+        evidence[service] = {
+            "user": expected["user"],
+            "read_only_rootfs": True,
+            "cap_drop": ["ALL"],
+            "no_new_privileges": True,
+            "tmpfs": ["/tmp"],
+            "read_only_mounts": sorted(expected["read_only_mounts"]),
+            "writable_mounts": sorted(expected["writable_mounts"]),
+        }
+    return evidence
 
 
 def _certificate_material(seed: Path) -> None:
@@ -783,6 +869,7 @@ class ClinicalStaging:
         inspected = {service: all_inspected[service] for service in LONG_RUNNING_SERVICES}
         publisher = verify_publishers(inspected, self.port)
         verify_network_topology(self.project, inspected, self._network_inspections())
+        restricted_controls = verify_restricted_container_controls(inspected)
         self.control("wait-mm")
         self.control("wait-hrh")
         tls_probe = self._probe_mattermost_tls()
@@ -827,6 +914,7 @@ class ClinicalStaging:
             "ingress_started_at": ingress_started_at,
             "tls_probe": tls_probe,
             "network_exception": "operator-proxy only: operator_access is non-internal",
+            "restricted_container_controls": restricted_controls,
             "privileged_provisioner_running": False,
             "nonclaims": ["not HIPAA", "not PHI-authorized", "not production"],
             "observed_at": datetime.now(UTC).isoformat(),
