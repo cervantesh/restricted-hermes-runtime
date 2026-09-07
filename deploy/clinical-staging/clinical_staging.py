@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import http.client
 import ipaddress
@@ -19,7 +20,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -33,6 +34,9 @@ REQUIRED_HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"
 REQUIRED_HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"
 SCHEMA = "restricted-synthetic-clinical-staging.v1"
 MARKER_NAME = "staging-state.json"
+INIT_ORPHAN_RE_TEMPLATE = r"^\.{state}\.init-[a-f0-9]{{16}}$"
+MAX_INITIALIZATION_ORPHANS = 8
+MAX_ABANDONED_ATOMIC_TEMPS = 8
 PROJECT_LABEL = "io.cervantesh.restricted-runtime.project"
 STATE_LABEL = "io.cervantesh.restricted-runtime.state-id"
 SYNTHETIC_LABEL = "io.cervantesh.restricted-runtime.synthetic-clinical"
@@ -108,8 +112,13 @@ class Shell:
             errors="replace",
         )
         if check and result.returncode:
-            detail = (result.stdout + result.stderr)[-1600:]
-            raise CommandError(f"{args[0]} exited {result.returncode}: {detail}")
+            # Child output can contain credentials (or values derived from them).
+            # Do not turn it into operator/CI output by copying it into the
+            # exception.  This wrapper deliberately keeps no secondary
+            # diagnostic receipt: its only public contract is a fixed command
+            # class and exit code.
+            command = Path(args[0]).name if args and Path(args[0]).name in {"docker", "git"} else "child"
+            raise CommandError(f"command failed: {command} exit={result.returncode}")
         return result
 
     def git(self, cwd: Path, *args: str) -> str:
@@ -193,20 +202,107 @@ def fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def write_json_atomic(path: Path, value: Mapping[str, Any], *, mode: int) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+def _assert_owned_regular(path: Path, *, mode: int, label: str) -> os.stat_result:
+    """Return a no-follow stat only for the private files this wrapper owns."""
+    metadata = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SafetyError(f"{label} is not a regular file")
+    if os.name == "posix" and (
+        metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        raise SafetyError(f"{label} is not an operator-owned mode-{mode:04o} file")
+    return metadata
+
+
+def _open_owned_lock(path: Path) -> int:
+    """Open a persistent private advisory-lock file without following links."""
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    created = False
     try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, path)
-        fsync_directory(path.parent)
+        fd = os.open(path, flags | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        _assert_owned_regular(path, mode=0o600, label="staging lock")
+        fd = os.open(path, flags)
+    try:
+        if created and hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SafetyError("staging lock is not a regular file")
+        if os.name == "posix" and (
+            metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise SafetyError("staging lock is not an operator-owned mode-0600 file")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@contextmanager
+def _exclusive_operator_lock(path: Path) -> Iterator[None]:
+    """Serialize recovery through a kernel-released, no-follow operator lock."""
+    fd = _open_owned_lock(path)
+    try:
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
     finally:
-        if tmp.exists():
-            tmp.unlink()
+        os.close(fd)
+
+
+def _discard_abandoned_atomic_temps(path: Path, *, mode: int) -> None:
+    """Remove bounded wrapper-owned atomic temps only while their writer lock is held."""
+    legacy = path.with_name(path.name + ".tmp")
+    current_expression = re.compile(rf"^\.{re.escape(path.name)}\.tmp-[a-f0-9]{{32}}$")
+    candidates = [legacy]
+    candidates.extend(entry for entry in path.parent.iterdir() if current_expression.fullmatch(entry.name))
+    present: list[Path] = []
+    for candidate in candidates:
+        try:
+            _assert_owned_regular(candidate, mode=mode, label="abandoned atomic temporary")
+        except FileNotFoundError:
+            continue
+        present.append(candidate)
+    if len(present) > MAX_ABANDONED_ATOMIC_TEMPS:
+        raise SafetyError("too many abandoned atomic temporaries; refusing unsafe cleanup")
+    for candidate in present:
+        candidate.unlink()
+    if present:
+        fsync_directory(path.parent)
+
+
+def write_json_atomic(path: Path, value: Mapping[str, Any], *, mode: int) -> None:
+    raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _exclusive_operator_lock(lock_path):
+        # Releases before this change could leave this fixed name behind after
+        # SIGKILL.  The lock makes cleanup non-racy; ownership/type checks make
+        # a planted link or foreign file fail closed instead of being removed.
+        _discard_abandoned_atomic_temps(path, mode=mode)
+        tmp = path.with_name(f".{path.name}.tmp-{secrets.token_hex(16)}")
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+        )
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, path)
+            fsync_directory(path.parent)
+        finally:
+            try:
+                _assert_owned_regular(tmp, mode=mode, label="atomic temporary")
+            except FileNotFoundError:
+                pass
+            else:
+                tmp.unlink()
 
 
 def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
@@ -232,7 +328,7 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         or value["volumes"] != volume_names(project)
         or not re.fullmatch(r"[a-f0-9]{32}", value["state_id"])
         or not re.fullmatch(r"[a-f0-9]{64}", value["compose_env_sha256"])
-        or value["lifecycle"] not in {"initializing", "ready", "stopped"}
+        or value["lifecycle"] not in {"initializing", "finalizing", "ready", "stopped"}
         or not isinstance(value["expected_images"], dict)
     ):
         raise SafetyError("staging marker does not match the requested synthetic target")
@@ -292,9 +388,9 @@ def verify_destructive_volumes(
     for name in discovered:
         if any(discovered[name].get(key) != value for key, value in required.items()):
             raise SafetyError(f"volume label mismatch: {name}")
-    if lifecycle in {"ready", "stopped"} and set(discovered) != expected:
-        raise SafetyError("ready/stopped staging requires the exact volume set")
-    if lifecycle not in {"initializing", "ready", "stopped"}:
+    if lifecycle in {"finalizing", "ready", "stopped"} and set(discovered) != expected:
+        raise SafetyError("finalizing/ready/stopped staging requires the exact volume set")
+    if lifecycle not in {"initializing", "finalizing", "ready", "stopped"}:
         raise SafetyError("unknown lifecycle for destructive volume verification")
     return sorted(discovered)
 
@@ -325,14 +421,14 @@ def verify_destructive_resources(
     duplicates = sorted({service for service in services if services.count(service) > 1})
     if duplicates:
         raise SafetyError("duplicate project service containers: " + ", ".join(duplicates))
-    if lifecycle in {"ready", "stopped"}:
+    if lifecycle in {"finalizing", "ready", "stopped"}:
         if "controller" in services:
-            raise SafetyError("controller must be absent from ready/stopped staging")
+            raise SafetyError("controller must be absent from finalizing/ready/stopped staging")
         expected_services = set(LONG_RUNNING_SERVICES) | set(ONE_SHOT_SERVICES)
         if set(services) != expected_services:
-            raise SafetyError("ready/stopped staging requires the exact service set")
+            raise SafetyError("finalizing/ready/stopped staging requires the exact service set")
         if set(networks) != allowed_networks:
-            raise SafetyError("ready/stopped staging requires the exact network set")
+            raise SafetyError("finalizing/ready/stopped staging requires the exact network set")
     elif lifecycle != "initializing":
         raise SafetyError("unknown lifecycle for destructive resource verification")
     return sorted(containers), sorted(networks)
@@ -671,7 +767,51 @@ class ClinicalStaging:
         )
         policy_path.chmod(0o600)
 
+    def _initialization_lock_path(self) -> Path:
+        return self.state_dir.parent / f".{self.state_dir.name}.initialization.lock"
+
+    def _owned_initialization_orphans(self) -> list[Path]:
+        """List only this target's exact private pre-rename initialization dirs."""
+        expression = re.compile(INIT_ORPHAN_RE_TEMPLATE.format(state=re.escape(self.state_dir.name)))
+        candidates = [entry for entry in self.state_dir.parent.iterdir() if expression.fullmatch(entry.name)]
+        if len(candidates) > MAX_INITIALIZATION_ORPHANS:
+            raise SafetyError("too many owned initialization remnants; refusing unsafe cleanup")
+        return candidates
+
+    @staticmethod
+    def _assert_orphan_tree_unlinked(root: Path) -> None:
+        """Reject anything but normal directories/files before delegated removal."""
+        with os.scandir(root) as entries:
+            for entry in entries:
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise SafetyError("initialization remnant contains a symlink")
+                if stat.S_ISDIR(metadata.st_mode):
+                    ClinicalStaging._assert_orphan_tree_unlinked(Path(entry.path))
+                elif not stat.S_ISREG(metadata.st_mode):
+                    raise SafetyError("initialization remnant contains an unsafe filesystem entry")
+
+    def _remove_owned_initialization_orphan(self, path: Path) -> None:
+        metadata = path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise SafetyError("initialization remnant is not an operator-owned mode-0700 directory")
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise SafetyError("platform cannot safely remove an initialization remnant")
+        self._assert_orphan_tree_unlinked(path)
+        shutil.rmtree(path)
+        fsync_directory(path.parent)
+
+    def _reconcile_owned_initialization_orphans(self) -> None:
+        """Erase bounded abandoned seed directories; never promote/reuse their seed."""
+        for orphan in self._owned_initialization_orphans():
+            self._remove_owned_initialization_orphan(orphan)
+
     def _prepare_new_state(self, frame: Mapping[str, str]) -> dict[str, Any]:
+        self._reconcile_owned_initialization_orphans()
         if self.state_dir.exists():
             if any(self.state_dir.iterdir()):
                 raise SafetyError("init requires a fresh target or a valid initializing marker")
@@ -712,61 +852,100 @@ class ClinicalStaging:
         self.compose("build", "ingress", "clinical-adapter", timeout=2400)
         self.compose("build", "controller", "hrh-migrate", "hrh", timeout=2400)
 
+    def _provision_initial_mattermost_admin(self) -> None:
+        """Create the initial admin inside the provisioner boundary.
+
+        The controller reads the mode-0600 seed file from its private,
+        read-only mount and sends the password only as the HTTPS request body.
+        The host never reads it for a child command, so neither host argv nor
+        Docker's container command metadata receives the value.
+        """
+        self.control("create-initial-admin", timeout=180)
+
+    def _erase_initial_admin_password(self) -> None:
+        """Discard the bootstrap-only secret while the marker is finalizing."""
+        password = self.state_dir / "seed" / "admin_password"
+        try:
+            metadata = password.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise SafetyError("bootstrap password artifact is not an operator-owned mode-0600 regular file")
+        password.unlink()
+        fsync_directory(password.parent)
+
+    def _finalize_initialization(self, marker: dict[str, Any]) -> None:
+        """Durably complete the one-way bootstrap-secret cleanup protocol.
+
+        ``finalizing`` is deliberately not an operational lifecycle.  It is a
+        recoverable checkpoint after every service has started, but before the
+        marker can advertise ``ready``.  An interrupt before unlink leaves the
+        protected seed and a finalizing marker; an interrupt after unlink but
+        before the atomic ready marker leaves only that finalizing marker.  A
+        subsequent ``init`` repeats this idempotent finalizer and cannot leave
+        a ready staging target with a reusable bootstrap secret.
+        """
+        self._require_lifecycle(marker, "initialization finalization", {"finalizing"})
+        self._erase_initial_admin_password()
+        marker["lifecycle"] = "ready"
+        self._write_marker(marker)
+
     def init(self) -> dict[str, Any]:
         self._require_linux()
         frame = verify_source_frame(self.runtime, self.hrh, self.shell)
-        if self.state_dir.exists() and (self.state_dir / MARKER_NAME).exists():
-            marker = read_marker(self.state_dir, self.project)
-            if marker["lifecycle"] != "initializing":
-                raise SafetyError("staging target is already initialized")
-            verify_effective_env(self.state_dir, marker)
-            if any(marker[key] != value for key, value in frame.items()):
-                raise SafetyError("initializing marker source frame changed")
-        else:
-            self.state_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            marker = self._prepare_new_state(frame)
-        state_stat = self.state_dir.stat()
-        if state_stat.st_uid != os.getuid() or stat.S_IMODE(state_stat.st_mode) != 0o700:
-            raise SafetyError("state directory must be owned by the operator with mode 0700")
-        self._create_volumes(marker)
-        self.compose("config", "--quiet")
-        self._build_images()
-        self.control("seed-volumes")
-        self.compose("up", "--detach", "mattermost-postgres", "hrh-postgres", "hrh-migrate", timeout=900)
-        migrated = self.compose("wait", "hrh-migrate", check=False, timeout=900)
-        if migrated.returncode:
-            raise CommandError("HRH migration did not complete successfully")
-        self.compose("up", "--detach", "mattermost", timeout=600)
-        self.control("wait-mm")
-        password = (self.state_dir / "seed" / "admin_password").read_text(encoding="ascii")
-        created = self.compose(
-            "exec", "--no-TTY", "mattermost", "/mattermost/bin/mmctl", "--local", "user", "create",
-            "--email", "admin@clinical.invalid", "--username", "clinicaladmin", "--password", password,
-            "--system-admin", "--email-verified", "--disable-welcome-email", "--quiet", check=False,
-        )
-        if created.returncode and "already exists" not in (created.stdout + created.stderr).lower():
-            raise CommandError("synthetic Mattermost administrator bootstrap failed")
-        self.control("bootstrap-mm")
-        self.control("seed-hrh")
-        self.control("policy", "clinical-e1", "3600")
-        self.control("outbox-init")
-        public_key = self.control("public-key")
-        base64.b64decode(public_key, validate=True)
-        env_public = next(
-            line.split("=", 1)[1]
-            for line in self.env_file.read_text(encoding="utf-8").splitlines()
-            if line.startswith("CLINICAL_POLICY_PUBLIC_KEY=")
-        )
-        if public_key != env_public:
-            raise SafetyError("provisioned policy public key differs from the sealed environment")
-        self.compose("up", "--detach", *ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
-        self.control("wait-mm")
-        self.control("wait-hrh")
-        marker["expected_images"] = self._built_images()
-        marker["lifecycle"] = "ready"
-        self._write_marker(marker)
-        self.up()
-        return self.status()
+        self.state_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Kernel advisory locking is released on SIGKILL.  It serializes both
+        # abandoned-temp cleanup and pre-rename seed reconciliation, so a
+        # second operator cannot observe or remove a live initializer's state.
+        with _exclusive_operator_lock(self._initialization_lock_path()):
+            self._reconcile_owned_initialization_orphans()
+            if self.state_dir.exists() and (self.state_dir / MARKER_NAME).exists():
+                marker = read_marker(self.state_dir, self.project)
+                if marker["lifecycle"] not in {"initializing", "finalizing"}:
+                    raise SafetyError("staging target is already initialized")
+                verify_effective_env(self.state_dir, marker)
+                if any(marker[key] != value for key, value in frame.items()):
+                    raise SafetyError("initializing marker source frame changed")
+            else:
+                marker = self._prepare_new_state(frame)
+            state_stat = self.state_dir.stat()
+            if state_stat.st_uid != os.getuid() or stat.S_IMODE(state_stat.st_mode) != 0o700:
+                raise SafetyError("state directory must be owned by the operator with mode 0700")
+            if marker["lifecycle"] == "finalizing":
+                self._finalize_initialization(marker)
+                return self.up()
+            self._create_volumes(marker)
+            self.compose("config", "--quiet")
+            self._build_images()
+            self.control("seed-volumes")
+            self.compose("up", "--detach", "mattermost-postgres", "hrh-postgres", "hrh-migrate", timeout=900)
+            migrated = self.compose("wait", "hrh-migrate", check=False, timeout=900)
+            if migrated.returncode:
+                raise CommandError("HRH migration did not complete successfully")
+            self.compose("up", "--detach", "mattermost", timeout=600)
+            self.control("wait-mm")
+            self._provision_initial_mattermost_admin()
+            self.control("bootstrap-mm")
+            self.control("seed-hrh")
+            self.control("policy", "clinical-e1", "3600")
+            self.control("outbox-init")
+            public_key = self.control("public-key")
+            base64.b64decode(public_key, validate=True)
+            env_public = next(
+                line.split("=", 1)[1]
+                for line in self.env_file.read_text(encoding="utf-8").splitlines()
+                if line.startswith("CLINICAL_POLICY_PUBLIC_KEY=")
+            )
+            if public_key != env_public:
+                raise SafetyError("provisioned policy public key differs from the sealed environment")
+            self.compose("up", "--detach", *ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
+            self.control("wait-mm")
+            self.control("wait-hrh")
+            marker["expected_images"] = self._built_images()
+            marker["lifecycle"] = "finalizing"
+            self._write_marker(marker)
+            self._finalize_initialization(marker)
+            return self.up()
 
     def up(self) -> dict[str, Any]:
         self._require_linux()
@@ -1062,7 +1241,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             result = staging.refresh_policy(args.epoch)
         else:
             result = getattr(staging, args.command)()
-    except (SafetyError, CommandError) as exc:
+    except CommandError:
+        # CommandError is a boundary type: never let a future child-output
+        # regression become public just because this CLI renders its message.
+        print("clinical_staging outcome=denied reason=command_failed", file=sys.stderr)
+        return 2
+    except SafetyError as exc:
         print(f"clinical_staging outcome=denied reason={exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, sort_keys=True))

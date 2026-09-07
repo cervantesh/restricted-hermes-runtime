@@ -157,6 +157,43 @@ def ensure_user(username: str, email: str, password: str, admin_token: str) -> d
     return user
 
 
+def provision_initial_mattermost_admin(*, boundary_delay_seconds: float = 0) -> None:
+    """Create the initial Mattermost account without exposing its password.
+
+    The controller is the only process that reads the mode-0600 seed file. It
+    sends the password in the TLS request body to Mattermost; it never passes
+    it to an argv or environment boundary.  A prior successful creation is a
+    normal resume case for an interrupted synthetic initialization.
+    """
+    password = (SEED / "admin_password").read_text(encoding="ascii").strip()
+    if boundary_delay_seconds:
+        # Used only by the synthetic E2E witness while a separate process
+        # reads argv surfaces.  The delay is non-secret and bounded; it makes
+        # the actual provisioning process observable without changing its
+        # transport or production behavior.
+        time.sleep(boundary_delay_seconds)
+    try:
+        user = request(MM_BASE, _mm_context(), "POST", "/users", {
+            "username": "clinicaladmin",
+            "email": "admin@clinical.invalid",
+            "password": password,
+            "email_verified": True,
+        })[0]
+    except ApiError as exc:
+        existing = exc.status in {400, 409} and "already" in exc.message.lower() and "exist" in exc.message.lower()
+        if existing:
+            return
+        raise RuntimeError("Mattermost initial administrator bootstrap failed") from None
+    roles = user.get("roles") if isinstance(user, dict) else None
+    if (
+        not isinstance(user, dict)
+        or not isinstance(user.get("id"), str)
+        or not isinstance(roles, str)
+        or "system_admin" not in roles.split()
+    ):
+        raise RuntimeError("Mattermost initial administrator bootstrap failed")
+
+
 def bootstrap_mattermost() -> None:
     admin, admin_token = login("admin@clinical.invalid", (SEED / "admin_password").read_text().strip())
     actor = ensure_user("clinicalactor", "actor@clinical.invalid", (SEED / "actor_password").read_text().strip(), admin_token)
@@ -627,6 +664,18 @@ def main() -> None:
         wait_https(MM_BASE, _mm_context(), "/system/ping")
     elif command == "wait-hrh":
         wait_https(HRH_BASE, _hrh_context(), "/api/health")
+    elif command == "create-initial-admin":
+        delay = 0.0
+        if len(sys.argv) == 3 and sys.argv[2].startswith("--boundary-delay-seconds="):
+            try:
+                delay = float(sys.argv[2].split("=", 1)[1])
+            except ValueError:
+                raise RuntimeError("invalid synthetic boundary delay") from None
+        elif len(sys.argv) != 2:
+            raise RuntimeError("invalid create-initial-admin arguments")
+        if not 0 <= delay <= 10:
+            raise RuntimeError("invalid synthetic boundary delay")
+        provision_initial_mattermost_admin(boundary_delay_seconds=delay)
     elif command == "bootstrap-mm":
         bootstrap_mattermost()
     elif command == "seed-hrh":
