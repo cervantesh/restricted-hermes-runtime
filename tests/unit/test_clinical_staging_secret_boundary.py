@@ -175,7 +175,6 @@ def test_controller_fails_closed_if_initial_api_response_is_not_an_administrator
     with pytest.raises(RuntimeError, match="initial administrator bootstrap failed"):
         module.provision_initial_mattermost_admin()
 
-
 def test_cli_never_renders_command_error_text(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
     module = load_staging()
     canary = "STDERR_SECRET_CANARY_9159"

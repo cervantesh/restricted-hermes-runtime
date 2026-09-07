@@ -7,7 +7,6 @@ import base64
 import json
 import os
 import platform
-import re
 import secrets
 import shutil
 import subprocess
@@ -160,15 +159,99 @@ def set_env(name: str, value: str) -> None:
 def control(*args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[str]:
     result = compose("exec", "--no-TTY", "controller", "python", "/harness/control.py", *args, check=False, timeout=timeout)
     if check and result.returncode:
-        diagnostic = re.sub(r"\b[a-z0-9]{26}\b", "[mattermost-id]", (result.stdout + result.stderr)[-1800:])
-        for secret in SEED.iterdir():
-            if "password" in secret.name or "api_key" in secret.name:
-                diagnostic = diagnostic.replace(secret.read_text(encoding="ascii"), "[secret]")
-        logs = compose("logs", "--no-color", "ingress", "clinical-adapter", "hrh", check=False).stdout[-1800:]
-        summary_result = compose("exec", "--no-TTY", "controller", "python", "/harness/control.py", "outbox-summary", check=False)
-        summary = (summary_result.stdout + summary_result.stderr).strip()
-        raise RuntimeError(f"control {args[0]} failed: {diagnostic}; outbox={summary}; logs={logs}")
+        # This E2E is itself public CI evidence.  Its controller can read the
+        # bootstrap seed, so raw child output must not be copied to the test
+        # failure stream either.
+        command = args[0] if args and args[0] in {
+            "create-initial-admin", "bootstrap-mm", "seed-hrh", "policy",
+            "outbox-init", "wait-mm", "wait-hrh", "send", "expect",
+            "mutate", "grant-count", "outbox-summary",
+        } else "controller"
+        raise RuntimeError(f"controller command failed: {command} exit={result.returncode}")
     return result
+
+
+def _compose_command(*args: str) -> list[str]:
+    return [
+        "docker", "compose", "--env-file", str(ENV_FILE), "--project-name", PROJECT,
+        "--file", str(COMPOSE_FILE), *args,
+    ]
+
+
+def _known_secret_canaries() -> dict[str, str]:
+    # Generated only for this synthetic run.  Each value comes from a
+    # different secret category and must be absent from every argv probe.
+    return {
+        "password": (SEED / "admin_password").read_text(encoding="ascii").strip(),
+        "api_key": (SEED / "hrh_api_key").read_text(encoding="ascii").strip(),
+        "key_material": (SEED / "mattermost.key").read_text(encoding="ascii").strip(),
+        "actor_password": (SEED / "actor_password").read_text(encoding="ascii").strip(),
+    }
+
+
+def _host_proc_cmdlines() -> list[str]:
+    if not sys.platform.startswith("linux"):
+        return []
+    observed: list[str] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            observed.append((entry / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace"))
+        except OSError:
+            continue
+    return observed
+
+
+def assert_initial_admin_secret_boundary() -> dict[str, object]:
+    """Run actual first-admin provisioning while independently observing argv."""
+    controller_id = compose("ps", "--quiet", "controller").stdout.strip()
+    if not controller_id:
+        raise RuntimeError("controller container unavailable for secret boundary witness")
+    canaries = _known_secret_canaries()
+    process = subprocess.Popen(
+        _compose_command(
+            "exec", "--no-TTY", "controller", "python", "/harness/control.py",
+            "create-initial-admin", "--boundary-delay-seconds=3",
+        ),
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    docker_top: list[str] = []
+    procfs: list[str] = []
+    observed_controller = False
+    try:
+        deadline = time.monotonic() + 8
+        while process.poll() is None and time.monotonic() < deadline:
+            top = run("docker", "top", controller_id, "-eo", "pid,args", check=False, timeout=20)
+            if top.returncode == 0:
+                docker_top.append(top.stdout)
+                observed_controller = observed_controller or "create-initial-admin" in top.stdout
+            procfs.extend(_host_proc_cmdlines())
+            time.sleep(0.1)
+        stdout, stderr = process.communicate(timeout=20)
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=10)
+        raise
+    if process.returncode != 0:
+        raise RuntimeError(f"initial administrator provisioning failed: exit={process.returncode}")
+    observed = [*docker_top, *procfs, stdout, stderr]
+    for category, canary in canaries.items():
+        if any(canary in surface for surface in observed):
+            raise RuntimeError(f"secret boundary witness found {category} canary")
+    if not observed_controller:
+        raise RuntimeError("docker top did not observe the real provisioning command")
+    return {
+        "docker_top_observed": True,
+        "procfs_observed": bool(procfs),
+        "canary_categories": sorted(canaries),
+    }
 
 
 def wait_ingress(after: int = 0, timeout: int = 60) -> None:
@@ -337,7 +420,8 @@ def main() -> None:
     phase("servers")
     compose("up", "--detach", "mattermost", timeout=300)
     control("wait-mm")
-    control("create-initial-admin")
+    phase("secret-boundary")
+    secret_boundary = assert_initial_admin_secret_boundary()
     control("bootstrap-mm")
     control("seed-hrh")
     control("policy")
@@ -476,6 +560,7 @@ def main() -> None:
         **SOURCE_FRAME,
         "runtime_product_sha": RUNTIME_PRODUCT_SHA,
         "images": image_evidence()["images"], "boundaries": boundaries,
+        "secret_boundary": secret_boundary,
         "built_images": built_image_evidence(),
         "commands": [
             "python tests/deployment/test_clinical_composed_e2e.py",
