@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import dataclasses
 import importlib.util
 import json
 import os
@@ -40,6 +42,29 @@ def test_state_path_is_absolute_bounded_and_project_specific(tmp_path: Path):
     ):
         with pytest.raises(module.SafetyError):
             module.validate_state_path(invalid, "clinicalstagingdemo")
+
+
+def test_backup_bundle_codec_is_an_immutable_one_way_leaf():
+    module = load_module()
+    codec = sys.modules["clinical_backup_bundle"]
+    contract = module._backup_contract()
+
+    assert dataclasses.is_dataclass(contract)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        contract.schema = "changed"  # type: ignore[misc]
+
+    tree = ast.parse(Path(codec.__file__).read_text(encoding="utf-8"))
+    assert all(
+        not (
+            isinstance(node, ast.Import)
+            and any(alias.name == "clinical_staging" for alias in node.names)
+        )
+        and not (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "clinical_staging"
+        )
+        for node in tree.body
+    )
 
 
 def test_clinical_staging_rejects_state_inside_either_build_context(tmp_path: Path):
@@ -1079,17 +1104,18 @@ def test_restore_snapshot_rejects_mid_copy_input_replacement_before_destination_
     shutil.rmtree(state)
     staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
     monkeypatch.setattr(staging, "_require_linux", lambda: None)
-    original_copy = module._copy_regular_file
+    codec = sys.modules["clinical_backup_bundle"]
+    original_copy = codec._copy_regular_file
     replaced = False
 
-    def replace_while_snapshotting(source: Path, destination: Path) -> None:
+    def replace_while_snapshotting(contract, source: Path, destination: Path) -> None:
         nonlocal replaced
         if source == backup / member and not replaced:
             replaced = True
             source.write_bytes(b"different-generation")
-        original_copy(source, destination)
+        original_copy(contract, source, destination)
 
-    monkeypatch.setattr(module, "_copy_regular_file", replace_while_snapshotting)
+    monkeypatch.setattr(codec, "_copy_regular_file", replace_while_snapshotting)
     monkeypatch.setattr(
         staging,
         "_require_empty_restore_destination",

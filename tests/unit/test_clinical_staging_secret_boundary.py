@@ -275,6 +275,15 @@ def test_next_init_invocation_resumes_finalizing_before_operational_lifecycle(
     state = tmp_path / "clinicalstagingsecret.synthetic-clinical-staging"
     runtime.mkdir()
     hrh.mkdir()
+    for name, bases in module.HRH_CANDIDATE_BASES.items():
+        (hrh / name).write_text(
+            "\n".join(
+                f"FROM {image} AS stage{index}"
+                for index, image in enumerate(bases)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     state.mkdir()
     (state / module.MARKER_NAME).write_text("synthetic", encoding="ascii")
     staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingsecret", 18443)
