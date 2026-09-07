@@ -55,6 +55,30 @@ class ReceiptError(RuntimeError):
     """A deliberately content-free collection failure."""
 
 
+def collector_error_class(exc: BaseException) -> str:
+    """Return a bounded diagnostic class without serializing exception content."""
+    message = str(exc)
+    if any(token in message for token in ("state, candidate", "output target", "request is incomplete")):
+        return "input"
+    if any(token in message for token in ("candidate source", "canonical staging")):
+        return "source-binding"
+    if "marker" in message or "initialized staging" in message:
+        return "marker-binding"
+    if "proof" in message or "retained" in message:
+        return "proof-binding"
+    if any(token in message for token in ("container image", "container inspection", "restricted service")):
+        return "image-binding"
+    if any(token in message for token in ("network probe", "controlled", "fixed probe", "live controlled")):
+        return "network-probe"
+    if "cleanup" in message:
+        return "cleanup"
+    if "command" in message:
+        return "local-command"
+    if "required" in message:
+        return "input"
+    return "receipt-policy"
+
+
 def canonical_receipt(value: dict[str, Any]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
@@ -650,8 +674,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         _write_atomic(args.output, receipt)
         print("representative-clinical-egress: PASS sha256=" + hashlib.sha256(canonical_receipt(receipt).encode()).hexdigest())
         return 0
-    except (ReceiptError, json.JSONDecodeError, OSError):
-        print("representative-clinical-egress: DENIED", file=sys.stderr)
+    except (ReceiptError, json.JSONDecodeError, OSError) as exc:
+        print("representative-clinical-egress: DENIED class=" + collector_error_class(exc), file=sys.stderr)
         return 2
 
 

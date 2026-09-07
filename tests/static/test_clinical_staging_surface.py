@@ -73,3 +73,17 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert "Dockerfile.web.clinical-candidate" in script
     assert "Dockerfile.migrate.clinical-candidate" in script
     assert "verify_hrh_candidate_build_inputs(self.hrh)" in script
+
+
+def test_egress_failure_packet_is_content_safe_and_outside_disposable_state():
+    harness = (ROOT / "tests" / "deployment" / "test_representative_clinical_egress.sh").read_text(encoding="utf-8")
+
+    assert 'diagnostic_dir="$receipt.diagnostic"' in harness
+    assert 'mkdir -m 0700 "$diagnostic_dir"' in harness
+    assert 'chmod 0600 "$temporary"' in harness
+    assert 'rm -f "$receipt"; rm -rf "$evidence_dir"' in harness
+    assert "write_diagnostic" in harness
+    assert "collector_class_from" in harness
+    packet = next(line for line in harness.splitlines() if '"schema":"restricted-runtime-representative-clinical-egress-diagnostic.v1"' in line)
+    for forbidden in ("$network", "$sink", "$state", "$project", "$controlled_"):
+        assert forbidden not in packet

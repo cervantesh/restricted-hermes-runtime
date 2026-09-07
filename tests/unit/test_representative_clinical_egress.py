@@ -218,6 +218,26 @@ def test_probe_accepts_only_explicit_program_outcomes(monkeypatch):
     assert module._probe("sha256:" + "a" * 64, "a" * 64, "controlled-probe", 80) is False
 
 
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("candidate source did not match expected frame", "source-binding"),
+        ("receipt marker proof does not match initialized staging", "marker-binding"),
+        ("green proof results are invalid", "proof-binding"),
+        ("container image identity was invalid", "image-binding"),
+        ("network probe did not produce an expected outcome", "network-probe"),
+        ("red cleanup was not proven", "cleanup"),
+        ("required local command was rejected", "local-command"),
+        ("state, candidate source and controlled endpoints are required", "input"),
+        ("collection did not meet receipt policy", "receipt-policy"),
+    ],
+)
+def test_collector_error_class_is_bounded_and_content_free(message, expected):
+    module = load_module()
+
+    assert module.collector_error_class(module.ReceiptError(message)) == expected
+
+
 @pytest.mark.parametrize("outcome", ["connected", "refused", "timeout"])
 def test_fixed_metadata_reachability_or_ambiguous_timeout_is_not_green(outcome):
     module = load_module()
@@ -256,6 +276,44 @@ def write_evidence(module, directory, value):
         path = directory / f"red-{service}.json"
         path.write_text(module.canonical_receipt(red) + "\n", encoding="utf-8")
         value["red_witness"]["proof_sha256"][service] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_final_collector_assembles_and_offline_verifies_semantic_fixture_proofs(tmp_path, monkeypatch):
+    """Keep final receipt assembly independent of a Docker witness failure."""
+    module = load_module()
+    value = receipt(module)
+    evidence = tmp_path / "evidence"
+    write_evidence(module, evidence, value)
+    marker = value["staging"]["marker"]
+
+    monkeypatch.setattr(module, "_source_marker", lambda *_args: marker)
+    monkeypatch.setattr(module, "_service_id", lambda _runtime, _state, _project, service: service)
+    monkeypatch.setattr(module, "_inspect_container", lambda _container: {})
+    monkeypatch.setattr(
+        module,
+        "_service_observation",
+        lambda service, *_args: value["services"][service],
+    )
+    monkeypatch.setattr(module, "_run", lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=""))
+
+    def version(*args, **_kwargs):
+        return "27.5.1" if args[1:3] == ("version", "--format") else "v2.31.0"
+
+    monkeypatch.setattr(module, "_stdout", version)
+    assembled = module.collect(
+        runtime=ROOT,
+        state_dir=tmp_path / "state",
+        project="clinicalstagingfixture",
+        expected_head=HEAD,
+        expected_tree=TREE,
+        proof_paths={service: evidence / f"red-{service}.json" for service in module.POLICIES},
+        green_path=evidence / "green.json",
+        marker_proof=evidence / "marker.json",
+        cleanup_network="owned-network",
+        cleanup_sink="owned-sink",
+    )
+
+    assert module.verify_receipt(assembled, expected_head=HEAD, expected_tree=TREE, evidence_dir=evidence) == []
 
 
 def test_offline_verifier_rejects_arbitrary_hash_matching_proof_bytes(tmp_path):

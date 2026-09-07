@@ -10,7 +10,9 @@ receipt="${2:?usage: $0 /absolute/path/to/Health-Record-Hub /absolute/path/to/re
 [[ "$hrh_root" = /* && -d "$hrh_root/.git" ]] || { echo "representative-clinical-egress: DENIED" >&2; exit 2; }
 [[ "$receipt" = /* && ! -e "$receipt" && -d "$(dirname "$receipt")" ]] || { echo "representative-clinical-egress: DENIED" >&2; exit 2; }
 evidence_dir="$receipt.evidence"
+diagnostic_dir="$receipt.diagnostic"
 [[ ! -e "$evidence_dir" ]] || { echo "representative-clinical-egress: DENIED" >&2; exit 2; }
+[[ ! -e "$diagnostic_dir" ]] || { echo "representative-clinical-egress: DENIED" >&2; exit 2; }
 docker info >/dev/null 2>&1 || { echo "representative-clinical-egress: SKIP docker-unavailable"; exit 77; }
 if command -v python3 >/dev/null 2>&1; then python_bin=python3
 elif command -v python >/dev/null 2>&1; then python_bin=python
@@ -29,16 +31,63 @@ collector="$runtime/tools/representative_clinical_egress.py"
 target_ids=()
 passed=0
 phase=preflight
+collector_class=not-applicable
+cleanup_network_absent=false
+cleanup_sink_absent=false
+cleanup_state_absent=false
+
+collector_class_from() {
+  local outcome="$1"
+  local candidate=unclassified
+  if [[ "$outcome" =~ ^representative-clinical-egress:\ DENIED\ class=([a-z-]+)$ ]]; then
+    candidate="${BASH_REMATCH[1]}"
+  fi
+  case "$candidate" in
+    source-binding|marker-binding|proof-binding|image-binding|network-probe|cleanup|local-command|input|receipt-policy|unclassified)
+      printf '%s' "$candidate" ;;
+    *) printf '%s' unclassified ;;
+  esac
+}
+
+write_diagnostic() {
+  local safe_phase="$phase"
+  case "$safe_phase" in
+    preflight|initialize|marker-proof|red-ingress|red-clinical-adapter|green-live-control|cleanup-proof|receipt|verify) ;;
+    *) safe_phase=unknown ;;
+  esac
+  mkdir -m 0700 "$diagnostic_dir" 2>/dev/null || return 0
+  local temporary="$diagnostic_dir/packet.json.tmp"
+  (umask 077
+    printf '{"schema":"restricted-runtime-representative-clinical-egress-diagnostic.v1","runtime":{"head":"%s","tree":"%s"},"phase":"%s","collector_error_class":"%s","cleanup":{"network_absent":%s,"sink_absent":%s,"state_absent":%s}}\n' \
+      "$head" "$tree" "$safe_phase" "$collector_class" "$cleanup_network_absent" "$cleanup_sink_absent" "$cleanup_state_absent" > "$temporary"
+    chmod 0600 "$temporary"
+    mv -f "$temporary" "$diagnostic_dir/packet.json") || rm -f "$temporary"
+}
 
 cleanup() {
+  local inspect_status
   for target in "${target_ids[@]:-}"; do docker network disconnect --force "$network" "$target" >/dev/null 2>&1 || true; done
   docker container rm --force "$sink" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   if [[ -f "$state/staging-state.json" ]]; then
     "$python_bin" "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" destroy >/dev/null 2>&1 || true
   fi
+  if docker network inspect "$network" >/dev/null 2>&1; then
+    :
+  else
+    inspect_status=$?
+    if [[ "$inspect_status" == 1 ]]; then cleanup_network_absent=true; fi
+  fi
+  if docker container inspect "$sink" >/dev/null 2>&1; then
+    :
+  else
+    inspect_status=$?
+    if [[ "$inspect_status" == 1 ]]; then cleanup_sink_absent=true; fi
+  fi
+  if [[ ! -e "$state" ]]; then cleanup_state_absent=true; fi
   if [[ "$passed" != 1 ]]; then
     rm -f "$receipt"; rm -rf "$evidence_dir"
+    write_diagnostic
     printf 'representative-clinical-egress: DENIED phase=%s\n' "$phase" >&2
   fi
   rmdir "$scratch" >/dev/null 2>&1 || true
@@ -59,10 +108,11 @@ controlled_ipv6="$(docker inspect --format '{{range .NetworkSettings.Networks}}{
 [[ -n "$controlled_ipv4" && -n "$controlled_ipv6" ]] || { echo "representative-clinical-egress: SKIP controlled-ipv6-address-unavailable"; exit 77; }
 phase=marker-proof
 set +e
-outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>/dev/null)"
+outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>&1)"
 status=$?
 set -e
 if [[ "$status" != 5 || ! "$outcome" =~ ^representative-clinical-egress:\ MARKER-PROVED\ proof_sha256=[a-f0-9]{64}$ || ! -f "$evidence_dir/marker.json" ]]; then
+  collector_class="$(collector_class_from "$outcome")"
   echo "representative-clinical-egress: DENIED" >&2
   exit 2
 fi
@@ -75,10 +125,11 @@ for service in ingress clinical-adapter; do
   docker network connect "$network" "$target"
   proof="$evidence_dir/red-$service.json"
   set +e
-  outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --red-service "$service" --red-network "$network" --red-sink "$sink" --red-proof "$proof" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>/dev/null)"
+  outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --red-service "$service" --red-network "$network" --red-sink "$sink" --red-proof "$proof" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>&1)"
   status=$?
   set -e
   if [[ "$status" != 3 || ! "$outcome" =~ ^representative-clinical-egress:\ RED-DETECTED\ proof_sha256=[a-f0-9]{64}$ || ! -f "$proof" ]]; then
+    collector_class="$(collector_class_from "$outcome")"
     echo "representative-clinical-egress: DENIED" >&2
     exit 2
   fi
@@ -87,10 +138,11 @@ done
 
 phase=green-live-control
 set +e
-outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --green-proof "$evidence_dir/green.json" --control-network "$network" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>/dev/null)"
+outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --green-proof "$evidence_dir/green.json" --control-network "$network" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>&1)"
 status=$?
 set -e
 if [[ "$status" != 4 || ! "$outcome" =~ ^representative-clinical-egress:\ GREEN-PROVED\ proof_sha256=[a-f0-9]{64}$ || ! -f "$evidence_dir/green.json" ]]; then
+  collector_class="$(collector_class_from "$outcome")"
   echo "representative-clinical-egress: DENIED" >&2
   exit 2
 fi
@@ -102,8 +154,22 @@ if docker container inspect "$sink" >/dev/null 2>&1 || docker network inspect "$
   exit 2
 fi
 phase=receipt
-"$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --red-ingress-proof "$evidence_dir/red-ingress.json" --red-clinical-adapter-proof "$evidence_dir/red-clinical-adapter.json" --green-proof "$evidence_dir/green.json" --cleanup-network "$network" --cleanup-sink "$sink" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 --output "$receipt" >/dev/null
+set +e
+outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --red-ingress-proof "$evidence_dir/red-ingress.json" --red-clinical-adapter-proof "$evidence_dir/red-clinical-adapter.json" --green-proof "$evidence_dir/green.json" --cleanup-network "$network" --cleanup-sink "$sink" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 --output "$receipt" 2>&1 >/dev/null)"
+status=$?
+set -e
+if [[ "$status" != 0 ]]; then
+  collector_class="$(collector_class_from "$outcome")"
+  exit 2
+fi
 phase=verify
-"$python_bin" "$collector" --verify "$receipt" --expected-head "$head" --expected-tree "$tree" --evidence-dir "$evidence_dir" >/dev/null
+set +e
+outcome="$("$python_bin" "$collector" --verify "$receipt" --expected-head "$head" --expected-tree "$tree" --evidence-dir "$evidence_dir" 2>&1 >/dev/null)"
+status=$?
+set -e
+if [[ "$status" != 0 ]]; then
+  collector_class="$(collector_class_from "$outcome")"
+  exit 2
+fi
 passed=1
 printf 'representative-clinical-egress: PASS receipt_sha256=%s\n' "$(sha256sum "$receipt" | awk '{print $1}')"
