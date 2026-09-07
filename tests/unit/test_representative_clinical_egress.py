@@ -53,8 +53,10 @@ def receipt(module):
         },
         "red_witness": {
             "proof_sha256": {"ingress": "d" * 64, "clinical-adapter": "e" * 64},
+            "green_proof_sha256": "f" * 64,
             "green": {service: {name: True for name in module.DENIED_CLASSES} for service in module.POLICIES},
             "cleanup": {"network_absent": True, "sink_absent": True},
+            "fixed": {service: {"public_dns_example_com": False, "metadata_ipv4": "network-unreachable", "metadata_ipv6": "network-unreachable"} for service in module.POLICIES},
             "metadata_scope": "synthetic-controlled-only",
         },
     }
@@ -130,6 +132,8 @@ def test_receipt_builder_records_only_classes_booleans_versions_and_hashes():
         proof_sha256={"ingress": "d" * 64, "clinical-adapter": "e" * 64},
         green={service: {name: True for name in module.DENIED_CLASSES} for service in module.POLICIES},
         cleanup={"network_absent": True, "sink_absent": True},
+        green_proof_sha256="f" * 64,
+        fixed={service: {"public_dns_example_com": False, "metadata_ipv4": "network-unreachable", "metadata_ipv6": "network-unreachable"} for service in module.POLICIES},
     )
 
     assert module.verify_receipt(value, expected_head=HEAD, expected_tree=TREE) == []
@@ -149,6 +153,8 @@ def test_builder_rejects_a_syntactically_valid_swapped_container_image():
             proof_sha256={"ingress": "d" * 64, "clinical-adapter": "e" * 64},
             green={service: {name: True for name in module.DENIED_CLASSES} for service in module.POLICIES},
             cleanup={"network_absent": True, "sink_absent": True},
+            green_proof_sha256="f" * 64,
+            fixed={service: {"public_dns_example_com": False, "metadata_ipv4": "network-unreachable", "metadata_ipv6": "network-unreachable"} for service in module.POLICIES},
         )
 
 

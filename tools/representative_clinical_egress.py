@@ -21,6 +21,10 @@ DENIED_CLASSES = (
 )
 DNS_CLASSES = frozenset({"controlled_dns", "synthetic_metadata_dns"})
 RED_SCHEMA = "restricted-runtime-representative-clinical-egress-red-proof.v1"
+GREEN_SCHEMA = "restricted-runtime-representative-clinical-egress-green-proof.v1"
+FIXED_PUBLIC_DNS = "example.com"
+FIXED_METADATA = {"metadata_ipv4": ("169.254.169.254", 80, "ipv4"), "metadata_ipv6": ("fd00:ec2::254", 80, "ipv6")}
+CONNECT_CLASSES = frozenset({"connected", "refused", "network-unreachable", "host-unreachable", "timeout", "other"})
 POLICIES = {
     "ingress": {
         "networks": ("mattermost_edge",),
@@ -54,7 +58,8 @@ def build_receipt(*, head: str, tree: str, kernel: str, architecture: str,
                   docker_version: str, compose_version: str,
                   observations: dict[str, dict[str, Any]], marker_sha256: str,
                   initialized_images: dict[str, str], proof_sha256: dict[str, str],
-                  green: dict[str, dict[str, bool]], cleanup: dict[str, bool]) -> dict[str, Any]:
+                  green: dict[str, dict[str, bool]], cleanup: dict[str, bool], green_proof_sha256: str,
+                  fixed: dict[str, dict[str, str | bool]]) -> dict[str, Any]:
     for service in POLICIES:
         if observations.get(service, {}).get("image_id") != initialized_images.get(service):
             raise ReceiptError("container image differs from initialized image")
@@ -67,13 +72,13 @@ def build_receipt(*, head: str, tree: str, kernel: str, architecture: str,
         "docker": {"server_version": docker_version, "compose_version": compose_version},
         "services": observations,
         "red_witness": {
-            "proof_sha256": proof_sha256, "green": green, "cleanup": cleanup,
+            "proof_sha256": proof_sha256, "green_proof_sha256": green_proof_sha256, "green": green, "cleanup": cleanup, "fixed": fixed,
             "metadata_scope": "synthetic-controlled-only",
         },
     }
 
 
-def verify_receipt(value: object, *, expected_head: str, expected_tree: str) -> list[str]:
+def verify_receipt(value: object, *, expected_head: str, expected_tree: str, evidence_dir: Path | None = None) -> list[str]:
     errors: list[str] = []
     if not isinstance(value, dict):
         return ["receipt is not an object"]
@@ -128,19 +133,33 @@ def verify_receipt(value: object, *, expected_head: str, expected_tree: str) -> 
             if not isinstance(got, dict) or set(got) != expected or any(result is not True for result in got.values()):
                 errors.append(f"{service} {key} is invalid")
     witness = value.get("red_witness")
-    if not isinstance(witness, dict) or set(witness) != {"proof_sha256", "green", "cleanup", "metadata_scope"}:
+    if not isinstance(witness, dict) or set(witness) != {"proof_sha256", "green_proof_sha256", "green", "cleanup", "fixed", "metadata_scope"}:
         return errors + ["red witness fields are invalid"]
     proofs = witness["proof_sha256"]
     if not isinstance(proofs, dict) or set(proofs) != set(POLICIES) or any(not isinstance(item, str) or not re.fullmatch(r"[a-f0-9]{64}", item) for item in proofs.values()):
         errors.append("red witness proof is invalid")
+    if not isinstance(witness.get("green_proof_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", witness["green_proof_sha256"]):
+        errors.append("green witness proof is invalid")
     green = witness["green"]
     if not isinstance(green, dict) or set(green) != set(POLICIES) or any(not isinstance(green.get(service), dict) or set(green[service]) != set(DENIED_CLASSES) or any(result is not True for result in green[service].values()) for service in POLICIES):
         errors.append("green controlled probes are incomplete")
     if witness.get("metadata_scope") != "synthetic-controlled-only":
         errors.append("metadata scope is invalid")
+    fixed = witness.get("fixed")
+    if (not isinstance(fixed, dict) or set(fixed) != set(POLICIES)
+            or any(not isinstance(item, dict) or item.get("public_dns_example_com") is not False or item.get("metadata_ipv4") not in CONNECT_CLASSES or item.get("metadata_ipv6") not in CONNECT_CLASSES for item in fixed.values())):
+        errors.append("fixed probe evidence is invalid")
     cleanup = witness["cleanup"]
     if not isinstance(cleanup, dict) or cleanup != {"network_absent": True, "sink_absent": True}:
         errors.append("red witness cleanup is incomplete")
+    if evidence_dir is not None:
+        for name, expected in (("red-ingress.json", proofs.get("ingress") if isinstance(proofs, dict) else None), ("red-clinical-adapter.json", proofs.get("clinical-adapter") if isinstance(proofs, dict) else None), ("green.json", witness.get("green_proof_sha256"))):
+            try:
+                actual = hashlib.sha256((evidence_dir / name).read_bytes()).hexdigest()
+            except OSError:
+                actual = ""
+            if actual != expected:
+                errors.append("retained proof hash is invalid")
     return errors
 
 
@@ -256,6 +275,32 @@ def _probe_results(image_id: str, container_id: str, endpoints: dict[str, tuple[
     return result
 
 
+def _network_control(image_id: str, network: str, endpoints: dict[str, tuple[str, int]]) -> bool:
+    checks = "\n".join(f"socket.getaddrinfo({host!r},{port}); socket.create_connection(({host!r},{port}),2).close()" for host, port in endpoints.values())
+    program = "import socket,sys\ntry:\n " + checks.replace("\n", "\n ") + "\nexcept OSError:\n sys.exit(1)"
+    return _run("docker", "run", "--rm", "--network", network, "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=8m", "--entrypoint", "python", image_id, "-c", program, timeout=30).returncode == 0
+
+
+def _control_resolves_public_dns(image_id: str, network: str) -> bool:
+    return _run("docker", "run", "--rm", "--network", network, "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=8m", "--entrypoint", "python", image_id, "-c", "import socket; socket.getaddrinfo('example.com',443)", timeout=15).returncode == 0
+
+
+def _fixed_outcomes(image_id: str, container_id: str) -> dict[str, str | bool]:
+    program = """import errno,socket
+def outcome(address,family):
+ s=socket.socket(family,socket.SOCK_STREAM); s.settimeout(2)
+ try: code=s.connect_ex(address)
+ finally: s.close()
+ return {0:'connected',errno.ECONNREFUSED:'refused',errno.ENETUNREACH:'network-unreachable',errno.EHOSTUNREACH:'host-unreachable',errno.ETIMEDOUT:'timeout'}.get(code,'other')
+try: socket.getaddrinfo('example.com',443); dns=True
+except OSError: dns=False
+print(('1' if dns else '0')+'|'+outcome(('169.254.169.254',80),socket.AF_INET)+'|'+outcome(('fd00:ec2::254',80,0,0),socket.AF_INET6))"""
+    raw = _run("docker", "run", "--rm", "--network", f"container:{container_id}", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=8m", "--entrypoint", "python", image_id, "-c", program, timeout=15).stdout.strip().split("|")
+    if len(raw) != 3 or raw[0] not in {"0", "1"} or raw[1] not in CONNECT_CLASSES or raw[2] not in CONNECT_CLASSES:
+        raise ReceiptError("fixed probe outcome was invalid")
+    return {"public_dns_example_com": raw[0] == "1", "metadata_ipv4": raw[1], "metadata_ipv6": raw[2]}
+
+
 def _red_network_shape(network: str, sink: str, target: str) -> str:
     try:
         item = json.loads(_stdout("docker", "network", "inspect", network))[0]
@@ -286,7 +331,7 @@ def _write_atomic(path: Path, value: dict[str, Any]) -> None:
             temporary.unlink()
 
 
-def _read_red_proof(path: Path, service: str, head: str, tree: str, image_id: str, endpoints: dict[str, tuple[str, int]]) -> str:
+def _read_red_proof(path: Path, service: str, head: str, tree: str, image_id: str, endpoint_sha256: dict[str, str]) -> str:
     try:
         raw = path.read_bytes()
         value = json.loads(raw)
@@ -294,7 +339,7 @@ def _read_red_proof(path: Path, service: str, head: str, tree: str, image_id: st
         raise ReceiptError("red proof is unavailable") from exc
     expected = {
         "schema": RED_SCHEMA, "service": service, "runtime": {"head": head, "tree": tree}, "image_id": image_id,
-        "endpoint_sha256": {name: hashlib.sha256(f"{host}:{port}".encode()).hexdigest() for name, (host, port) in endpoints.items()},
+        "endpoint_sha256": endpoint_sha256,
         "probes": {name: True for name in DENIED_CLASSES},
     }
     if not isinstance(value, dict) or set(value) != {"schema", "service", "runtime", "image_id", "endpoint_sha256", "network_shape_sha256", "probes"} or any(value.get(key) != expected[key] for key in expected) or not isinstance(value.get("network_shape_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", value["network_shape_sha256"]):
@@ -303,12 +348,11 @@ def _read_red_proof(path: Path, service: str, head: str, tree: str, image_id: st
 
 
 def _service_observation(service: str, container_id: str, inspected: dict[str, Any], project: str,
-                         endpoints: dict[str, tuple[str, int]], initialized_image: str) -> dict[str, Any]:
+                         denied: dict[str, bool], initialized_image: str) -> dict[str, Any]:
     policy = POLICIES[service]
     image_id = inspected.get("Image")
     if not isinstance(image_id, str) or not SHA256.fullmatch(image_id) or image_id != initialized_image:
         raise ReceiptError("container image identity was invalid")
-    denied = _probe_results(image_id, container_id, endpoints, reachable=False)
     permitted = {name: _probe(image_id, container_id, name, port) for name, port in policy["permitted_internal"].items()}
     blocked = {name: not _probe(image_id, container_id, name, port) for name, port in policy["denied_internal"].items()}
     return {
@@ -356,18 +400,61 @@ def collect_red(*, runtime: Path, state_dir: Path, project: str, expected_head: 
     return hashlib.sha256((canonical_receipt(proof) + "\n").encode()).hexdigest()
 
 
+def collect_green(*, runtime: Path, state_dir: Path, project: str, expected_head: str, expected_tree: str,
+                  network: str, endpoints: dict[str, tuple[str, int]], output: Path) -> str:
+    _, initialized = _source_marker(runtime, state_dir, project, expected_head, expected_tree)
+    target: dict[str, dict[str, bool]] = {}
+    fixed: dict[str, dict[str, str | bool]] = {}
+    for service in POLICIES:
+        container_id = _service_id(runtime, state_dir, project, service)
+        image_id = _inspect_container(container_id).get("Image")
+        if image_id != initialized[service]:
+            raise ReceiptError("green service image differs from initialized image")
+        target[service] = _probe_results(image_id, container_id, endpoints, reachable=False)
+        fixed[service] = _fixed_outcomes(image_id, container_id)
+    public_dns_control = _control_resolves_public_dns(initialized["ingress"], network)
+    if not all(all(results.values()) for results in target.values()) or not _network_control(initialized["ingress"], network, endpoints) or not public_dns_control:
+        raise ReceiptError("live controlled green proof was not discriminating")
+    proof = {"schema": GREEN_SCHEMA, "runtime": {"head": expected_head, "tree": expected_tree}, "images": initialized,
+             "target": target, "control_reachable": True, "public_dns_control": public_dns_control, "fixed": fixed,
+             "endpoint_sha256": {name: hashlib.sha256(f"{host}:{port}".encode()).hexdigest() for name, (host, port) in endpoints.items()},
+             "fixed_definitions_sha256": hashlib.sha256(canonical_receipt({"public_dns": FIXED_PUBLIC_DNS, "metadata": FIXED_METADATA}).encode()).hexdigest()}
+    _write_atomic(output, proof)
+    return hashlib.sha256((canonical_receipt(proof) + "\n").encode()).hexdigest()
+
+
+def _read_green_proof(path: Path, head: str, tree: str, images: dict[str, str]) -> tuple[str, dict[str, dict[str, bool]], dict[str, dict[str, str | bool]], dict[str, str]]:
+    try: raw = path.read_bytes(); value = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc: raise ReceiptError("green proof is unavailable") from exc
+    expected_hash = hashlib.sha256(canonical_receipt({"public_dns": FIXED_PUBLIC_DNS, "metadata": FIXED_METADATA}).encode()).hexdigest()
+    if (not isinstance(value, dict) or value.get("schema") != GREEN_SCHEMA or value.get("runtime") != {"head": head, "tree": tree}
+            or value.get("images") != images or value.get("control_reachable") is not True or value.get("public_dns_control") is not True or value.get("fixed_definitions_sha256") != expected_hash):
+        raise ReceiptError("green proof does not bind candidate")
+    target, fixed, endpoints = value.get("target"), value.get("fixed"), value.get("endpoint_sha256")
+    if (not isinstance(target, dict) or set(target) != set(POLICIES) or any(results != {name: True for name in DENIED_CLASSES} for results in target.values())
+            or not isinstance(fixed, dict) or set(fixed) != set(POLICIES)):
+        raise ReceiptError("green proof results are invalid")
+    for result in fixed.values():
+        if not isinstance(result, dict) or set(result) != {"public_dns_example_com", "metadata_ipv4", "metadata_ipv6"} or result["public_dns_example_com"] is not False or result["metadata_ipv4"] not in CONNECT_CLASSES or result["metadata_ipv6"] not in CONNECT_CLASSES:
+            raise ReceiptError("fixed probe classes are invalid")
+    if not isinstance(endpoints, dict) or set(endpoints) != set(DENIED_CLASSES) or any(not isinstance(item, str) or not re.fullmatch(r"[a-f0-9]{64}", item) for item in endpoints.values()):
+        raise ReceiptError("green controlled endpoint binding is invalid")
+    return hashlib.sha256(raw).hexdigest(), target, fixed, endpoints
+
+
 def collect(*, runtime: Path, state_dir: Path, project: str, expected_head: str, expected_tree: str,
-            endpoints: dict[str, tuple[str, int]], proof_paths: dict[str, Path], cleanup_network: str, cleanup_sink: str) -> dict[str, Any]:
+            proof_paths: dict[str, Path], green_path: Path, cleanup_network: str, cleanup_sink: str) -> dict[str, Any]:
     marker_sha256, initialized = _source_marker(runtime, state_dir, project, expected_head, expected_tree)
     if not GIT_SHA.fullmatch(expected_head) or not GIT_SHA.fullmatch(expected_tree):
         raise ReceiptError("candidate source shape was invalid")
     observations: dict[str, dict[str, Any]] = {}
     proof_sha256: dict[str, str] = {}
+    green_sha256, green, fixed, endpoint_sha256 = _read_green_proof(green_path, expected_head, expected_tree, initialized)
     for service in POLICIES:
         container_id = _service_id(runtime, state_dir, project, service)
         inspected = _inspect_container(container_id)
-        observations[service] = _service_observation(service, container_id, inspected, project, endpoints, initialized[service])
-        proof_sha256[service] = _read_red_proof(proof_paths[service], service, expected_head, expected_tree, initialized[service], endpoints)
+        observations[service] = _service_observation(service, container_id, inspected, project, green[service], initialized[service])
+        proof_sha256[service] = _read_red_proof(proof_paths[service], service, expected_head, expected_tree, initialized[service], endpoint_sha256)
     cleanup = {"network_absent": _run("docker", "network", "inspect", cleanup_network).returncode != 0,
                "sink_absent": _run("docker", "container", "inspect", cleanup_sink).returncode != 0}
     if cleanup != {"network_absent": True, "sink_absent": True}:
@@ -376,7 +463,8 @@ def collect(*, runtime: Path, state_dir: Path, project: str, expected_head: str,
                          docker_version=_stdout("docker", "version", "--format", "{{.Server.Version}}"),
                          compose_version=_stdout("docker", "compose", "version", "--short"), observations=observations,
                          marker_sha256=marker_sha256, initialized_images=initialized, proof_sha256=proof_sha256,
-                         green={service: observations[service]["denied"] for service in POLICIES}, cleanup=cleanup)
+                         green={service: observations[service]["denied"] for service in POLICIES}, cleanup=cleanup,
+                         green_proof_sha256=green_sha256, fixed=fixed)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -390,10 +478,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--red-network")
     parser.add_argument("--red-sink")
     parser.add_argument("--red-proof", type=Path)
+    parser.add_argument("--green-proof", type=Path)
     parser.add_argument("--red-ingress-proof", type=Path)
     parser.add_argument("--red-clinical-adapter-proof", type=Path)
     parser.add_argument("--cleanup-network")
     parser.add_argument("--cleanup-sink")
+    parser.add_argument("--control-network")
     parser.add_argument("--controlled-ipv4")
     parser.add_argument("--controlled-ipv6")
     parser.add_argument("--controlled-dns")
@@ -401,12 +491,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--controlled-port", type=int)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--verify", type=Path)
+    parser.add_argument("--evidence-dir", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.verify:
-            if not args.expected_head or not args.expected_tree:
+            if not args.expected_head or not args.expected_tree or not args.evidence_dir:
                 raise ReceiptError("candidate source is required for verification")
-            errors = verify_receipt(json.loads(args.verify.read_text(encoding="utf-8")), expected_head=args.expected_head, expected_tree=args.expected_tree)
+            errors = verify_receipt(json.loads(args.verify.read_text(encoding="utf-8")), expected_head=args.expected_head, expected_tree=args.expected_tree, evidence_dir=args.evidence_dir)
             if errors:
                 raise ReceiptError("receipt verification failed")
             print("representative-clinical-egress: PASS")
@@ -422,9 +513,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             proof = collect_red(**frame, service=args.red_service, network=args.red_network, sink=args.red_sink, endpoints=endpoints, output=args.red_proof)
             print("representative-clinical-egress: RED-DETECTED proof_sha256=" + proof)
             return 3
-        if not all((args.output, args.cleanup_network, args.cleanup_sink, args.red_ingress_proof, args.red_clinical_adapter_proof)):
+        if args.green_proof and not args.output:
+            if not args.control_network:
+                raise ReceiptError("green control network is required")
+            proof = collect_green(**frame, network=args.control_network, endpoints=endpoints, output=args.green_proof)
+            print("representative-clinical-egress: GREEN-PROVED proof_sha256=" + proof)
+            return 4
+        if not all((args.output, args.cleanup_network, args.cleanup_sink, args.red_ingress_proof, args.red_clinical_adapter_proof, args.green_proof)):
             raise ReceiptError("green receipt request is incomplete")
-        receipt = collect(**frame, endpoints=endpoints, proof_paths={"ingress": args.red_ingress_proof, "clinical-adapter": args.red_clinical_adapter_proof}, cleanup_network=args.cleanup_network, cleanup_sink=args.cleanup_sink)
+        receipt = collect(**frame, proof_paths={"ingress": args.red_ingress_proof, "clinical-adapter": args.red_clinical_adapter_proof}, green_path=args.green_proof, cleanup_network=args.cleanup_network, cleanup_sink=args.cleanup_sink)
         errors = verify_receipt(receipt, expected_head=args.expected_head, expected_tree=args.expected_tree)
         if errors:
             raise ReceiptError("collection did not meet receipt policy")
