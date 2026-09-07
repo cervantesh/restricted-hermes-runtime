@@ -32,9 +32,11 @@ from test_mattermost_ingress import (
 from restricted_runtime.mattermost_outbox import DeliveryState, MattermostOutbox
 import os
 import re
+import sqlite3
 from types import SimpleNamespace
 
 import restricted_runtime.mattermost_ingress as mattermost_ingress
+from restricted_runtime.mattermost_ingress import DefinitiveMattermostError
 
 
 PATIENT = "123e4567-e89b-42d3-a456-426614174000"
@@ -628,6 +630,44 @@ def test_roster_is_revalidated_after_hrh_delivery_authorization(tmp_path):
     clinical.reauthorize_delivery = revoke_audience
     service.handle(event(rest.posts[ROOT], channel_type="D"))
     assert conversation.calls == [] and rest.created == []
+
+
+def test_source_deleted_after_delivery_authorization_blocks_and_erases_payload(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    source = rest.posts[ROOT]
+    record_tag = service.outbox.record_tag(service._clinical_envelope(source, PATIENT))
+    original_reauthorize = clinical.reauthorize_delivery
+    original_get_post = rest.get_post
+
+    def delete_source(request):
+        result = original_reauthorize(request)
+        rest.posts.pop(ROOT)
+        return result
+
+    def definitive_missing_source(post_id, *, definitive=False):
+        if post_id == ROOT and post_id not in rest.posts and definitive:
+            raise DefinitiveMattermostError("Mattermost REST current resource rejected")
+        return original_get_post(post_id, definitive=definitive)
+
+    clinical.reauthorize_delivery = delete_source
+    rest.get_post = definitive_missing_source
+    service.handle(event(source, channel_type="D"))
+
+    record = service.outbox.get(record_tag)
+    assert record is not None
+    assert record.state is DeliveryState.BLOCKED
+    assert record.reason == "post_authorization_source_rejected"
+    assert record.envelope is None
+    assert conversation.calls == [] and rest.created == []
+
+    database = service.outbox.path
+    service.outbox.close()
+    with sqlite3.connect(database) as connection:
+        raw = connection.execute(
+            "SELECT nonce, ciphertext FROM records WHERE record_tag=?",
+            (record_tag,),
+        ).fetchone()
+    assert raw == (None, None)
 
 
 def test_source_identity_swap_before_query_discloses_nothing(tmp_path):

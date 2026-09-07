@@ -193,6 +193,51 @@ def wait_grants(before: int) -> None:
     raise RuntimeError("durable HRH grant was not observed")
 
 
+def wait_delivery_delay() -> None:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if int(control("delivery-delay-active").stdout.strip()) == 1:
+            return
+        time.sleep(0.1)
+    raise RuntimeError("delivery reauthorization did not enter the harness-only delay")
+
+
+def wait_delivery_reauthorized(label: str) -> None:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        evidence = json.loads(control("grant-evidence", label).stdout)
+        if evidence["audits"].get("restricted_hermes_delivery_reauthorized", 0) >= 1:
+            return
+        time.sleep(0.1)
+    raise RuntimeError("durable delivery reauthorization was not observed")
+
+
+def wait_hrh_postgres() -> None:
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        ready = compose(
+            "exec", "--no-TTY", "hrh-postgres",
+            "pg_isready", "-U", "hrh", "-d", "hrh",
+            check=False,
+        )
+        if ready.returncode == 0:
+            return
+        time.sleep(0.25)
+    raise RuntimeError("HRH PostgreSQL readiness deadline exceeded")
+
+
+def paused_outbox_snapshot(record_tag: str | None = None) -> list[dict[str, object]]:
+    compose("pause", "ingress")
+    try:
+        arguments = ("snapshot-outbox-records", record_tag) if record_tag else ("snapshot-outbox-records",)
+        result = json.loads(control(*arguments).stdout)
+    finally:
+        compose("unpause", "ingress", check=False)
+    if not isinstance(result, list):
+        raise RuntimeError("outbox snapshot result was not a list")
+    return result
+
+
 def image_evidence() -> dict[str, object]:
     result: dict[str, object] = {"host": {"os": platform.system(), "architecture": platform.machine()}, "images": {}}
     for name, reference in (("mattermost", MM_IMAGE), ("postgres", PG_IMAGE), ("tls", NGINX_IMAGE)):
@@ -272,10 +317,16 @@ def main() -> None:
     CREATED = True
     control("seed-volumes")
     phase("databases-and-migrations")
-    compose("up", "--detach", "mattermost-postgres", "hrh-postgres", "hrh-migrate", timeout=600)
+    compose("up", "--detach", "mattermost-postgres", "hrh-postgres", timeout=600)
+    wait_hrh_postgres()
+    compose("up", "--detach", "hrh-migrate", timeout=600)
     migrated = compose("wait", "hrh-migrate", check=False, timeout=600)
     if migrated.returncode:
-        raise RuntimeError("HRH migration container did not complete successfully")
+        logs = compose("logs", "--no-color", "hrh-migrate", check=False).stdout[-2400:]
+        raise RuntimeError(
+            "HRH migration container did not complete successfully: "
+            f"wait_exit={migrated.returncode}; wait={(migrated.stdout + migrated.stderr)[-800:]}; logs={logs}"
+        )
     phase("servers")
     compose("up", "--detach", "mattermost", timeout=300)
     control("wait-mm")
@@ -325,6 +376,43 @@ def main() -> None:
     wait_ingress_marker(denial_marker, denial_before)
     control("expect", "revoked", "no-reply", timeout=45)
     control("mutate", "drop-revoke-trigger")
+    phase("source-deletion-before-delivery")
+    control("mutate", "reset")
+    before = int(control("grant-count").stdout.strip())
+    control("mutate", "crash-delay")
+    control("send", "actor", "actor_dm", "018f22bb-414d-7cc4-b5a4-83cc8ec92cb1", "source-deleted")
+    wait_grants(before)
+    wait_delivery_delay()
+    ready_records = [row for row in paused_outbox_snapshot() if row.get("state") == "READY"]
+    if len(ready_records) != 1:
+        raise RuntimeError("source-deletion barrier did not isolate exactly one READY outbox record")
+    source_before = ready_records[0]
+    if source_before.get("reason") != "" or source_before.get("nonce_erased") or source_before.get("ciphertext_erased"):
+        raise RuntimeError("source-deletion READY record did not retain its encrypted payload")
+    source_record_tag = source_before.get("record_tag")
+    if not isinstance(source_record_tag, str) or len(source_record_tag) != 64:
+        raise RuntimeError("source-deletion READY record tag was invalid")
+    source_deletion = json.loads(control("delete-source", "source-deleted").stdout)
+    control("mutate", "drop-crash-delay", timeout=60)
+    wait_delivery_reauthorized("source-deleted")
+    control("expect", "source-deleted", "no-reply", timeout=45)
+    terminal_records = paused_outbox_snapshot(source_record_tag)
+    if len(terminal_records) != 1:
+        raise RuntimeError("source-deletion terminal record was not found by exact tag")
+    source_after = terminal_records[0]
+    expected_after = {
+        "record_tag": source_record_tag,
+        "state": "BLOCKED",
+        "reason": "current_authorization_rejected",
+        "generation": int(source_before["generation"]) + 1,
+        "nonce_erased": True,
+        "ciphertext_erased": True,
+    }
+    if source_after != expected_after:
+        raise RuntimeError(
+            "source deletion did not produce the observed terminal contract: "
+            + json.dumps(source_after, sort_keys=True)
+        )
     phase("crash-retry")
     control("mutate", "reset")
     before = int(control("grant-count").stdout.strip())
@@ -377,6 +465,7 @@ def main() -> None:
     post_counts = {
         "valid": int(control("post-count", "success").stdout.strip()),
         "recovered": int(control("post-count", "crash-retry").stdout.strip()),
+        "source_deleted": int(control("post-count", "source-deleted").stdout.strip()),
         **{label: int(control("post-count", label).stdout.strip()) for label in denied_labels},
     }
     phase("evidence")
@@ -391,8 +480,14 @@ def main() -> None:
             "pytest tests/static/test_clinical_composed_e2e_surface.py tests/unit/test_clinical_adapter.py tests/unit/test_mattermost_clinical.py",
         ],
         "crash_invariants": crash_invariants,
+        "source_deletion": {
+            **source_deletion,
+            "delivery_count": post_counts["source_deleted"],
+            "before": source_before,
+            "after": source_after,
+        },
         "post_counts": post_counts,
-        "scenarios": {"valid": "pass", "actor_cross": "deny", "channel_cross": "deny", "patient_cross": "deny", "unbound": "deny", "disabled": "deny", "missing_each_permission": "deny", "revoked_before_delivery": "zero-post", "swapped_digest": "deny", "crash_retry": "stable-result", "logs": "no synthetic identifiers"},
+        "scenarios": {"valid": "pass", "actor_cross": "deny", "channel_cross": "deny", "patient_cross": "deny", "unbound": "deny", "disabled": "deny", "missing_each_permission": "deny", "revoked_before_delivery": "zero-post", "source_deleted_before_delivery": "blocked-zero-post", "swapped_digest": "deny", "crash_retry": "stable-result", "logs": "no synthetic identifiers"},
         "residual_limitations": [
             "Synthetic data and a test CA were used; this is technical conformance evidence, not a compliance certification.",
             "The run exercised Linux containers and the pinned Mattermost ESR image, not a production deployment or host-level operating-system controls.",
