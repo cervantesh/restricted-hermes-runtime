@@ -36,7 +36,27 @@ STATE = Path(tempfile.mkdtemp(prefix="mattermost-esr-"))
 SEED = STATE / "seed"
 EVIDENCE = SEED / "evidence"
 ENV_FILE = STATE / "compose.env"
-INGRESS_IMAGE = f"restricted-mattermost-esr:{PROJECT}"
+CANDIDATE_MANIFEST = os.environ.get("RESTRICTED_IMMUTABLE_CANDIDATE_MANIFEST")
+
+
+def candidate_subject_image(name: str) -> str | None:
+    if not CANDIDATE_MANIFEST:
+        return None
+    try:
+        manifest = json.loads(Path(CANDIDATE_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("immutable candidate manifest is unreadable") from exc
+    for subject in manifest.get("subjects", []):
+        if isinstance(subject, dict) and subject.get("name") == name:
+            image = subject.get("image")
+            if not isinstance(image, str) or "@sha256:" not in image:
+                raise RuntimeError("published subject requires an immutable digest")
+            return image
+    raise RuntimeError(f"immutable candidate subject is missing: {name}")
+
+
+INGRESS_IMAGE = candidate_subject_image("restricted-mattermost-ingress") or f"restricted-mattermost-esr:{PROJECT}"
+PUBLISHED_INGRESS = CANDIDATE_MANIFEST is not None
 MUTANT_IMAGE = f"restricted-mattermost-esr-mutant:{PROJECT}"
 CREATED = False
 
@@ -277,8 +297,12 @@ def main() -> None:
         raise RuntimeError("refusing pre-existing project resources")
     phase("prepare")
     prepare()
-    phase("build")
-    compose("build", "ingress", timeout=600)
+    if PUBLISHED_INGRESS:
+        phase("pull-published-no-rebuild")
+        run("docker", "pull", INGRESS_IMAGE, timeout=600)
+    else:
+        phase("build")
+        compose("build", "ingress", timeout=600)
     phase("seed")
     compose("up", "--detach", "controller")
     CREATED = True
