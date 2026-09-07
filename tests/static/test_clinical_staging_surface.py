@@ -64,6 +64,7 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert "validate_backup_bundle" in script
     assert "expected_manifest_sha256" in script
     assert "EXCLUDED_RECOVERY_VOLUME" in script
+    assert "ownership_sha256" in script
     assert "synthetic-only" in runbook
     assert "not HIPAA" in runbook
     assert "not production" in runbook

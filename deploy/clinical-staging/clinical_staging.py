@@ -342,6 +342,31 @@ def inspect_safe_tar(path: Path, *, require_regular_file: bool) -> tuple[str, ..
     return tuple(sorted(names))
 
 
+def archive_ownership_sha256(path: Path) -> str:
+    """Bind archive ownership/mode metadata without disclosing member paths."""
+    try:
+        with tarfile.open(path, "r:") as archive:
+            records: list[dict[str, Any]] = []
+            for member in archive.getmembers():
+                name = _safe_archive_name(member.name)
+                if not name:
+                    if member.isdir():
+                        continue
+                    raise SafetyError("backup archive has an invalid root member")
+                if not (member.isdir() or member.isreg()):
+                    raise SafetyError("backup archive contains a link or special member")
+                records.append({
+                    "name": name,
+                    "kind": "directory" if member.isdir() else "file",
+                    "uid": member.uid,
+                    "gid": member.gid,
+                    "mode": member.mode & 0o7777,
+                })
+    except (OSError, tarfile.TarError) as exc:
+        raise SafetyError("backup archive is unreadable or corrupt") from exc
+    return hashlib.sha256(canonical_json_bytes({"entries": sorted(records, key=lambda item: item["name"])})).hexdigest()
+
+
 def _iter_safe_tree(root: Path) -> Iterable[tuple[Path, str, os.stat_result]]:
     """Yield a deterministic, symlink-free tree for the private state archive."""
     for current, directories, files in os.walk(root, topdown=True, followlinks=False):
@@ -389,7 +414,11 @@ def _manifest_members(backup_dir: Path) -> dict[str, dict[str, Any]]:
         path = backup_dir / name
         if not path.is_file():
             raise SafetyError(f"backup member is missing: {name}")
-        members[name] = {"sha256": file_sha256(path), "size": path.stat().st_size}
+        members[name] = {
+            "sha256": file_sha256(path),
+            "size": path.stat().st_size,
+            "ownership_sha256": archive_ownership_sha256(path),
+        }
     return members
 
 
@@ -476,9 +505,10 @@ def _validate_backup_manifest_shape(
     if not isinstance(members, dict) or set(members) != expected_members:
         raise SafetyError("backup manifest members are not the exact allowlist")
     for name, value in members.items():
-        if not isinstance(value, dict) or set(value) != {"sha256", "size"}:
+        if not isinstance(value, dict) or set(value) != {"sha256", "size", "ownership_sha256"}:
             raise SafetyError(f"backup manifest member metadata is invalid: {name}")
         _require_sha256(value["sha256"], name=f"backup member hash for {name}")
+        _require_sha256(value["ownership_sha256"], name=f"backup ownership hash for {name}")
         if not isinstance(value["size"], int) or value["size"] <= 0:
             raise SafetyError(f"backup member size is invalid: {name}")
     return dict(manifest)
@@ -563,7 +593,11 @@ def validate_backup_bundle(
     )
     for name, metadata in manifest["members"].items():
         member_path = backup_dir / name
-        if member_path.stat().st_size != metadata["size"] or file_sha256(member_path) != metadata["sha256"]:
+        if (
+            member_path.stat().st_size != metadata["size"]
+            or file_sha256(member_path) != metadata["sha256"]
+            or archive_ownership_sha256(member_path) != metadata["ownership_sha256"]
+        ):
             raise SafetyError(f"backup member hash or size differs: {name}")
     _validate_archived_marker(backup_dir / BACKUP_STATE_ARCHIVE, project=project, state_dir=state_dir, manifest=manifest)
     for key in BACKED_UP_VOLUME_KEYS:

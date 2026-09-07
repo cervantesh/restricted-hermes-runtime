@@ -943,11 +943,22 @@ def test_cold_backup_bundle_rejects_path_traversal_before_any_restore_mutation(t
         payload = b"escape"
         info.size = len(payload)
         opened.addfile(info, __import__("io").BytesIO(payload))
-    manifest = module.build_backup_manifest(module.read_marker(state, "clinicalstagingdemo"), state, backup)
+    manifest = json.loads((backup / module.BACKUP_MANIFEST_NAME).read_text(encoding="utf-8"))
+    manifest["members"]["state.tar"]["sha256"] = module.file_sha256(archive)
+    manifest["members"]["state.tar"]["size"] = archive.stat().st_size
     module.write_backup_manifest(backup, manifest)
     expected_hash = module.file_sha256(backup / module.BACKUP_MANIFEST_NAME)
     with pytest.raises(module.SafetyError, match="path"):
         module.validate_backup_bundle(backup, expected_hash, "clinicalstagingdemo", state)
+
+
+def test_backup_manifest_binds_content_safe_ownership_metadata(tmp_path: Path):
+    module = load_module()
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
+    manifest = module.validate_backup_bundle(backup, expected_hash, "clinicalstagingdemo", state)
+    metadata = manifest["members"]["volumes/hrh_secret.tar"]
+    assert set(metadata) == {"sha256", "size", "ownership_sha256"}
+    assert len(metadata["ownership_sha256"]) == 64
 
 
 def test_recovery_lifecycle_is_destroyable_but_never_operational(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
