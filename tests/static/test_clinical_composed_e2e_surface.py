@@ -78,7 +78,7 @@ def test_clinical_e2e_proves_clean_descendant_sources_and_exact_post_cardinality
     assert "HRH E2E checkout tree does not match the frozen source" in runner
     assert "runtime_head" in runner and "runtime_tree" in runner
     assert "hrh_head" in runner and "hrh_tree" in runner
-    assert "effective_images" in runner
+    assert 'field = "effective_images" if HRH_MODE == "published" else "built_images"' in runner
     assert "len(responses) != 1" in control
     assert "final-denial-sweep" in runner
     assert "post_count" in control

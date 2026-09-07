@@ -499,6 +499,12 @@ def effective_image_evidence() -> dict[str, object]:
     return result
 
 
+def attach_hrh_image_evidence(evidence: dict[str, object]) -> None:
+    """Preserve the source-build receipt schema; use neutral wording for pulls."""
+    field = "effective_images" if HRH_MODE == "published" else "built_images"
+    evidence[field] = effective_image_evidence()
+
+
 def run_hrh_migration() -> dict[str, object] | None:
     """Complete the migration gate before any HRH web/clinical startup."""
     compose("up", "--detach", "hrh-migrate", timeout=600)
@@ -826,7 +832,6 @@ def main() -> None:
         "policy": policy_binding,
         "images": image_evidence()["images"], "boundaries": boundaries,
         "secret_boundary": secret_boundary,
-        "effective_images": effective_image_evidence(),
         "published_hrh": {
             "verification": PUBLISHED_HRH_VERIFICATION,
             "web_container": published_web,
@@ -861,6 +866,7 @@ def main() -> None:
             ),
         ],
     }
+    attach_hrh_image_evidence(evidence)
     _assert_no_secret_canaries([logs, json.dumps(evidence, sort_keys=True)], _known_secret_canaries())
     (EVIDENCE / "report.json").write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(evidence, sort_keys=True))

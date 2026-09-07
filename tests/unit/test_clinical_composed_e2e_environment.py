@@ -173,3 +173,21 @@ def test_host_pull_keeps_run_owned_docker_config_after_caller_path_retargets(
     caller.symlink_to(attacker, target_is_directory=True)
 
     assert runner.registry_docker_environment()["DOCKER_CONFIG"] == str(snapshot)
+
+
+def test_image_evidence_preserves_source_schema_and_uses_neutral_published_field(
+    monkeypatch,
+):
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+    monkeypatch.setattr(runner, "effective_image_evidence", lambda: {"hrh": {"image_id": "sha256:test"}})
+
+    source_receipt = {}
+    runner.HRH_MODE = "source-build"
+    runner.attach_hrh_image_evidence(source_receipt)
+    assert source_receipt == {"built_images": {"hrh": {"image_id": "sha256:test"}}}
+
+    published_receipt = {}
+    runner.HRH_MODE = "published"
+    runner.attach_hrh_image_evidence(published_receipt)
+    assert published_receipt == {"effective_images": {"hrh": {"image_id": "sha256:test"}}}
