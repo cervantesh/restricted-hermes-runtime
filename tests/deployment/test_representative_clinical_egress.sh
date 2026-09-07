@@ -28,6 +28,7 @@ staging="$runtime/deploy/clinical-staging/clinical_staging.py"
 collector="$runtime/tools/representative_clinical_egress.py"
 target_ids=()
 passed=0
+phase=preflight
 
 cleanup() {
   for target in "${target_ids[@]:-}"; do docker network disconnect --force "$network" "$target" >/dev/null 2>&1 || true; done
@@ -36,12 +37,16 @@ cleanup() {
   if [[ -f "$state/staging-state.json" ]]; then
     "$python_bin" "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" destroy >/dev/null 2>&1 || true
   fi
-  if [[ "$passed" != 1 ]]; then rm -f "$receipt"; rm -rf "$evidence_dir"; fi
+  if [[ "$passed" != 1 ]]; then
+    rm -f "$receipt"; rm -rf "$evidence_dir"
+    printf 'representative-clinical-egress: DENIED phase=%s\n' "$phase" >&2
+  fi
   rmdir "$scratch" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 mkdir -m 0700 "$evidence_dir"
 
+phase=initialize
 "$python_bin" "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" init >/dev/null 2>&1
 compose=(docker compose --env-file "$state/compose.env" --project-name "$project" --file "$runtime/tests/deployment/clinical-composed-e2e/compose.yaml" --file "$runtime/deploy/clinical-staging/compose.yaml")
 if ! docker network create --ipv6 "$network" >/dev/null; then
@@ -54,6 +59,7 @@ controlled_ipv6="$(docker inspect --format '{{range .NetworkSettings.Networks}}{
 [[ -n "$controlled_ipv4" && -n "$controlled_ipv6" ]] || { echo "representative-clinical-egress: SKIP controlled-ipv6-address-unavailable"; exit 77; }
 
 for service in ingress clinical-adapter; do
+  phase="red-$service"
   target="$("${compose[@]}" ps --quiet "$service")"
   [[ "$target" =~ ^[a-f0-9]{12,64}$ ]] || { echo "representative-clinical-egress: DENIED" >&2; exit 2; }
   target_ids+=("$target")
@@ -70,6 +76,7 @@ for service in ingress clinical-adapter; do
   docker network disconnect "$network" "$target"
 done
 
+phase=green-live-control
 set +e
 outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --green-proof "$evidence_dir/green.json" --control-network "$network" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>/dev/null)"
 status=$?
@@ -80,11 +87,14 @@ if [[ "$status" != 4 || ! "$outcome" =~ ^representative-clinical-egress:\ GREEN-
 fi
 docker container rm --force "$sink" >/dev/null
 docker network rm "$network" >/dev/null
+phase=cleanup-proof
 if docker container inspect "$sink" >/dev/null 2>&1 || docker network inspect "$network" >/dev/null 2>&1; then
   echo "representative-clinical-egress: DENIED" >&2
   exit 2
 fi
+phase=receipt
 "$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --red-ingress-proof "$evidence_dir/red-ingress.json" --red-clinical-adapter-proof "$evidence_dir/red-clinical-adapter.json" --green-proof "$evidence_dir/green.json" --cleanup-network "$network" --cleanup-sink "$sink" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 --output "$receipt" >/dev/null
+phase=verify
 "$python_bin" "$collector" --verify "$receipt" --expected-head "$head" --expected-tree "$tree" --evidence-dir "$evidence_dir" >/dev/null
 passed=1
 printf 'representative-clinical-egress: PASS receipt_sha256=%s\n' "$(sha256sum "$receipt" | awk '{print $1}')"
