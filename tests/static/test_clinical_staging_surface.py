@@ -86,6 +86,9 @@ def test_egress_failure_packet_is_content_safe_and_outside_disposable_state():
     assert "collector_class_from" in harness
     assert "receipt-policy/service-observation" in harness
     assert "collector-generic" in harness
+    assert "receipt-policy/verification-ingress-networks" in harness
+    assert "receipt-policy/verification-clinical-adapter-proxy" in harness
+    assert "receipt-policy/verification-unknown" in harness
     assert "exact_name_absent" in harness
     assert "docker network ls --format '{{.Name}}'" in harness
     assert "docker container ls --all --format '{{.Names}}'" in harness

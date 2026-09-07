@@ -42,6 +42,38 @@ POLICIES = {
         "denied_internal": {"mattermost": 8065},
     },
 }
+VERIFICATION_ERROR_CODES = {
+    "receipt is not an object": "receipt-object",
+    "receipt fields are not exact": "receipt-fields",
+    "receipt schema or synthetic marker is invalid": "receipt-schema",
+    "runtime head does not bind the candidate": "runtime-head",
+    "runtime tree does not bind the candidate": "runtime-tree",
+    "staging marker binding is invalid": "staging-marker",
+    "host versions are invalid": "host-versions",
+    "docker versions are invalid": "docker-versions",
+    "service classes are not exact": "service-classes",
+    "red witness fields are invalid": "witness-fields",
+    "red witness proof is invalid": "red-proof",
+    "green witness proof is invalid": "green-proof",
+    "green controlled probes are incomplete": "green-probes",
+    "metadata scope is invalid": "metadata-scope",
+    "fixed probe evidence is invalid": "fixed",
+    "red witness cleanup is incomplete": "cleanup",
+    "retained proof semantics are invalid": "retained-proofs",
+}
+for _service in POLICIES:
+    VERIFICATION_ERROR_CODES.update({
+        f"{_service} observation is invalid": f"{_service}-observation",
+        f"{_service} image is invalid": f"{_service}-image",
+        f"{_service} image differs from initialized image": f"{_service}-image-binding",
+        f"{_service} networks are unexpected": f"{_service}-networks",
+        f"{_service} proxy environment is present": f"{_service}-proxy",
+        f"{_service} mounts or capabilities are unexpected": f"{_service}-controls",
+        f"{_service} denied classes are incomplete": f"{_service}-denied-classes",
+        f"{_service} denied probe succeeded": f"{_service}-denied-probe",
+        f"{_service} permitted_internal is invalid": f"{_service}-permitted-internal",
+        f"{_service} denied_internal is invalid": f"{_service}-denied-internal",
+    })
 CONTROL_DESTINATIONS = {
     "ingress": {"/run/ingress", "/run/restricted-clinical", "/var/lib/restricted-mattermost-outbox"},
     "clinical-adapter": {"/run/clinical-config", "/run/hrh-secret", "/run/hrh-tls", "/run/restricted-clinical"},
@@ -58,8 +90,8 @@ class ReceiptError(RuntimeError):
 
 FINAL_RECEIPT_SUBCODES = frozenset({
     "source-marker", "marker-proof", "green-proof", "service-lookup", "service-inspection",
-    "service-observation", "red-proof", "cleanup", "build", "verification", "output",
-})
+    "service-observation", "red-proof", "cleanup", "build", "output",
+}) | frozenset("verification-" + code for code in VERIFICATION_ERROR_CODES.values()) | {"verification-unknown"}
 
 
 class FinalReceiptError(ReceiptError):
@@ -70,6 +102,12 @@ class FinalReceiptError(ReceiptError):
             raise ValueError("invalid final receipt subcode")
         self.subcode = subcode
         super().__init__("final receipt " + subcode)
+
+
+def verification_failure_subcode(errors: object) -> str:
+    if not isinstance(errors, list) or not errors or not isinstance(errors[0], str):
+        return "verification-unknown"
+    return "verification-" + VERIFICATION_ERROR_CODES.get(errors[0], "unknown")
 
 
 def collector_error_class(exc: BaseException) -> str:
@@ -733,7 +771,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         receipt = collect(**frame, proof_paths={"ingress": args.red_ingress_proof, "clinical-adapter": args.red_clinical_adapter_proof}, green_path=args.green_proof, marker_proof=args.marker_proof, cleanup_network=args.cleanup_network, cleanup_sink=args.cleanup_sink)
         errors = verify_receipt(receipt, expected_head=args.expected_head, expected_tree=args.expected_tree)
         if errors:
-            raise FinalReceiptError("verification")
+            raise FinalReceiptError(verification_failure_subcode(errors))
         _final_collect_step("output", lambda: _write_atomic(args.output, receipt))
         print("representative-clinical-egress: PASS sha256=" + hashlib.sha256(canonical_receipt(receipt).encode()).hexdigest())
         return 0

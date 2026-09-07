@@ -112,6 +112,24 @@ def test_verifier_rejects_each_required_negative_control(mutate, expected):
     assert any(expected in error for error in module.verify_receipt(value, expected_head=HEAD, expected_tree=TREE))
 
 
+@pytest.mark.parametrize(
+    "mutate, expected",
+    [
+        (lambda value: value["services"]["ingress"].update(networks=["unexpected"]), "verification-ingress-networks"),
+        (lambda value: value["services"]["clinical-adapter"].update(proxy_environment_absent=False), "verification-clinical-adapter-proxy"),
+        (lambda value: value["services"]["ingress"]["controls"].update(read_only_rootfs=False), "verification-ingress-controls"),
+        (lambda value: value["services"]["clinical-adapter"]["permitted_internal"].update(**{"hrh-tls": False}), "verification-clinical-adapter-permitted-internal"),
+        (lambda value: value["services"]["ingress"]["denied_internal"].update(**{"hrh-tls": False}), "verification-ingress-denied-internal"),
+    ],
+)
+def test_likely_live_only_observations_map_to_opaque_verification_codes(mutate, expected):
+    module = load_module()
+    value = receipt(module)
+    mutate(value)
+
+    assert module.verification_failure_subcode(module.verify_receipt(value, expected_head=HEAD, expected_tree=TREE)) == expected
+
+
 def test_receipt_builder_records_only_classes_booleans_versions_and_hashes():
     module = load_module()
     observations = {
@@ -242,7 +260,7 @@ def test_collector_error_class_is_bounded_and_content_free(message, expected):
     "subcode",
     [
         "source-marker", "marker-proof", "green-proof", "service-lookup", "service-inspection",
-        "service-observation", "red-proof", "cleanup", "build", "verification", "output",
+        "service-observation", "red-proof", "cleanup", "build", "verification-unknown", "output",
     ],
 )
 def test_final_receipt_subcodes_are_allowlisted_and_opaque(subcode):
@@ -259,6 +277,49 @@ def test_unknown_collector_exception_has_one_generic_content_safe_class():
 
     assert module.collector_error_class(ValueError("arbitrary secret / path / endpoint")) == "collector-generic"
     assert module.collector_error_class(module.ReceiptError("unrecognized arbitrary detail")) == "collector-generic"
+
+
+def test_verifier_error_producers_have_an_exhaustive_closed_opaque_code_map():
+    module = load_module()
+    expected = {
+        "receipt is not an object": "receipt-object",
+        "receipt fields are not exact": "receipt-fields",
+        "receipt schema or synthetic marker is invalid": "receipt-schema",
+        "runtime head does not bind the candidate": "runtime-head",
+        "runtime tree does not bind the candidate": "runtime-tree",
+        "staging marker binding is invalid": "staging-marker",
+        "host versions are invalid": "host-versions",
+        "docker versions are invalid": "docker-versions",
+        "service classes are not exact": "service-classes",
+        "red witness fields are invalid": "witness-fields",
+        "red witness proof is invalid": "red-proof",
+        "green witness proof is invalid": "green-proof",
+        "green controlled probes are incomplete": "green-probes",
+        "metadata scope is invalid": "metadata-scope",
+        "fixed probe evidence is invalid": "fixed",
+        "red witness cleanup is incomplete": "cleanup",
+        "retained proof semantics are invalid": "retained-proofs",
+    }
+    for service in module.POLICIES:
+        expected.update({
+            f"{service} observation is invalid": f"{service}-observation",
+            f"{service} image is invalid": f"{service}-image",
+            f"{service} image differs from initialized image": f"{service}-image-binding",
+            f"{service} networks are unexpected": f"{service}-networks",
+            f"{service} proxy environment is present": f"{service}-proxy",
+            f"{service} mounts or capabilities are unexpected": f"{service}-controls",
+            f"{service} denied classes are incomplete": f"{service}-denied-classes",
+            f"{service} denied probe succeeded": f"{service}-denied-probe",
+            f"{service} permitted_internal is invalid": f"{service}-permitted-internal",
+            f"{service} denied_internal is invalid": f"{service}-denied-internal",
+        })
+
+    assert module.VERIFICATION_ERROR_CODES == expected
+    for error, code in expected.items():
+        subcode = module.verification_failure_subcode([error])
+        assert subcode == "verification-" + code
+        assert subcode in module.FINAL_RECEIPT_SUBCODES
+    assert module.verification_failure_subcode(["arbitrary secret / endpoint / path"]) == "verification-unknown"
 
 
 @pytest.mark.parametrize("outcome", ["connected", "refused", "timeout"])
@@ -375,12 +436,12 @@ def test_final_collect_maps_each_expected_failure_to_its_opaque_subcode(tmp_path
     assert "arbitrary" not in str(raised.value)
 
 
-@pytest.mark.parametrize("stage", ["verification", "output"])
+@pytest.mark.parametrize("stage", ["verification-unknown", "output"])
 def test_final_main_maps_verification_and_output_without_emitting_detail(tmp_path, monkeypatch, capsys, stage):
     module = load_module()
     value = receipt(module)
     monkeypatch.setattr(module, "collect", lambda **_kwargs: value)
-    if stage == "verification":
+    if stage == "verification-unknown":
         monkeypatch.setattr(module, "verify_receipt", lambda *_args, **_kwargs: ["arbitrary private detail"])
     else:
         monkeypatch.setattr(module, "verify_receipt", lambda *_args, **_kwargs: [])

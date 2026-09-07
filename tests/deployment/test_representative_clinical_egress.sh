@@ -46,8 +46,32 @@ collector_class_from() {
     source-binding|marker-binding|proof-binding|image-binding|network-probe|cleanup|local-command|input|collector-generic|unclassified|\
     receipt-policy/source-marker|receipt-policy/marker-proof|receipt-policy/green-proof|receipt-policy/service-lookup|\
     receipt-policy/service-inspection|receipt-policy/service-observation|receipt-policy/red-proof|receipt-policy/cleanup|\
-    receipt-policy/build|receipt-policy/verification|receipt-policy/output)
+    receipt-policy/build|receipt-policy/output)
       printf '%s' "$candidate" ;;
+    receipt-policy/verification-*)
+      case "$candidate" in
+        receipt-policy/verification-receipt-object|receipt-policy/verification-receipt-fields|\
+        receipt-policy/verification-receipt-schema|receipt-policy/verification-runtime-head|\
+        receipt-policy/verification-runtime-tree|receipt-policy/verification-staging-marker|\
+        receipt-policy/verification-host-versions|receipt-policy/verification-docker-versions|\
+        receipt-policy/verification-service-classes|receipt-policy/verification-witness-fields|\
+        receipt-policy/verification-red-proof|receipt-policy/verification-green-proof|\
+        receipt-policy/verification-green-probes|receipt-policy/verification-metadata-scope|\
+        receipt-policy/verification-fixed|receipt-policy/verification-cleanup|\
+        receipt-policy/verification-retained-proofs|receipt-policy/verification-unknown|\
+        receipt-policy/verification-ingress-observation|receipt-policy/verification-ingress-image|\
+        receipt-policy/verification-ingress-image-binding|receipt-policy/verification-ingress-networks|\
+        receipt-policy/verification-ingress-proxy|receipt-policy/verification-ingress-controls|\
+        receipt-policy/verification-ingress-denied-classes|receipt-policy/verification-ingress-denied-probe|\
+        receipt-policy/verification-ingress-permitted-internal|receipt-policy/verification-ingress-denied-internal|\
+        receipt-policy/verification-clinical-adapter-observation|receipt-policy/verification-clinical-adapter-image|\
+        receipt-policy/verification-clinical-adapter-image-binding|receipt-policy/verification-clinical-adapter-networks|\
+        receipt-policy/verification-clinical-adapter-proxy|receipt-policy/verification-clinical-adapter-controls|\
+        receipt-policy/verification-clinical-adapter-denied-classes|receipt-policy/verification-clinical-adapter-denied-probe|\
+        receipt-policy/verification-clinical-adapter-permitted-internal|receipt-policy/verification-clinical-adapter-denied-internal)
+          printf '%s' "$candidate" ;;
+        *) printf '%s' unclassified ;;
+      esac ;;
     *) printf '%s' unclassified ;;
   esac
 }
