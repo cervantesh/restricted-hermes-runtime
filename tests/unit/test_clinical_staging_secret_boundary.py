@@ -157,6 +157,25 @@ def test_controller_initial_admin_conflict_is_idempotent_but_other_failures_are_
     assert "PASSWORD_SECRET_CANARY_9159" not in str(raised.value)
 
 
+def test_controller_fails_closed_if_initial_api_response_is_not_an_administrator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_control()
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "admin_password").write_text("PASSWORD_SECRET_CANARY_9159\n", encoding="ascii")
+    monkeypatch.setattr(module, "SEED", seed)
+    monkeypatch.setattr(module, "_mm_context", lambda: object())
+    monkeypatch.setattr(
+        module,
+        "request",
+        lambda *_args, **_kwargs: ({"id": "nonadmin", "roles": "system_user"}, {}),
+    )
+
+    with pytest.raises(RuntimeError, match="initial administrator bootstrap failed"):
+        module.provision_initial_mattermost_admin()
+
+
 def test_cli_never_renders_command_error_text(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
     module = load_staging()
     canary = "STDERR_SECRET_CANARY_9159"
