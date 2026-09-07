@@ -58,6 +58,11 @@ def _subject(name: str, image: str, lock: str, marker: str, repo_root: Path) -> 
         "resolved_platform": "linux/amd64",
         "subject_kind": "manifest",
         "linux_amd64_child_digest": digest,
+        "source": "https://github.com/cervantesh/restricted-hermes-runtime",
+        "labels": {
+            "org.opencontainers.image.source": "https://github.com/cervantesh/restricted-hermes-runtime",
+            "org.opencontainers.image.revision": "d" * 40,
+        },
     }
     for relative, value in ((verification_path, verification), (platform_path, platform)):
         path = repo_root / relative
