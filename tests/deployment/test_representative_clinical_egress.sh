@@ -57,6 +57,15 @@ docker run --detach --name "$sink" --network "$network" --network-alias controll
 controlled_ipv4="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$sink")"
 controlled_ipv6="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' "$sink")"
 [[ -n "$controlled_ipv4" && -n "$controlled_ipv6" ]] || { echo "representative-clinical-egress: SKIP controlled-ipv6-address-unavailable"; exit 77; }
+phase=marker-proof
+set +e
+outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>/dev/null)"
+status=$?
+set -e
+if [[ "$status" != 5 || ! "$outcome" =~ ^representative-clinical-egress:\ MARKER-PROVED\ proof_sha256=[a-f0-9]{64}$ || ! -f "$evidence_dir/marker.json" ]]; then
+  echo "representative-clinical-egress: DENIED" >&2
+  exit 2
+fi
 
 for service in ingress clinical-adapter; do
   phase="red-$service"
@@ -66,7 +75,7 @@ for service in ingress clinical-adapter; do
   docker network connect "$network" "$target"
   proof="$evidence_dir/red-$service.json"
   set +e
-  outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --red-service "$service" --red-network "$network" --red-sink "$sink" --red-proof "$proof" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>/dev/null)"
+  outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --red-service "$service" --red-network "$network" --red-sink "$sink" --red-proof "$proof" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>/dev/null)"
   status=$?
   set -e
   if [[ "$status" != 3 || ! "$outcome" =~ ^representative-clinical-egress:\ RED-DETECTED\ proof_sha256=[a-f0-9]{64}$ || ! -f "$proof" ]]; then
@@ -78,7 +87,7 @@ done
 
 phase=green-live-control
 set +e
-outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --green-proof "$evidence_dir/green.json" --control-network "$network" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>/dev/null)"
+outcome="$("$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --green-proof "$evidence_dir/green.json" --control-network "$network" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 2>/dev/null)"
 status=$?
 set -e
 if [[ "$status" != 4 || ! "$outcome" =~ ^representative-clinical-egress:\ GREEN-PROVED\ proof_sha256=[a-f0-9]{64}$ || ! -f "$evidence_dir/green.json" ]]; then
@@ -93,7 +102,7 @@ if docker container inspect "$sink" >/dev/null 2>&1 || docker network inspect "$
   exit 2
 fi
 phase=receipt
-"$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --red-ingress-proof "$evidence_dir/red-ingress.json" --red-clinical-adapter-proof "$evidence_dir/red-clinical-adapter.json" --green-proof "$evidence_dir/green.json" --cleanup-network "$network" --cleanup-sink "$sink" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 --output "$receipt" >/dev/null
+"$python_bin" "$collector" --runtime-root "$runtime" --state-dir "$state" --project "$project" --expected-head "$head" --expected-tree "$tree" --marker-proof "$evidence_dir/marker.json" --red-ingress-proof "$evidence_dir/red-ingress.json" --red-clinical-adapter-proof "$evidence_dir/red-clinical-adapter.json" --green-proof "$evidence_dir/green.json" --cleanup-network "$network" --cleanup-sink "$sink" --controlled-ipv4 "$controlled_ipv4" --controlled-ipv6 "$controlled_ipv6" --controlled-dns controlled-probe --synthetic-metadata-dns synthetic-metadata-probe --controlled-port 80 --output "$receipt" >/dev/null
 phase=verify
 "$python_bin" "$collector" --verify "$receipt" --expected-head "$head" --expected-tree "$tree" --evidence-dir "$evidence_dir" >/dev/null
 passed=1
