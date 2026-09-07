@@ -39,7 +39,7 @@ cleanup_state_absent=false
 collector_class_from() {
   local outcome="$1"
   local candidate=unclassified
-  if [[ "$outcome" =~ ^representative-clinical-egress:\ DENIED\ class=([a-z-]+(/[a-z-]+)?)$ ]]; then
+  if [[ "$outcome" =~ ^representative-clinical-egress:\ DENIED\ class=([a-z-]+(/[a-z0-9-]+)?)$ ]]; then
     candidate="${BASH_REMATCH[1]}"
   fi
   case "$candidate" in
@@ -47,6 +47,17 @@ collector_class_from() {
     receipt-policy/source-marker|receipt-policy/marker-proof|receipt-policy/green-proof|receipt-policy/service-lookup|\
     receipt-policy/service-inspection|receipt-policy/service-observation|receipt-policy/red-proof|receipt-policy/cleanup|\
     receipt-policy/build|receipt-policy/output)
+      printf '%s' "$candidate" ;;
+    green-policy/target-denial|green-policy/controlled-sink|green-policy/public-dns-control|green-policy/fixed-shape|\
+    green-policy/ingress-fixed-shape|green-policy/clinical-adapter-fixed-shape|\
+    green-policy/ingress-target-public-dns|green-policy/clinical-adapter-target-public-dns|\
+    green-policy/ingress-control-public-dns|green-policy/clinical-adapter-control-public-dns|\
+    green-policy/ingress-target-metadata-ipv4|green-policy/clinical-adapter-target-metadata-ipv4|\
+    green-policy/ingress-target-metadata-ipv6|green-policy/clinical-adapter-target-metadata-ipv6|\
+    green-policy/ingress-control-metadata-ipv4|green-policy/clinical-adapter-control-metadata-ipv4|\
+    green-policy/ingress-control-metadata-ipv6|green-policy/clinical-adapter-control-metadata-ipv6|\
+    green-policy/ingress-metadata-ipv4-discrimination|green-policy/clinical-adapter-metadata-ipv4-discrimination|\
+    green-policy/ingress-metadata-ipv6-attribution|green-policy/clinical-adapter-metadata-ipv6-attribution)
       printf '%s' "$candidate" ;;
     receipt-policy/verification-*)
       case "$candidate" in

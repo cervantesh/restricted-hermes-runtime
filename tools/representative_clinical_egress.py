@@ -92,6 +92,24 @@ FINAL_RECEIPT_SUBCODES = frozenset({
     "source-marker", "marker-proof", "green-proof", "service-lookup", "service-inspection",
     "service-observation", "red-proof", "cleanup", "build", "output",
 }) | frozenset("verification-" + code for code in VERIFICATION_ERROR_CODES.values()) | {"verification-unknown"}
+GREEN_FIXED_FAILURES = frozenset({
+    "fixed-shape", "target-public-dns", "control-public-dns", "target-metadata-ipv4",
+    "target-metadata-ipv6", "control-metadata-ipv4", "control-metadata-ipv6",
+    "metadata-ipv4-discrimination", "metadata-ipv6-attribution",
+})
+GREEN_POLICY_SUBCODES = frozenset({
+    "target-denial", "controlled-sink", "public-dns-control", "fixed-shape",
+}) | frozenset(service + "-" + reason for service in POLICIES for reason in GREEN_FIXED_FAILURES)
+
+
+class GreenPolicyError(ReceiptError):
+    """A failed live green control identified without endpoint or probe content."""
+
+    def __init__(self, subcode: str):
+        if subcode not in GREEN_POLICY_SUBCODES:
+            raise ValueError("invalid green policy subcode")
+        self.subcode = subcode
+        super().__init__("green policy " + subcode)
 
 
 class FinalReceiptError(ReceiptError):
@@ -114,6 +132,8 @@ def collector_error_class(exc: BaseException) -> str:
     """Return a bounded diagnostic class without serializing exception content."""
     if isinstance(exc, FinalReceiptError):
         return "receipt-policy/" + exc.subcode
+    if isinstance(exc, GreenPolicyError):
+        return "green-policy/" + exc.subcode
     if not isinstance(exc, ReceiptError):
         return "collector-generic"
     message = str(exc)
@@ -402,23 +422,35 @@ def _read_marker_proof(path: Path, head: str, tree: str) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _fixed_evidence_valid(fixed: object, control: object, attribution: object) -> bool:
+def _fixed_evidence_failure(fixed: object, control: object, attribution: object) -> str | None:
     if not isinstance(fixed, dict) or not isinstance(control, dict) or not isinstance(attribution, dict) or set(fixed) != set(POLICIES) or set(control) != set(POLICIES) or set(attribution) != set(POLICIES):
-        return False
+        return "fixed-shape"
     for service in POLICIES:
         target, independent = fixed[service], control[service]
         if (not isinstance(target, dict) or not isinstance(independent, dict)
                 or set(target) != {"public_dns_example_com", "metadata_ipv4", "metadata_ipv6"}
-                or set(independent) != {"public_dns_example_com", "metadata_ipv4", "metadata_ipv6"}
-                or target["public_dns_example_com"] is not False or independent["public_dns_example_com"] is not True
-                or target["metadata_ipv4"] not in METADATA_DENIED_CLASSES or target["metadata_ipv6"] not in METADATA_DENIED_CLASSES
-                or independent["metadata_ipv4"] not in CONNECT_CLASSES or independent["metadata_ipv6"] not in CONNECT_CLASSES
-                or target["metadata_ipv4"] == independent["metadata_ipv4"]):
-            return False
+                or set(independent) != {"public_dns_example_com", "metadata_ipv4", "metadata_ipv6"}):
+            return service + "-fixed-shape"
+        if target["public_dns_example_com"] is not False:
+            return service + "-target-public-dns"
+        if independent["public_dns_example_com"] is not True:
+            return service + "-control-public-dns"
+        for family in ("ipv4", "ipv6"):
+            if target["metadata_" + family] not in METADATA_DENIED_CLASSES:
+                return service + "-target-metadata-" + family
+        for family in ("ipv4", "ipv6"):
+            if independent["metadata_" + family] not in CONNECT_CLASSES:
+                return service + "-control-metadata-" + family
+        if target["metadata_ipv4"] == independent["metadata_ipv4"]:
+            return service + "-metadata-ipv4-discrimination"
         expected = "host-bound-control-unreachable" if independent["metadata_ipv6"] in METADATA_DENIED_CLASSES else "target-only-denied"
         if attribution[service] != expected:
-            return False
-    return True
+            return service + "-metadata-ipv6-attribution"
+    return None
+
+
+def _fixed_evidence_valid(fixed: object, control: object, attribution: object) -> bool:
+    return _fixed_evidence_failure(fixed, control, attribution) is None
 
 
 def _proxy_absent(inspected: dict[str, Any]) -> bool:
@@ -636,9 +668,15 @@ def collect_green(*, runtime: Path, state_dir: Path, project: str, expected_head
         fixed_control[service] = _fixed_outcomes(image_id, network)
         attribution[service] = "host-bound-control-unreachable" if fixed_control[service]["metadata_ipv6"] in METADATA_DENIED_CLASSES else "target-only-denied"
     public_dns_control = _control_resolves_public_dns(initialized["ingress"], network)
-    if (not all(all(results.values()) for results in target.values()) or not _network_control(initialized["ingress"], network, endpoints)
-            or not public_dns_control or not _fixed_evidence_valid(fixed, fixed_control, attribution)):
-        raise ReceiptError("live controlled green proof was not discriminating")
+    if not all(all(results.values()) for results in target.values()):
+        raise GreenPolicyError("target-denial")
+    if not _network_control(initialized["ingress"], network, endpoints):
+        raise GreenPolicyError("controlled-sink")
+    if not public_dns_control:
+        raise GreenPolicyError("public-dns-control")
+    fixed_failure = _fixed_evidence_failure(fixed, fixed_control, attribution)
+    if fixed_failure is not None:
+        raise GreenPolicyError(fixed_failure)
     proof = {"schema": GREEN_SCHEMA, "runtime": {"head": expected_head, "tree": expected_tree}, "images": initialized,
              "target": target, "control_reachable": True, "public_dns_control": public_dns_control, "fixed": fixed, "fixed_control": fixed_control,
              "metadata_ipv6_attribution": attribution, "marker_proof_sha256": marker_hash,
