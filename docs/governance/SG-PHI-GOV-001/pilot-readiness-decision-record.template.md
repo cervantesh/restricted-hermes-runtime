@@ -10,9 +10,11 @@
 > This is a governance record, not a certification, legal opinion, provider
 > attestation, security warranty, or authorization to process PHI. This record
 > may register an external decision after it has been made, but it never grants
-> authority. Every blank,
-> `TBD`, `UNRESOLVED`, stale, or unbound value is a failed gate. Until all
-> mandatory evidence and sign-offs are present, use synthetic/non-PHI data only.
+> authority. Every blank, `TBD`, `UNRESOLVED`, stale, or unbound value is a
+> failed gate. Candidate validation and staging remain synthetic/non-PHI only
+> while the effective decision is `NO-GO` or before a valid external decision
+> exists. `NO-GO` prohibits starting the controlled pilot; it does not prohibit
+> continuing that synthetic validation or staging work.
 
 ## 1. Decision frame
 
@@ -27,6 +29,7 @@
 | Decision owner | `UNRESOLVED` |
 | External decision references and scope | `UNRESOLVED` — attributable records required; this document cannot create them |
 | Evidence manifest digest | `UNRESOLVED` |
+| Decision payload digest | `UNRESOLVED` — computed as defined in section 8.1 |
 
 `GO WITH CONDITIONS` cannot authorize PHI while any mandatory technical,
 independent, operator, privacy/legal, or clinical/product item remains open. It
@@ -74,7 +77,8 @@ authorization claim:
 6. The response is posted only to the original approved source/root under the
    documented ambiguity, retention, and recovery rules.
 
-Before the pilot gate is closed, every identifier, patient identifier, user,
+While candidate validation/staging is synthetic-only, and in all work before a
+valid external decision exists, every identifier, patient identifier, user,
 channel, message, fixture, and test record must be synthetic and must have no
 correspondence with a real person, patient, workforce member, tenant, or
 production record. Record the synthetic-data generator/fixture revision and
@@ -87,8 +91,10 @@ memory, compression, fallback, retries, streaming, attachments, OCR, vision,
 arbitrary model selection; public/group channels, federation, webhooks, email,
 SMS, unmanaged clients, arbitrary Mattermost membership; arbitrary HRH routes,
 bulk/export operations, unrestricted database access, cross-tenant access; and
-provider/network paths outside the signed allowlist are all disabled. No PHI is
-permitted before an effective `GO`.
+provider/network paths outside the signed allowlist are all disabled. The
+controlled-pilot data class and permitted PHI scope, if any, come exclusively
+from the verifiable external decisions referenced in section 1; this record
+does not enable or authorize PHI.
 
 ## 4. Named decision roles
 
@@ -175,7 +181,7 @@ a signature, or a synthetic test is not such proof.
 | Maximum named users / roster | `UNRESOLVED` |
 | Allowed Mattermost team/channel/DM set | `UNRESOLVED` |
 | Allowed operation and patient projection | `UNRESOLVED` |
-| PHI fields allowed | `UNRESOLVED` — none until effective `GO` |
+| PHI fields allowed by external decision | `UNRESOLVED` — this record cannot set the permitted scope |
 | Pilot dates and review checkpoints | `UNRESOLVED` |
 | Monitoring and alert owner | `UNRESOLVED` |
 | Stop triggers | `UNRESOLVED` |
@@ -207,6 +213,27 @@ untested rollback is not evidence of recovery.
 
 **Decision rationale:** `UNRESOLVED`
 
+### 8.1 Canonical decision payload
+
+The **Decision Payload** is the canonical serialization of the completed content
+of sections 1 through 9, including the exact candidate bindings, evidence
+manifest digest, external decision references, conditions, and effective
+decision. It excludes section 10, all signature rows, and any signature
+envelope. The `Decision payload digest` field in section 1 is computed over
+sections 1 through 9 with that field itself represented as a fixed empty value
+before hashing; it is not computed over the signature envelope. This removes
+the circularity between the payload and its signatures.
+
+Each signatory signs the tuple:
+
+```text
+(candidate_id, decision_payload_digest, evidence_manifest_digest)
+```
+
+Adding a later signature does not change the Decision Payload or invalidate
+earlier signatures. Any change to the payload or evidence manifest does
+invalidate every signature and requires a new digest, decision, and review.
+
 ## 9. Fail-closed gate
 
 | Gate | Required condition | Result |
@@ -221,7 +248,7 @@ untested rollback is not evidence of recovery.
 
 If any mandatory row is `UNRESOLVED`, `MISSING`, `FAILED`, rejected, `NO-GO`, or
 has a pending condition, or is bound to another candidate, the effective
-decision is `NO-GO` for PHI. `ACCEPT WITH CONDITIONS` cannot close a blocker and
+decision is `NO-GO` for the controlled pilot. `ACCEPT WITH CONDITIONS` cannot close a blocker and
 cannot be compatible with `GO` while conditions remain. `GO WITH CONDITIONS`
 cannot waive a mandatory row. `GO` requires every row to be `PASS`, affirmative
 and unanimous compatible approvals from every required role, verifiable external
@@ -230,13 +257,14 @@ of `ACCEPT` with no open condition.
 
 ## 10. Final sign-off
 
-Every signatory must attest to the same final candidate ID, final record digest,
-evidence-manifest digest, and verified role authority/delegation. A change to
-any of those values invalidates every signature and requires a new decision
-record and re-review. The independent reviewer must additionally attest to
-independence from the author, operator, security/risk owner, and pilot approver.
+Every signatory must attest to the same final candidate ID, Decision Payload
+digest, evidence-manifest digest, and verified role authority/delegation. A
+change to the payload or evidence manifest invalidates every signature and
+requires a new decision record and re-review; adding another signature does
+not. The independent reviewer must additionally attest to independence from
+the author, operator, security/risk owner, and pilot approver.
 
-| Signatory | Name / organization | Decision | Candidate ID | Record digest | Evidence manifest digest | Signature / record | Date |
+| Signatory | Name / organization | Decision | Candidate ID | Decision payload digest | Evidence manifest digest | Signature / record | Date |
 |---|---|---|---|---|---|---|---|
 | Technical deployment operator | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
 | Security / risk owner | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` | `UNRESOLVED` |
