@@ -229,13 +229,36 @@ def test_probe_accepts_only_explicit_program_outcomes(monkeypatch):
         ("red cleanup was not proven", "cleanup"),
         ("required local command was rejected", "local-command"),
         ("state, candidate source and controlled endpoints are required", "input"),
-        ("collection did not meet receipt policy", "receipt-policy"),
+        ("collection did not meet receipt policy", "collector-generic"),
     ],
 )
 def test_collector_error_class_is_bounded_and_content_free(message, expected):
     module = load_module()
 
     assert module.collector_error_class(module.ReceiptError(message)) == expected
+
+
+@pytest.mark.parametrize(
+    "subcode",
+    [
+        "source-marker", "marker-proof", "green-proof", "service-lookup", "service-inspection",
+        "service-observation", "red-proof", "cleanup", "build", "verification", "output",
+    ],
+)
+def test_final_receipt_subcodes_are_allowlisted_and_opaque(subcode):
+    module = load_module()
+
+    error = module.FinalReceiptError(subcode)
+
+    assert module.collector_error_class(error) == "receipt-policy/" + subcode
+    assert "arbitrary" not in str(error)
+
+
+def test_unknown_collector_exception_has_one_generic_content_safe_class():
+    module = load_module()
+
+    assert module.collector_error_class(ValueError("arbitrary secret / path / endpoint")) == "collector-generic"
+    assert module.collector_error_class(module.ReceiptError("unrecognized arbitrary detail")) == "collector-generic"
 
 
 @pytest.mark.parametrize("outcome", ["connected", "refused", "timeout"])
@@ -278,9 +301,7 @@ def write_evidence(module, directory, value):
         value["red_witness"]["proof_sha256"][service] = hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def test_final_collector_assembles_and_offline_verifies_semantic_fixture_proofs(tmp_path, monkeypatch):
-    """Keep final receipt assembly independent of a Docker witness failure."""
-    module = load_module()
+def prepare_final_collect_fixture(module, tmp_path, monkeypatch):
     value = receipt(module)
     evidence = tmp_path / "evidence"
     write_evidence(module, evidence, value)
@@ -302,20 +323,111 @@ def test_final_collector_assembles_and_offline_verifies_semantic_fixture_proofs(
         return "27.5.1" if args[1:3] == ("version", "--format") else "v2.31.0"
 
     monkeypatch.setattr(module, "_stdout", version)
-    assembled = module.collect(
-        runtime=ROOT,
-        state_dir=tmp_path / "state",
-        project="clinicalstagingfixture",
-        expected_head=HEAD,
-        expected_tree=TREE,
-        proof_paths={service: evidence / f"red-{service}.json" for service in module.POLICIES},
-        green_path=evidence / "green.json",
-        marker_proof=evidence / "marker.json",
-        cleanup_network="owned-network",
-        cleanup_sink="owned-sink",
-    )
+    return value, {
+        "runtime": ROOT,
+        "state_dir": tmp_path / "state",
+        "project": "clinicalstagingfixture",
+        "expected_head": HEAD,
+        "expected_tree": TREE,
+        "proof_paths": {service: evidence / f"red-{service}.json" for service in module.POLICIES},
+        "green_path": evidence / "green.json",
+        "marker_proof": evidence / "marker.json",
+        "cleanup_network": "owned-network",
+        "cleanup_sink": "owned-sink",
+    }
 
-    assert module.verify_receipt(assembled, expected_head=HEAD, expected_tree=TREE, evidence_dir=evidence) == []
+
+def test_final_collector_assembles_and_offline_verifies_semantic_fixture_proofs(tmp_path, monkeypatch):
+    """Keep final receipt assembly independent of a Docker witness failure."""
+    module = load_module()
+    _value, kwargs = prepare_final_collect_fixture(module, tmp_path, monkeypatch)
+    assembled = module.collect(**kwargs)
+
+    assert module.verify_receipt(assembled, expected_head=HEAD, expected_tree=TREE, evidence_dir=kwargs["marker_proof"].parent) == []
+
+
+@pytest.mark.parametrize(
+    "target, subcode",
+    [
+        ("_source_marker", "source-marker"),
+        ("_read_marker_proof", "marker-proof"),
+        ("_read_green_proof", "green-proof"),
+        ("_service_id", "service-lookup"),
+        ("_inspect_container", "service-inspection"),
+        ("_service_observation", "service-observation"),
+        ("_read_red_proof", "red-proof"),
+        ("_exact_name_absent", "cleanup"),
+        ("build_receipt", "build"),
+    ],
+)
+def test_final_collect_maps_each_expected_failure_to_its_opaque_subcode(tmp_path, monkeypatch, target, subcode):
+    module = load_module()
+    _value, kwargs = prepare_final_collect_fixture(module, tmp_path, monkeypatch)
+
+    def fail(*_args, **_kwargs):
+        raise module.ReceiptError("arbitrary private value must not escape")
+
+    monkeypatch.setattr(module, target, fail)
+    with pytest.raises(module.FinalReceiptError) as raised:
+        module.collect(**kwargs)
+
+    assert raised.value.subcode == subcode
+    assert "arbitrary" not in str(raised.value)
+
+
+@pytest.mark.parametrize("stage", ["verification", "output"])
+def test_final_main_maps_verification_and_output_without_emitting_detail(tmp_path, monkeypatch, capsys, stage):
+    module = load_module()
+    value = receipt(module)
+    monkeypatch.setattr(module, "collect", lambda **_kwargs: value)
+    if stage == "verification":
+        monkeypatch.setattr(module, "verify_receipt", lambda *_args, **_kwargs: ["arbitrary private detail"])
+    else:
+        monkeypatch.setattr(module, "verify_receipt", lambda *_args, **_kwargs: [])
+
+        def fail(*_args, **_kwargs):
+            raise module.ReceiptError("arbitrary private detail")
+
+        monkeypatch.setattr(module, "_write_atomic", fail)
+    code = module.main([
+        "--state-dir", str(tmp_path / "state"), "--project", "clinicalstagingfixture",
+        "--expected-head", HEAD, "--expected-tree", TREE,
+        "--marker-proof", str(tmp_path / "marker.json"),
+        "--red-ingress-proof", str(tmp_path / "red-ingress.json"),
+        "--red-clinical-adapter-proof", str(tmp_path / "red-clinical-adapter.json"),
+        "--green-proof", str(tmp_path / "green.json"),
+        "--cleanup-network", "owned-network", "--cleanup-sink", "owned-sink",
+        "--controlled-ipv4", "198.18.0.1", "--controlled-ipv6", "2001:db8::1",
+        "--controlled-dns", "controlled-probe", "--synthetic-metadata-dns", "synthetic-metadata-probe",
+        "--controlled-port", "80", "--output", str(tmp_path / "receipt.json"),
+    ])
+
+    assert code == 2
+    assert capsys.readouterr().err == "representative-clinical-egress: DENIED class=receipt-policy/" + stage + "\n"
+
+
+def test_final_main_reduces_unknown_exception_to_one_generic_class(tmp_path, monkeypatch, capsys):
+    module = load_module()
+
+    def fail(**_kwargs):
+        raise ValueError("arbitrary secret, endpoint, path, and command output")
+
+    monkeypatch.setattr(module, "collect", fail)
+    code = module.main([
+        "--state-dir", str(tmp_path / "state"), "--project", "clinicalstagingfixture",
+        "--expected-head", HEAD, "--expected-tree", TREE,
+        "--marker-proof", str(tmp_path / "marker.json"),
+        "--red-ingress-proof", str(tmp_path / "red-ingress.json"),
+        "--red-clinical-adapter-proof", str(tmp_path / "red-clinical-adapter.json"),
+        "--green-proof", str(tmp_path / "green.json"),
+        "--cleanup-network", "owned-network", "--cleanup-sink", "owned-sink",
+        "--controlled-ipv4", "198.18.0.1", "--controlled-ipv6", "2001:db8::1",
+        "--controlled-dns", "controlled-probe", "--synthetic-metadata-dns", "synthetic-metadata-probe",
+        "--controlled-port", "80", "--output", str(tmp_path / "receipt.json"),
+    ])
+
+    assert code == 2
+    assert capsys.readouterr().err == "representative-clinical-egress: DENIED class=collector-generic\n"
 
 
 @pytest.mark.parametrize(

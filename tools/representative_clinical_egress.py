@@ -56,8 +56,28 @@ class ReceiptError(RuntimeError):
     """A deliberately content-free collection failure."""
 
 
+FINAL_RECEIPT_SUBCODES = frozenset({
+    "source-marker", "marker-proof", "green-proof", "service-lookup", "service-inspection",
+    "service-observation", "red-proof", "cleanup", "build", "verification", "output",
+})
+
+
+class FinalReceiptError(ReceiptError):
+    """A final-receipt failure reduced to one stable, content-safe stage."""
+
+    def __init__(self, subcode: str):
+        if subcode not in FINAL_RECEIPT_SUBCODES:
+            raise ValueError("invalid final receipt subcode")
+        self.subcode = subcode
+        super().__init__("final receipt " + subcode)
+
+
 def collector_error_class(exc: BaseException) -> str:
     """Return a bounded diagnostic class without serializing exception content."""
+    if isinstance(exc, FinalReceiptError):
+        return "receipt-policy/" + exc.subcode
+    if not isinstance(exc, ReceiptError):
+        return "collector-generic"
     message = str(exc)
     if any(token in message for token in ("state, candidate", "output target", "request is incomplete")):
         return "input"
@@ -77,7 +97,15 @@ def collector_error_class(exc: BaseException) -> str:
         return "local-command"
     if "required" in message:
         return "input"
-    return "receipt-policy"
+    return "collector-generic"
+
+
+def _final_collect_step(subcode: str, operation: Any) -> Any:
+    """Bind expected receipt-policy failures to an opaque collection stage."""
+    try:
+        return operation()
+    except ReceiptError:
+        raise FinalReceiptError(subcode) from None
 
 
 def canonical_receipt(value: dict[str, Any]) -> str:
@@ -602,32 +630,44 @@ def _read_green_proof(path: Path, head: str, tree: str, images: dict[str, str], 
 def collect(*, runtime: Path, state_dir: Path, project: str, expected_head: str, expected_tree: str,
             proof_paths: dict[str, Path], green_path: Path, marker_proof: Path,
             cleanup_network: str, cleanup_sink: str) -> dict[str, Any]:
-    marker = _source_marker(runtime, state_dir, project, expected_head, expected_tree)
-    marker_sha256 = _read_marker_proof(marker_proof, expected_head, expected_tree)
-    if _read_json(marker_proof) != marker:
-        raise ReceiptError("receipt marker proof does not match initialized staging")
+    marker = _final_collect_step("source-marker", lambda: _source_marker(runtime, state_dir, project, expected_head, expected_tree))
+    marker_sha256 = _final_collect_step("marker-proof", lambda: _read_marker_proof(marker_proof, expected_head, expected_tree))
+    if _final_collect_step("marker-proof", lambda: _read_json(marker_proof)) != marker:
+        raise FinalReceiptError("marker-proof")
     initialized = marker["expected_images"]
     if not GIT_SHA.fullmatch(expected_head) or not GIT_SHA.fullmatch(expected_tree):
-        raise ReceiptError("candidate source shape was invalid")
+        raise FinalReceiptError("source-marker")
     observations: dict[str, dict[str, Any]] = {}
     proof_sha256: dict[str, str] = {}
-    green_sha256, green, fixed, fixed_control, attribution, endpoint_sha256 = _read_green_proof(green_path, expected_head, expected_tree, initialized, marker_sha256)
+    green_sha256, green, fixed, fixed_control, attribution, endpoint_sha256 = _final_collect_step(
+        "green-proof", lambda: _read_green_proof(green_path, expected_head, expected_tree, initialized, marker_sha256),
+    )
     for service in POLICIES:
-        container_id = _service_id(runtime, state_dir, project, service)
-        inspected = _inspect_container(container_id)
-        observations[service] = _service_observation(service, container_id, inspected, project, green[service], initialized[service])
-        proof_sha256[service] = _read_red_proof(proof_paths[service], service, expected_head, expected_tree, initialized[service], endpoint_sha256, marker_sha256)
-    cleanup = {"network_absent": _exact_name_absent("network", cleanup_network),
-               "sink_absent": _exact_name_absent("container", cleanup_sink)}
+        container_id = _final_collect_step("service-lookup", lambda service=service: _service_id(runtime, state_dir, project, service))
+        inspected = _final_collect_step("service-inspection", lambda: _inspect_container(container_id))
+        observations[service] = _final_collect_step(
+            "service-observation", lambda service=service: _service_observation(service, container_id, inspected, project, green[service], initialized[service]),
+        )
+        proof_sha256[service] = _final_collect_step(
+            "red-proof", lambda service=service: _read_red_proof(proof_paths[service], service, expected_head, expected_tree, initialized[service], endpoint_sha256, marker_sha256),
+        )
+    cleanup = _final_collect_step(
+        "cleanup", lambda: {"network_absent": _exact_name_absent("network", cleanup_network),
+                              "sink_absent": _exact_name_absent("container", cleanup_sink)},
+    )
     if cleanup != {"network_absent": True, "sink_absent": True}:
-        raise ReceiptError("red cleanup was not proven")
-    return build_receipt(head=expected_head, tree=expected_tree, kernel=platform.release(), architecture=platform.machine(),
-                         docker_version=_stdout("docker", "version", "--format", "{{.Server.Version}}"),
-                         compose_version=_stdout("docker", "compose", "version", "--short"), observations=observations,
-                          marker=marker, marker_proof_sha256=marker_sha256, proof_sha256=proof_sha256,
-                          green={service: observations[service]["denied"] for service in POLICIES}, cleanup=cleanup,
-                          green_proof_sha256=green_sha256, fixed=fixed, fixed_control=fixed_control,
-                          metadata_ipv6_attribution=attribution)
+        raise FinalReceiptError("cleanup")
+    return _final_collect_step(
+        "build", lambda: build_receipt(
+            head=expected_head, tree=expected_tree, kernel=platform.release(), architecture=platform.machine(),
+            docker_version=_stdout("docker", "version", "--format", "{{.Server.Version}}"),
+            compose_version=_stdout("docker", "compose", "version", "--short"), observations=observations,
+            marker=marker, marker_proof_sha256=marker_sha256, proof_sha256=proof_sha256,
+            green={service: observations[service]["denied"] for service in POLICIES}, cleanup=cleanup,
+            green_proof_sha256=green_sha256, fixed=fixed, fixed_control=fixed_control,
+            metadata_ipv6_attribution=attribution,
+        ),
+    )
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -693,12 +733,15 @@ def main(argv: Iterable[str] | None = None) -> int:
         receipt = collect(**frame, proof_paths={"ingress": args.red_ingress_proof, "clinical-adapter": args.red_clinical_adapter_proof}, green_path=args.green_proof, marker_proof=args.marker_proof, cleanup_network=args.cleanup_network, cleanup_sink=args.cleanup_sink)
         errors = verify_receipt(receipt, expected_head=args.expected_head, expected_tree=args.expected_tree)
         if errors:
-            raise ReceiptError("collection did not meet receipt policy")
-        _write_atomic(args.output, receipt)
+            raise FinalReceiptError("verification")
+        _final_collect_step("output", lambda: _write_atomic(args.output, receipt))
         print("representative-clinical-egress: PASS sha256=" + hashlib.sha256(canonical_receipt(receipt).encode()).hexdigest())
         return 0
     except (ReceiptError, json.JSONDecodeError, OSError) as exc:
         print("representative-clinical-egress: DENIED class=" + collector_error_class(exc), file=sys.stderr)
+        return 2
+    except Exception:
+        print("representative-clinical-egress: DENIED class=collector-generic", file=sys.stderr)
         return 2
 
 

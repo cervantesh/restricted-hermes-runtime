@@ -39,11 +39,14 @@ cleanup_state_absent=false
 collector_class_from() {
   local outcome="$1"
   local candidate=unclassified
-  if [[ "$outcome" =~ ^representative-clinical-egress:\ DENIED\ class=([a-z-]+)$ ]]; then
+  if [[ "$outcome" =~ ^representative-clinical-egress:\ DENIED\ class=([a-z-]+(/[a-z-]+)?)$ ]]; then
     candidate="${BASH_REMATCH[1]}"
   fi
   case "$candidate" in
-    source-binding|marker-binding|proof-binding|image-binding|network-probe|cleanup|local-command|input|receipt-policy|unclassified)
+    source-binding|marker-binding|proof-binding|image-binding|network-probe|cleanup|local-command|input|collector-generic|unclassified|\
+    receipt-policy/source-marker|receipt-policy/marker-proof|receipt-policy/green-proof|receipt-policy/service-lookup|\
+    receipt-policy/service-inspection|receipt-policy/service-observation|receipt-policy/red-proof|receipt-policy/cleanup|\
+    receipt-policy/build|receipt-policy/verification|receipt-policy/output)
       printf '%s' "$candidate" ;;
     *) printf '%s' unclassified ;;
   esac
