@@ -56,6 +56,7 @@ def _declaration() -> dict[str, object]:
     return {
         "profile": "restricted-clinical-candidate.v1",
         "sources": [
+            {"name": "governance-contract", "revision": "9" * 40, "tree": "8" * 40},
             {"name": "health-record-hub-contract", "revision": "a" * 40, "tree": "b" * 40},
             {"name": "health-record-hub-publication", "revision": "b" * 40, "tree": "c" * 40},
             {"name": "restricted-edge", "revision": "c" * 40, "tree": "d" * 40},
@@ -70,6 +71,7 @@ def _declaration() -> dict[str, object]:
         "producer": {"producer_id": "ci", "run_id": "run-17", "toolchain_id": "python-3.11", "host_id": "synthetic-linux"},
         "policy": {"epoch": "policy-7", "digest": "sha256:" + "1" * 64},
         "controls": [
+            {"id": "bounded-inputs", "status": "NOT_VERIFIED", "dependencies": [], "evidence_paths": ["evidence/bounded-inputs.json"]},
             {"id": "clinical-composition", "status": "NOT_VERIFIED", "dependencies": ["immutable-images"], "evidence_paths": ["contracts/clinical-composition.json", "evidence/clinical-receipt.json"]},
             {"id": "cold-recovery", "status": "NOT_VERIFIED", "dependencies": [], "evidence_paths": ["evidence/cold-recovery.json"]},
             {"id": "governance-decision", "status": "NOT_VERIFIED", "dependencies": [], "evidence_paths": ["governance/risk-map.json"]},
@@ -86,7 +88,7 @@ def _declaration() -> dict[str, object]:
             "no PHI authorization", "no production approval", "not a compliance certification",
         ],
         "files": [
-            "contracts/clinical-composition.json", "evidence/clinical-receipt.json",
+            "contracts/clinical-composition.json", "evidence/bounded-inputs.json", "evidence/clinical-receipt.json",
             "evidence/cold-recovery.json", "evidence/hrh-publication.json", "evidence/representative-host.json",
             "governance/risk-map.json", "independent-review/findings.json", "subjects/images.json",
         ],
@@ -132,6 +134,10 @@ def _ready_declaration() -> dict[str, object]:
     return value
 
 
+def _control(declaration: dict[str, object], identifier: str) -> dict[str, object]:
+    return next(control for control in declaration["controls"] if control["id"] == identifier)
+
+
 def _evidence(relative: str, *, outcome: str = "NOT_VERIFIED", declaration: dict[str, object] | None = None) -> dict[str, object]:
     declaration_value = declaration or _declaration()
     common = {
@@ -145,19 +151,28 @@ def _evidence(relative: str, *, outcome: str = "NOT_VERIFIED", declaration: dict
     if outcome == "NOT_VERIFIED":
         if relative == "evidence/representative-host.json":
             return {**common, "observations": [{"id": identifier, "outcome": "NOT_VERIFIED", "reason": "external-evidence-missing"} for identifier in HOST_OBSERVATIONS]}
+        if relative == "subjects/images.json":
+            return {**common, "reason": "external-evidence-missing", "edge_candidate_manifest_sha256": "sha256:" + "d" * 64}
         return {**common, "reason": "external-evidence-missing"}
     if outcome == "NOT_APPLICABLE":
+        if relative == "subjects/images.json":
+            return {**common, "rationale": "closed-profile-exception", "edge_candidate_manifest_sha256": "sha256:" + "d" * 64}
         return {**common, "rationale": "closed-profile-exception"}
     if outcome not in {"PASS", "FAIL"}:
         raise AssertionError(outcome)
     if relative == "contracts/clinical-composition.json": return {**common, "claim_id": "synthetic-clinical-composition"}
     if relative == "evidence/clinical-receipt.json": return {**common, "negative_controls": ["no-general-hermes"]}
-    if relative == "evidence/cold-recovery.json": return {**common, "manifest_sha256": "sha256:" + "a" * 64}
+    if relative == "evidence/cold-recovery.json": return {**common, "manifest_sha256": "sha256:" + "a" * 64, "recovery_receipt_sha256": "sha256:" + "b" * 64}
+    if relative == "evidence/bounded-inputs.json": return {**common, "inputs": [
+        {"id": "delivery-reauthorization-pr18", "source_revision": "1" * 40, "source_tree": "2" * 40, "evidence_artifact_sha256": "sha256:" + "3" * 64, "hosted_ci": {"run_url": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/34104221878", "head_sha": "1" * 40, "receipt_sha256": "sha256:" + "a" * 64, "conclusion": "PASS"}, "classification": "bounded-delivery-reauthorization"},
+        {"id": "representative-container-egress-pr19", "source_revision": "4" * 40, "source_tree": "5" * 40, "evidence_artifact_sha256": "sha256:" + "6" * 64, "hosted_ci": {"run_url": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/34109706405", "head_sha": "4" * 40, "receipt_sha256": "sha256:" + "b" * 64, "conclusion": "PASS"}, "classification": "bounded-synthetic-container"},
+        {"id": "secret-boundary-pr15", "source_revision": "7" * 40, "source_tree": "8" * 40, "evidence_artifact_sha256": "sha256:" + "9" * 64, "hosted_ci": {"run_url": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/34101476120", "head_sha": "7" * 40, "receipt_sha256": "sha256:" + "c" * 64, "conclusion": "PASS"}, "classification": "bounded-secret-boundary"},
+    ]}
     if relative == "evidence/hrh-publication.json": return {**common, "publication_receipt_sha256": "sha256:" + "b" * 64, "verification_receipt_sha256": "sha256:" + "c" * 64}
     if relative == "evidence/representative-host.json": return {**common, "observations": [{"id": identifier, "outcome": outcome, "witness_sha256": "sha256:" + "a" * 64} for identifier in HOST_OBSERVATIONS]}
     if relative == "governance/risk-map.json": return {**common, "risk_owner": "technical-owner", "risks": [{"id": "synthetic-scope", "severity": "P2", "disposition": "CLOSED"}]}
     if relative == "independent-review/findings.json": return {**common, "reviewer_id": "external-reviewer", "authority": "independent-technical-review", "conflict_statement": "none-declared", "findings": ["external-inputs-missing"], "technical_go_no_go": "GO" if outcome == "PASS" else "NO_GO"}
-    if relative == "subjects/images.json": return common
+    if relative == "subjects/images.json": return {**common, "edge_candidate_manifest_sha256": "sha256:" + "d" * 64}
     raise AssertionError(relative)
 
 
@@ -178,6 +193,7 @@ def test_synthetic_bundle_is_clean_room_verifiable_and_not_ready(tmp_path: Path)
     result = verifier.verify(bundle, expected_manifest_sha256=_expected(bundle))
     assert result.errors == []
     assert result.ready_for_technical_go is False
+    assert result.statuses["bounded-inputs"] == "NOT_VERIFIED"
     assert result.statuses["representative-host"] == "NOT_VERIFIED"
     manifest = json.loads((bundle / "assessment.manifest.json").read_text(encoding="utf-8"))
     payload = dict(manifest)
@@ -233,7 +249,7 @@ def test_export_rejects_canary_traversal_and_external_acceptance_without_authori
     declaration = tmp_path / "declaration.json"; declaration.write_text(json.dumps(_declaration()), encoding="utf-8")
     rejected = subprocess.run([sys.executable, str(BUILD), "--declaration", str(declaration), "--input-dir", str(source), "--output-dir", str(tmp_path / "bundle")], capture_output=True, text=True)
     assert rejected.returncode != 0 and "secret-bearing" in rejected.stderr
-    bad = _declaration(); bad["controls"][5] = {"id": "independent-review", "status": "EXTERNALLY_ACCEPTED", "dependencies": [], "evidence_paths": ["independent-review/findings.json"]}
+    bad = _declaration(); bad["controls"][bad["controls"].index(_control(bad, "independent-review"))] = {"id": "independent-review", "status": "EXTERNALLY_ACCEPTED", "dependencies": [], "evidence_paths": ["independent-review/findings.json"]}
     declaration.write_text(json.dumps(bad), encoding="utf-8")
     (source / "evidence" / "clinical-receipt.json").write_text(json.dumps(_evidence("evidence/clinical-receipt.json")), encoding="utf-8")
     rejected = subprocess.run([sys.executable, str(BUILD), "--declaration", str(declaration), "--input-dir", str(source), "--output-dir", str(tmp_path / "bundle")], capture_output=True, text=True)
@@ -247,7 +263,7 @@ def test_export_rejects_canary_traversal_and_external_acceptance_without_authori
 def test_external_acceptance_is_a_retained_risk_decision_not_a_technical_pass(tmp_path: Path):
     verifier = _load(VERIFY, "assessment_bundle_acceptance")
     declaration_value = _ready_declaration()
-    declaration_value["controls"][5] = {
+    declaration_value["controls"][declaration_value["controls"].index(_control(declaration_value, "independent-review"))] = {
         "id": "independent-review", "status": "EXTERNALLY_ACCEPTED", "dependencies": [], "evidence_paths": ["independent-review/findings.json"],
         "acceptance": {"owner": "risk-owner", "authority": "technical-risk-board", "evidence_path": "governance/risk-map.json", "technical_status": "NOT_VERIFIED"},
     }
@@ -310,7 +326,7 @@ def test_truthful_not_ready_records_are_individually_closed_and_mixed_shapes_are
 def test_pass_and_fail_require_complete_proof_shapes_and_no_go_cannot_be_ready(tmp_path: Path):
     verifier = _load(VERIFY, "assessment_bundle_pass_fail_shapes")
     declaration_value = _ready_declaration()
-    declaration_value["controls"][5]["status"] = "FAIL"
+    _control(declaration_value, "independent-review")["status"] = "FAIL"
     source = tmp_path / "source"
     outcomes = {relative: "PASS" for relative in declaration_value["files"]}
     outcomes["independent-review/findings.json"] = "FAIL"
@@ -339,12 +355,43 @@ def test_pass_and_fail_require_complete_proof_shapes_and_no_go_cannot_be_ready(t
     (source / "evidence" / "cold-recovery.json").write_text(json.dumps(incomplete), encoding="utf-8")
     assert subprocess.run([sys.executable, str(BUILD), "--declaration", str(declaration), "--input-dir", str(source), "--output-dir", str(tmp_path / "missing-pass-proof")], capture_output=True, text=True).returncode != 0
 
-
     (source / "evidence" / "cold-recovery.json").write_text(json.dumps(_evidence("evidence/cold-recovery.json", outcome="PASS", declaration=declaration_value)), encoding="utf-8")
     host = _evidence("evidence/representative-host.json", outcome="PASS", declaration=declaration_value)
     host["observations"][0].pop("witness_sha256")
     (source / "evidence" / "representative-host.json").write_text(json.dumps(host), encoding="utf-8")
     assert subprocess.run([sys.executable, str(BUILD), "--declaration", str(declaration), "--input-dir", str(source), "--output-dir", str(tmp_path / "missing-host-witness")], capture_output=True, text=True).returncode != 0
+
+
+def test_cold_recovery_requires_independent_manifest_and_recovery_receipt_bindings(tmp_path: Path):
+    declaration_value = _ready_declaration()
+    source = tmp_path / "source"
+    _write_evidence(source, declaration_value, {relative: "PASS" for relative in declaration_value["files"]})
+    declaration = tmp_path / "ready.json"
+    declaration.write_text(json.dumps(declaration_value), encoding="utf-8")
+
+    def export(record: dict[str, object], name: str) -> subprocess.CompletedProcess[str]:
+        (source / "evidence" / "cold-recovery.json").write_text(json.dumps(record), encoding="utf-8")
+        return subprocess.run([sys.executable, str(BUILD), "--declaration", str(declaration), "--input-dir", str(source), "--output-dir", str(tmp_path / name)], capture_output=True, text=True)
+
+    complete = _evidence("evidence/cold-recovery.json", outcome="PASS", declaration=declaration_value)
+    assert export(complete, "complete-cold-proof").returncode == 0
+
+    for field in ("manifest_sha256", "recovery_receipt_sha256"):
+        diagnostic = "immutable manifest sha256" if field == "manifest_sha256" else "recovery receipt sha256"
+        missing = dict(complete)
+        missing.pop(field)
+        missing_result = export(missing, f"missing-{field}")
+        assert missing_result.returncode != 0 and diagnostic in missing_result.stderr
+
+        malformed = dict(complete)
+        malformed[field] = "sha256:not-a-binding"
+        malformed_result = export(malformed, f"malformed-{field}")
+        assert malformed_result.returncode != 0 and diagnostic in malformed_result.stderr
+
+    manifest_only = dict(complete)
+    manifest_only.pop("recovery_receipt_sha256")
+    manifest_only_result = export(manifest_only, "manifest-only-cannot-ready")
+    assert manifest_only_result.returncode != 0 and "recovery receipt sha256" in manifest_only_result.stderr
 
 
 def test_profile_dependency_inventory_mapping_and_not_applicable_cannot_waive_readiness(tmp_path: Path):
@@ -362,12 +409,17 @@ def test_profile_dependency_inventory_mapping_and_not_applicable_cannot_waive_re
     replacement["dependencies"][1]["id"] = "replacement-host-input"
     assert export(replacement, "replacement-dependency").returncode != 0
 
+    wrong_governance_source = _declaration()
+    wrong_governance_source["sources"][0]["name"] = "replacement-governance-contract"
+    wrong_source_result = export(wrong_governance_source, "replacement-governance-source")
+    assert wrong_source_result.returncode != 0 and "source inventory" in wrong_source_result.stderr
+
     empty = _declaration()
     empty["dependencies"] = []
     assert export(empty, "empty-dependencies").returncode != 0
 
     wrong_gate_mapping = _declaration()
-    wrong_gate_mapping["controls"][0]["dependencies"] = []
+    _control(wrong_gate_mapping, "clinical-composition")["dependencies"] = []
     assert export(wrong_gate_mapping, "wrong-gate-dependency").returncode != 0
 
     ready = _ready_declaration()
@@ -415,6 +467,100 @@ def test_hrh_publication_proof_binds_both_external_receipts(tmp_path: Path):
     assert invalid.returncode != 0
 
 
+def test_edge_manifest_availability_binding_is_closed_and_changes_the_candidate(tmp_path: Path):
+    declaration_value = _declaration()
+    source = tmp_path / "source"
+    _write_evidence(source, declaration_value)
+    declaration = tmp_path / "declaration.json"
+    declaration.write_text(json.dumps(declaration_value), encoding="utf-8")
+
+    def export(name: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, str(BUILD), "--declaration", str(declaration), "--input-dir", str(source), "--output-dir", str(tmp_path / name)], capture_output=True, text=True)
+
+    first = export("edge-binding-first")
+    assert first.returncode == 0, first.stderr
+    first_manifest = json.loads((tmp_path / "edge-binding-first" / "assessment.manifest.json").read_text(encoding="utf-8"))
+
+    images_path = source / "subjects" / "images.json"
+    changed = _evidence("subjects/images.json", declaration=declaration_value)
+    changed["edge_candidate_manifest_sha256"] = "sha256:" + "e" * 64
+    images_path.write_text(json.dumps(changed), encoding="utf-8")
+    second = export("edge-binding-second")
+    assert second.returncode == 0, second.stderr
+    second_manifest = json.loads((tmp_path / "edge-binding-second" / "assessment.manifest.json").read_text(encoding="utf-8"))
+    assert first_manifest["candidate_id"] != second_manifest["candidate_id"]
+
+    for value in (None, "sha256:not-a-binding"):
+        invalid = _evidence("subjects/images.json", declaration=declaration_value)
+        if value is None:
+            invalid.pop("edge_candidate_manifest_sha256")
+        else:
+            invalid["edge_candidate_manifest_sha256"] = value
+        images_path.write_text(json.dumps(invalid), encoding="utf-8")
+        rejected = export("edge-binding-" + ("missing" if value is None else "malformed"))
+        assert rejected.returncode != 0
+
+    pass_declaration = _ready_declaration()
+    pass_source = tmp_path / "pass-source"
+    _write_evidence(pass_source, pass_declaration, {relative: "PASS" for relative in pass_declaration["files"]})
+    pass_images = _evidence("subjects/images.json", outcome="PASS", declaration=pass_declaration)
+    pass_images.pop("edge_candidate_manifest_sha256")
+    (pass_source / "subjects" / "images.json").write_text(json.dumps(pass_images), encoding="utf-8")
+    pass_declaration_path = tmp_path / "pass-declaration.json"
+    pass_declaration_path.write_text(json.dumps(pass_declaration), encoding="utf-8")
+    missing_pass_binding = subprocess.run([sys.executable, str(BUILD), "--declaration", str(pass_declaration_path), "--input-dir", str(pass_source), "--output-dir", str(tmp_path / "missing-pass-edge-binding")], capture_output=True, text=True)
+    assert missing_pass_binding.returncode != 0 and "edge candidate manifest sha256" in missing_pass_binding.stderr
+
+
+def test_bounded_inputs_gate_closes_inventory_shape_and_classification(tmp_path: Path):
+    declaration_value = _ready_declaration()
+    source = tmp_path / "source"
+    _write_evidence(source, declaration_value, {relative: "PASS" for relative in declaration_value["files"]})
+    declaration = tmp_path / "ready.json"
+    declaration.write_text(json.dumps(declaration_value), encoding="utf-8")
+    bounded_path = source / "evidence" / "bounded-inputs.json"
+    complete = _evidence("evidence/bounded-inputs.json", outcome="PASS", declaration=declaration_value)
+
+    def export(record: dict[str, object], name: str) -> subprocess.CompletedProcess[str]:
+        bounded_path.write_text(json.dumps(record), encoding="utf-8")
+        return subprocess.run([sys.executable, str(BUILD), "--declaration", str(declaration), "--input-dir", str(source), "--output-dir", str(tmp_path / name)], capture_output=True, text=True)
+
+    complete_result = export(complete, "bounded-complete")
+    assert complete_result.returncode == 0, complete_result.stderr
+
+    missing = json.loads(json.dumps(complete))
+    missing["inputs"].pop()
+    assert export(missing, "bounded-missing").returncode != 0
+
+    extra = json.loads(json.dumps(complete))
+    extra["inputs"].append({"id": "extra-input", "source_revision": "a" * 40, "source_tree": "b" * 40, "evidence_artifact_sha256": "sha256:" + "c" * 64, "hosted_ci": {"run_url": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/1", "head_sha": "a" * 40, "receipt_sha256": "sha256:" + "d" * 64, "conclusion": "PASS"}, "classification": "bounded-secret-boundary"})
+    assert export(extra, "bounded-extra").returncode != 0
+
+    malformed = json.loads(json.dumps(complete))
+    malformed["inputs"][0]["evidence_artifact_sha256"] = "not-a-hash"
+    assert export(malformed, "bounded-malformed").returncode != 0
+
+    misclassified = json.loads(json.dumps(complete))
+    misclassified["inputs"][1]["classification"] = "representative-host"
+    assert export(misclassified, "bounded-misclassified").returncode != 0
+
+    hosted_mutations = {
+        "missing-hosted-ci": lambda item: item.pop("hosted_ci"),
+        "malformed-hosted-ci": lambda item: item.update(hosted_ci="run-34104221878"),
+        "fabricated-run-id": lambda item: item["hosted_ci"].update(run_url="https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/99999999999"),
+        "wrong-run-repo": lambda item: item["hosted_ci"].update(run_url="https://github.com/other/repository/actions/runs/34104221878"),
+        "wrong-run-path": lambda item: item["hosted_ci"].update(run_url="https://github.com/cervantesh/restricted-hermes-runtime/runs/34104221878"),
+        "mismatched-head": lambda item: item["hosted_ci"].update(head_sha="f" * 40),
+        "non-pass-conclusion": lambda item: item["hosted_ci"].update(conclusion="SUCCESS"),
+        "missing-ci-receipt": lambda item: item["hosted_ci"].pop("receipt_sha256"),
+    }
+    for name, mutate in hosted_mutations.items():
+        candidate = json.loads(json.dumps(complete))
+        mutate(candidate["inputs"][0])
+        result = export(candidate, "bounded-" + name)
+        assert result.returncode != 0
+
+
 def test_partial_host_and_multifile_control_evidence_follow_the_closed_lattice(tmp_path: Path):
     verifier = _load(VERIFY, "assessment_bundle_partial_evidence")
     declaration_value = _declaration()
@@ -438,7 +584,7 @@ def test_partial_host_and_multifile_control_evidence_follow_the_closed_lattice(t
     assert retained["observations"][1]["rationale"] == "not-applicable-on-host"
 
     pass_control = _declaration()
-    pass_control["controls"][0]["status"] = "PASS"
+    _control(pass_control, "clinical-composition")["status"] = "PASS"
     pass_declaration = tmp_path / "pass-control.json"
     pass_declaration.write_text(json.dumps(pass_control), encoding="utf-8")
     inconsistent_control = subprocess.run([sys.executable, str(BUILD), "--declaration", str(pass_declaration), "--input-dir", str(source), "--output-dir", str(tmp_path / "pass-with-unverified-sibling")], capture_output=True, text=True)
@@ -453,7 +599,7 @@ def test_partial_host_and_multifile_control_evidence_follow_the_closed_lattice(t
 
     host_path.write_text(json.dumps(host), encoding="utf-8")
     failed_control = _declaration()
-    failed_control["controls"][0]["status"] = "FAIL"
+    _control(failed_control, "clinical-composition")["status"] = "FAIL"
     failed_declaration = tmp_path / "failed-control.json"
     failed_declaration.write_text(json.dumps(failed_control), encoding="utf-8")
     (source / "evidence" / "clinical-receipt.json").write_text(json.dumps(_evidence("evidence/clinical-receipt.json", outcome="FAIL", declaration=failed_control)), encoding="utf-8")
@@ -464,8 +610,8 @@ def test_partial_host_and_multifile_control_evidence_follow_the_closed_lattice(t
 
 def test_pass_aggregate_retains_not_applicable_host_and_multifile_evidence(tmp_path: Path):
     declaration_value = _declaration()
-    declaration_value["controls"][0]["status"] = "PASS"
-    declaration_value["controls"][6]["status"] = "PASS"
+    _control(declaration_value, "clinical-composition")["status"] = "PASS"
+    _control(declaration_value, "representative-host")["status"] = "PASS"
     source = tmp_path / "source"
     _write_evidence(source, declaration_value)
 
@@ -541,7 +687,7 @@ def test_profile_rejects_ready_bypasses_for_collisions_opaque_evidence_subjects_
     assert export(_declaration(), "extra-phi").returncode != 0
     (source / "evidence" / "clinical-receipt.json").write_text(json.dumps(_evidence("evidence/clinical-receipt.json")), encoding="utf-8")
     invalid_recovery_declaration = _declaration()
-    invalid_recovery_declaration["controls"][1]["status"] = "PASS"
+    _control(invalid_recovery_declaration, "cold-recovery")["status"] = "PASS"
     invalid_recovery = _evidence("evidence/cold-recovery.json", outcome="PASS", declaration=invalid_recovery_declaration)
     invalid_recovery["manifest_sha256"] = "not-a-hash"
     (source / "evidence" / "cold-recovery.json").write_text(json.dumps(invalid_recovery), encoding="utf-8")
@@ -563,7 +709,7 @@ def test_profile_rejects_ready_bypasses_for_collisions_opaque_evidence_subjects_
     (source / "evidence" / "representative-host.json").write_text(json.dumps(bad_host), encoding="utf-8")
     assert export(_declaration(), "bad-host").returncode != 0
     failed_host_declaration = _declaration()
-    failed_host_declaration["controls"][6]["status"] = "FAIL"
+    _control(failed_host_declaration, "representative-host")["status"] = "FAIL"
     failed_host = _evidence("evidence/representative-host.json", outcome="FAIL", declaration=failed_host_declaration)
     failed_host["observations"][0]["witness_sha256"] = "not-a-hash"
     (source / "evidence" / "representative-host.json").write_text(json.dumps(failed_host), encoding="utf-8")
