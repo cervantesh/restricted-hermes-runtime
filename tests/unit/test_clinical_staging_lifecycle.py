@@ -438,6 +438,7 @@ def _restricted_control_inspections():
         "clinical-adapter": {
             "Config": {"User": "restricted-clinical-adapter"},
             "HostConfig": {
+                "Privileged": False,
                 "ReadonlyRootfs": True,
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges=true"],
@@ -455,6 +456,7 @@ def _restricted_control_inspections():
         "ingress": {
             "Config": {"User": "restricted-mattermost-ingress"},
             "HostConfig": {
+                "Privileged": False,
                 "ReadonlyRootfs": True,
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges=true"],
@@ -477,6 +479,7 @@ def test_restricted_container_guard_requires_exact_effective_confinement():
     evidence = module.verify_restricted_container_controls(inspected)
     assert evidence["ingress"] == {
         "user": "restricted-mattermost-ingress",
+        "privileged": False,
         "read_only_rootfs": True,
         "cap_drop": ["ALL"],
         "no_new_privileges": True,
@@ -490,6 +493,7 @@ def test_restricted_container_guard_requires_exact_effective_confinement():
 
     mutations = (
         ("ingress", "Config", "User", "root"),
+        ("ingress", "HostConfig", "Privileged", True),
         ("ingress", "HostConfig", "ReadonlyRootfs", False),
         ("ingress", "HostConfig", "CapDrop", []),
         ("ingress", "HostConfig", "CapAdd", ["NET_ADMIN"]),

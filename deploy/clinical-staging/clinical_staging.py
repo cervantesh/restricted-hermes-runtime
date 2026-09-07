@@ -485,6 +485,7 @@ def verify_restricted_container_controls(
         }
         if (
             config.get("User") != expected["user"]
+            or host.get("Privileged") is not False
             or host.get("ReadonlyRootfs") is not True
             or {str(value).upper() for value in (host.get("CapDrop") or [])} != {"ALL"}
             or host.get("CapAdd") not in (None, [])
@@ -498,6 +499,7 @@ def verify_restricted_container_controls(
             raise SafetyError(f"{service} effective container confinement rejected")
         evidence[service] = {
             "user": expected["user"],
+            "privileged": False,
             "read_only_rootfs": True,
             "cap_drop": ["ALL"],
             "no_new_privileges": True,
