@@ -262,6 +262,9 @@ def test_ready_resource_guard_requires_exact_services_once_and_exact_networks():
     subset_networks.pop(next(iter(subset_networks)))
     with pytest.raises(module.SafetyError, match="exact network set"):
         module.verify_destructive_resources(project, state_id, containers, subset_networks, "stopped")
+    assert module.verify_destructive_resources(project, state_id, {}, {}, "stopped") == ([], [])
+    with pytest.raises(module.SafetyError, match="exact service set or no resources"):
+        module.verify_destructive_resources(project, state_id, {next(iter(containers)): next(iter(containers.values()))}, {}, "stopped")
 
 
 def test_initializing_resource_guard_rejects_duplicate_service_containers():

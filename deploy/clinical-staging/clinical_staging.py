@@ -807,14 +807,27 @@ def verify_destructive_resources(
     duplicates = sorted({service for service in services if services.count(service) > 1})
     if duplicates:
         raise SafetyError("duplicate project service containers: " + ", ".join(duplicates))
-    if lifecycle in {"ready", "stopped"}:
+    if lifecycle == "ready":
         if "controller" in services:
-            raise SafetyError("controller must be absent from ready/stopped staging")
+            raise SafetyError("controller must be absent from ready staging")
         expected_services = set(LONG_RUNNING_SERVICES) | set(ONE_SHOT_SERVICES)
         if set(services) != expected_services:
-            raise SafetyError("ready/stopped staging requires the exact service set")
+            raise SafetyError("ready staging requires the exact service set")
         if set(networks) != allowed_networks:
-            raise SafetyError("ready/stopped staging requires the exact network set")
+            raise SafetyError("ready staging requires the exact network set")
+    elif lifecycle == "stopped":
+        # A normal stop retains the exact Compose resources, while a cold
+        # backup intentionally tears them down to prove no container retains a
+        # writable volume mount.  Either complete shape is destroyable; a
+        # partial shape is never accepted.
+        expected_services = set(LONG_RUNNING_SERVICES) | set(ONE_SHOT_SERVICES)
+        if services or networks:
+            if "controller" in services:
+                raise SafetyError("controller must be absent from stopped staging")
+            if set(services) != expected_services:
+                raise SafetyError("stopped staging requires the exact service set or no resources")
+            if set(networks) != allowed_networks:
+                raise SafetyError("stopped staging requires the exact network set or no resources")
     elif lifecycle not in {"initializing", "recovering"}:
         raise SafetyError("unknown lifecycle for destructive resource verification")
     return sorted(containers), sorted(networks)
