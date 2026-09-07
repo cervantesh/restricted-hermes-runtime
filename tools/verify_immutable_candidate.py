@@ -15,6 +15,7 @@ SCHEMA = "restricted-runtime-immutable-candidate.v1"
 PLATFORM = "linux/amd64"
 REPOSITORY = "cervantesh/restricted-hermes-runtime"
 WORKFLOW = ".github/workflows/immutable-candidate.yml"
+SOURCE = "https://github.com/cervantesh/restricted-hermes-runtime"
 RUN_URL = re.compile(r"https://github\.com/cervantesh/restricted-hermes-runtime/actions/runs/[1-9][0-9]*$")
 SHA256 = re.compile(r"sha256:[0-9a-f]{64}$")
 SHA256_RAW = re.compile(r"[0-9a-f]{64}$")
@@ -105,7 +106,10 @@ def _verify_platform(errors: list[str], name: str, item: dict[str, Any], image: 
     if (receipt.get("schema_version") != "restricted-runtime-subject-receipt.v1" or receipt.get("image") != image
             or receipt.get("subject_digest") != digest or receipt.get("source_revision") != source_revision
             or receipt.get("workflow_run_url") != run_url or receipt.get("resolved_platform") != PLATFORM
-            or receipt.get("subject_kind") not in {"manifest", "index"} or not _digest(receipt.get("linux_amd64_child_digest"))):
+            or receipt.get("subject_kind") not in {"manifest", "index"} or not _digest(receipt.get("linux_amd64_child_digest"))
+            or receipt.get("source") != SOURCE or _mapping(receipt.get("labels")) is None
+            or _mapping(receipt.get("labels")).get("org.opencontainers.image.source") != SOURCE
+            or _mapping(receipt.get("labels")).get("org.opencontainers.image.revision") != source_revision):
         _error(errors, f"{name}: platform receipt does not prove linux/amd64 exact subject")
 
 
