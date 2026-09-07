@@ -54,7 +54,7 @@ services:
   hrh-migrate:
     build:
       context: ${CLINICAL_HRH_ROOT:?required}
-      dockerfile: Dockerfile.migrate
+      dockerfile: Dockerfile.migrate.clinical-candidate
     environment:
       DATABASE_URL: postgresql://hrh:${CLINICAL_HRH_DB_PASSWORD:?required}@hrh-postgres:5432/hrh
     depends_on:
@@ -64,7 +64,7 @@ services:
   hrh:
     build:
       context: ${CLINICAL_HRH_ROOT:?required}
-      dockerfile: Dockerfile.web
+      dockerfile: Dockerfile.web.clinical-candidate
       args:
         BUILD_SHA: ${CLINICAL_HRH_BUILD_SHA:?required}
     environment:

@@ -29,14 +29,28 @@ from cryptography.x509.oid import NameOID
 
 
 RUNTIME_BASE_SHA = "41464aee8748f857153ba2b47377515d4847d210"
-REQUIRED_HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"
-REQUIRED_HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"
+REQUIRED_HRH_SHA = "e30a4f968de6727519f49c08369f561fdf269ec5"
+REQUIRED_HRH_TREE = "7fb2543a2ceb1649f05c467b38708d1404106659"
+HRH_WEB_CANDIDATE_DOCKERFILE = "Dockerfile.web.clinical-candidate"
+HRH_MIGRATE_CANDIDATE_DOCKERFILE = "Dockerfile.migrate.clinical-candidate"
+HRH_NODE_BASE = "node:24-alpine@sha256:4caaaf42195bcd6f6f3559a413b20cb8f8ad089e231ee874cf7701643966689f"
+HRH_MIGRATE_BASE = "alpine:3.21@sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339"
+HRH_CANDIDATE_BASES = {
+    HRH_WEB_CANDIDATE_DOCKERFILE: (HRH_NODE_BASE, HRH_NODE_BASE, HRH_NODE_BASE),
+    HRH_MIGRATE_CANDIDATE_DOCKERFILE: (HRH_MIGRATE_BASE,),
+}
 SCHEMA = "restricted-synthetic-clinical-staging.v1"
 MARKER_NAME = "staging-state.json"
 PROJECT_LABEL = "io.cervantesh.restricted-runtime.project"
 STATE_LABEL = "io.cervantesh.restricted-runtime.state-id"
 SYNTHETIC_LABEL = "io.cervantesh.restricted-runtime.synthetic-clinical"
 PROJECT_RE = re.compile(r"^clinicalstaging[a-z0-9]{1,32}$")
+FROM_RE = re.compile(r"^\s*FROM\s+(?:--platform=\S+\s+)?(?P<image>\S+)", re.MULTILINE | re.IGNORECASE)
+COMPOSE_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+SAFE_COMPOSE_PROCESS_ENV = (
+    "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG",
+    "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR",
+)
 VOLUME_KEYS = (
     "mattermost_db", "mattermost_data", "mattermost_tls", "hrh_db",
     "hrh_tls", "hrh_secret", "clinical_config", "clinical_socket",
@@ -94,12 +108,14 @@ class Shell:
         self,
         *args: str,
         cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
         check: bool = True,
         timeout: int = 600,
     ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
             args,
             cwd=cwd,
+            env=dict(env) if env is not None else None,
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -276,6 +292,19 @@ def verify_source_frame(runtime: Path, hrh: Path, shell: Any) -> dict[str, str]:
         "hrh_head": hrh_head,
         "hrh_tree": hrh_tree,
     }
+
+
+def verify_hrh_candidate_build_inputs(hrh: Path) -> None:
+    """Fail before Compose when the frozen HRH build recipes are not closed."""
+    for name, expected in HRH_CANDIDATE_BASES.items():
+        try:
+            images = tuple(match.group("image") for match in FROM_RE.finditer((hrh / name).read_text(encoding="utf-8")))
+        except OSError as exc:
+            raise SafetyError("candidate HRH Dockerfile is unavailable") from exc
+        if not images or any("@sha256:" not in image for image in images):
+            raise SafetyError("candidate HRH Dockerfile contains a mutable base")
+        if images != expected:
+            raise SafetyError("candidate HRH Dockerfile base digest differs from the frozen contract")
 
 
 def verify_destructive_volumes(
@@ -592,8 +621,27 @@ class ClinicalStaging:
             "--file", str(self.overlay),
         )
 
+    def _sealed_compose_environment(self) -> dict[str, str]:
+        try:
+            lines = self.env_file.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise SafetyError("sealed compose environment is unavailable") from exc
+        sealed: dict[str, str] = {}
+        for line in lines:
+            if not line or "=" not in line:
+                raise SafetyError("sealed compose environment is malformed")
+            key, value = line.split("=", 1)
+            if not COMPOSE_ENV_RE.fullmatch(key) or key in sealed:
+                raise SafetyError("sealed compose environment is malformed")
+            sealed[key] = value
+        if not sealed:
+            raise SafetyError("sealed compose environment is empty")
+        process = {key: os.environ[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in os.environ}
+        process.update(sealed)
+        return process
+
     def compose(self, *args: str, check: bool = True, timeout: int = 1200) -> subprocess.CompletedProcess[str]:
-        return self.shell.run(*self._compose_args(), *args, cwd=self.runtime, check=check, timeout=timeout)
+        return self.shell.run(*self._compose_args(), *args, cwd=self.runtime, env=self._sealed_compose_environment(), check=check, timeout=timeout)
 
     def control(self, *args: str, timeout: int = 600) -> str:
         result = self.compose(
@@ -715,6 +763,7 @@ class ClinicalStaging:
     def init(self) -> dict[str, Any]:
         self._require_linux()
         frame = verify_source_frame(self.runtime, self.hrh, self.shell)
+        verify_hrh_candidate_build_inputs(self.hrh)
         if self.state_dir.exists() and (self.state_dir / MARKER_NAME).exists():
             marker = read_marker(self.state_dir, self.project)
             if marker["lifecycle"] != "initializing":
