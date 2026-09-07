@@ -89,6 +89,19 @@ def test_valid_candidate_bound_receipt_verifies_and_contains_no_probe_content():
     assert "PASSWORD_SECRET_CANARY" not in rendered
 
 
+def test_version_grammar_accepts_observed_package_version_and_rejects_unsafe_characters():
+    module = load_module()
+
+    assert module.SAFE_VERSION.fullmatch("2.40.3+ds1-0ubuntu1~24.04.1")
+    for invalid in (
+        "", "contains space", "slash/value", r"back\\slash", "equals=value", "quote'value", 'quote"value',
+        "line\nbreak", "tab\tvalue", "dollar$value", "semi;colon", "pipe|value", "amp&value",
+        "less<value", "greater>value", "paren(value)", "star*value", "question?value", "bracket[value]",
+        "brace{value}", "bang!value",
+    ):
+        assert not module.SAFE_VERSION.fullmatch(invalid)
+
+
 @pytest.mark.parametrize(
     "mutate, expected",
     [

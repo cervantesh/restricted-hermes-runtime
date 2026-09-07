@@ -78,7 +78,7 @@ CONTROL_DESTINATIONS = {
     "ingress": {"/run/ingress", "/run/restricted-clinical", "/var/lib/restricted-mattermost-outbox"},
     "clinical-adapter": {"/run/clinical-config", "/run/hrh-secret", "/run/hrh-tls", "/run/restricted-clinical"},
 }
-SAFE_VERSION = re.compile(r"^[A-Za-z0-9._+-]{1,80}$")
+SAFE_VERSION = re.compile(r"^[A-Za-z0-9._+~-]{1,80}$")
 SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
 GIT_SHA = re.compile(r"^[a-f0-9]{40}$")
 DOCKER_RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
