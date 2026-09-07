@@ -24,3 +24,11 @@ def test_cold_recovery_drill_exercises_real_wrapper_and_causal_controls():
         assert invariant in script
     assert "synthetic_only" in script
     assert "not PHI" in script
+
+
+def test_cold_recovery_drill_only_reports_success_after_verified_teardown():
+    script = (ROOT / "tests" / "deployment" / "test_clinical_cold_recovery_e2e.py").read_text(encoding="utf-8")
+    assert "cold recovery E2E cleanup was not verified" in script
+    assert "teardown._assert_destroyed_absent()" in script
+    assert "ignore_errors=True" not in script
+    assert script.index("teardown._assert_destroyed_absent()") < script.rindex("print(json.dumps(report, sort_keys=True))")

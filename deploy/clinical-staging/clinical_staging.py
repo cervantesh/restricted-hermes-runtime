@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import hashlib
 import http.client
 import ipaddress
@@ -29,6 +30,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+
+
+_STAGING_MODULE_DIR = str(Path(__file__).resolve().parent)
+if _STAGING_MODULE_DIR not in sys.path:
+    sys.path.insert(0, _STAGING_MODULE_DIR)
+from clinical_operator_lock import OperatorLockError, operator_lock_path, persistent_operator_lock
 
 
 RUNTIME_BASE_SHA = "41464aee8748f857153ba2b47377515d4847d210"
@@ -113,6 +120,20 @@ class SafetyError(RuntimeError):
 
 class CommandError(RuntimeError):
     pass
+
+
+def _serialized_mutator(method):
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        try:
+            with persistent_operator_lock(self.state_dir, self.project):
+                return method(self, *args, **kwargs)
+        except OperatorLockError as exc:
+            raise SafetyError(str(exc)) from exc
+    return wrapped
+
+
+_operator_lock = persistent_operator_lock  # Test seam for the shared boundary.
 
 
 class Shell:
@@ -1211,6 +1232,7 @@ class ClinicalStaging:
         self.compose("build", "ingress", "clinical-adapter", timeout=2400)
         self.compose("build", "controller", "hrh-migrate", "hrh", timeout=2400)
 
+    @_serialized_mutator
     def init(self) -> dict[str, Any]:
         self._require_linux()
         frame = verify_source_frame(self.runtime, self.hrh, self.shell)
@@ -1267,6 +1289,7 @@ class ClinicalStaging:
         self.up()
         return self.status()
 
+    @_serialized_mutator
     def up(self) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
@@ -1452,6 +1475,7 @@ class ClinicalStaging:
         write_json_atomic(self.state_dir / "evidence" / "status.json", evidence, mode=0o600)
         return evidence
 
+    @_serialized_mutator
     def refresh_policy(self, epoch: str) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
@@ -1466,6 +1490,7 @@ class ClinicalStaging:
         self.compose("up", "--detach", "ingress")
         return self.status()
 
+    @_serialized_mutator
     def stop(self) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
@@ -1562,6 +1587,7 @@ class ClinicalStaging:
         inspect_safe_tar(backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar", require_regular_file=True)
         fsync_file(backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar")
 
+    @_serialized_mutator
     def backup(self, backup_dir: Path) -> dict[str, Any]:
         """Create an atomically published, cold-only backup.  No overwrite exists."""
         self._require_linux()
@@ -1702,6 +1728,7 @@ class ClinicalStaging:
         self.control("wait-hrh")
         self.compose("up", "--detach", "ingress", timeout=600)
 
+    @_serialized_mutator
     def restore(self, backup_dir: Path, expected_manifest_sha256: str) -> dict[str, Any]:
         """Restore only a fully validated cold bundle into a clean destination."""
         self._require_linux()
@@ -1789,6 +1816,7 @@ class ClinicalStaging:
             if snapshot.exists():
                 shutil.rmtree(snapshot)
 
+    @_serialized_mutator
     def finalize_cold_recovery_verification(
         self, expected_manifest_sha256: str, causal_checks: Mapping[str, bool],
     ) -> dict[str, Any]:
@@ -1874,6 +1902,33 @@ class ClinicalStaging:
         for name in volume_names_to_remove:
             self.shell.run("docker", "volume", "rm", name, cwd=self.runtime)
 
+    def _assert_destroyed_absent(self) -> None:
+        """Prove the exact bounded project namespace is gone after destroy.
+
+        The check is deliberately narrower than a Docker-wide sweep: it covers
+        only the fixed Compose-name prefix, fixed network names, and the
+        marker-derived volume allowlist that ``destroy`` was authorized to
+        remove.  A teardown that cannot establish this condition is a failed
+        teardown, even though a later operator may still perform manual
+        cleanup.
+        """
+        names = self.shell.run("docker", "container", "ls", "--all", "--format", "{{.Names}}")
+        prefix = f"{self.project}-"
+        remaining_containers = sorted(
+            line.strip() for line in names.stdout.splitlines()
+            if line.strip().startswith(prefix)
+        )
+        if remaining_containers:
+            raise SafetyError("project containers remain after destroy: " + ", ".join(remaining_containers))
+        for key in NETWORK_KEYS:
+            name = f"{self.project}_{key}"
+            if self.shell.run("docker", "network", "inspect", name, check=False).returncode == 0:
+                raise SafetyError(f"project network remains after destroy: {name}")
+        for name in volume_names(self.project).values():
+            if self.shell.run("docker", "volume", "inspect", name, check=False).returncode == 0:
+                raise SafetyError(f"project volume remains after destroy: {name}")
+
+    @_serialized_mutator
     def reset(self) -> dict[str, Any]:
         self._require_linux()
         self._destroy_resources()
@@ -1883,10 +1938,12 @@ class ClinicalStaging:
             (self.state_dir / name).unlink()
         return self.init()
 
+    @_serialized_mutator
     def destroy(self) -> dict[str, Any]:
         self._require_linux()
         marker = read_marker(self.state_dir, self.project)
         self._destroy_resources()
+        self._assert_destroyed_absent()
         result = {"schema": SCHEMA, "project": self.project, "state_id": marker["state_id"], "lifecycle": "destroyed"}
         shutil.rmtree(self.state_dir)
         return result

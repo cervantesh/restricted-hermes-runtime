@@ -103,6 +103,7 @@ def main() -> None:
         state = root / f"{project}.synthetic-clinical-staging"
         backup = root / "cold-backup"
         staging = module.ClinicalStaging(ROOT, HRH_ROOT, state, project, 18473)
+        report: dict[str, object] | None = None
         try:
             staging.init()
             # A separate ordinary success proves the normal one-authorization,
@@ -228,14 +229,32 @@ def main() -> None:
             }
             if report["elapsed_seconds"] > 1200:
                 raise RuntimeError("synthetic cold recovery exceeded the 1200-second bound")
-            print(json.dumps(report, sort_keys=True))
         finally:
+            cleanup_failures: list[Exception] = []
+            teardown = module.ClinicalStaging(ROOT, HRH_ROOT, state, project, 18473)
             if state.exists():
                 try:
-                    module.ClinicalStaging(ROOT, HRH_ROOT, state, project, 18473).destroy()
-                except Exception:
-                    pass
-            shutil.rmtree(backup, ignore_errors=True)
+                    teardown.destroy()
+                except Exception as exc:
+                    cleanup_failures.append(exc)
+            try:
+                # ``destroy`` has already performed this check on its success
+                # path.  Repeat it even when destroy raised so a partial
+                # teardown cannot be mistaken for a passing composed witness.
+                teardown._assert_destroyed_absent()
+            except Exception as exc:
+                cleanup_failures.append(exc)
+            try:
+                if backup.exists():
+                    shutil.rmtree(backup)
+            except Exception as exc:
+                cleanup_failures.append(exc)
+            if cleanup_failures:
+                detail = "; ".join(str(error) for error in cleanup_failures)
+                raise RuntimeError(f"cold recovery E2E cleanup was not verified: {detail}") from cleanup_failures[0]
+        if report is None:
+            raise RuntimeError("cold recovery E2E did not produce a report")
+        print(json.dumps(report, sort_keys=True))
 
 
 if __name__ == "__main__":

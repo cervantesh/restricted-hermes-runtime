@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
+import subprocess
+import sys
 import tarfile
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1405,6 +1410,265 @@ def test_backup_interruption_never_publishes_a_complete_bundle(tmp_path: Path, m
         staging.backup(backup)
     assert not backup.exists()
     assert not list(tmp_path.glob(".interrupted-backup.partial-*"))
+
+
+def test_backup_holds_the_operator_lock_after_final_unmounted_check_until_archive_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A concurrent ``up`` cannot reopen a volume after the final cold fence."""
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / "seed").mkdir()
+    (state / "evidence").mkdir()
+    env = state / "compose.env"
+    env.write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32,
+        env_sha256=module.file_sha256(env), runtime_head="a" * 40,
+        runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA, hrh_tree=module.REQUIRED_HRH_TREE,
+        lifecycle="stopped", expected_images={"ingress": "sha256:" + "c" * 64},
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    backup_stage = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    up_stage = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    for staging in (backup_stage, up_stage):
+        monkeypatch.setattr(staging, "_require_linux", lambda: None)
+        monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
+    monkeypatch.setattr(backup_stage, "_verify_cold_quiescence", lambda _marker: None)
+    monkeypatch.setattr(
+        backup_stage, "compose", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(backup_stage, "_assert_unmounted_backup_volumes", lambda _volumes: None)
+    archive_paused = threading.Event()
+    release_archive = threading.Event()
+    last_key = module.BACKED_UP_VOLUME_KEYS[-1]
+
+    def pause_after_final_fence(key: str, *_args) -> None:
+        if key == last_key:
+            archive_paused.set()
+            assert release_archive.wait(timeout=3), "test did not release paused archive"
+            raise module.CommandError("synthetic archive interruption")
+
+    monkeypatch.setattr(backup_stage, "_backup_volume", pause_after_final_fence)
+    up_crossed = threading.Event()
+    monkeypatch.setattr(
+        up_stage,
+        "compose",
+        lambda *args, **_kwargs: (
+            up_crossed.set() if args == ("up", "--detach", *module.ONE_SHOT_SERVICES, *module.LONG_RUNNING_SERVICES) else None,
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )[1],
+    )
+    monkeypatch.setattr(up_stage, "control", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(up_stage, "status", lambda: {"lifecycle": "ready"})
+    failures: list[Exception] = []
+
+    def run_backup() -> None:
+        try:
+            backup_stage.backup(tmp_path / "serialized-backup")
+        except Exception as exc:
+            failures.append(exc)
+
+    backup_thread = threading.Thread(target=run_backup)
+    backup_thread.start()
+    assert archive_paused.wait(timeout=3)
+    up_thread = threading.Thread(target=up_stage.up)
+    up_thread.start()
+    time.sleep(0.15)
+    assert not up_crossed.is_set(), "up crossed the cold fence while backup still owned it"
+    release_archive.set()
+    backup_thread.join(timeout=3)
+    up_thread.join(timeout=3)
+    assert not backup_thread.is_alive() and not up_thread.is_alive()
+    assert len(failures) == 1 and isinstance(failures[0], module.CommandError)
+    assert up_crossed.is_set()
+
+
+@pytest.mark.parametrize("command", ("init", "restore", "destroy"))
+def test_other_lifecycle_mutators_wait_for_the_persistent_operator_lock(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Every state-mutating public command shares the same operator boundary."""
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    crossed = threading.Event()
+
+    def deny_after_lock() -> None:
+        crossed.set()
+        raise module.CommandError("stop after lock witness")
+
+    monkeypatch.setattr(staging, "_require_linux", deny_after_lock)
+    arguments = () if command != "restore" else (tmp_path / "backup", "a" * 64)
+    failures: list[Exception] = []
+    with module.persistent_operator_lock(state, project):
+        worker = threading.Thread(
+            target=lambda: _record_lifecycle_failure(failures, getattr(staging, command), *arguments),
+        )
+        worker.start()
+        time.sleep(0.15)
+        assert not crossed.is_set(), f"{command} crossed another mutator's operator lock"
+    worker.join(timeout=3)
+    assert not worker.is_alive() and crossed.is_set()
+    assert len(failures) == 1 and isinstance(failures[0], module.CommandError)
+
+
+def _record_lifecycle_failure(failures: list[Exception], callback, *args) -> None:
+    try:
+        callback(*args)
+    except Exception as exc:
+        failures.append(exc)
+
+
+def test_operator_lock_survives_exceptions_without_unlinking_its_persistent_boundary(tmp_path: Path):
+    module = load_module()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    lock_path = module.operator_lock_path(state)
+    with pytest.raises(module.CommandError, match="synthetic"):
+        with module._operator_lock(state):
+            raise module.CommandError("synthetic")
+    assert lock_path.is_file(), "release must not unlink the lock boundary"
+    with module._operator_lock(state):
+        with module._operator_lock(state):
+            assert lock_path.is_file(), "nested lifecycle calls must not deadlock"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership and no-follow semantics")
+def test_operator_lock_rejects_unsafe_persistent_lock_files(tmp_path: Path):
+    module = load_module()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    lock_path = module.operator_lock_path(state)
+    lock_path.write_text("unsafe", encoding="utf-8")
+    lock_path.chmod(0o644)
+    with pytest.raises(module.OperatorLockError, match="mode 0600"):
+        with module._operator_lock(state):
+            pass
+    lock_path.unlink()
+    target = tmp_path / "different-lock-target"
+    target.write_text("target", encoding="utf-8")
+    lock_path.symlink_to(target)
+    with pytest.raises(module.OperatorLockError, match="safely open"):
+        with module._operator_lock(state):
+            pass
+    lock_path.unlink()
+
+
+def test_operator_lock_uses_the_shared_project_namespace_not_private_state_path(tmp_path: Path):
+    module = load_module()
+    state_a = tmp_path / "a.synthetic-clinical-staging"
+    state_b = tmp_path / "b.synthetic-clinical-staging"
+    acquired = threading.Event()
+
+    def contender() -> None:
+        with module.persistent_operator_lock(state_b, "clinicalstagingdemo"):
+            acquired.set()
+
+    with module.persistent_operator_lock(state_a, "clinicalstagingdemo"):
+        worker = threading.Thread(target=contender)
+        worker.start()
+        time.sleep(0.15)
+        assert not acquired.is_set(), "separate state paths crossed one Compose project boundary"
+    worker.join(timeout=3)
+    assert not worker.is_alive() and acquired.is_set()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fcntl process serialization is POSIX-only")
+def test_operator_lock_blocks_an_independent_process_until_release(tmp_path: Path):
+    module = load_module()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    acquired = tmp_path / "child-acquired"
+    source = MODULE_PATH.parent / "clinical_operator_lock.py"
+    child = "\n".join((
+        "import importlib.util, pathlib, sys",
+        "spec = importlib.util.spec_from_file_location('operator_lock_child', sys.argv[1])",
+        "mod = importlib.util.module_from_spec(spec)",
+        "spec.loader.exec_module(mod)",
+        "with mod.persistent_operator_lock(pathlib.Path(sys.argv[2])):",
+        "    pathlib.Path(sys.argv[3]).write_text('ok')",
+    ))
+    with module._operator_lock(state):
+        process = subprocess.Popen([sys.executable, "-c", child, str(source), str(state), str(acquired)])
+        time.sleep(0.15)
+        assert not acquired.exists(), "independent process crossed the persistent operator lock"
+    assert process.wait(timeout=3) == 0
+    assert acquired.read_text(encoding="utf-8") == "ok"
+
+
+def test_destroy_fails_when_exact_project_resources_remain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    state.mkdir()
+    env = state / "compose.env"
+    env.write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32,
+        env_sha256=module.file_sha256(env), runtime_head="a" * 40,
+        runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA, hrh_tree=module.REQUIRED_HRH_TREE,
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+
+    class ResidualShell:
+        def run(self, *args, **_kwargs):
+            if args[:4] == ("docker", "container", "ls", "--all"):
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if args[:3] == ("docker", "network", "inspect"):
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            if args[:3] == ("docker", "volume", "inspect"):
+                remaining = args[3] == module.volume_names(project)["hrh_secret"]
+                return SimpleNamespace(returncode=0 if remaining else 1, stdout="", stderr="")
+            raise AssertionError(args)
+
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, shell=ResidualShell())
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_destroy_resources", lambda: None)
+    with pytest.raises(module.SafetyError, match="project volume remains.*hrh_secret"):
+        staging.destroy()
+    assert state.exists(), "failed teardown must retain state for bounded operator recovery"
+
+
+def test_destroy_propagates_teardown_failure_and_keeps_recovery_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    state.mkdir()
+    env = state / "compose.env"
+    env.write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32,
+        env_sha256=module.file_sha256(env), runtime_head="a" * 40,
+        runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA, hrh_tree=module.REQUIRED_HRH_TREE,
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(
+        staging, "_destroy_resources", lambda: (_ for _ in ()).throw(module.CommandError("docker down failed")),
+    )
+    with pytest.raises(module.CommandError, match="docker down failed"):
+        staging.destroy()
+    assert state.exists() and (state / module.MARKER_NAME).exists()
 
 
 def test_restore_post_start_failure_returns_to_non_operational_recovering_state(
