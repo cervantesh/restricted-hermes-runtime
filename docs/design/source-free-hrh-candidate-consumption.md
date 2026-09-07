@@ -8,6 +8,13 @@ mode, only the Health-Record-Hub web and migration services are source-free.
 The restricted runtime and the test controller are still built from this
 repository. The existing `source-build` mode remains the default.
 
+This mode selector belongs to the composed E2E witness. The operator-driven
+`deploy/clinical-staging/clinical_staging.py` lifecycle remains source-build:
+its marker, source-frame checks, image evidence, backup and recovery contract
+all bind an HRH checkout. Extending that durable lifecycle to published inputs
+requires an explicit persisted trust/evidence design; selecting the published
+Compose overlay alone would bypass that contract.
+
 This contract uses synthetic data only. It is not PHI authorization, HIPAA
 certification, deployment conformance, or approval for medical production.
 

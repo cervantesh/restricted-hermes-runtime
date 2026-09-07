@@ -933,6 +933,13 @@ class ClinicalStaging:
         self.port = port
         self.shell = shell or Shell()
         self.base_compose = self.runtime / "tests" / "deployment" / "clinical-composed-e2e" / "compose.yaml"
+        self.hrh_overlay = (
+            self.runtime
+            / "tests"
+            / "deployment"
+            / "clinical-composed-e2e"
+            / "compose.source-build.yaml"
+        )
         self.overlay = self.runtime / "deploy" / "clinical-staging" / "compose.yaml"
         self.harness = self.runtime / "tests" / "deployment" / "clinical-composed-e2e"
         self.env_file = self.state_dir / "compose.env"
@@ -945,6 +952,7 @@ class ClinicalStaging:
         return (
             "docker", "compose", "--env-file", str(self.env_file),
             "--project-name", self.project, "--file", str(self.base_compose),
+            "--file", str(self.hrh_overlay),
             "--file", str(self.overlay),
         )
 
