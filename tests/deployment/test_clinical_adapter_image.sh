@@ -2,6 +2,10 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+if [[ "${RESTRICTED_PUBLISHED_CANDIDATE:-}" == "1" && -z "${RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST:-}" ]]; then
+  printf '%s\n' 'published candidate requires an immutable digest' >&2
+  exit 64
+fi
 image="${RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST:-${RESTRICTED_CLINICAL_ADAPTER_IMAGE_TAG:-restricted-clinical-adapter-closure:sg-clinical-005}}"
 if [[ -n "${RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST:-}" ]]; then
   if [[ "$image" != *@sha256:* ]]; then

@@ -2,22 +2,21 @@ name: Immutable clinical-edge candidate
 
 on:
   push:
-    tags:
-      - "immutable-candidate-*"
+    tags: ["immutable-candidate-*"]
   workflow_dispatch:
 
-# This workflow has no pull_request trigger.  Publishing is restricted again at
-# job level so a copied workflow or a future trigger cannot publish from a fork.
 permissions:
   contents: read
-  packages: write
-  attestations: write
-  id-token: write
 
 jobs:
   build-publish:
     if: github.event_name != 'pull_request' && github.repository == 'cervantesh/restricted-hermes-runtime'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -71,19 +70,10 @@ jobs:
           digest = os.environ["DIGEST"]
           if not digest.startswith("sha256:"):
               raise SystemExit("build did not emit an immutable OCI digest")
-          result = {
-              "name": os.environ["SUBJECT"],
-              "image": f"{os.environ['IMAGE']}@{digest}",
-              "digest": digest,
-              "base_materials": [{
-                  "image": "docker.io/library/python",
-                  "digest": "sha256:d1053354624536b044162aaab1e418bd000ea35184fb1ae098ab3166b1072e72",
-                  "platform": "linux/amd64",
-              }],
-          }
-          directory = Path("candidate-subjects")
-          directory.mkdir()
-          (directory / f"{result['name']}.json").write_text(json.dumps(result), encoding="utf-8")
+          record = {"name": os.environ["SUBJECT"], "image": f"{os.environ['IMAGE']}@{digest}", "digest": digest,
+                    "base_materials": [{"image": "docker.io/library/python", "digest": "sha256:d1053354624536b044162aaab1e418bd000ea35184fb1ae098ab3166b1072e72", "platform": "linux/amd64"}]}
+          Path("candidate-subjects").mkdir(exist_ok=True)
+          Path(f"candidate-subjects/{record['name']}.json").write_text(json.dumps(record), encoding="utf-8")
           PY
       - name: Upload immutable subject receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.0.0
@@ -96,9 +86,18 @@ jobs:
     needs: build-publish
     if: github.event_name != 'pull_request' && github.repository == 'cervantesh/restricted-hermes-runtime'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Check out the candidate revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to GHCR for private subject consumption
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -111,59 +110,73 @@ jobs:
           path: candidate-subjects
           pattern: immutable-subject-*
           merge-multiple: true
-      - name: Pull only the published subjects and verify their role closure
-        id: role-closure
+      - name: Export immutable published subject references
         run: |
           python - <<'PY' >> "$GITHUB_ENV"
           import json
           from pathlib import Path
-          records = {p.stem: json.loads(p.read_text()) for p in Path("candidate-subjects").glob("*.json")}
-          for name in ("restricted-mattermost-ingress", "restricted-clinical-adapter"):
-              image = records[name]["image"]
-              if "@sha256:" not in image:
-                  raise SystemExit("published subject requires an immutable digest")
-              key = "RESTRICTED_MATTERMOST_IMAGE_DIGEST" if name.endswith("ingress") else "RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST"
-              print(f"{key}={image}")
+          records = {p.stem: json.loads(p.read_text()) for p in Path("candidate-subjects").glob("restricted-*.json")}
+          for name, env in (("restricted-mattermost-ingress", "RESTRICTED_MATTERMOST_IMAGE_DIGEST"), ("restricted-clinical-adapter", "RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST")):
+              image = records.get(name, {}).get("image", "")
+              if not image.startswith(f"ghcr.io/cervantesh/{name}@sha256:"):
+                  raise SystemExit(f"{name}: published subject requires an immutable expected GHCR digest")
+              print(f"{env}={image}")
+          print("RESTRICTED_PUBLISHED_CANDIDATE=1")
           PY
+      - name: Pull only the published subjects and verify their role closure
+        id: role-closure
+        run: |
+          : "${RESTRICTED_PUBLISHED_CANDIDATE:?missing published candidate mode}"
+          : "${RESTRICTED_MATTERMOST_IMAGE_DIGEST:?missing immutable Mattermost digest}"
+          : "${RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST:?missing immutable clinical digest}"
           bash tests/deployment/test_mattermost_ingress_image.sh
           bash tests/deployment/test_clinical_adapter_image.sh
+      - name: Inspect pulled subject platform and source labels
+        run: |
+          mkdir -p candidate-subjects/candidate-verification
+          python tools/inspect_published_subject.py --image "$RESTRICTED_MATTERMOST_IMAGE_DIGEST" --source-revision "$GITHUB_SHA" --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --output candidate-subjects/candidate-verification/restricted-mattermost-ingress.platform.json
+          python tools/inspect_published_subject.py --image "$RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST" --source-revision "$GITHUB_SHA" --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --output candidate-subjects/candidate-verification/restricted-clinical-adapter.platform.json
+      - name: Verify exact OCI provenance and SPDX SBOM predicates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p candidate-subjects/candidate-verification
+          for name in restricted-mattermost-ingress restricted-clinical-adapter; do
+            if [[ "$name" == "restricted-mattermost-ingress" ]]; then image="$RESTRICTED_MATTERMOST_IMAGE_DIGEST"; else image="$RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST"; fi
+            gh attestation verify "oci://$image" --repo "$GITHUB_REPOSITORY" --bundle-from-oci --source-digest "$GITHUB_SHA" --predicate-type https://slsa.dev/provenance/v1 --format=json > "candidate-subjects/candidate-verification/$name.provenance.json"
+            gh attestation verify "oci://$image" --repo "$GITHUB_REPOSITORY" --bundle-from-oci --source-digest "$GITHUB_SHA" --predicate-type https://spdx.dev/Document --format=json > "candidate-subjects/candidate-verification/$name.sbom.json"
+            python tools/verify_published_attestations.py --image "$image" --source-revision "$GITHUB_SHA" --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --provenance "candidate-subjects/candidate-verification/$name.provenance.json" --sbom "candidate-subjects/candidate-verification/$name.sbom.json" --output "candidate-subjects/candidate-verification/$name.attestations.json"
+          done
       - name: Prove the bounded clinical adapter protocol remains closed
         id: clinical-protocol
         run: python -m pytest tests/unit/test_clinical_adapter.py tests/integration/test_clinical_adapter_process.py
-      - name: Run the published ingress through Mattermost ESR conformance without rebuilding it
+      - name: Run the published ingress through Mattermost ESR without rebuilding it
         id: mattermost-esr
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
-          subjects = [json.loads(path.read_text()) for path in Path("candidate-subjects").glob("*.json")]
-          manifest = {
-              "schema_version": "restricted-runtime-immutable-candidate.v1",
-              "source_revision": "${{ github.sha }}",
-              "platform": "linux/amd64",
-              "workflow": {"repository": "cervantesh/restricted-hermes-runtime", "path": ".github/workflows/immutable-candidate.yml", "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"},
-              "subjects": subjects,
-          }
-          Path("candidate-subjects/published-subjects.json").write_text(json.dumps(manifest))
+          root = Path("candidate-subjects")
+          subjects = [json.loads(path.read_text()) for path in root.glob("restricted-*.json")]
+          manifest = {"schema_version": "restricted-runtime-immutable-candidate.v1", "source_revision": "${{ github.sha }}", "platform": "linux/amd64", "workflow": {"repository": "cervantesh/restricted-hermes-runtime", "path": ".github/workflows/immutable-candidate.yml", "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}, "subjects": subjects}
+          (root / "published-subjects.json").write_text(json.dumps(manifest))
           PY
           RESTRICTED_IMMUTABLE_CANDIDATE_MANIFEST="$PWD/candidate-subjects/published-subjects.json" python tests/deployment/test_mattermost_esr_staging.py
-      - name: Verify the published SBOM and provenance are attached to each exact subject
-        run: |
-          for image in "$RESTRICTED_MATTERMOST_IMAGE_DIGEST" "$RESTRICTED_CLINICAL_ADAPTER_IMAGE_DIGEST"; do
-            gh attestation verify "oci://$image" --repo "$GITHUB_REPOSITORY"
-          done
-      - name: Emit candidate test receipts and closed-subject manifest
+      - name: Emit candidate test receipts, nonclaims, and manifest
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
-          records = {p.stem: json.loads(p.read_text()) for p in Path("candidate-subjects").glob("restricted-*.json")}
+          root = Path("candidate-subjects")
           url = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          receipts = {name: [{"name": "published-role-and-path-closure", "outcome": "passed", "subject_digest": record["digest"], "receipt": url}] for name, record in records.items()}
-          Path("candidate-subjects/test-receipts.json").write_text(json.dumps(receipts))
+          records = {p.stem: json.loads(p.read_text()) for p in root.glob("restricted-*.json")}
+          tests = {name: [{"name": "published-role-and-path-closure", "outcome": "passed", "subject_digest": item["digest"], "receipt": url}] for name, item in records.items()}
+          (root / "test-receipts.json").write_text(json.dumps(tests))
+          evidence = {"source_revision": "${{ github.sha }}", "workflow_run_url": url, "phi_authorized": False, "deployment_conformant": False, "commands": [{"name": "published-role-closure", "outcome": "passed"}, {"name": "clinical-protocol", "outcome": "passed"}, {"name": "mattermost-esr", "outcome": "passed"}], "results": {"published_role_closure": "passed", "clinical_protocol": "passed", "mattermost_esr": "passed"}, "summary": {"passed": 3, "skipped": 0, "failed": 0}, "subject_digests": {name: item["digest"] for name, item in records.items()}}
+          (root / "candidate-evidence.json").write_text(json.dumps(evidence))
           PY
-          python tools/build_immutable_candidate_manifest.py --source-revision "$GITHUB_SHA" --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --subject-dir candidate-subjects --test-receipts candidate-subjects/test-receipts.json --output candidate-subjects/candidate.manifest.json
-          python tools/verify_immutable_candidate.py candidate-subjects/candidate.manifest.json --closed-subjects-only
+          python tools/build_immutable_candidate_manifest.py --source-revision "$GITHUB_SHA" --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --subject-dir candidate-subjects --test-receipts candidate-subjects/test-receipts.json --verification-dir candidate-subjects/candidate-verification --evidence candidate-subjects/candidate-evidence.json --output candidate-subjects/candidate.manifest.json
+          python tools/verify_immutable_candidate.py candidate-subjects/candidate.manifest.json --repo-root . --closed-subjects-only
       - name: Upload immutable candidate evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.0.0
         with:
