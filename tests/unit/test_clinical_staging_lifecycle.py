@@ -802,6 +802,35 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
         staging.status()
 
 
+def test_authenticated_ingress_wait_is_generation_bound_and_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    staging = module.ClinicalStaging(
+        runtime, hrh, tmp_path / "clinicalstagingdemo.synthetic-clinical-staging", "clinicalstagingdemo", 18443,
+    )
+    marker = "mattermost_ingress_outcome=authenticated_ready\n"
+    delayed = iter(["", marker])
+    monkeypatch.setattr(staging, "_container_inspections", lambda: {"ingress": {"State": {"Running": True}}})
+    monkeypatch.setattr(
+        staging, "compose", lambda *_args, **_kwargs: SimpleNamespace(stdout=next(delayed), returncode=0),
+    )
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    staging._wait_for_authenticated_ingress("2026-09-06T15:00:00.000000000Z")
+
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: SimpleNamespace(stdout="", returncode=0))
+    ticks = iter([0.0, 0.0, float(module.INGRESS_READY_TIMEOUT_SECONDS), float(module.INGRESS_READY_TIMEOUT_SECONDS)])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(ticks))
+    with pytest.raises(module.SafetyError, match="did not become authenticated-ready"):
+        staging._wait_for_authenticated_ingress("2026-09-06T15:00:00.000000000Z")
+
+    monkeypatch.setattr(staging, "_container_inspections", lambda: {"ingress": {"State": {"Running": False}}})
+    with pytest.raises(module.SafetyError, match="ingress exited"):
+        staging._wait_for_authenticated_ingress("2026-09-06T15:00:00.000000000Z")
+
+
 @pytest.mark.parametrize("command", ("up", "status", "refresh_policy", "stop"))
 def test_operational_commands_reject_initializing_marker_before_compose(
     command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

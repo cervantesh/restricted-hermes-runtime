@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -66,6 +67,7 @@ RECOVERY_HELPER_IMAGE = (
     "postgres:17.10-bookworm@sha256:"
     "9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f"
 )
+INGRESS_READY_TIMEOUT_SECONDS = 60
 LONG_RUNNING_SERVICES = (
     "mattermost-postgres", "mattermost", "hrh-postgres", "hrh", "hrh-tls",
     "clinical-adapter", "ingress", "operator-proxy",
@@ -1374,6 +1376,22 @@ class ClinicalStaging:
         if any(labels.get("com.docker.compose.service") == "controller" for labels in containers.values()):
             raise SafetyError("privileged provisioner must not remain after initialization")
 
+    def _wait_for_authenticated_ingress(self, started_at: str) -> None:
+        """Wait only for the current ingress generation's non-sensitive readiness marker."""
+        deadline = time.monotonic() + INGRESS_READY_TIMEOUT_SECONDS
+        while True:
+            state = self._container_inspections().get("ingress", {}).get("State", {})
+            if state.get("Running") is False or state.get("Status") in {"exited", "dead"}:
+                raise SafetyError("Mattermost ingress exited before authenticated readiness")
+            logs = self.compose(
+                "logs", "--no-color", "--since", started_at, "ingress", check=False,
+            ).stdout
+            if "mattermost_ingress_outcome=authenticated_ready" in logs:
+                return
+            if time.monotonic() >= deadline:
+                raise SafetyError("Mattermost ingress did not become authenticated-ready in time")
+            time.sleep(0.25)
+
     def status(self, *, _allow_recovering: bool = False) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
@@ -1406,16 +1424,7 @@ class ClinicalStaging:
             ingress_started_at,
         ) or ingress_started_at.startswith("0001-"):
             raise SafetyError("current Mattermost ingress start time is unavailable")
-        logs = self.compose(
-            "logs",
-            "--no-color",
-            "--since",
-            ingress_started_at,
-            "ingress",
-            check=False,
-        ).stdout
-        if "mattermost_ingress_outcome=authenticated_ready" not in logs:
-            raise SafetyError("Mattermost ingress is not authenticated-ready")
+        self._wait_for_authenticated_ingress(ingress_started_at)
         current_images = self._built_images()
         if not marker["expected_images"] or current_images != marker["expected_images"]:
             raise SafetyError("running service image identities differ from initialized receipt")
