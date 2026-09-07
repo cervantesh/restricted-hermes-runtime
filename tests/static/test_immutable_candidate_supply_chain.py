@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -145,8 +146,8 @@ def valid_manifest(repo_root: Path) -> dict[str, object]:
             "workflow_run_url": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/1",
             "phi_authorized": False,
             "deployment_conformant": False,
-            "commands": [{"name": "published-role-closure", "outcome": "passed"}],
-            "results": {"published_role_closure": "passed"},
+            "commands": [{"id": "published-role-closure", "command": "bash role-closure.sh", "outcome": "passed", "exit_code": 0}],
+            "results": {"published-role-closure": "passed"},
             "summary": {"passed": 1, "skipped": 0, "failed": 0},
             "subject_digests": {
                 "restricted-mattermost-ingress": _digest("e"),
@@ -204,6 +205,7 @@ def test_candidate_workflow_exports_published_digests_before_consuming_them_and_
     assert "GH_TOKEN: ${{ github.token }}" in consumer
     assert "--predicate-type https://slsa.dev/provenance/v1" in consumer
     assert "--predicate-type https://spdx.dev/Document" in consumer
+    assert '--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/immutable-candidate.yml"' in consumer
     assert "verify_published_attestations.py" in consumer
     assert "inspect_published_subject.py" in consumer
     builder = (ROOT / "tools" / "build_immutable_candidate_manifest.py").read_text(encoding="utf-8")
@@ -268,6 +270,14 @@ def test_candidate_verifier_accepts_matching_subjects_and_rejects_relational_fai
     wrong_claim["evidence"]["phi_authorized"] = True
     assert any("phi_authorized" in error for error in verifier.verify(wrong_claim, repo_root=tmp_path))
 
+    wrong_command = copy.deepcopy(manifest)
+    wrong_command["evidence"]["commands"][0]["exit_code"] = 1
+    assert any("exit_code=0" in error for error in verifier.verify(wrong_command, repo_root=tmp_path))
+
+    wrong_summary = copy.deepcopy(manifest)
+    wrong_summary["evidence"]["summary"]["passed"] = 2
+    assert any("summary is inconsistent" in error for error in verifier.verify(wrong_summary, repo_root=tmp_path))
+
     wrong_run = copy.deepcopy(manifest)
     wrong_run["subjects"][0]["tests"][0]["receipt"] = "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/2"
     assert any("exact subject and run" in error for error in verifier.verify(wrong_run, repo_root=tmp_path))
@@ -278,6 +288,45 @@ def test_candidate_verifier_accepts_matching_subjects_and_rejects_relational_fai
     receipt["resolved_platform"] = "linux/arm64"
     platform_path.write_text(json.dumps(receipt), encoding="utf-8")
     assert any("receipt hash does not match" in error for error in verifier.verify(wrong_receipt, repo_root=tmp_path))
+
+
+def test_actual_candidate_layout_receipts_build_and_verify_from_repo_root(tmp_path: Path):
+    repo = tmp_path / "repo"
+    candidate = repo / "candidate-subjects"
+    verification = candidate / "candidate-verification"
+    verification.mkdir(parents=True)
+    for lock in ("requirements/immutable/mattermost-ingress.txt", "requirements/immutable/clinical-adapter.txt"):
+        target = repo / lock
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((ROOT / lock).read_bytes())
+    revision = "d" * 40
+    run_url = "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/1"
+    subjects: dict[str, dict[str, str]] = {}
+    for name, marker in (("restricted-mattermost-ingress", "e"), ("restricted-clinical-adapter", "f")):
+        digest = _digest(marker)
+        image = f"ghcr.io/cervantesh/{name}@{digest}"
+        subjects[name] = {"digest": digest, "image": image}
+        (candidate / f"{name}.json").write_text(json.dumps({"name": name, "image": image, "digest": digest, "base_materials": [{"image": "docker.io/library/python", "digest": _digest("a"), "platform": "linux/amd64"}]}), encoding="utf-8")
+        provenance = [{"verificationResult": {"statement": {"predicateType": "https://slsa.dev/provenance/v1", "subject": [{"digest": {"sha256": digest.removeprefix("sha256:")}}], "predicate": {"buildDefinition": {"resolvedDependencies": [{"digest": {"gitCommit": revision}}]}}}}}]
+        sbom = [{"verificationResult": {"statement": {"predicateType": "https://spdx.dev/Document", "subject": [{"digest": {"sha256": digest.removeprefix("sha256:")}}]}}}]
+        prov_path = verification / f"{name}.provenance.json"
+        sbom_path = verification / f"{name}.sbom.json"
+        prov_path.write_text(json.dumps(provenance), encoding="utf-8")
+        sbom_path.write_text(json.dumps(sbom), encoding="utf-8")
+        generated = subprocess.run([sys.executable, str(ROOT / "tools" / "verify_published_attestations.py"), "--repo-root", str(repo), "--image", image, "--source-revision", revision, "--workflow-run-url", run_url, "--provenance", str(prov_path), "--sbom", str(sbom_path), "--output", str(verification / f"{name}.attestations.json")], capture_output=True, text=True)
+        assert generated.returncode == 0, generated.stderr
+        platform = {"schema_version": "restricted-runtime-subject-receipt.v1", "image": image, "subject_digest": digest, "source_revision": revision, "workflow_run_url": run_url, "resolved_platform": "linux/amd64", "subject_kind": "manifest", "linux_amd64_child_digest": digest, "source": "https://github.com/cervantesh/restricted-hermes-runtime", "labels": {"org.opencontainers.image.source": "https://github.com/cervantesh/restricted-hermes-runtime", "org.opencontainers.image.revision": revision}}
+        (verification / f"{name}.platform.json").write_text(json.dumps(platform), encoding="utf-8")
+    assert json.loads((verification / "restricted-mattermost-ingress.attestations.json").read_text())["provenance"]["raw_artifact"].startswith("candidate-subjects/")
+    test_receipts = {name: [{"name": "closure", "outcome": "passed", "subject_digest": item["digest"], "receipt": run_url}] for name, item in subjects.items()}
+    (candidate / "test-receipts.json").write_text(json.dumps(test_receipts), encoding="utf-8")
+    command_ids = ["mattermost-role-closure", "clinical-role-closure", "subject-platform-source-inspection", "provenance-predicate-verification", "spdx-sbom-predicate-verification", "clinical-protocol", "mattermost-esr"]
+    evidence = {"source_revision": revision, "workflow_run_url": run_url, "phi_authorized": False, "deployment_conformant": False, "commands": [{"id": identifier, "command": identifier, "outcome": "passed", "exit_code": 0} for identifier in command_ids], "results": {identifier: "passed" for identifier in command_ids}, "summary": {"passed": len(command_ids), "skipped": 0, "failed": 0}, "subject_digests": {name: item["digest"] for name, item in subjects.items()}}
+    (candidate / "candidate-evidence.json").write_text(json.dumps(evidence), encoding="utf-8")
+    built = subprocess.run([sys.executable, str(ROOT / "tools" / "build_immutable_candidate_manifest.py"), "--repo-root", str(repo), "--source-revision", revision, "--run-url", run_url, "--subject-dir", str(candidate), "--test-receipts", str(candidate / "test-receipts.json"), "--verification-dir", str(verification), "--evidence", str(candidate / "candidate-evidence.json"), "--output", str(candidate / "candidate.manifest.json")], capture_output=True, text=True)
+    assert built.returncode == 0, built.stderr
+    verified = subprocess.run([sys.executable, str(ROOT / "tools" / "verify_immutable_candidate.py"), str(candidate / "candidate.manifest.json"), "--repo-root", str(repo), "--closed-subjects-only"], capture_output=True, text=True)
+    assert verified.returncode == 0, verified.stderr
 
 
 def test_published_subject_harnesses_pull_digest_and_never_build_when_digest_is_supplied():

@@ -48,8 +48,17 @@ def _contains_revision(value: object, revision: str) -> bool:
     return False
 
 
+def _repo_relative(path: Path, repo_root: Path) -> str:
+    root = repo_root.resolve()
+    resolved = (root / path).resolve() if not path.is_absolute() else path.resolve()
+    if not resolved.is_relative_to(root):
+        raise SystemExit(f"verification artifact escapes repository root: {path}")
+    return resolved.relative_to(root).as_posix()
+
+
 def _raw_ref(path: Path, root: Path) -> dict[str, str]:
-    return {"raw_artifact": path.relative_to(root).as_posix(), "raw_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    resolved = (root.resolve() / path).resolve() if not path.is_absolute() else path.resolve()
+    return {"raw_artifact": _repo_relative(resolved, root), "raw_sha256": hashlib.sha256(resolved.read_bytes()).hexdigest()}
 
 
 def main() -> int:
@@ -60,22 +69,28 @@ def main() -> int:
     parser.add_argument("--provenance", type=Path, required=True)
     parser.add_argument("--sbom", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     args = parser.parse_args()
+    repo_root = args.repo_root.resolve()
+    provenance_path = (repo_root / args.provenance).resolve() if not args.provenance.is_absolute() else args.provenance.resolve()
+    sbom_path = (repo_root / args.sbom).resolve() if not args.sbom.is_absolute() else args.sbom.resolve()
+    output_path = (repo_root / args.output).resolve() if not args.output.is_absolute() else args.output.resolve()
+    for path in (provenance_path, sbom_path, output_path):
+        _repo_relative(path, repo_root)
     if "@" not in args.image:
         raise SystemExit("image must be digest-pinned")
     _, digest = args.image.rsplit("@", 1)
     if not DIGEST.fullmatch(digest):
         raise SystemExit("image digest is invalid")
-    if not _contains_subject(_load(args.provenance), digest, "https://slsa.dev/provenance/v1"):
+    if not _contains_subject(_load(provenance_path), digest, "https://slsa.dev/provenance/v1"):
         raise SystemExit("provenance verification does not name the exact subject")
-    if not _contains_subject(_load(args.sbom), digest, "https://spdx.dev/Document"):
+    if not _contains_subject(_load(sbom_path), digest, "https://spdx.dev/Document"):
         raise SystemExit("SPDX verification does not name the exact subject")
-    provenance = _load(args.provenance)
+    provenance = _load(provenance_path)
     if not _contains_revision(provenance, args.source_revision):
         raise SystemExit("provenance verification does not name the expected source revision")
-    root = args.output.parent.parent
-    result: dict[str, Any] = {"schema_version": "restricted-runtime-attestation-receipt.v1", "image": args.image, "digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.workflow_run_url, "provenance": {"predicate_type": "https://slsa.dev/provenance/v1", **_raw_ref(args.provenance, root)}, "sbom": {"predicate_type": "https://spdx.dev/Document", **_raw_ref(args.sbom, root)}}
-    args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    result: dict[str, Any] = {"schema_version": "restricted-runtime-attestation-receipt.v1", "image": args.image, "digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.workflow_run_url, "provenance": {"predicate_type": "https://slsa.dev/provenance/v1", **_raw_ref(provenance_path, repo_root)}, "sbom": {"predicate_type": "https://spdx.dev/Document", **_raw_ref(sbom_path, repo_root)}}
+    output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0
 
 
