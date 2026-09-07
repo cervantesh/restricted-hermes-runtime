@@ -446,7 +446,7 @@ def send_negative(label: str, mutation: str, *, actor: str = "actor", channel: s
     control("expect", label, "no-reply", timeout=45)
 
 
-def scan_logs() -> None:
+def scan_logs(canaries: dict[str, str]) -> str:
     logs = compose("logs", "--no-color", check=False).stdout
     forbidden = [
         "018f22bb-414d-7cc4-b5a4-83cc8ec92cb1", "018f22bb-414d-7cc4-b5a4-83cc8ec92cb2",
@@ -455,6 +455,8 @@ def scan_logs() -> None:
     leaked = [value for value in forbidden if value in logs]
     if leaked:
         raise RuntimeError("container logs contain synthetic clinical identifiers")
+    _assert_no_secret_canaries([logs], canaries)
+    return logs
 
 
 def main() -> None:
@@ -615,7 +617,7 @@ def main() -> None:
         **{label: int(control("post-count", label).stdout.strip()) for label in denied_labels},
     }
     phase("evidence")
-    scan_logs()
+    logs = scan_logs(_known_secret_canaries())
     evidence = {
         **SOURCE_FRAME,
         "runtime_product_sha": RUNTIME_PRODUCT_SHA,
@@ -635,13 +637,15 @@ def main() -> None:
             "after": source_after,
         },
         "post_counts": post_counts,
-        "scenarios": {"valid": "pass", "actor_cross": "deny", "channel_cross": "deny", "patient_cross": "deny", "unbound": "deny", "disabled": "deny", "missing_each_permission": "deny", "revoked_before_delivery": "zero-post", "source_deleted_before_delivery": "blocked-zero-post", "swapped_digest": "deny", "crash_retry": "stable-result", "logs": "no synthetic identifiers"},
+        "scenarios": {"valid": "pass", "actor_cross": "deny", "channel_cross": "deny", "patient_cross": "deny", "unbound": "deny", "disabled": "deny", "missing_each_permission": "deny", "revoked_before_delivery": "zero-post", "source_deleted_before_delivery": "blocked-zero-post", "swapped_digest": "deny", "crash_retry": "stable-result", "logs": "no synthetic identifiers or secret canaries"},
+        "retained_output_secret_canaries_absent": sorted(_known_secret_canaries()),
         "residual_limitations": [
             "Synthetic data and a test CA were used; this is technical conformance evidence, not a compliance certification.",
             "The run exercised Linux containers and the pinned Mattermost ESR image, not a production deployment or host-level operating-system controls.",
             "The HRH service was built from the clean head/tree source frame; no published HRH registry digest, SBOM, provenance attestation, or no-rebuild verification is claimed.",
         ],
     }
+    _assert_no_secret_canaries([logs, json.dumps(evidence, sort_keys=True)], _known_secret_canaries())
     (EVIDENCE / "report.json").write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(evidence, sort_keys=True))
     phase("cleanup")

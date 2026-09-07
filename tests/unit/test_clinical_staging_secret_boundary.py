@@ -4,6 +4,7 @@ import atexit
 import importlib.util
 import os
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -304,6 +305,122 @@ def test_next_init_invocation_resumes_finalizing_before_operational_lifecycle(
     assert resumed == ["finalizing"]
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only wrapper recovery contract")
+def test_atomic_marker_write_recovers_a_killed_legacy_temp_and_rejects_symlink(
+    tmp_path: Path,
+):
+    """A resumed finalizer recovers only a private regular SIGKILL-era temp."""
+    module = load_staging()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / "clinicalstagingsecret.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir(mode=0o700)
+    marker = state / module.MARKER_NAME
+    stale = marker.with_name(marker.name + ".tmp")
+    stale.write_text('{"incomplete": true}\n', encoding="utf-8")
+    stale.chmod(0o600)
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingsecret", 18443)
+    lifecycle = {"lifecycle": "finalizing"}
+
+    staging._finalize_initialization(lifecycle)
+    assert not stale.exists()
+    assert lifecycle["lifecycle"] == "ready"
+
+    sentinel = tmp_path / "unrelated-sentinel"
+    sentinel.write_text("must remain", encoding="ascii")
+    stale.symlink_to(sentinel)
+    with pytest.raises(module.SafetyError, match="regular file"):
+        staging._finalize_initialization({"lifecycle": "finalizing"})
+    assert sentinel.read_text(encoding="ascii") == "must remain"
+    assert stale.is_symlink()
+    stale.unlink()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only wrapper recovery contract")
+def test_next_initializer_erases_hard_killed_owned_seed_without_reusing_it(tmp_path: Path):
+    """A real child os._exit after _seed_material cannot strand a reusable seed."""
+    module = load_staging()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / "clinicalstagingsecret.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    frame = {
+        "runtime_head": "a" * 40,
+        "runtime_tree": "b" * 40,
+        "hrh_head": "c" * 40,
+        "hrh_tree": "d" * 40,
+    }
+    crash_script = """
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+script_path = Path(sys.argv[1])
+root = Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location('clinical_staging_child', script_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+runtime = root / 'runtime'
+hrh = root / 'hrh'
+state = root / 'clinicalstagingsecret.synthetic-clinical-staging'
+staging = module.ClinicalStaging(runtime, hrh, state, 'clinicalstagingsecret', 18443)
+original = staging._seed_material
+def seed_then_die(destination):
+    original(destination)
+    os._exit(71)
+staging._seed_material = seed_then_die
+staging._prepare_new_state({
+    'runtime_head': 'a' * 40,
+    'runtime_tree': 'b' * 40,
+    'hrh_head': 'c' * 40,
+    'hrh_tree': 'd' * 40,
+})
+"""
+    crashed = subprocess.run(
+        [sys.executable, "-c", crash_script, str(STAGING_PATH), str(tmp_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert crashed.returncode == 71
+    remnants = list(tmp_path.glob(f".{state.name}.init-*"))
+    assert len(remnants) == 1
+    old_password = remnants[0] / "seed" / "admin_password"
+    old_secret = old_password.read_bytes()
+
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingsecret", 18443)
+    marker = staging._prepare_new_state(frame)
+
+    assert marker["state_dir"] == str(state)
+    assert not list(tmp_path.glob(f".{state.name}.init-*"))
+    assert (state / "seed" / "admin_password").read_bytes() != old_secret
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only wrapper recovery contract")
+def test_orphan_reconciliation_refuses_symlinked_or_unowned_tree(tmp_path: Path):
+    module = load_staging()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / "clinicalstagingsecret.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    orphan = tmp_path / f".{state.name}.init-0123456789abcdef"
+    orphan.mkdir(mode=0o700)
+    sentinel = tmp_path / "unrelated-sentinel"
+    sentinel.write_text("must remain", encoding="ascii")
+    (orphan / "trap").symlink_to(sentinel)
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingsecret", 18443)
+
+    with pytest.raises(module.SafetyError, match="symlink"):
+        staging._reconcile_owned_initialization_orphans()
+    assert sentinel.read_text(encoding="ascii") == "must remain"
+    assert orphan.exists()
+
+
 def test_composed_e2e_public_failure_paths_discard_child_output(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ):
@@ -320,6 +437,22 @@ def test_composed_e2e_public_failure_paths_discard_child_output(
     public_stderr = capsys.readouterr().err
     assert public_stderr == "clinical_composed_e2e debug=crash-retry details=omitted\n"
     assert canaries not in public_stderr
+
+
+def test_composed_e2e_retained_logs_reject_every_secret_canary(monkeypatch: pytest.MonkeyPatch):
+    module = load_composed_e2e(monkeypatch)
+    canaries = {
+        "password": "PASSWORD_SECRET_CANARY_9159",
+        "api_key": "API_KEY_SECRET_CANARY_9159",
+        "key_material": "KEY_MATERIAL_SECRET_CANARY_9159",
+    }
+    monkeypatch.setattr(
+        module,
+        "compose",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=" ".join(canaries.values()), stderr=""),
+    )
+    with pytest.raises(RuntimeError, match="secret boundary witness found password canary"):
+        module.scan_logs(canaries)
 
 
 def test_linux_procfs_witness_requires_the_same_uid_provisioner_and_rejects_canaries(
