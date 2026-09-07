@@ -111,7 +111,7 @@ def request(base: str, context: ssl.SSLContext, method: str, path: str, body: An
         payload = exc.read()
         try:
             decoded = json.loads(payload)
-            code = str(decoded.get("code", "unknown"))
+            code = str(decoded.get("code", decoded.get("id", "unknown")))
             message = str(decoded.get("message", "unknown"))
         except (json.JSONDecodeError, AttributeError):
             code = "unknown"
@@ -392,6 +392,34 @@ def expect_post(label: str, *, expect_reply: bool) -> None:
         raise RuntimeError("denied clinical scenario disclosed a response")
 
 
+def delete_source(label: str) -> dict[str, Any]:
+    """Delete the real Mattermost source and prove its definitive absence."""
+    saved = json.loads((STATE / f"post-{label}.json").read_text())
+    email = "actor@clinical.invalid" if saved["actor"] == "actor" else "denied@clinical.invalid"
+    password = (SEED / ("actor_password" if saved["actor"] == "actor" else "denied_password")).read_text().strip()
+    _user, token = login(email, password)
+    source, _headers = request(MM_BASE, _mm_context(), "GET", f"/posts/{saved['root']}", token=token)
+    if not isinstance(source, dict) or source.get("id") != saved["root"]:
+        raise RuntimeError("Mattermost source was unavailable before deletion")
+    request(MM_BASE, _mm_context(), "DELETE", f"/posts/{saved['root']}", token=token)
+    outcomes: dict[str, Any] = {"delete_accepted": True}
+    bot_token = (INGRESS / "bot_token").read_text(encoding="ascii").strip()
+    for identity, current_token in (("actor", token), ("bot", bot_token)):
+        try:
+            request(MM_BASE, _mm_context(), "GET", f"/posts/{saved['root']}", token=current_token)
+        except ApiError as exc:
+            if exc.status != 404 or exc.code != "app.post.get.app_error":
+                raise RuntimeError(
+                    f"Mattermost {identity} source lookup returned unexpected "
+                    f"status={exc.status} code={exc.code}"
+                ) from None
+            outcomes[f"{identity}_get_status"] = 404
+            outcomes[f"{identity}_get_code"] = exc.code
+            continue
+        raise RuntimeError(f"Mattermost source remained readable to {identity} after deletion")
+    return outcomes
+
+
 def post_count(label: str) -> int:
     saved = json.loads((STATE / f"post-{label}.json").read_text())
     return int(saved.get("post_count", -1))
@@ -521,6 +549,17 @@ def grant_count() -> int:
         return int(cursor.fetchone()[0])
 
 
+def delivery_delay_active() -> int:
+    """Return whether the harness-only delivery reauthorization delay is active."""
+    with db() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """SELECT count(*) FROM pg_stat_activity
+               WHERE datname=current_database() AND pid<>pg_backend_pid()
+                 AND wait_event='PgSleep'"""
+        )
+        return int(cursor.fetchone()[0] > 0)
+
+
 def clinical_db_summary() -> dict[str, Any]:
     with db() as connection, connection.cursor() as cursor:
         cursor.execute("SELECT count(*) FROM restricted_hermes_clinical_read_grants WHERE response_digest IS NOT NULL")
@@ -556,6 +595,40 @@ def outbox_summary() -> dict[str, int]:
     with sqlite3.connect(OUTBOX / "mattermost-outbox.sqlite3") as connection:
         rows = connection.execute("SELECT state, COALESCE(reason,''), count(*) FROM records GROUP BY state, reason").fetchall()
     return {f"{state}:{reason}": count for state, reason, count in rows}
+
+
+def snapshot_outbox_records(record_tag: str | None = None) -> list[dict[str, Any]]:
+    """Read a coherent copy while the harness has paused the exclusive owner."""
+    source = OUTBOX / "mattermost-outbox.sqlite3"
+    snapshot = Path("/tmp/mattermost-outbox-snapshot.sqlite3")
+    for suffix in ("", "-wal", "-shm"):
+        target = Path(str(snapshot) + suffix)
+        target.unlink(missing_ok=True)
+        current = Path(str(source) + suffix)
+        if current.exists():
+            shutil.copyfile(current, target)
+    query = (
+        "SELECT record_tag, state, COALESCE(reason,''), generation, "
+        "nonce IS NULL, ciphertext IS NULL FROM records"
+    )
+    parameters: tuple[str, ...] = ()
+    if record_tag is not None:
+        query += " WHERE record_tag=?"
+        parameters = (record_tag,)
+    query += " ORDER BY created_at, record_tag"
+    with sqlite3.connect(snapshot) as connection:
+        rows = connection.execute(query, parameters).fetchall()
+    return [
+        {
+            "record_tag": row[0],
+            "state": row[1],
+            "reason": row[2],
+            "generation": row[3],
+            "nonce_erased": bool(row[4]),
+            "ciphertext_erased": bool(row[5]),
+        }
+        for row in rows
+    ]
 
 
 def main() -> None:
@@ -597,6 +670,10 @@ def main() -> None:
         mutate(sys.argv[2])
     elif command == "grant-count":
         print(grant_count())
+    elif command == "delivery-delay-active":
+        print(delivery_delay_active())
+    elif command == "delete-source":
+        print(json.dumps(delete_source(sys.argv[2]), sort_keys=True))
     elif command == "clinical-db-summary":
         print(json.dumps(clinical_db_summary(), sort_keys=True))
     elif command == "grant-evidence":
@@ -605,6 +682,8 @@ def main() -> None:
         print(post_count(sys.argv[2]))
     elif command == "outbox-summary":
         print(json.dumps(outbox_summary(), sort_keys=True))
+    elif command == "snapshot-outbox-records":
+        print(json.dumps(snapshot_outbox_records(sys.argv[2] if len(sys.argv) > 2 else None), sort_keys=True))
     else:
         raise RuntimeError("unknown clinical E2E control command")
 
