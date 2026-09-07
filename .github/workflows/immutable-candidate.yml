@@ -31,16 +31,16 @@ jobs:
       - name: Check out the candidate revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
       - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Build once and publish the immutable linux/amd64 subject
         id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -91,7 +91,7 @@ jobs:
           Path(f"candidate-subjects/{record['name']}.json").write_text(json.dumps(record), encoding="utf-8")
           PY
       - name: Upload immutable subject receipt
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: immutable-subject-${{ matrix.subject }}
           path: |
@@ -110,7 +110,7 @@ jobs:
       - name: Check out the candidate revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Log in to GHCR for private subject consumption
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -122,7 +122,7 @@ jobs:
       - name: Install bounded test dependencies
         run: python -m pip install --disable-pip-version-check -e ".[test,google]"
       - name: Download immutable subject receipts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: candidate-subjects
           pattern: immutable-subject-*
@@ -205,7 +205,7 @@ jobs:
           python tools/build_immutable_candidate_manifest.py --repo-root . --source-revision "$GITHUB_SHA" --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --subject-dir candidate-subjects --test-receipts candidate-subjects/test-receipts.json --verification-dir candidate-subjects/candidate-verification --evidence candidate-subjects/candidate-evidence.json --output candidate-subjects/candidate.manifest.json
           python tools/verify_immutable_candidate.py candidate-subjects/candidate.manifest.json --repo-root . --closed-subjects-only
       - name: Upload immutable candidate evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: immutable-candidate-evidence
           path: candidate-subjects/
