@@ -7,8 +7,10 @@ import base64
 import hashlib
 import http.client
 import ipaddress
+import io
 import json
 import os
+import posixpath
 import re
 import secrets
 import shutil
@@ -17,6 +19,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import tarfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -41,6 +44,19 @@ VOLUME_KEYS = (
     "mattermost_db", "mattermost_data", "mattermost_tls", "hrh_db",
     "hrh_tls", "hrh_secret", "clinical_config", "clinical_socket",
     "ingress_config", "ingress_outbox", "controller_state",
+)
+EXCLUDED_RECOVERY_VOLUME = "clinical_socket"
+BACKED_UP_VOLUME_KEYS = tuple(key for key in VOLUME_KEYS if key != EXCLUDED_RECOVERY_VOLUME)
+BACKUP_SCHEMA = "restricted-synthetic-clinical-cold-backup.v1"
+BACKUP_MANIFEST_NAME = "backup-manifest.json"
+BACKUP_COMPLETE_NAME = "COMPLETE"
+BACKUP_STATE_ARCHIVE = "state.tar"
+BACKUP_VOLUME_DIR = "volumes"
+# This is also the pinned PostgreSQL image used by the composed witness. It
+# supplies GNU tar inside a networkless, ephemeral helper for volume exports.
+RECOVERY_HELPER_IMAGE = (
+    "postgres:17.10-bookworm@sha256:"
+    "9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f"
 )
 LONG_RUNNING_SERVICES = (
     "mattermost-postgres", "mattermost", "hrh-postgres", "hrh", "hrh-tls",
@@ -147,6 +163,27 @@ def validate_state_path(
     return resolved
 
 
+def validate_backup_path(
+    path: Path,
+    *,
+    state_dir: Path,
+    forbidden_roots: Iterable[Path] = (),
+) -> Path:
+    """A backup is a new sibling-owned directory, never build or live state input."""
+    if not path.is_absolute():
+        raise SafetyError("backup path must be absolute")
+    resolved = path.resolve()
+    if resolved.name in {"", ".", resolved.anchor} or resolved == state_dir.resolve():
+        raise SafetyError("backup path is too broad or conflicts with staging state")
+    for root in (state_dir, *(Path(item).resolve() for item in forbidden_roots)):
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        raise SafetyError("backup path must remain outside state and repository build contexts")
+    return resolved
+
+
 def volume_names(project: str) -> dict[str, str]:
     validate_project(project)
     return {key: f"{project}_{key}" for key in VOLUME_KEYS}
@@ -232,7 +269,7 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         or value["volumes"] != volume_names(project)
         or not re.fullmatch(r"[a-f0-9]{32}", value["state_id"])
         or not re.fullmatch(r"[a-f0-9]{64}", value["compose_env_sha256"])
-        or value["lifecycle"] not in {"initializing", "ready", "stopped"}
+        or value["lifecycle"] not in {"initializing", "recovering", "ready", "stopped"}
         or not isinstance(value["expected_images"], dict)
     ):
         raise SafetyError("staging marker does not match the requested synthetic target")
@@ -244,6 +281,295 @@ def file_sha256(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError as exc:
         raise SafetyError(f"required file is unavailable: {path.name}") from exc
+
+
+def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _require_sha256(value: Any, *, name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value):
+        raise SafetyError(f"{name} must be a lowercase SHA-256")
+    return value
+
+
+def _backup_member_names() -> tuple[str, ...]:
+    return (
+        BACKUP_MANIFEST_NAME,
+        BACKUP_COMPLETE_NAME,
+        BACKUP_STATE_ARCHIVE,
+        *(f"{BACKUP_VOLUME_DIR}/{key}.tar" for key in BACKED_UP_VOLUME_KEYS),
+    )
+
+
+def _safe_archive_name(name: str) -> str:
+    """Return a normalized relative tar member name or fail before extraction."""
+    if not isinstance(name, str) or not name or "\\" in name or name.startswith("/"):
+        raise SafetyError("backup archive contains an unsafe path")
+    normalized = posixpath.normpath(name)
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if normalized in {"", "."}:
+        return ""
+    if normalized == ".." or normalized.startswith("../") or normalized.startswith("/"):
+        raise SafetyError("backup archive contains a path traversal member")
+    if any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise SafetyError("backup archive contains an unsafe path")
+    return normalized
+
+
+def inspect_safe_tar(path: Path, *, require_regular_file: bool) -> tuple[str, ...]:
+    """Validate an archive without extracting it into an operator destination."""
+    try:
+        with tarfile.open(path, "r:") as archive:
+            names: list[str] = []
+            has_regular = False
+            for member in archive.getmembers():
+                name = _safe_archive_name(member.name)
+                if not name:
+                    if member.isdir():
+                        continue
+                    raise SafetyError("backup archive has an invalid root member")
+                if not (member.isdir() or member.isreg()):
+                    raise SafetyError("backup archive contains a link or special member")
+                if name in names:
+                    raise SafetyError("backup archive contains duplicate members")
+                names.append(name)
+                has_regular = has_regular or member.isreg()
+    except (OSError, tarfile.TarError) as exc:
+        raise SafetyError("backup archive is unreadable or corrupt") from exc
+    if require_regular_file and not has_regular:
+        raise SafetyError("backup archive does not contain a regular file")
+    return tuple(sorted(names))
+
+
+def _iter_safe_tree(root: Path) -> Iterable[tuple[Path, str, os.stat_result]]:
+    """Yield a deterministic, symlink-free tree for the private state archive."""
+    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        directories.sort()
+        files.sort()
+        for name in [*directories, *files]:
+            path = current_path / name
+            info = path.lstat()
+            relative = path.relative_to(root).as_posix()
+            if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise SafetyError("state directory contains a link or special file")
+            yield path, relative, info
+
+
+def create_state_archive(state_dir: Path, archive_path: Path) -> None:
+    """Archive only regular private state files with explicit metadata."""
+    if archive_path.exists():
+        raise SafetyError("backup state archive already exists")
+    try:
+        with tarfile.open(archive_path, "x") as archive:
+            for path, relative, info in _iter_safe_tree(state_dir):
+                member = tarfile.TarInfo(relative)
+                member.mode = stat.S_IMODE(info.st_mode)
+                member.uid = info.st_uid
+                member.gid = info.st_gid
+                member.mtime = int(info.st_mtime)
+                if stat.S_ISDIR(info.st_mode):
+                    member.type = tarfile.DIRTYPE
+                    archive.addfile(member)
+                else:
+                    member.size = info.st_size
+                    with path.open("rb") as stream:
+                        archive.addfile(member, stream)
+    except OSError as exc:
+        raise SafetyError("could not write private state archive") from exc
+    inspect_safe_tar(archive_path, require_regular_file=True)
+
+
+def _manifest_members(backup_dir: Path) -> dict[str, dict[str, Any]]:
+    members: dict[str, dict[str, Any]] = {}
+    for name in _backup_member_names():
+        if name in {BACKUP_MANIFEST_NAME, BACKUP_COMPLETE_NAME}:
+            continue
+        path = backup_dir / name
+        if not path.is_file():
+            raise SafetyError(f"backup member is missing: {name}")
+        members[name] = {"sha256": file_sha256(path), "size": path.stat().st_size}
+    return members
+
+
+def build_backup_manifest(
+    marker: Mapping[str, Any], state_dir: Path, backup_dir: Path,
+) -> dict[str, Any]:
+    """Create the content-safe manifest; its SHA is recorded externally by the operator."""
+    members = _manifest_members(backup_dir)
+    return {
+        "schema": BACKUP_SCHEMA,
+        "synthetic_only": True,
+        "complete": True,
+        "project": marker["project"],
+        "state_id": marker["state_id"],
+        "state_dir": str(state_dir.resolve()),
+        "compose_env_sha256": marker["compose_env_sha256"],
+        "source": {key: marker[key] for key in ("runtime_head", "runtime_tree", "hrh_head", "hrh_tree")},
+        "expected_images": dict(marker["expected_images"]),
+        "volumes": dict(marker["volumes"]),
+        "excluded_volume": EXCLUDED_RECOVERY_VOLUME,
+        "members": members,
+    }
+
+
+def write_backup_manifest(backup_dir: Path, manifest: Mapping[str, Any]) -> None:
+    write_json_atomic(backup_dir / BACKUP_MANIFEST_NAME, manifest, mode=0o600)
+
+
+def write_backup_completion(backup_dir: Path) -> None:
+    path = backup_dir / BACKUP_COMPLETE_NAME
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(b"complete\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        fsync_directory(backup_dir)
+    except OSError as exc:
+        raise SafetyError("could not publish backup completion marker") from exc
+
+
+def _read_backup_manifest(backup_dir: Path) -> dict[str, Any]:
+    try:
+        value = json.loads((backup_dir / BACKUP_MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SafetyError("backup manifest is missing or invalid") from exc
+    if not isinstance(value, dict):
+        raise SafetyError("backup manifest must be an object")
+    return value
+
+
+def _validate_backup_manifest_shape(
+    manifest: Mapping[str, Any], *, project: str, state_dir: Path,
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema", "synthetic_only", "complete", "project", "state_id", "state_dir",
+        "compose_env_sha256", "source", "expected_images", "volumes", "excluded_volume", "members",
+    }
+    if set(manifest) != expected_keys:
+        raise SafetyError("backup manifest has unknown or missing fields")
+    if (
+        manifest["schema"] != BACKUP_SCHEMA
+        or manifest["synthetic_only"] is not True
+        or manifest["complete"] is not True
+        or manifest["project"] != project
+        or manifest["state_dir"] != str(state_dir.resolve())
+        or manifest["excluded_volume"] != EXCLUDED_RECOVERY_VOLUME
+        or not re.fullmatch(r"[a-f0-9]{32}", str(manifest["state_id"]))
+        or not isinstance(manifest["expected_images"], dict)
+        or manifest["volumes"] != volume_names(project)
+    ):
+        raise SafetyError("backup manifest does not bind the requested synthetic target")
+    _require_sha256(manifest["compose_env_sha256"], name="backup compose environment hash")
+    source = manifest["source"]
+    if not isinstance(source, dict) or set(source) != {"runtime_head", "runtime_tree", "hrh_head", "hrh_tree"}:
+        raise SafetyError("backup source frame is invalid")
+    for key, value in source.items():
+        if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{40}", value):
+            raise SafetyError(f"backup source frame has an invalid {key}")
+    if source["hrh_head"] != REQUIRED_HRH_SHA or source["hrh_tree"] != REQUIRED_HRH_TREE:
+        raise SafetyError("backup source frame does not match the required HRH source")
+    expected_members = set(_backup_member_names()) - {BACKUP_MANIFEST_NAME, BACKUP_COMPLETE_NAME}
+    members = manifest["members"]
+    if not isinstance(members, dict) or set(members) != expected_members:
+        raise SafetyError("backup manifest members are not the exact allowlist")
+    for name, value in members.items():
+        if not isinstance(value, dict) or set(value) != {"sha256", "size"}:
+            raise SafetyError(f"backup manifest member metadata is invalid: {name}")
+        _require_sha256(value["sha256"], name=f"backup member hash for {name}")
+        if not isinstance(value["size"], int) or value["size"] <= 0:
+            raise SafetyError(f"backup member size is invalid: {name}")
+    return dict(manifest)
+
+
+def _archive_member_bytes(path: Path, name: str) -> bytes:
+    try:
+        with tarfile.open(path, "r:") as archive:
+            matching = [member for member in archive.getmembers() if _safe_archive_name(member.name) == name]
+            if len(matching) != 1 or not matching[0].isreg():
+                raise SafetyError("backup state archive does not contain the required marker")
+            stream = archive.extractfile(matching[0])
+            if stream is None:
+                raise SafetyError("backup state archive member is unreadable")
+            return stream.read()
+    except (OSError, tarfile.TarError) as exc:
+        raise SafetyError("backup state archive is unreadable") from exc
+
+
+def _validate_archived_marker(state_archive: Path, *, project: str, state_dir: Path, manifest: Mapping[str, Any]) -> None:
+    inspect_safe_tar(state_archive, require_regular_file=True)
+    try:
+        marker = json.loads(_archive_member_bytes(state_archive, MARKER_NAME))
+    except json.JSONDecodeError as exc:
+        raise SafetyError("backup state marker is invalid") from exc
+    if not isinstance(marker, dict):
+        raise SafetyError("backup state marker is invalid")
+    expected_keys = {
+        "schema", "synthetic_only", "project", "state_dir", "state_id", "compose_env_sha256",
+        "lifecycle", "runtime_head", "runtime_tree", "hrh_head", "hrh_tree", "volumes", "expected_images",
+    }
+    if set(marker) != expected_keys:
+        raise SafetyError("backup state marker has unknown or missing fields")
+    if (
+        marker["schema"] != SCHEMA
+        or marker["synthetic_only"] is not True
+        or marker["project"] != project
+        or marker["state_dir"] != str(state_dir.resolve())
+        or marker["state_id"] != manifest["state_id"]
+        or marker["compose_env_sha256"] != manifest["compose_env_sha256"]
+        or marker["lifecycle"] != "stopped"
+        or marker["volumes"] != manifest["volumes"]
+        or marker["expected_images"] != manifest["expected_images"]
+    ):
+        raise SafetyError("backup state marker conflicts with the manifest")
+    for key, value in manifest["source"].items():
+        if marker[key] != value:
+            raise SafetyError("backup state marker source frame conflicts with the manifest")
+
+
+def validate_backup_bundle(
+    backup_dir: Path, expected_manifest_sha256: str, project: str, state_dir: Path,
+) -> dict[str, Any]:
+    """Validate every recovery input while the destination remains untouched."""
+    validate_project(project)
+    backup_dir = backup_dir.resolve()
+    if not backup_dir.is_dir():
+        raise SafetyError("backup directory is unavailable")
+    _require_sha256(expected_manifest_sha256, name="external manifest hash")
+    completion_path = backup_dir / BACKUP_COMPLETE_NAME
+    try:
+        completed = completion_path.read_bytes()
+    except OSError as exc:
+        raise SafetyError("backup complete marker is missing") from exc
+    if completed != b"complete\n":
+        raise SafetyError("backup complete marker is invalid")
+    entries = list(backup_dir.rglob("*"))
+    if any(item.is_symlink() for item in entries):
+        raise SafetyError("backup directory must not contain symbolic links")
+    actual_members = {item.relative_to(backup_dir).as_posix() for item in entries if item.is_file()}
+    actual_directories = {item.relative_to(backup_dir).as_posix() for item in entries if item.is_dir()}
+    expected_members = set(_backup_member_names())
+    if actual_members != expected_members:
+        raise SafetyError("backup directory has unexpected or missing members")
+    if actual_directories != {BACKUP_VOLUME_DIR}:
+        raise SafetyError("backup directory has unexpected or missing directories")
+    manifest_path = backup_dir / BACKUP_MANIFEST_NAME
+    if file_sha256(manifest_path) != expected_manifest_sha256:
+        raise SafetyError("external manifest hash does not match the backup")
+    manifest = _validate_backup_manifest_shape(
+        _read_backup_manifest(backup_dir), project=project, state_dir=state_dir,
+    )
+    for name, metadata in manifest["members"].items():
+        member_path = backup_dir / name
+        if member_path.stat().st_size != metadata["size"] or file_sha256(member_path) != metadata["sha256"]:
+            raise SafetyError(f"backup member hash or size differs: {name}")
+    _validate_archived_marker(backup_dir / BACKUP_STATE_ARCHIVE, project=project, state_dir=state_dir, manifest=manifest)
+    for key in BACKED_UP_VOLUME_KEYS:
+        inspect_safe_tar(backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar", require_regular_file=True)
+    return manifest
 
 
 def verify_effective_env(state_dir: Path, marker: Mapping[str, Any]) -> None:
@@ -294,7 +620,7 @@ def verify_destructive_volumes(
             raise SafetyError(f"volume label mismatch: {name}")
     if lifecycle in {"ready", "stopped"} and set(discovered) != expected:
         raise SafetyError("ready/stopped staging requires the exact volume set")
-    if lifecycle not in {"initializing", "ready", "stopped"}:
+    if lifecycle not in {"initializing", "recovering", "ready", "stopped"}:
         raise SafetyError("unknown lifecycle for destructive volume verification")
     return sorted(discovered)
 
@@ -333,7 +659,7 @@ def verify_destructive_resources(
             raise SafetyError("ready/stopped staging requires the exact service set")
         if set(networks) != allowed_networks:
             raise SafetyError("ready/stopped staging requires the exact network set")
-    elif lifecycle != "initializing":
+    elif lifecycle not in {"initializing", "recovering"}:
         raise SafetyError("unknown lifecycle for destructive resource verification")
     return sorted(containers), sorted(networks)
 
@@ -972,6 +1298,236 @@ class ClinicalStaging:
         write_json_atomic(self.state_dir / "evidence" / "last-transition.json", evidence, mode=0o600)
         return evidence
 
+    def _verify_cold_quiescence(self, marker: Mapping[str, Any]) -> None:
+        """A stopped marker alone is not a fence; Docker state must agree."""
+        self._require_lifecycle(marker, "backup", {"stopped"})
+        expected_volumes = set(marker["volumes"].values())
+        verify_destructive_volumes(
+            self.project, marker["state_id"], expected_volumes, self._volume_labels(), "stopped",
+        )
+        containers = self._labeled_resources("container")
+        networks = self._labeled_resources("network")
+        verify_destructive_resources(self.project, marker["state_id"], containers, networks, "stopped")
+        rows = self._containers(all_containers=True)
+        by_service = {str(row.get("Service")): row for row in rows}
+        expected_services = set(LONG_RUNNING_SERVICES) | set(ONE_SHOT_SERVICES)
+        if set(by_service) != expected_services:
+            raise SafetyError("backup quiescence does not cover the exact Compose service set")
+        running = sorted(
+            service for service in LONG_RUNNING_SERVICES
+            if str(by_service[service].get("State", "")).lower() in {"running", "restarting", "created"}
+        )
+        if running:
+            raise SafetyError("backup requires fully stopped staging services: " + ", ".join(running))
+
+    def _backup_volume(self, key: str, volume: str, backup_dir: Path) -> None:
+        if key not in BACKED_UP_VOLUME_KEYS or volume != volume_names(self.project)[key]:
+            raise SafetyError("backup volume is outside the exact allowlist")
+        archive = f"/{BACKUP_VOLUME_DIR}/{key}.tar"
+        self.shell.run(
+            "docker", "run", "--rm", "--network", "none", "--read-only",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+            "--mount", f"type=volume,src={volume},dst=/source,readonly",
+            "--mount", f"type=bind,src={backup_dir},dst=/backup",
+            RECOVERY_HELPER_IMAGE,
+            "sh", "-ec", f"tar --numeric-owner -C /source -cf {archive} .",
+            cwd=self.runtime, timeout=1200,
+        )
+        inspect_safe_tar(backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar", require_regular_file=True)
+
+    def backup(self, backup_dir: Path) -> dict[str, Any]:
+        """Create an atomically published, cold-only backup.  No overwrite exists."""
+        self._require_linux()
+        marker = self._verify_marker_and_source()
+        self._verify_cold_quiescence(marker)
+        backup_dir = validate_backup_path(
+            backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime, self.hrh),
+        )
+        if backup_dir.exists():
+            raise SafetyError("backup target must be a new directory")
+        if not backup_dir.parent.is_dir():
+            raise SafetyError("backup parent directory must already exist")
+        temporary = backup_dir.parent / f".{backup_dir.name}.partial-{secrets.token_hex(8)}"
+        try:
+            temporary.mkdir(mode=0o700)
+            (temporary / BACKUP_VOLUME_DIR).mkdir(mode=0o700)
+            create_state_archive(self.state_dir, temporary / BACKUP_STATE_ARCHIVE)
+            for key in BACKED_UP_VOLUME_KEYS:
+                self._backup_volume(key, marker["volumes"][key], temporary)
+            manifest = build_backup_manifest(marker, self.state_dir, temporary)
+            write_backup_manifest(temporary, manifest)
+            write_backup_completion(temporary)
+            fsync_directory(temporary)
+            os.replace(temporary, backup_dir)
+            fsync_directory(backup_dir.parent)
+        except Exception:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+            raise
+        manifest_sha256 = file_sha256(backup_dir / BACKUP_MANIFEST_NAME)
+        return {
+            "schema": BACKUP_SCHEMA,
+            "synthetic_only": True,
+            "project": self.project,
+            "state_id": marker["state_id"],
+            "backup_dir": str(backup_dir),
+            "manifest_sha256": manifest_sha256,
+            "excluded_volume": EXCLUDED_RECOVERY_VOLUME,
+            "lifecycle": "stopped",
+            "nonclaims": ["not a scheduled backup", "not encrypted", "not production"],
+        }
+
+    def _require_empty_restore_destination(self) -> None:
+        if self.state_dir.exists() and any(self.state_dir.iterdir()):
+            raise SafetyError("restore requires an absent or empty state destination")
+        if not self.state_dir.parent.is_dir():
+            raise SafetyError("restore state parent directory must already exist")
+        existing_labeled = self._labeled_resources("container") | self._labeled_resources("network")
+        if existing_labeled:
+            raise SafetyError("restore destination conflicts with labeled Docker resources")
+        for volume in volume_names(self.project).values():
+            if self.shell.run("docker", "volume", "inspect", volume, check=False).returncode == 0:
+                raise SafetyError(f"restore destination conflicts with existing Docker volume: {volume}")
+        for key in NETWORK_KEYS:
+            name = f"{self.project}_{key}"
+            if self.shell.run("docker", "network", "inspect", name, check=False).returncode == 0:
+                raise SafetyError(f"restore destination conflicts with existing Docker network: {name}")
+        names = self.shell.run("docker", "container", "ls", "--all", "--format", "{{.Names}}")
+        conflict_prefix = f"{self.project}-"
+        if any(line.strip().startswith(conflict_prefix) for line in names.stdout.splitlines()):
+            raise SafetyError("restore destination conflicts with a project-named Docker container")
+
+    @staticmethod
+    def _extract_safe_state_archive(archive_path: Path, destination: Path) -> None:
+        """Extract a previously validated regular-file archive without tarfile.extractall."""
+        try:
+            with tarfile.open(archive_path, "r:") as archive:
+                for member in archive.getmembers():
+                    name = _safe_archive_name(member.name)
+                    if not name:
+                        if member.isdir():
+                            continue
+                        raise SafetyError("backup state archive has an invalid root member")
+                    if not (member.isdir() or member.isreg()):
+                        raise SafetyError("backup state archive contains a non-regular member")
+                    target = destination.joinpath(*name.split("/"))
+                    try:
+                        target.resolve().relative_to(destination.resolve())
+                    except ValueError as exc:
+                        raise SafetyError("backup state archive escapes its destination") from exc
+                    if member.isdir():
+                        target.mkdir(mode=member.mode & 0o777, parents=True, exist_ok=False)
+                        continue
+                    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    stream = archive.extractfile(member)
+                    if stream is None:
+                        raise SafetyError("backup state archive member is unreadable")
+                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, member.mode & 0o777)
+                    with os.fdopen(fd, "wb") as output:
+                        shutil.copyfileobj(stream, output)
+                        output.flush()
+                        os.fsync(output.fileno())
+        except (OSError, tarfile.TarError) as exc:
+            raise SafetyError("could not safely restore private state") from exc
+
+    def _restore_volume(self, key: str, volume: str, backup_dir: Path) -> None:
+        if key not in BACKED_UP_VOLUME_KEYS or volume != volume_names(self.project)[key]:
+            raise SafetyError("restore volume is outside the exact allowlist")
+        archive = f"/{BACKUP_VOLUME_DIR}/{key}.tar"
+        self.shell.run(
+            "docker", "run", "--rm", "--network", "none", "--read-only",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+            "--mount", f"type=volume,src={volume},dst=/destination",
+            "--mount", f"type=bind,src={backup_dir},dst=/backup,readonly",
+            RECOVERY_HELPER_IMAGE,
+            "sh", "-ec", f"tar --numeric-owner -C /destination -xf {archive}",
+            cwd=self.runtime, timeout=1200,
+        )
+
+    def _start_restored_stack(self) -> None:
+        """The explicit dependency order is part of the cold-restore witness."""
+        self.compose("up", "--detach", "mattermost-postgres", "hrh-postgres", "hrh-migrate", timeout=900)
+        migrated = self.compose("wait", "hrh-migrate", check=False, timeout=900)
+        if migrated.returncode:
+            raise CommandError("restored HRH migration did not complete successfully")
+        self.compose("up", "--detach", "mattermost", "operator-proxy", timeout=600)
+        self.control("wait-mm")
+        self.compose("up", "--detach", "clinical-socket-init", "hrh", "hrh-tls", "clinical-adapter", timeout=900)
+        self.control("wait-hrh")
+        self.compose("up", "--detach", "ingress", timeout=600)
+
+    def restore(self, backup_dir: Path, expected_manifest_sha256: str) -> dict[str, Any]:
+        """Restore only a fully validated cold bundle into a clean destination."""
+        self._require_linux()
+        backup_dir = validate_backup_path(
+            backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime, self.hrh),
+        )
+        manifest = validate_backup_bundle(backup_dir, expected_manifest_sha256, self.project, self.state_dir)
+        frame = verify_source_frame(self.runtime, self.hrh, self.shell)
+        if frame != manifest["source"]:
+            raise SafetyError("current source frame differs from the validated backup source frame")
+        self._require_empty_restore_destination()
+
+        temporary = self.state_dir.parent / f".{self.state_dir.name}.recovering-{secrets.token_hex(8)}"
+        published_state = False
+        try:
+            temporary.mkdir(mode=0o700)
+            self._extract_safe_state_archive(backup_dir / BACKUP_STATE_ARCHIVE, temporary)
+            marker = _read_backup_manifest(backup_dir)  # manifest bytes were validated before mutation
+            del marker  # make accidental use of untrusted backup metadata impossible below
+            restored_marker = json.loads((temporary / MARKER_NAME).read_text(encoding="utf-8"))
+            if not isinstance(restored_marker, dict):
+                raise SafetyError("restored marker is invalid")
+            # The bundle validator bound every value below before this extraction.
+            restored_marker["lifecycle"] = "recovering"
+            write_json_atomic(temporary / MARKER_NAME, restored_marker, mode=0o600)
+            if file_sha256(temporary / "compose.env") != manifest["compose_env_sha256"]:
+                raise SafetyError("restored compose environment differs from the validated backup")
+            fsync_directory(temporary)
+            if self.state_dir.exists():
+                self.state_dir.rmdir()
+            os.replace(temporary, self.state_dir)
+            fsync_directory(self.state_dir.parent)
+            published_state = True
+
+            marker = read_marker(self.state_dir, self.project)
+            self._create_volumes(marker)
+            for key in BACKED_UP_VOLUME_KEYS:
+                self._restore_volume(key, marker["volumes"][key], backup_dir)
+            # The excluded transport socket is recreated empty by _create_volumes;
+            # clinical-socket-init rebuilds its socket during the ordered startup.
+            marker["lifecycle"] = "stopped"
+            self._write_marker(marker)
+            self._start_restored_stack()
+            marker["lifecycle"] = "ready"
+            self._write_marker(marker)
+            status = self.status()
+            receipt = {
+                "schema": BACKUP_SCHEMA,
+                "synthetic_only": True,
+                "project": self.project,
+                "state_id": marker["state_id"],
+                "manifest_sha256": expected_manifest_sha256,
+                "excluded_volume": EXCLUDED_RECOVERY_VOLUME,
+                "source": manifest["source"],
+                "status_observed_at": status["observed_at"],
+                "restored_at": datetime.now(UTC).isoformat(),
+                "nonclaims": ["not a hot restore", "not encrypted", "not production"],
+            }
+            receipt_dir = self.state_dir / "evidence" / "recovery"
+            receipt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write_json_atomic(receipt_dir / f"restore-{expected_manifest_sha256}.json", receipt, mode=0o600)
+            return receipt
+        except Exception as exc:
+            if published_state:
+                raise SafetyError(
+                    "restore failed after controlled recovery state was published; run destroy before retrying"
+                ) from exc
+            raise
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+
     def _volume_labels(self) -> dict[str, dict[str, str]]:
         names: set[str] = set(volume_names(self.project).values())
         for key, value in ((PROJECT_LABEL, self.project), ("com.docker.compose.project", self.project)):
@@ -1051,6 +1607,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         sub.add_parser(name)
     refresh = sub.add_parser("refresh-policy")
     refresh.add_argument("--epoch", required=True)
+    backup = sub.add_parser("backup")
+    backup.add_argument("--backup-dir", type=Path, required=True)
+    restore = sub.add_parser("restore")
+    restore.add_argument("--backup-dir", type=Path, required=True)
+    restore.add_argument("--expected-manifest-sha256", required=True)
     return parser.parse_args(argv)
 
 
@@ -1060,6 +1621,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     try:
         if args.command == "refresh-policy":
             result = staging.refresh_policy(args.epoch)
+        elif args.command == "backup":
+            result = staging.backup(args.backup_dir)
+        elif args.command == "restore":
+            result = staging.restore(args.backup_dir, args.expected_manifest_sha256)
         else:
             result = getattr(staging, args.command)()
     except (SafetyError, CommandError) as exc:

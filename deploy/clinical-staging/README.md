@@ -88,3 +88,46 @@ If initialization stops before `status` succeeds, do not hand-edit the marker,
 environment file or Docker labels. Diagnose the failing bounded command, then
 use `destroy` only after its label/path/project checks succeed. A failed safety
 check is intentionally not bypassable through this wrapper.
+
+## Cold backup and restore
+
+`backup` and `restore` are a deliberately bounded cold-recovery witness. This
+is not a scheduled backup: it does not provide encrypted storage, retention
+policy, support a hot restore, or make a production/PHI claim.
+
+Stop a healthy candidate first. Choose a **new, absolute** backup directory
+outside the runtime checkout, Health-Record-Hub checkout and private staging
+state. The operator must record the printed manifest SHA-256 independently of
+the backup directory; `restore` refuses a bundle without that external value.
+
+```bash
+backup=/absolute/operator-backups/clinicalstagingdemo-cold-001
+
+python "$tool" --hrh-root "$hrh" --state-dir "$state" --project "$project" stop
+python "$tool" --hrh-root "$hrh" --state-dir "$state" --project "$project" \
+  backup --backup-dir "$backup"
+# Record manifest_sha256 from the JSON result outside "$backup".
+
+python "$tool" --hrh-root "$hrh" --state-dir "$state" --project "$project" destroy
+python "$tool" --hrh-root "$hrh" --state-dir "$state" --project "$project" \
+  restore --backup-dir "$backup" --expected-manifest-sha256 '<externally-recorded-sha256>'
+```
+
+The backup contains the private state directory and ten explicitly named
+persistent volumes. `clinical_socket` is intentionally not exported; the
+restore creates it empty and `clinical-socket-init` reconstructs the transport
+socket during the ordered startup. The manifest contains names, sizes, hashes,
+source frame and image identities, but no fixture payload values. A `COMPLETE`
+marker is written and fsynced before the temporary directory is atomically
+published. A partial directory is never a restore input.
+
+Before Docker state or the destination state directory is changed, `restore`
+requires the exact member allowlist, completion marker, external manifest hash,
+safe non-link tar members, marker/source identity, every member hash and an
+empty destination with no conflicting named or labeled Docker resource. It
+then starts databases/migration, Mattermost/proxy, HRH/socket/adapter and
+ingress in that order, and runs the normal status/identity/confinement/policy
+checks before writing its content-safe receipt. If an error occurs after the
+temporary recovery state is published, it remains in a non-operational
+`recovering` lifecycle; use `destroy` before retrying instead of attempting to
+start or hand-edit it.
