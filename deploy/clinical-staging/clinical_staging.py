@@ -424,12 +424,31 @@ def verify_network_topology(
 def _tmpfs_is_confined(value: Any, *, uid: int, gid: int) -> bool:
     if not isinstance(value, str):
         return False
-    options = set(value.split(","))
-    size_values = {item for item in options if item.startswith("size=")}
-    size_is_16m = bool(size_values & {"size=16m", "size=16384k", "size=16777216"})
-    mode_is_0700 = bool(options & {"mode=0700", "mode=700"})
+    tokens = [item.strip() for item in value.split(",")]
+    if not tokens or any(not item for item in tokens):
+        return False
+    flags: set[str] = set()
+    values: dict[str, str] = {}
+    allowed_flags = {"rw", "ro", "noexec", "exec", "nosuid", "suid"}
+    allowed_values = {"size", "mode", "uid", "gid"}
+    for token in tokens:
+        if "=" in token:
+            key, item = token.split("=", 1)
+            if key not in allowed_values or not item or key in values:
+                return False
+            values[key] = item
+        else:
+            if token not in allowed_flags or token in flags:
+                return False
+            flags.add(token)
+    if {"ro", "rw"} <= flags or {"exec", "noexec"} <= flags or {"suid", "nosuid"} <= flags:
+        return False
+    size_is_16m = values.get("size") in {"16m", "16384k", "16777216"}
+    mode_is_0700 = values.get("mode") in {"0700", "700"}
     return (
-        {"rw", "noexec", "nosuid", f"uid={uid}", f"gid={gid}"} <= options
+        {"rw", "noexec", "nosuid"} <= flags
+        and values.get("uid") == str(uid)
+        and values.get("gid") == str(gid)
         and size_is_16m
         and mode_is_0700
     )
@@ -468,6 +487,7 @@ def verify_restricted_container_controls(
             config.get("User") != expected["user"]
             or host.get("ReadonlyRootfs") is not True
             or {str(value).upper() for value in (host.get("CapDrop") or [])} != {"ALL"}
+            or host.get("CapAdd") not in (None, [])
             or security != {"no-new-privileges=true"}
             or set(tmpfs) != {"/tmp"}
             or not _tmpfs_is_confined(

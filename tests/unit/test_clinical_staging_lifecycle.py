@@ -492,8 +492,11 @@ def test_restricted_container_guard_requires_exact_effective_confinement():
         ("ingress", "Config", "User", "root"),
         ("ingress", "HostConfig", "ReadonlyRootfs", False),
         ("ingress", "HostConfig", "CapDrop", []),
+        ("ingress", "HostConfig", "CapAdd", ["NET_ADMIN"]),
         ("ingress", "HostConfig", "SecurityOpt", []),
-        ("ingress", "HostConfig", "Tmpfs", {}),
+        ("ingress", "HostConfig", "Tmpfs", {
+            "/tmp": "rw,noexec,nosuid,size=16m,size=1g,mode=0700,uid=10007,gid=20005",
+        }),
     )
     for service, section, key, value in mutations:
         changed = json.loads(json.dumps(inspected))
@@ -505,6 +508,17 @@ def test_restricted_container_guard_requires_exact_effective_confinement():
     changed["clinical-adapter"]["Mounts"][2]["RW"] = True
     with pytest.raises(module.SafetyError, match="clinical-adapter"):
         module.verify_restricted_container_controls(changed)
+
+    for tmpfs in (
+        "rw,noexec,exec,nosuid,size=16m,mode=0700,uid=10007,gid=20005",
+        "rw,noexec,nosuid,suid,size=16m,mode=0700,uid=10007,gid=20005",
+        "rw,noexec,nosuid,size=16m,size=1g,mode=0700,uid=10007,gid=20005",
+        "rw,noexec,nosuid,size=16m,mode=0700,mode=0777,uid=10007,gid=20005",
+    ):
+        changed = json.loads(json.dumps(inspected))
+        changed["ingress"]["HostConfig"]["Tmpfs"] = {"/tmp": tmpfs}
+        with pytest.raises(module.SafetyError, match="ingress"):
+            module.verify_restricted_container_controls(changed)
 
 
 def test_generated_mattermost_certificate_covers_dns_and_advertised_loopback_ip(tmp_path: Path):
