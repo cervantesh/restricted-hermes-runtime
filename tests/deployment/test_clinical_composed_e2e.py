@@ -24,14 +24,15 @@ from cryptography.x509.oid import NameOID
 
 
 ROOT = Path(__file__).resolve().parents[2]
-HRH_ROOT = Path(os.environ.get("CLINICAL_E2E_HRH_ROOT", r"C:\dev\Health-Record-Hub-wt-hermes-clinical")).resolve()
+HRH_ROOT = Path(os.environ.get("CLINICAL_E2E_HRH_ROOT", r"C:\dev\Health-Record-Hub-wt-restricted-hermes-clinical-current")).resolve()
 HARNESS = ROOT / "tests" / "deployment" / "clinical-composed-e2e"
 COMPOSE_FILE = HARNESS / "compose.yaml"
 MM_IMAGE = "mattermost/mattermost-team-edition:11.7.10@sha256:84a041d836bf6fbf6a9a78ab699fa5ebe5437bfb6a514b5afad4121fa3800696"
 PG_IMAGE = "postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f"
 NGINX_IMAGE = "nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284"
 RUNTIME_PRODUCT_SHA = "8049dd7612176b33e65ef19f61f5699aef7e0a28"
-HRH_SHA = "89fea476ef95a0dfd3cd60a587ec6cb9e1d3aa1f"
+HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"
+HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"
 PROJECT = f"clinicale2e{os.getpid()}_{int(time.time())}"
 STATE = Path(tempfile.mkdtemp(prefix="clinical-composed-e2e-"))
 SEED = STATE / "seed"
@@ -125,6 +126,8 @@ def prepare() -> None:
         raise RuntimeError("HRH E2E checkout must be clean before build")
     if hrh_head != HRH_SHA:
         raise RuntimeError("HRH E2E checkout is not at the frozen SHA")
+    if hrh_tree != HRH_TREE:
+        raise RuntimeError("HRH E2E checkout tree does not match the frozen source")
     SOURCE_FRAME.update(
         runtime_head=runtime_head, runtime_tree=runtime_tree,
         hrh_head=hrh_head, hrh_tree=hrh_tree,

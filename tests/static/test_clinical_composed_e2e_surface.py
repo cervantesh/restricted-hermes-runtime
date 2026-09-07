@@ -39,6 +39,8 @@ def test_clinical_e2e_proves_clean_descendant_sources_and_exact_post_cardinality
 
     assert "merge-base" in runner and "--is-ancestor" in runner
     assert "status" in runner and "--porcelain=v1" in runner
+    assert "HRH E2E checkout must be clean before build" in runner
+    assert "HRH E2E checkout tree does not match the frozen source" in runner
     assert "runtime_head" in runner and "runtime_tree" in runner
     assert "hrh_head" in runner and "hrh_tree" in runner
     assert "built_images" in runner
@@ -53,7 +55,9 @@ def test_clinical_e2e_uses_current_hrh_build_provenance_and_atomic_policy_refres
     control = (HARNESS / "control.py").read_text(encoding="utf-8")
 
     assert "BUILD_SHA: ${CLINICAL_HRH_BUILD_SHA:?required}" in compose
-    assert 'HRH_SHA = "89fea476ef95a0dfd3cd60a587ec6cb9e1d3aa1f"' in runner
+    assert 'HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"' in runner
+    assert 'HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"' in runner
+    assert 'C:\\dev\\Health-Record-Hub-wt-restricted-hermes-clinical-current' in runner
     assert '"CLINICAL_HRH_BUILD_SHA": HRH_SHA' in runner
     assert "os.replace" in control
     assert 'command == "policy-digest"' in control
