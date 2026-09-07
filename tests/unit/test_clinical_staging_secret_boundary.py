@@ -247,45 +247,6 @@ def test_finalization_recovers_before_and_after_secret_erase(
     assert not password.exists()
     assert writes == ["ready"]
 
-
-@pytest.mark.skipif(os.name != "posix", reason="mode/ownership contract is Linux-only")
-def test_next_init_invocation_resumes_finalizing_before_operational_lifecycle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-):
-    module = load_staging()
-    runtime = tmp_path / "runtime"
-    hrh = tmp_path / "hrh"
-    state = tmp_path / "clinicalstagingsecret.synthetic-clinical-staging"
-    runtime.mkdir()
-    hrh.mkdir()
-    state.mkdir()
-    (state / module.MARKER_NAME).write_text("synthetic", encoding="ascii")
-    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingsecret", 18443)
-    marker = {"lifecycle": "finalizing"}
-    resumed: list[str] = []
-    original_stat = Path.stat
-
-    def fake_stat(path: Path, *args: object, **kwargs: object):
-        if path == state:
-            return SimpleNamespace(st_uid=os.getuid(), st_mode=stat.S_IFDIR | 0o700)
-        return original_stat(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "stat", fake_stat)
-    monkeypatch.setattr(staging, "_require_linux", lambda: None)
-    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: {})
-    monkeypatch.setattr(module, "read_marker", lambda *_args: marker)
-    monkeypatch.setattr(module, "verify_effective_env", lambda *_args: None)
-    monkeypatch.setattr(
-        staging,
-        "_finalize_initialization",
-        lambda value: (resumed.append(value["lifecycle"]), value.update(lifecycle="ready")),
-    )
-    monkeypatch.setattr(staging, "up", lambda: {"lifecycle": "ready"})
-    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: pytest.fail("finalizing resume must not reprovision"))
-
-    assert staging.init() == {"lifecycle": "ready"}
-    assert resumed == ["finalizing"]
-
     password.write_text("PASSWORD_SECRET_CANARY_9159\n", encoding="ascii")
     password.chmod(0o600)
     marker["lifecycle"] = "finalizing"
@@ -301,6 +262,46 @@ def test_next_init_invocation_resumes_finalizing_before_operational_lifecycle(
     staging._finalize_initialization(marker)
     assert marker["lifecycle"] == "ready"
     assert writes == ["ready"]
+
+
+def test_next_init_invocation_resumes_finalizing_before_operational_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_staging()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / "clinicalstagingsecret.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / module.MARKER_NAME).write_text("synthetic", encoding="ascii")
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingsecret", 18443)
+    marker = {"lifecycle": "finalizing"}
+    resumed: list[str] = []
+    original_stat = Path.stat
+    operator_uid = 1000
+
+    def fake_stat(path: Path, *args: object, **kwargs: object):
+        if path == state:
+            return SimpleNamespace(st_uid=operator_uid, st_mode=stat.S_IFDIR | 0o700)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(module.os, "getuid", lambda: operator_uid, raising=False)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: {})
+    monkeypatch.setattr(module, "read_marker", lambda *_args: marker)
+    monkeypatch.setattr(module, "verify_effective_env", lambda *_args: None)
+    monkeypatch.setattr(
+        staging,
+        "_finalize_initialization",
+        lambda value: (resumed.append(value["lifecycle"]), value.update(lifecycle="ready")),
+    )
+    monkeypatch.setattr(staging, "up", lambda: {"lifecycle": "ready"})
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: pytest.fail("finalizing resume must not reprovision"))
+
+    assert staging.init() == {"lifecycle": "ready"}
+    assert resumed == ["finalizing"]
 
 
 def test_composed_e2e_public_failure_paths_discard_child_output(
