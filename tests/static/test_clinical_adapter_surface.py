@@ -43,7 +43,10 @@ def test_adapter_has_only_two_external_hrh_routes_and_one_uds_path():
 
 def test_socket_group_contract_and_parent_initializer_are_executable():
     source = (ROOT / "src/restricted_runtime/clinical_adapter.py").read_text(encoding="utf-8")
-    initializer = (ROOT / "deploy/mattermost/clinical-socket-init.sh").read_text(encoding="utf-8")
+    initializer_path = ROOT / "deploy/mattermost/clinical-socket-init.sh"
+    initializer = initializer_path.read_text(encoding="utf-8")
     assert "CLINICAL_SOCKET_GID = 20006" in source
     assert "os.chown" in source and "st_gid" in source and "0o660" in source
     assert "10008:20006" in initializer and "-m 0770" in initializer
+    assert b"\r\n" not in initializer_path.read_bytes()
+    assert "*.sh text eol=lf" in (ROOT / ".gitattributes").read_text(encoding="utf-8")
