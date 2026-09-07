@@ -205,18 +205,37 @@ def _known_secret_canaries() -> dict[str, str]:
     }
 
 
-def _host_proc_cmdlines() -> list[str]:
+def _same_uid_host_proc_cmdlines() -> list[str]:
+    """Read only same-UID Linux-host argv surfaces for the delayed witness."""
     if not sys.platform.startswith("linux"):
         return []
     observed: list[str] = []
+    observer_uid = os.getuid()
     for entry in Path("/proc").iterdir():
         if not entry.name.isdecimal():
             continue
         try:
+            if entry.stat(follow_symlinks=False).st_uid != observer_uid:
+                continue
             observed.append((entry / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace"))
         except OSError:
             continue
     return observed
+
+
+def _require_same_uid_linux_procfs_observer(procfs: list[str]) -> bool:
+    """Require a separate same-UID Linux observer when the host supports it."""
+    if not sys.platform.startswith("linux"):
+        return False
+    if not any("create-initial-admin" in command for command in procfs):
+        raise RuntimeError("same-UID host procfs did not observe the real provisioning command")
+    return True
+
+
+def _assert_no_secret_canaries(surfaces: list[str], canaries: dict[str, str]) -> None:
+    for category, canary in canaries.items():
+        if any(canary in surface for surface in surfaces):
+            raise RuntimeError(f"secret boundary witness found {category} canary")
 
 
 def assert_initial_admin_secret_boundary() -> dict[str, object]:
@@ -247,7 +266,7 @@ def assert_initial_admin_secret_boundary() -> dict[str, object]:
             if top.returncode == 0:
                 docker_top.append(top.stdout)
                 observed_controller = observed_controller or "create-initial-admin" in top.stdout
-            procfs.extend(_host_proc_cmdlines())
+            procfs.extend(_same_uid_host_proc_cmdlines())
             time.sleep(0.1)
         stdout, stderr = process.communicate(timeout=20)
     except BaseException:
@@ -257,15 +276,14 @@ def assert_initial_admin_secret_boundary() -> dict[str, object]:
         raise
     if process.returncode != 0:
         raise RuntimeError(f"initial administrator provisioning failed: exit={process.returncode}")
+    procfs_observed = _require_same_uid_linux_procfs_observer(procfs)
     observed = [*docker_top, *procfs, stdout, stderr]
-    for category, canary in canaries.items():
-        if any(canary in surface for surface in observed):
-            raise RuntimeError(f"secret boundary witness found {category} canary")
+    _assert_no_secret_canaries(observed, canaries)
     if not observed_controller:
         raise RuntimeError("docker top did not observe the real provisioning command")
     return {
         "docker_top_observed": True,
-        "procfs_observed": bool(procfs),
+        "procfs_observed": procfs_observed,
         "canary_categories": sorted(canaries),
     }
 

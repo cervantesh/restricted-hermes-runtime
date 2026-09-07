@@ -321,6 +321,27 @@ def test_composed_e2e_public_failure_paths_discard_child_output(
     assert canaries not in public_stderr
 
 
+def test_linux_procfs_witness_requires_the_same_uid_provisioner_and_rejects_canaries(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_composed_e2e(monkeypatch)
+    monkeypatch.setattr(module.sys, "platform", "linux")
+
+    with pytest.raises(RuntimeError, match="same-UID host procfs"):
+        module._require_same_uid_linux_procfs_observer(["python unrelated.py"])
+    assert module._require_same_uid_linux_procfs_observer(
+        ["docker compose exec controller python /harness/control.py create-initial-admin"]
+    ) is True
+    with pytest.raises(RuntimeError, match="password canary"):
+        module._assert_no_secret_canaries(
+            ["docker compose PASSWORD_SECRET_CANARY_9159"],
+            {"password": "PASSWORD_SECRET_CANARY_9159"},
+        )
+
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    assert module._require_same_uid_linux_procfs_observer([]) is False
+
+
 @pytest.mark.skipif(os.name != "posix", reason="mode/ownership contract is Linux-only")
 def test_initial_admin_password_cleanup_is_strict_and_interruption_safe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
