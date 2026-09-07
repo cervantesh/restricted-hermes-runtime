@@ -78,7 +78,7 @@ def test_clinical_e2e_proves_clean_descendant_sources_and_exact_post_cardinality
     assert "HRH E2E checkout tree does not match the frozen source" in runner
     assert "runtime_head" in runner and "runtime_tree" in runner
     assert "hrh_head" in runner and "hrh_tree" in runner
-    assert "built_images" in runner
+    assert "effective_images" in runner
     assert "len(responses) != 1" in control
     assert "final-denial-sweep" in runner
     assert "post_count" in control
@@ -105,11 +105,13 @@ def test_clinical_e2e_uses_current_hrh_build_provenance_and_atomic_policy_refres
 
 
 def test_published_hrh_overlay_has_no_source_build_or_fallback_surface():
+    common = yaml.safe_load((HARNESS / "compose.yaml").read_text(encoding="utf-8"))
     published_path = HARNESS / "compose.published-hrh.yaml"
     published_text = published_path.read_text(encoding="utf-8")
     published = yaml.safe_load(published_text)
 
     assert set(published["services"]) == {"hrh", "hrh-migrate"}
+    assert {"hrh", "hrh-migrate"}.isdisjoint(common["services"])
     assert "CLINICAL_HRH_ROOT" not in published_text
     for service, variable in (("hrh", "CLINICAL_HRH_WEB_IMAGE"), ("hrh-migrate", "CLINICAL_HRH_MIGRATE_IMAGE")):
         config = published["services"][service]

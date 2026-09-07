@@ -17,6 +17,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -152,9 +153,10 @@ def validate_candidate(trust_value: object, receipt_value: object, public_key: b
     return {"trust": trust, "receipt": receipt, "subjects": by_role, "public_key_sha256": _hash(public_key)}
 
 
-def validate_docker_config(directory: Path, *, registries: set[str] | None = None) -> Path:
+def validate_docker_config(directory: Path, *, registries: set[str] | None = None) -> bytes:
+    _require(not directory.is_symlink(), "Docker config boundary must not be a symlink")
     directory = directory.resolve()
-    _require(directory.is_dir() and not directory.is_symlink(), "Docker config boundary must be a real directory")
+    _require(directory.is_dir(), "Docker config boundary must be a real directory")
     _require({path.name for path in directory.iterdir()} == {"config.json"}, "Docker config boundary must contain only config.json")
     config = directory / "config.json"
     _require(config.is_file() and not config.is_symlink(), "Docker config boundary requires a regular config.json")
@@ -163,8 +165,9 @@ def validate_docker_config(directory: Path, *, registries: set[str] | None = Non
         _require(stat.S_IMODE(directory.stat().st_mode) & 0o077 == 0, "Docker config directory must not grant group/other access")
         _require(stat.S_IMODE(config.stat().st_mode) & 0o077 == 0, "Docker config file must not grant group/other access")
     try:
-        value = json.loads(config.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        config_bytes = _read_regular_snapshot(config, "Docker config")
+        value = json.loads(config_bytes.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CandidateVerificationError("Docker config is unreadable") from exc
     root = _mapping(value, "Docker config must be an object")
     _closed(root, {"auths"}, "Docker config")
@@ -181,33 +184,60 @@ def validate_docker_config(directory: Path, *, registries: set[str] | None = Non
         _require(b":" in decoded and len(decoded) > 2, "Docker registry auth must encode username:credential")
     if registries is not None:
         _require(registries == set(auths), "Docker config registries must exactly match approved subject registries")
-    return config
+    return config_bytes
+
+
+def _materialize_docker_config(config_bytes: bytes, directory: Path) -> Path:
+    _require(not directory.exists(), "private Docker config snapshot target already exists")
+    directory.mkdir(mode=0o700, parents=False)
+    if os.name != "nt":
+        directory.chmod(0o700)
+    config = directory / "config.json"
+    with config.open("xb") as stream:
+        stream.write(config_bytes)
+    if os.name != "nt":
+        config.chmod(0o600)
+    return directory
 
 
 def sealed_docker_environment() -> dict[str, str]:
     return {name: os.environ[name] for name in SAFE_DOCKER_ENV if name in os.environ}
 
 
-def _statements(value: object) -> list[dict[str, Any]]:
-    found: list[dict[str, Any]] = []
-    if isinstance(value, str):
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise CandidateVerificationError("JSON contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _parse_cosign_envelopes(raw: str) -> list[dict[str, Any]]:
+    """Return only the once-decoded outer statement from each Cosign result."""
+    try:
+        output = json.loads(raw, object_pairs_hook=_unique_object)
+    except json.JSONDecodeError as exc:
+        raise CandidateVerificationError("Cosign verification did not return JSON") from exc
+    _require(isinstance(output, list) and output, "Cosign verification must return a non-empty result list")
+    statements: list[dict[str, Any]] = []
+    for envelope in output:
+        _require(isinstance(envelope, dict), "Cosign result envelope must be an object")
+        payload = envelope.get("payload")
+        _require(isinstance(payload, str) and payload, "Cosign result envelope requires one payload")
         try:
-            return _statements(json.loads(value))
-        except json.JSONDecodeError:
-            try:
-                decoded = base64.b64decode(value, validate=True).decode("utf-8")
-                return _statements(json.loads(decoded))
-            except (ValueError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError):
-                return []
-    if isinstance(value, list):
-        for item in value:
-            found.extend(_statements(item))
-    elif isinstance(value, dict):
-        if isinstance(value.get("predicateType"), str) and isinstance(value.get("subject"), list) and isinstance(value.get("predicate"), dict):
-            found.append(value)
-        for item in value.values():
-            found.extend(_statements(item))
-    return found
+            decoded = base64.b64decode(payload, validate=True).decode("utf-8")
+            statement = json.loads(decoded, object_pairs_hook=_unique_object)
+        except (ValueError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError) as exc:
+            raise CandidateVerificationError("Cosign result payload is not one base64 JSON statement") from exc
+        _require(isinstance(statement, dict), "Cosign payload must decode to one in-toto statement")
+        _closed(statement, {"_type", "predicateType", "subject", "predicate"}, "in-toto statement")
+        _require(statement["_type"] == "https://in-toto.io/Statement/v1", "Cosign payload has an unsupported statement type")
+        _require(isinstance(statement["predicateType"], str), "Cosign statement predicate type is invalid")
+        _require(isinstance(statement["subject"], list) and statement["subject"], "Cosign statement subjects are invalid")
+        _require(isinstance(statement["predicate"], dict), "Cosign statement predicate is invalid")
+        statements.append(statement)
+    return statements
 
 
 def _statement_matches(statement: dict[str, Any], candidate: dict[str, Any], role: str, field: str) -> bool:
@@ -242,55 +272,101 @@ def _statement_matches(statement: dict[str, Any], candidate: dict[str, Any], rol
 
 def verify_attestations(
     candidate: dict[str, Any],
-    public_key_path: Path,
+    public_key: bytes,
     docker_config: Path,
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
     """Use pinned Cosign and a mounted private Docker config; no token enters argv."""
     registries = {candidate["subjects"][role]["image"].split("/", 1)[0] for role in ("web", "migrate")}
-    validate_docker_config(docker_config, registries=registries)
-    public_key_path = public_key_path.resolve()
-    _require(public_key_path.is_file() and not public_key_path.is_symlink(), "public key must be a regular file")
-    mount_key = f"{public_key_path}:/trust/public.pem:ro"
-    mount_config = f"{docker_config.resolve()}:/home/nonroot/.docker:ro"
+    docker_config_bytes = validate_docker_config(docker_config, registries=registries)
     verified = 0
-    for role in ("web", "migrate"):
-        subject = candidate["subjects"][role]["image"]
-        for field, (_, cosign_type) in PREDICATES.items():
-            args = ["docker", "run", "--rm"]
-            if hasattr(os, "getuid"):
-                args.extend(("--user", f"{os.getuid()}:{os.getgid()}"))
-            args.extend(
-                [
-                    "--env", "DOCKER_CONFIG=/home/nonroot/.docker",
-                    "--volume", mount_config, "--volume", mount_key,
-                    COSIGN_IMAGE, "verify-attestation", "--output", "json",
-                    "--key", "/trust/public.pem", "--type", cosign_type,
-                    "--check-claims=true", subject,
-                ]
-            )
-            result = runner(args, text=True, capture_output=True, check=False, timeout=300, env=sealed_docker_environment())
-            _require(result.returncode == 0, f"{role} {field} cryptographic verification failed")
-            try:
-                output = json.loads(result.stdout)
-            except json.JSONDecodeError as exc:
-                raise CandidateVerificationError(f"{role} {field} verification did not return JSON") from exc
-            _require(any(_statement_matches(statement, candidate, role, field) for statement in _statements(output)), f"{role} {field} verified payload does not bind the exact signed candidate contract")
-            verified += 1
+    with tempfile.TemporaryDirectory(prefix="hrh-candidate-key-") as key_directory_value:
+        key_directory = Path(key_directory_value)
+        if os.name != "nt":
+            key_directory.chmod(0o700)
+        key_path = key_directory / "public.pem"
+        with key_path.open("xb") as stream:
+            stream.write(public_key)
+        if os.name != "nt":
+            key_path.chmod(0o600)
+        config_snapshot = _materialize_docker_config(
+            docker_config_bytes, key_directory / "docker"
+        )
+        mount_config = f"{config_snapshot}:/home/nonroot/.docker:ro"
+        mount_key = f"{key_path}:/trust/public.pem:ro"
+        for role in ("web", "migrate"):
+            subject = candidate["subjects"][role]["image"]
+            for field, (_, cosign_type) in PREDICATES.items():
+                args = ["docker", "run", "--rm"]
+                if hasattr(os, "getuid"):
+                    args.extend(("--user", f"{os.getuid()}:{os.getgid()}"))
+                args.extend(
+                    [
+                        "--env", "DOCKER_CONFIG=/home/nonroot/.docker",
+                        "--volume", mount_config, "--volume", mount_key,
+                        COSIGN_IMAGE, "verify-attestation", "--output", "json",
+                        "--key", "/trust/public.pem", "--type", cosign_type,
+                        "--check-claims=true", subject,
+                    ]
+                )
+                result = runner(args, text=True, capture_output=True, check=False, timeout=300, env=sealed_docker_environment())
+                _require(result.returncode == 0, f"{role} {field} cryptographic verification failed")
+                statements = _parse_cosign_envelopes(result.stdout)
+                _require(any(_statement_matches(statement, candidate, role, field) for statement in statements), f"{role} {field} verified payload does not bind the exact signed candidate contract")
+                verified += 1
     return {"verified_predicates": verified}
 
 
-def _read_json(path: Path, name: str) -> object:
+def _read_regular_snapshot(path: Path, name: str) -> bytes:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        before = path.lstat()
+        _require(stat.S_ISREG(before.st_mode), f"{name} must be a regular file")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            _require(stat.S_ISREG(opened.st_mode), f"{name} must be a regular file")
+            _require((before.st_dev, before.st_ino) == (opened.st_dev, opened.st_ino), f"{name} changed while opening")
+            return stream.read()
+    except OSError as exc:
         raise CandidateVerificationError(f"{name} is unreadable") from exc
 
 
-def verify_files(trust_path: Path, receipt_path: Path, public_key_path: Path, docker_config: Path) -> dict[str, Any]:
-    candidate = validate_candidate(_read_json(trust_path, "trust declaration"), _read_json(receipt_path, "candidate receipt"), public_key_path.read_bytes())
-    result = verify_attestations(candidate, public_key_path, docker_config)
+def _parse_snapshot(data: bytes, name: str) -> object:
+    try:
+        return json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CandidateVerificationError(f"{name} is unreadable") from exc
+
+
+def verify_files(
+    trust_path: Path,
+    receipt_path: Path,
+    public_key_path: Path,
+    docker_config: Path,
+    *,
+    docker_config_snapshot: Path | None = None,
+) -> dict[str, Any]:
+    trust_bytes = _read_regular_snapshot(trust_path, "trust declaration")
+    receipt_bytes = _read_regular_snapshot(receipt_path, "candidate receipt")
+    public_key_bytes = _read_regular_snapshot(public_key_path, "public key")
+    candidate = validate_candidate(
+        _parse_snapshot(trust_bytes, "trust declaration"),
+        _parse_snapshot(receipt_bytes, "candidate receipt"),
+        public_key_bytes,
+    )
+    registries = {
+        candidate["subjects"][role]["image"].split("/", 1)[0]
+        for role in ("web", "migrate")
+    }
+    docker_config_bytes = validate_docker_config(docker_config, registries=registries)
+    active_docker_config = docker_config
+    if docker_config_snapshot is not None:
+        active_docker_config = _materialize_docker_config(
+            docker_config_bytes, docker_config_snapshot
+        )
+    result = verify_attestations(candidate, public_key_bytes, active_docker_config)
     return {
         "schema_version": "restricted-runtime-hrh-verification.v1",
         "mode": "published",
@@ -301,8 +377,8 @@ def verify_files(trust_path: Path, receipt_path: Path, public_key_path: Path, do
         "kms_key_version": candidate["trust"]["kms_key_version"],
         "public_key_sha256": candidate["public_key_sha256"],
         "subjects": candidate["trust"]["subjects"],
-        "receipt_sha256": _hash(receipt_path.read_bytes()),
-        "trust_declaration_sha256": _hash(trust_path.read_bytes()),
+        "receipt_sha256": _hash(receipt_bytes),
+        "trust_declaration_sha256": _hash(trust_bytes),
         **result,
         "git_ancestry_recomputed": False,
         "phi_authorized": False,
@@ -316,9 +392,16 @@ def main() -> int:
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--public-key", type=Path, required=True)
     parser.add_argument("--docker-config", type=Path, required=True)
+    parser.add_argument("--docker-config-snapshot", type=Path)
     args = parser.parse_args()
     try:
-        result = verify_files(args.trust, args.receipt, args.public_key, args.docker_config)
+        result = verify_files(
+            args.trust,
+            args.receipt,
+            args.public_key,
+            args.docker_config,
+            docker_config_snapshot=args.docker_config_snapshot,
+        )
     except (CandidateVerificationError, OSError) as exc:
         print(f"HRH published candidate: DENIED: {exc}", file=sys.stderr)
         return 1

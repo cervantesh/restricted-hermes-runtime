@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import importlib.util
+import os
 import subprocess
 from pathlib import Path
 
@@ -101,7 +102,8 @@ def test_published_pull_uses_exact_subjects_and_private_config_only(monkeypatch,
     runner = load_runner()
     atexit.unregister(runner.cleanup)
     runner.HRH_MODE = "published"
-    runner.PUBLISHED_HRH_INPUTS["docker_config"] = str(tmp_path / "private-docker")
+    runner.PUBLISHED_HRH_INPUTS["docker_config"] = str(tmp_path / "caller-docker")
+    runner.ACTIVE_HRH_DOCKER_CONFIG = tmp_path / "private-docker-snapshot"
     runner.PUBLISHED_HRH_VERIFICATION = {
         "subjects": {
             "web": "registry.example/web@sha256:" + "1" * 64,
@@ -122,5 +124,52 @@ def test_published_pull_uses_exact_subjects_and_private_config_only(monkeypatch,
         runner.PUBLISHED_HRH_VERIFICATION["subjects"]["migrate"],
     ]
     assert all(call[0][:2] == ("docker", "pull") for call in calls)
-    assert all(call[1]["env"]["DOCKER_CONFIG"] == str((tmp_path / "private-docker").resolve()) for call in calls)
+    assert all(call[1]["env"]["DOCKER_CONFIG"] == str(tmp_path / "private-docker-snapshot") for call in calls)
     assert all("never-publish" not in " ".join(call[0]) for call in calls)
+
+
+def test_failed_published_migration_stops_before_web_or_clinical_startup(monkeypatch):
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+    runner.HRH_MODE = "published"
+    calls = []
+
+    def fake_compose(*args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 17 if args[0] == "wait" else 0, "", "")
+
+    monkeypatch.setattr(runner, "compose", fake_compose)
+    monkeypatch.setattr(
+        runner,
+        "published_hrh_container_evidence",
+        lambda *args, **kwargs: pytest.fail("image evidence cannot run after migration failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="hrh-migrate"):
+        runner.run_hrh_migration()
+
+    assert calls == [("up", "--detach", "hrh-migrate"), ("wait", "hrh-migrate")]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink retarget regression")
+def test_host_pull_keeps_run_owned_docker_config_after_caller_path_retargets(
+    tmp_path,
+):
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+    runner.HRH_MODE = "published"
+    original = tmp_path / "original"
+    attacker = tmp_path / "attacker"
+    snapshot = tmp_path / "run-owned-snapshot"
+    original.mkdir()
+    attacker.mkdir()
+    snapshot.mkdir()
+    caller = tmp_path / "caller"
+    caller.symlink_to(original, target_is_directory=True)
+    runner.PUBLISHED_HRH_INPUTS["docker_config"] = str(caller)
+    runner.ACTIVE_HRH_DOCKER_CONFIG = snapshot
+
+    caller.unlink()
+    caller.symlink_to(attacker, target_is_directory=True)
+
+    assert runner.registry_docker_environment()["DOCKER_CONFIG"] == str(snapshot)

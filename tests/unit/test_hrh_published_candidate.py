@@ -150,9 +150,15 @@ def test_separate_trust_declaration_and_four_signed_statements_are_required(tmp_
     trust, receipt, key = fixture(tmp_path)
     candidate = tool.validate_candidate(trust, receipt, key.read_bytes())
     calls = []
+    mounted_key_bytes = []
 
     def runner(args, **kwargs):
         calls.append((args, kwargs))
+        mount_indexes = [index for index, value in enumerate(args) if value == "--volume"]
+        key_mount = args[mount_indexes[1] + 1]
+        mounted_key_bytes.append(
+            Path(key_mount.rsplit(":/trust/public.pem:ro", 1)[0]).read_bytes()
+        )
         role = "migrate" if MIGRATE in args else "web"
         predicate = (
             "https://spdx.dev/Document/v2.3"
@@ -179,7 +185,10 @@ def test_separate_trust_declaration_and_four_signed_statements_are_required(tmp_
     )
     if os.name != "nt":
         config.chmod(0o600)
-    result = tool.verify_attestations(candidate, key, docker_config, runner=runner)
+    expected_key = key.read_bytes()
+    result = tool.verify_attestations(
+        candidate, expected_key, docker_config, runner=runner
+    )
 
     assert result["verified_predicates"] == 4
     assert len(calls) == 4
@@ -188,6 +197,7 @@ def test_separate_trust_declaration_and_four_signed_statements_are_required(tmp_
     assert encoded_credential not in rendered
     assert "--registry-token" not in rendered
     assert all(call[1].get("env") == tool.sealed_docker_environment() for call in calls)
+    assert mounted_key_bytes == [expected_key] * 4
 
 
 @pytest.mark.parametrize(
@@ -285,12 +295,89 @@ def test_valid_signature_for_wrong_purpose_or_contract_is_rejected(
                 statement["subject"][0]["digest"]["sha256"] = "9" * 64
             elif signed_mutation == "predicate":
                 statement["predicateType"] = "https://example.invalid/wrong-purpose"
-        return subprocess.CompletedProcess(args, 0, json.dumps([statement]), "")
+        payload = base64.b64encode(json.dumps(statement).encode()).decode()
+        return subprocess.CompletedProcess(args, 0, json.dumps([{"payload": payload}]), "")
 
     with pytest.raises(
         tool.CandidateVerificationError, match="signed candidate contract"
     ):
-        tool.verify_attestations(candidate, key, docker_config, runner=runner)
+        tool.verify_attestations(candidate, key.read_bytes(), docker_config, runner=runner)
+
+
+def test_forged_nested_matching_statement_cannot_replace_wrong_signed_outer_statement(
+    tmp_path,
+):
+    tool = load_tool()
+    trust, receipt, key = fixture(tmp_path)
+    candidate = tool.validate_candidate(trust, receipt, key.read_bytes())
+    docker_config = tmp_path / "docker"
+    docker_config.mkdir(mode=0o700)
+    config = docker_config / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "auths": {
+                    "us-east4-docker.pkg.dev": {
+                        "auth": base64.b64encode(b"user:placeholder").decode()
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        config.chmod(0o600)
+
+    def runner(args, **kwargs):
+        role = "migrate" if MIGRATE in args else "web"
+        predicate = (
+            "https://spdx.dev/Document/v2.3"
+            if "spdxjson" in args
+            else "https://slsa.dev/provenance/v1"
+        )
+        outer = signed_statement(receipt, role, predicate)
+        if role == "web" and predicate.endswith("provenance/v1"):
+            matching_nested = signed_statement(receipt, role, predicate)
+            outer["predicate"]["buildDefinition"]["externalParameters"]["role"] = (
+                "migrate"
+            )
+            outer["predicate"]["attacker_controlled_nested"] = matching_nested
+        payload = base64.b64encode(json.dumps(outer).encode()).decode()
+        return subprocess.CompletedProcess(
+            args, 0, json.dumps([{"payload": payload}]), ""
+        )
+
+    with pytest.raises(
+        tool.CandidateVerificationError, match="signed candidate contract"
+    ):
+        tool.verify_attestations(candidate, key.read_bytes(), docker_config, runner=runner)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "{}",
+        "[]",
+        "[{}]",
+        json.dumps([{"payload": base64.b64encode(b"[]").decode()}]),
+        json.dumps(
+            [
+                {
+                    "payload": base64.b64encode(
+                        b'{"_type":"https://in-toto.io/Statement/v1",'
+                        b'"predicateType":"x","subject":[],"predicate":{},'
+                        b'"predicate":{}}'
+                    ).decode()
+                }
+            ]
+        ),
+    ],
+)
+def test_cosign_result_rejects_ambiguous_or_malformed_envelopes(raw):
+    tool = load_tool()
+
+    with pytest.raises(tool.CandidateVerificationError):
+        tool._parse_cosign_envelopes(raw)
 
 
 def test_verification_summary_contains_identity_hashes_but_no_credentials(
@@ -323,6 +410,116 @@ def test_verification_summary_contains_identity_hashes_but_no_credentials(
     assert result["phi_authorized"] is False
     assert credential not in rendered
     assert "never-publish-this" not in rendered
+
+
+def test_input_swaps_cannot_change_validated_key_or_emitted_snapshot_hashes(
+    tmp_path, monkeypatch
+):
+    tool = load_tool()
+    trust, receipt, key = fixture(tmp_path)
+    trust_path = tmp_path / "trust.json"
+    receipt_path = tmp_path / "receipt.json"
+    trust_bytes = json.dumps(trust, sort_keys=True).encode()
+    receipt_bytes = json.dumps(receipt, sort_keys=True).encode()
+    key_bytes = key.read_bytes()
+    trust_path.write_bytes(trust_bytes)
+    receipt_path.write_bytes(receipt_bytes)
+    docker_config = tmp_path / "docker"
+    docker_config.mkdir(mode=0o700)
+    config = docker_config / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "auths": {
+                    "us-east4-docker.pkg.dev": {
+                        "auth": base64.b64encode(b"user:original").decode()
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        config.chmod(0o600)
+
+    def swap_after_snapshot(candidate, mounted_key, _docker_config):
+        assert mounted_key == key_bytes
+        trust_path.write_text("{}", encoding="utf-8")
+        receipt_path.write_text("{}", encoding="utf-8")
+        key.write_text("substituted key", encoding="utf-8")
+        return {"verified_predicates": 4}
+
+    monkeypatch.setattr(tool, "verify_attestations", swap_after_snapshot)
+    snapshot = tmp_path / "docker-snapshot"
+    result = tool.verify_files(
+        trust_path,
+        receipt_path,
+        key,
+        docker_config,
+        docker_config_snapshot=snapshot,
+    )
+
+    assert result["trust_declaration_sha256"] == hashlib.sha256(trust_bytes).hexdigest()
+    assert result["receipt_sha256"] == hashlib.sha256(receipt_bytes).hexdigest()
+    assert result["public_key_sha256"] == hashlib.sha256(key_bytes).hexdigest()
+    assert result["subjects"] == trust["subjects"]
+    assert "docker-snapshot" not in json.dumps(result)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink retarget regression")
+def test_docker_config_symlink_retarget_cannot_change_cosign_snapshot(tmp_path, monkeypatch):
+    tool = load_tool()
+    trust, receipt, key = fixture(tmp_path)
+    trust_path = tmp_path / "trust.json"
+    receipt_path = tmp_path / "receipt.json"
+    trust_path.write_text(json.dumps(trust), encoding="utf-8")
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    source = tmp_path / "docker-source"
+    source.mkdir(mode=0o700)
+    original = json.dumps(
+        {
+            "auths": {
+                "us-east4-docker.pkg.dev": {
+                    "auth": base64.b64encode(b"user:original").decode()
+                }
+            }
+        }
+    ).encode()
+    (source / "config.json").write_bytes(original)
+    (source / "config.json").chmod(0o600)
+    attacker = tmp_path / "attacker"
+    attacker.mkdir(mode=0o700)
+    (attacker / "config.json").write_text(
+        json.dumps(
+            {
+                "auths": {
+                    "us-east4-docker.pkg.dev": {
+                        "auth": base64.b64encode(b"user:attacker").decode()
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (attacker / "config.json").chmod(0o600)
+    snapshot = tmp_path / "docker-snapshot"
+
+    def retarget_then_verify(candidate, public_key, active_config):
+        (source / "config.json").unlink()
+        source.rmdir()
+        source.symlink_to(attacker, target_is_directory=True)
+        assert active_config == snapshot
+        assert (active_config / "config.json").read_bytes() == original
+        return {"verified_predicates": 4}
+
+    monkeypatch.setattr(tool, "verify_attestations", retarget_then_verify)
+    tool.verify_files(
+        trust_path,
+        receipt_path,
+        key,
+        source,
+        docker_config_snapshot=snapshot,
+    )
 
 
 def test_registry_native_retention_resolution_can_bind_the_exact_digest(tmp_path):

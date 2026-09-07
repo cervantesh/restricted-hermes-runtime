@@ -80,6 +80,7 @@ PUBLISHED_SUBJECTS = CANDIDATE_MANIFEST is not None
 CREATED = False
 SOURCE_FRAME: dict[str, str] = {}
 PUBLISHED_HRH_VERIFICATION: dict[str, object] | None = None
+ACTIVE_HRH_DOCKER_CONFIG: Path | None = None
 
 
 def selected_compose_files() -> tuple[Path, Path]:
@@ -199,7 +200,7 @@ def make_certificates() -> None:
 
 
 def prepare() -> None:
-    global PUBLISHED_HRH_VERIFICATION
+    global ACTIVE_HRH_DOCKER_CONFIG, PUBLISHED_HRH_VERIFICATION
     if HRH_MODE not in {"source-build", "published"}:
         raise RuntimeError("CLINICAL_E2E_HRH_MODE must be source-build or published")
     if HRH_MODE == "source-build" and HRH_ROOT is None:
@@ -234,6 +235,7 @@ def prepare() -> None:
             "--receipt", str(PUBLISHED_HRH_INPUTS["receipt"]),
             "--public-key", str(PUBLISHED_HRH_INPUTS["public_key"]),
             "--docker-config", str(PUBLISHED_HRH_INPUTS["docker_config"]),
+            "--docker-config-snapshot", str(STATE / "private-docker-config"),
             env={key: os.environ[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in os.environ},
             timeout=1500,
         )
@@ -241,6 +243,9 @@ def prepare() -> None:
             PUBLISHED_HRH_VERIFICATION = json.loads(verify.stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError("published HRH verification returned malformed evidence") from exc
+        ACTIVE_HRH_DOCKER_CONFIG = STATE / "private-docker-config"
+        if not (ACTIVE_HRH_DOCKER_CONFIG / "config.json").is_file():
+            raise RuntimeError("published HRH Docker config snapshot is unavailable")
         SOURCE_FRAME.update(
             hrh_clinical_contract_revision=str(PUBLISHED_HRH_VERIFICATION["clinical_contract_revision"]),
             hrh_build_source_revision=str(PUBLISHED_HRH_VERIFICATION["build_source_revision"]),
@@ -478,12 +483,12 @@ def image_evidence() -> dict[str, object]:
     return result
 
 
-def built_image_evidence() -> dict[str, object]:
+def effective_image_evidence() -> dict[str, object]:
     result: dict[str, object] = {}
     for service in ("ingress", "clinical-adapter", "hrh"):
         container = compose("ps", "--quiet", service).stdout.strip()
         if not container:
-            raise RuntimeError(f"built image container unavailable: {service}")
+            raise RuntimeError(f"effective image container unavailable: {service}")
         inspected = json.loads(run("docker", "container", "inspect", container).stdout)[0]
         image_id = inspected["Image"]
         image = json.loads(run("docker", "image", "inspect", image_id).stdout)[0]
@@ -494,14 +499,23 @@ def built_image_evidence() -> dict[str, object]:
     return result
 
 
+def run_hrh_migration() -> dict[str, object] | None:
+    """Complete the migration gate before any HRH web/clinical startup."""
+    compose("up", "--detach", "hrh-migrate", timeout=600)
+    migrated = compose("wait", "hrh-migrate", check=False, timeout=600)
+    require_success(migrated, "hrh-migrate")
+    if HRH_MODE == "published":
+        return published_hrh_container_evidence("hrh-migrate", "migrate", completed=True)
+    return None
+
+
 def registry_docker_environment() -> dict[str, str]:
     """Expose only the Docker config path, never its credential contents."""
     environment = {key: os.environ[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in os.environ}
     if HRH_MODE == "published":
-        config = PUBLISHED_HRH_INPUTS.get("docker_config")
-        if not config:
+        if ACTIVE_HRH_DOCKER_CONFIG is None:
             raise RuntimeError("published HRH Docker config is unavailable")
-        environment["DOCKER_CONFIG"] = str(Path(config).resolve())
+        environment["DOCKER_CONFIG"] = str(ACTIVE_HRH_DOCKER_CONFIG)
     return environment
 
 
@@ -631,10 +645,7 @@ def main() -> None:
     phase("databases-and-migrations")
     compose("up", "--detach", "mattermost-postgres", "hrh-postgres", timeout=600)
     wait_hrh_postgres()
-    compose("up", "--detach", "hrh-migrate", timeout=600)
-    migrated = compose("wait", "hrh-migrate", check=False, timeout=600)
-    require_success(migrated, "hrh-migrate")
-    published_migrate = published_hrh_container_evidence("hrh-migrate", "migrate", completed=True) if HRH_MODE == "published" else None
+    published_migrate = run_hrh_migration()
     phase("servers")
     compose("up", "--detach", "mattermost", timeout=300)
     control("wait-mm")
@@ -815,7 +826,7 @@ def main() -> None:
         "policy": policy_binding,
         "images": image_evidence()["images"], "boundaries": boundaries,
         "secret_boundary": secret_boundary,
-        "built_images": built_image_evidence(),
+        "effective_images": effective_image_evidence(),
         "published_hrh": {
             "verification": PUBLISHED_HRH_VERIFICATION,
             "web_container": published_web,

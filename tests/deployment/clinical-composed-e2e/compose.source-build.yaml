@@ -30,4 +30,3 @@ services:
     depends_on:
       hrh-migrate: {condition: service_completed_successfully}
     networks: [hrh_backend]
-
