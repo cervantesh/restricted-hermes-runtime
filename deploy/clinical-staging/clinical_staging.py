@@ -1492,7 +1492,7 @@ class ClinicalStaging:
         archive = f"/backup/{BACKUP_VOLUME_DIR}/{key}.tar"
         self.shell.run(
             "docker", "run", "--rm", "--network", "none", "--read-only",
-            "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--user", "0:0",
             "--entrypoint", "sh",
             "--mount", f"type=volume,src={volume},dst=/source,readonly",
             "--mount", f"type=bind,src={backup_dir},dst=/backup",
@@ -1611,7 +1611,7 @@ class ClinicalStaging:
         archive = f"/backup/{BACKUP_VOLUME_DIR}/{key}.tar"
         self.shell.run(
             "docker", "run", "--rm", "--network", "none", "--read-only",
-            "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--user", "0:0",
             "--entrypoint", "sh",
             "--mount", f"type=volume,src={volume},dst=/destination",
             "--mount", f"type=bind,src={backup_dir},dst=/backup,readonly",

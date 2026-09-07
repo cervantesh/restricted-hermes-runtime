@@ -1151,6 +1151,7 @@ def test_volume_transfer_helper_is_pinned_networkless_and_never_uses_socket(tmp_
         assert "--network" in call and call[call.index("--network") + 1] == "none"
         assert "--read-only" in call
         assert "--cap-drop" in call and call[call.index("--cap-drop") + 1] == "ALL"
+        assert "--user" in call and call[call.index("--user") + 1] == "0:0"
         assert "--entrypoint" in call and call[call.index("--entrypoint") + 1] == "sh"
         assert module.RECOVERY_HELPER_IMAGE in call
     assert shell.calls[0][-1] == "tar --numeric-owner -C /source -cf /backup/volumes/hrh_secret.tar ."
