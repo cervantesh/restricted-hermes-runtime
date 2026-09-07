@@ -49,6 +49,7 @@ CONTROL_DESTINATIONS = {
 SAFE_VERSION = re.compile(r"^[A-Za-z0-9._+-]{1,80}$")
 SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
 GIT_SHA = re.compile(r"^[a-f0-9]{40}$")
+DOCKER_RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 class ReceiptError(RuntimeError):
@@ -224,6 +225,28 @@ def _stdout(*args: str, cwd: Path | None = None, timeout: int = 20) -> str:
     if result.returncode:
         raise ReceiptError("required local command was rejected")
     return result.stdout.strip()
+
+
+def _exact_name_absent(resource: str, name: str) -> bool:
+    """Prove absence only from a successful, parseable exact-name enumeration."""
+    if not DOCKER_RESOURCE_NAME.fullmatch(name):
+        raise ReceiptError("cleanup resource name was invalid")
+    if resource == "network":
+        command = ("docker", "network", "ls", "--format", "{{.Name}}")
+    elif resource == "container":
+        command = ("docker", "container", "ls", "--all", "--format", "{{.Names}}")
+    else:
+        raise ReceiptError("cleanup resource type was invalid")
+    result = _run(*command)
+    if result.returncode != 0:
+        return False
+    output = result.stdout
+    if output == "":
+        return True
+    names = output.splitlines()
+    if not names or any(not DOCKER_RESOURCE_NAME.fullmatch(item) for item in names):
+        return False
+    return name not in names
 
 
 def _git(runtime: Path, revision: str) -> str:
@@ -594,8 +617,8 @@ def collect(*, runtime: Path, state_dir: Path, project: str, expected_head: str,
         inspected = _inspect_container(container_id)
         observations[service] = _service_observation(service, container_id, inspected, project, green[service], initialized[service])
         proof_sha256[service] = _read_red_proof(proof_paths[service], service, expected_head, expected_tree, initialized[service], endpoint_sha256, marker_sha256)
-    cleanup = {"network_absent": _run("docker", "network", "inspect", cleanup_network).returncode != 0,
-               "sink_absent": _run("docker", "container", "inspect", cleanup_sink).returncode != 0}
+    cleanup = {"network_absent": _exact_name_absent("network", cleanup_network),
+               "sink_absent": _exact_name_absent("container", cleanup_sink)}
     if cleanup != {"network_absent": True, "sink_absent": True}:
         raise ReceiptError("red cleanup was not proven")
     return build_receipt(head=expected_head, tree=expected_tree, kernel=platform.release(), architecture=platform.machine(),

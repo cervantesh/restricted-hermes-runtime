@@ -294,7 +294,9 @@ def test_final_collector_assembles_and_offline_verifies_semantic_fixture_proofs(
         "_service_observation",
         lambda service, *_args: value["services"][service],
     )
-    monkeypatch.setattr(module, "_run", lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=""))
+    # A successful, parsed empty enumeration—not a generic inspect failure—is
+    # the only allowed cleanup-absence fixture.
+    monkeypatch.setattr(module, "_run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=""))
 
     def version(*args, **_kwargs):
         return "27.5.1" if args[1:3] == ("version", "--format") else "v2.31.0"
@@ -314,6 +316,36 @@ def test_final_collector_assembles_and_offline_verifies_semantic_fixture_proofs(
     )
 
     assert module.verify_receipt(assembled, expected_head=HEAD, expected_tree=TREE, evidence_dir=evidence) == []
+
+
+@pytest.mark.parametrize(
+    "resource, returncode, output, expected",
+    [
+        ("network", 1, "", False),
+        ("network", 125, "", False),
+        ("container", 1, "permission denied\n", False),
+        ("container", 0, "owned-resource\n", False),
+        ("network", 0, "malformed/name\n", False),
+        ("container", 0, "", True),
+    ],
+)
+def test_exact_name_enumeration_never_treats_failures_or_retained_names_as_absent(
+    monkeypatch, resource, returncode, output, expected,
+):
+    module = load_module()
+    calls = []
+
+    def run(*args, **_kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=returncode, stdout=output)
+
+    monkeypatch.setattr(module, "_run", run)
+
+    assert module._exact_name_absent(resource, "owned-resource") is expected
+    expected_command = ("docker", "network", "ls", "--format", "{{.Name}}") if resource == "network" else (
+        "docker", "container", "ls", "--all", "--format", "{{.Names}}",
+    )
+    assert calls == [expected_command]
 
 
 def test_offline_verifier_rejects_arbitrary_hash_matching_proof_bytes(tmp_path):

@@ -64,26 +64,32 @@ write_diagnostic() {
     mv -f "$temporary" "$diagnostic_dir/packet.json") || rm -f "$temporary"
 }
 
+exact_name_absent() {
+  local resource="$1" name="$2" output listed
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 1
+  case "$resource" in
+    network)
+      if ! output="$(docker network ls --format '{{.Name}}' 2>/dev/null)"; then return 1; fi ;;
+    container)
+      if ! output="$(docker container ls --all --format '{{.Names}}' 2>/dev/null)"; then return 1; fi ;;
+    *) return 1 ;;
+  esac
+  [[ -z "$output" ]] && return 0
+  while IFS= read -r listed || [[ -n "$listed" ]]; do
+    [[ "$listed" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 1
+    [[ "$listed" != "$name" ]] || return 1
+  done <<< "$output"
+}
+
 cleanup() {
-  local inspect_status
   for target in "${target_ids[@]:-}"; do docker network disconnect --force "$network" "$target" >/dev/null 2>&1 || true; done
   docker container rm --force "$sink" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   if [[ -f "$state/staging-state.json" ]]; then
     "$python_bin" "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" destroy >/dev/null 2>&1 || true
   fi
-  if docker network inspect "$network" >/dev/null 2>&1; then
-    :
-  else
-    inspect_status=$?
-    if [[ "$inspect_status" == 1 ]]; then cleanup_network_absent=true; fi
-  fi
-  if docker container inspect "$sink" >/dev/null 2>&1; then
-    :
-  else
-    inspect_status=$?
-    if [[ "$inspect_status" == 1 ]]; then cleanup_sink_absent=true; fi
-  fi
+  if exact_name_absent network "$network"; then cleanup_network_absent=true; fi
+  if exact_name_absent container "$sink"; then cleanup_sink_absent=true; fi
   if [[ ! -e "$state" ]]; then cleanup_state_absent=true; fi
   if [[ "$passed" != 1 ]]; then
     rm -f "$receipt"; rm -rf "$evidence_dir"
@@ -149,7 +155,7 @@ fi
 docker container rm --force "$sink" >/dev/null
 docker network rm "$network" >/dev/null
 phase=cleanup-proof
-if docker container inspect "$sink" >/dev/null 2>&1 || docker network inspect "$network" >/dev/null 2>&1; then
+if ! exact_name_absent container "$sink" || ! exact_name_absent network "$network"; then
   echo "representative-clinical-egress: DENIED" >&2
   exit 2
 fi
