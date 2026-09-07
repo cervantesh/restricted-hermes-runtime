@@ -34,13 +34,21 @@ def load_control():
 
 def test_shell_failure_public_message_never_copies_child_output(monkeypatch: pytest.MonkeyPatch):
     module = load_staging()
-    stdout_canary = "STDOUT_SECRET_CANARY_9159"
-    stderr_canary = "STDERR_SECRET_CANARY_9159"
+    canaries = {
+        "password": "PASSWORD_SECRET_CANARY_9159",
+        "api_key": "API_KEY_SECRET_CANARY_9159",
+        "token": "TOKEN_SECRET_CANARY_9159",
+        "key_material": "KEY_MATERIAL_SECRET_CANARY_9159",
+        "stdout": "STDOUT_SECRET_CANARY_9159",
+        "stderr": "STDERR_SECRET_CANARY_9159",
+    }
     monkeypatch.setattr(
         module.subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=17, stdout=stdout_canary, stderr=stderr_canary,
+            returncode=17,
+            stdout=" ".join((canaries["password"], canaries["api_key"], canaries["stdout"])),
+            stderr=" ".join((canaries["token"], canaries["key_material"], canaries["stderr"])),
         ),
     )
 
@@ -49,8 +57,7 @@ def test_shell_failure_public_message_never_copies_child_output(monkeypatch: pyt
 
     public = str(raised.value)
     assert public == "command failed: child exit=17"
-    assert stdout_canary not in public
-    assert stderr_canary not in public
+    assert all(canary not in public for canary in canaries.values())
 
 
 def test_initial_admin_provisioner_never_passes_password_to_host_command_arguments(
