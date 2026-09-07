@@ -5,6 +5,8 @@ import importlib.util
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py"
@@ -56,6 +58,69 @@ def test_compose_ignores_inherited_clinical_variables_and_uses_generated_e30_fra
     assert args[-2:] == ("config", "--quiet")
     assert runner.HRH_SHA == E30_HRH_SHA
     assert runner.HRH_TREE == E30_HRH_TREE
-    compose = runner.COMPOSE_FILE.read_text(encoding="utf-8")
+    compose = runner.SOURCE_BUILD_COMPOSE_FILE.read_text(encoding="utf-8")
     assert "Dockerfile.web.clinical-candidate" in compose
     assert "Dockerfile.migrate.clinical-candidate" in compose
+
+
+def test_published_mode_uses_two_files_and_injects_pull_never(tmp_path, monkeypatch):
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+    runner.HRH_MODE = "published"
+    runner.ENV_FILE = tmp_path / "compose.env"
+    runner.ENV_FILE.write_text("CLINICAL_HRH_WEB_IMAGE=registry/web@sha256:" + "1" * 64 + "\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(*args: str, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(runner, "run", fake_run)
+    runner.compose("up", "--detach", "hrh")
+
+    args = captured["args"]
+    assert str(runner.COMPOSE_FILE) in args
+    assert str(runner.PUBLISHED_HRH_COMPOSE_FILE) in args
+    assert str(runner.SOURCE_BUILD_COMPOSE_FILE) not in args
+    assert args[-5:] == ("up", "--pull", "never", "--detach", "hrh")
+    assert "DOCKER_CONFIG" not in captured["env"]
+
+
+def test_published_mode_rejects_even_an_empty_hrh_root_variable(monkeypatch):
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+    runner.HRH_MODE = "published"
+    monkeypatch.setenv("CLINICAL_E2E_HRH_ROOT", "")
+
+    with pytest.raises(RuntimeError, match="forbids CLINICAL_E2E_HRH_ROOT"):
+        runner.prepare()
+
+
+def test_published_pull_uses_exact_subjects_and_private_config_only(monkeypatch, tmp_path):
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+    runner.HRH_MODE = "published"
+    runner.PUBLISHED_HRH_INPUTS["docker_config"] = str(tmp_path / "private-docker")
+    runner.PUBLISHED_HRH_VERIFICATION = {
+        "subjects": {
+            "web": "registry.example/web@sha256:" + "1" * 64,
+            "migrate": "registry.example/migrate@sha256:" + "2" * 64,
+        }
+    }
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(runner, "run", fake_run)
+    runner.pull_published_hrh_subjects()
+
+    assert [call[0][2] for call in calls] == [
+        runner.PUBLISHED_HRH_VERIFICATION["subjects"]["web"],
+        runner.PUBLISHED_HRH_VERIFICATION["subjects"]["migrate"],
+    ]
+    assert all(call[0][:2] == ("docker", "pull") for call in calls)
+    assert all(call[1]["env"]["DOCKER_CONFIG"] == str((tmp_path / "private-docker").resolve()) for call in calls)
+    assert all("never-publish" not in " ".join(call[0]) for call in calls)

@@ -25,10 +25,13 @@ from cryptography.x509.oid import NameOID
 
 
 ROOT = Path(__file__).resolve().parents[2]
+HRH_MODE = os.environ.get("CLINICAL_E2E_HRH_MODE", "source-build")
 HRH_ROOT_VALUE = os.environ.get("CLINICAL_E2E_HRH_ROOT")
 HRH_ROOT = Path(HRH_ROOT_VALUE).resolve() if HRH_ROOT_VALUE else None
 HARNESS = ROOT / "tests" / "deployment" / "clinical-composed-e2e"
 COMPOSE_FILE = HARNESS / "compose.yaml"
+SOURCE_BUILD_COMPOSE_FILE = HARNESS / "compose.source-build.yaml"
+PUBLISHED_HRH_COMPOSE_FILE = HARNESS / "compose.published-hrh.yaml"
 MM_IMAGE = "mattermost/mattermost-team-edition:11.7.10@sha256:84a041d836bf6fbf6a9a78ab699fa5ebe5437bfb6a514b5afad4121fa3800696"
 PG_IMAGE = "postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f"
 NGINX_IMAGE = "nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284"
@@ -37,8 +40,9 @@ HRH_SHA = "e30a4f968de6727519f49c08369f561fdf269ec5"
 HRH_TREE = "7fb2543a2ceb1649f05c467b38708d1404106659"
 COMPOSE_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 SAFE_COMPOSE_PROCESS_ENV = (
-    "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG",
+    "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT",
     "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
 )
 PROJECT = f"clinicale2e{os.getpid()}_{int(time.time())}"
 STATE = Path(tempfile.mkdtemp(prefix="clinical-composed-e2e-"))
@@ -46,6 +50,12 @@ SEED = STATE / "seed"
 EVIDENCE = STATE / "evidence"
 ENV_FILE = STATE / "compose.env"
 CANDIDATE_MANIFEST = os.environ.get("RESTRICTED_IMMUTABLE_CANDIDATE_MANIFEST")
+PUBLISHED_HRH_INPUTS = {
+    "trust": os.environ.get("CLINICAL_E2E_HRH_TRUST_DECLARATION"),
+    "receipt": os.environ.get("CLINICAL_E2E_HRH_RECEIPT"),
+    "public_key": os.environ.get("CLINICAL_E2E_HRH_PUBLIC_KEY"),
+    "docker_config": os.environ.get("CLINICAL_E2E_HRH_DOCKER_CONFIG"),
+}
 
 
 def candidate_subject_image(name: str) -> str | None:
@@ -69,6 +79,15 @@ ADAPTER_IMAGE = candidate_subject_image("restricted-clinical-adapter") or f"rest
 PUBLISHED_SUBJECTS = CANDIDATE_MANIFEST is not None
 CREATED = False
 SOURCE_FRAME: dict[str, str] = {}
+PUBLISHED_HRH_VERIFICATION: dict[str, object] | None = None
+
+
+def selected_compose_files() -> tuple[Path, Path]:
+    if HRH_MODE == "source-build":
+        return COMPOSE_FILE, SOURCE_BUILD_COMPOSE_FILE
+    if HRH_MODE == "published":
+        return COMPOSE_FILE, PUBLISHED_HRH_COMPOSE_FILE
+    raise RuntimeError("CLINICAL_E2E_HRH_MODE must be source-build or published")
 
 
 def run(
@@ -112,9 +131,15 @@ def sealed_compose_environment() -> dict[str, str]:
 
 
 def compose(*args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+    compose_files: list[str] = []
+    for path in selected_compose_files():
+        compose_files.extend(("--file", str(path)))
+    compose_args = list(args)
+    if HRH_MODE == "published" and compose_args and compose_args[0] == "up":
+        compose_args[1:1] = ["--pull", "never"]
     return run(
         "docker", "compose", "--env-file", str(ENV_FILE), "--project-name", PROJECT,
-        "--file", str(COMPOSE_FILE), *args, env=sealed_compose_environment(),
+        *compose_files, *compose_args, env=sealed_compose_environment(),
         check=check, timeout=timeout,
     )
 
@@ -174,26 +199,52 @@ def make_certificates() -> None:
 
 
 def prepare() -> None:
-    if HRH_ROOT is None:
+    global PUBLISHED_HRH_VERIFICATION
+    if HRH_MODE not in {"source-build", "published"}:
+        raise RuntimeError("CLINICAL_E2E_HRH_MODE must be source-build or published")
+    if HRH_MODE == "source-build" and HRH_ROOT is None:
         raise RuntimeError("CLINICAL_E2E_HRH_ROOT must name a clean HRH checkout")
+    if HRH_MODE == "published" and "CLINICAL_E2E_HRH_ROOT" in os.environ:
+        raise RuntimeError("published HRH mode forbids CLINICAL_E2E_HRH_ROOT")
     runtime_head = run("git", "rev-parse", "HEAD").stdout.strip()
     runtime_tree = run("git", "rev-parse", "HEAD^{tree}").stdout.strip()
-    hrh_head = run("git", "-C", str(HRH_ROOT), "rev-parse", "HEAD").stdout.strip()
-    hrh_tree = run("git", "-C", str(HRH_ROOT), "rev-parse", "HEAD^{tree}").stdout.strip()
     if run("git", "merge-base", "--is-ancestor", RUNTIME_PRODUCT_SHA, runtime_head, check=False).returncode:
         raise RuntimeError("runtime E2E checkout does not descend from the frozen product commit")
     if run("git", "status", "--porcelain=v1").stdout:
         raise RuntimeError("runtime E2E checkout must be clean before build")
-    if run("git", "-C", str(HRH_ROOT), "status", "--porcelain=v1").stdout:
-        raise RuntimeError("HRH E2E checkout must be clean before build")
-    if hrh_head != HRH_SHA:
-        raise RuntimeError("HRH E2E checkout is not at the frozen SHA")
-    if hrh_tree != HRH_TREE:
-        raise RuntimeError("HRH E2E checkout tree does not match the frozen source")
-    SOURCE_FRAME.update(
-        runtime_head=runtime_head, runtime_tree=runtime_tree,
-        hrh_head=hrh_head, hrh_tree=hrh_tree,
-    )
+    SOURCE_FRAME.update(runtime_head=runtime_head, runtime_tree=runtime_tree, hrh_mode=HRH_MODE)
+    if HRH_MODE == "source-build":
+        assert HRH_ROOT is not None
+        hrh_head = run("git", "-C", str(HRH_ROOT), "rev-parse", "HEAD").stdout.strip()
+        hrh_tree = run("git", "-C", str(HRH_ROOT), "rev-parse", "HEAD^{tree}").stdout.strip()
+        if run("git", "-C", str(HRH_ROOT), "status", "--porcelain=v1").stdout:
+            raise RuntimeError("HRH E2E checkout must be clean before build")
+        if hrh_head != HRH_SHA:
+            raise RuntimeError("HRH E2E checkout is not at the frozen SHA")
+        if hrh_tree != HRH_TREE:
+            raise RuntimeError("HRH E2E checkout tree does not match the frozen source")
+        SOURCE_FRAME.update(hrh_head=hrh_head, hrh_tree=hrh_tree)
+    else:
+        missing = sorted(name for name, value in PUBLISHED_HRH_INPUTS.items() if not value)
+        if missing:
+            raise RuntimeError("published HRH inputs are incomplete: " + ",".join(missing))
+        verify = run(
+            sys.executable, str(ROOT / "tools" / "verify_hrh_published_candidate.py"),
+            "--trust", str(PUBLISHED_HRH_INPUTS["trust"]),
+            "--receipt", str(PUBLISHED_HRH_INPUTS["receipt"]),
+            "--public-key", str(PUBLISHED_HRH_INPUTS["public_key"]),
+            "--docker-config", str(PUBLISHED_HRH_INPUTS["docker_config"]),
+            env={key: os.environ[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in os.environ},
+            timeout=1500,
+        )
+        try:
+            PUBLISHED_HRH_VERIFICATION = json.loads(verify.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("published HRH verification returned malformed evidence") from exc
+        SOURCE_FRAME.update(
+            hrh_clinical_contract_revision=str(PUBLISHED_HRH_VERIFICATION["clinical_contract_revision"]),
+            hrh_build_source_revision=str(PUBLISHED_HRH_VERIFICATION["build_source_revision"]),
+        )
     SEED.mkdir()
     EVIDENCE.mkdir()
     for name in ("admin_password", "actor_password", "denied_password", "hrh_api_key"):
@@ -202,11 +253,19 @@ def prepare() -> None:
     env = {
         "CLINICAL_MM_DB_PASSWORD": secrets.token_hex(24), "CLINICAL_HRH_DB_PASSWORD": secrets.token_hex(24),
         "CLINICAL_HRH_SESSION_SECRET": secrets.token_hex(32), "CLINICAL_HRH_ENCRYPTION_KEY": secrets.token_hex(32),
-        "CLINICAL_HRH_ROOT": HRH_ROOT.as_posix(), "CLINICAL_HARNESS": HARNESS.as_posix(), "CLINICAL_SEED": SEED.as_posix(),
+        "CLINICAL_HARNESS": HARNESS.as_posix(), "CLINICAL_SEED": SEED.as_posix(),
         "CLINICAL_INGRESS_IMAGE": INGRESS_IMAGE, "CLINICAL_ADAPTER_IMAGE": ADAPTER_IMAGE,
         "CLINICAL_POLICY_PUBLIC_KEY": "placeholder",
-        "CLINICAL_HRH_BUILD_SHA": HRH_SHA,
     }
+    if HRH_MODE == "source-build":
+        assert HRH_ROOT is not None
+        env.update(CLINICAL_HRH_ROOT=HRH_ROOT.as_posix(), CLINICAL_HRH_BUILD_SHA=HRH_SHA)
+    else:
+        assert PUBLISHED_HRH_VERIFICATION is not None
+        subjects = PUBLISHED_HRH_VERIFICATION["subjects"]
+        if not isinstance(subjects, dict):
+            raise RuntimeError("published HRH verification subjects are malformed")
+        env.update(CLINICAL_HRH_WEB_IMAGE=str(subjects["web"]), CLINICAL_HRH_MIGRATE_IMAGE=str(subjects["migrate"]))
     ENV_FILE.write_text("".join(f"{key}={value}\n" for key, value in env.items()), encoding="utf-8")
 
 
@@ -231,9 +290,12 @@ def control(*args: str, check: bool = True, timeout: int = 300) -> subprocess.Co
 
 
 def _compose_command(*args: str) -> list[str]:
+    files: list[str] = []
+    for path in selected_compose_files():
+        files.extend(("--file", str(path)))
     return [
         "docker", "compose", "--env-file", str(ENV_FILE), "--project-name", PROJECT,
-        "--file", str(COMPOSE_FILE), *args,
+        *files, *args,
     ]
 
 
@@ -432,6 +494,50 @@ def built_image_evidence() -> dict[str, object]:
     return result
 
 
+def registry_docker_environment() -> dict[str, str]:
+    """Expose only the Docker config path, never its credential contents."""
+    environment = {key: os.environ[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in os.environ}
+    if HRH_MODE == "published":
+        config = PUBLISHED_HRH_INPUTS.get("docker_config")
+        if not config:
+            raise RuntimeError("published HRH Docker config is unavailable")
+        environment["DOCKER_CONFIG"] = str(Path(config).resolve())
+    return environment
+
+
+def pull_published_hrh_subjects() -> None:
+    if not PUBLISHED_HRH_VERIFICATION:
+        raise RuntimeError("published HRH subjects were not verified before pull")
+    subjects = PUBLISHED_HRH_VERIFICATION.get("subjects")
+    if not isinstance(subjects, dict) or set(subjects) != {"web", "migrate"}:
+        raise RuntimeError("published HRH subject set is malformed")
+    for role in ("web", "migrate"):
+        run("docker", "pull", str(subjects[role]), env=registry_docker_environment(), timeout=600)
+
+
+def published_hrh_container_evidence(service: str, role: str, *, completed: bool = False) -> dict[str, object]:
+    if not PUBLISHED_HRH_VERIFICATION:
+        raise RuntimeError("published HRH verification evidence is unavailable")
+    subjects = PUBLISHED_HRH_VERIFICATION["subjects"]
+    approved = str(subjects[role])
+    ps_args = ("ps", "--all", "--quiet", service) if completed else ("ps", "--quiet", service)
+    container = compose(*ps_args).stdout.strip()
+    if not container:
+        raise RuntimeError(f"published HRH {role} container is unavailable")
+    inspected = json.loads(run("docker", "container", "inspect", container).stdout)[0]
+    if inspected.get("Config", {}).get("Image") != approved:
+        raise RuntimeError(f"published HRH {role} container did not use the approved subject")
+    image = json.loads(run("docker", "image", "inspect", approved).stdout)[0]
+    if inspected.get("Image") != image.get("Id"):
+        raise RuntimeError(f"published HRH {role} container image ID differs from the approved subject")
+    expected_digest = approved.split("@", 1)[1]
+    if not any(value.endswith("@" + expected_digest) for value in image.get("RepoDigests") or []):
+        raise RuntimeError(f"published HRH {role} local image lacks the approved digest")
+    if image.get("Os") != "linux" or image.get("Architecture") != "amd64":
+        raise RuntimeError(f"published HRH {role} image platform differs from the approved platform")
+    return {"service": service, "role": role, "approved_subject": approved, "image_id": image["Id"], "completed": completed}
+
+
 def restricted_container_control_evidence() -> dict[str, object]:
     module_path = ROOT / "deploy" / "clinical-staging" / "clinical_staging.py"
     spec = importlib.util.spec_from_file_location("clinical_staging_controls", module_path)
@@ -512,7 +618,12 @@ def main() -> None:
     else:
         phase("build")
         compose("build", "ingress", "clinical-adapter", timeout=600)
-    compose("build", "controller", "hrh-migrate", "hrh", timeout=1800)
+    if HRH_MODE == "published":
+        phase("pull-verified-hrh-subjects")
+        pull_published_hrh_subjects()
+        compose("build", "controller", timeout=600)
+    else:
+        compose("build", "controller", "hrh-migrate", "hrh", timeout=1800)
     phase("initialize-volumes")
     compose("up", "--detach", "controller")
     CREATED = True
@@ -523,6 +634,7 @@ def main() -> None:
     compose("up", "--detach", "hrh-migrate", timeout=600)
     migrated = compose("wait", "hrh-migrate", check=False, timeout=600)
     require_success(migrated, "hrh-migrate")
+    published_migrate = published_hrh_container_evidence("hrh-migrate", "migrate", completed=True) if HRH_MODE == "published" else None
     phase("servers")
     compose("up", "--detach", "mattermost", timeout=300)
     control("wait-mm")
@@ -536,6 +648,7 @@ def main() -> None:
     base64.b64decode(public_key, validate=True)
     set_env("CLINICAL_POLICY_PUBLIC_KEY", public_key)
     compose("up", "--detach", "hrh", "hrh-tls", "clinical-socket-init", "clinical-adapter", timeout=600)
+    published_web = published_hrh_container_evidence("hrh", "web") if HRH_MODE == "published" else None
     control("wait-hrh", timeout=300)
     compose("up", "--detach", "ingress", timeout=180)
     wait_ingress()
@@ -703,6 +816,13 @@ def main() -> None:
         "images": image_evidence()["images"], "boundaries": boundaries,
         "secret_boundary": secret_boundary,
         "built_images": built_image_evidence(),
+        "published_hrh": {
+            "verification": PUBLISHED_HRH_VERIFICATION,
+            "web_container": published_web,
+            "migrate_container": published_migrate,
+            "hrh_source_dependency_configured": False,
+            "runtime_controller_source_present": True,
+        } if HRH_MODE == "published" else None,
         "restricted_container_controls": restricted_controls,
         "commands": [
             "python tests/deployment/test_clinical_composed_e2e.py",
@@ -723,7 +843,11 @@ def main() -> None:
         "residual_limitations": [
             "Synthetic data and a test CA were used; this is technical conformance evidence, not a compliance certification.",
             "The run exercised Linux containers and the pinned Mattermost ESR image, not a production deployment or host-level operating-system controls.",
-            "The HRH service was built from the clean head/tree source frame; no published HRH registry digest, SBOM, provenance attestation, or no-rebuild verification is claimed.",
+            (
+                "HRH web and migrations were consumed from verified exact subjects without HRH source; runtime/controller source remained present. Signed publication claims were verified, but Git ancestry was not recomputed."
+                if HRH_MODE == "published"
+                else "The HRH service was built from the clean head/tree source frame; no published HRH registry digest, SBOM, provenance attestation, or no-rebuild verification is claimed."
+            ),
         ],
     }
     _assert_no_secret_canaries([logs, json.dumps(evidence, sort_keys=True)], _known_secret_canaries())

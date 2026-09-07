@@ -23,6 +23,7 @@ def test_clinical_composed_e2e_wrapper_selects_a_portable_python_interpreter():
 
 def test_clinical_composed_e2e_is_a_pinned_real_boundary_harness():
     compose = (HARNESS / "compose.yaml").read_text(encoding="utf-8")
+    source_build = (HARNESS / "compose.source-build.yaml").read_text(encoding="utf-8")
     runner = (ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py").read_text(encoding="utf-8")
     control = (HARNESS / "control.py").read_text(encoding="utf-8")
 
@@ -30,8 +31,8 @@ def test_clinical_composed_e2e_is_a_pinned_real_boundary_harness():
     assert compose.count("postgres:17.10-bookworm@sha256:") == 2
     assert "Dockerfile.clinical-adapter" in compose
     assert "Dockerfile.mattermost-ingress" in compose
-    assert "Dockerfile.web.clinical-candidate" in compose
-    assert "Dockerfile.migrate.clinical-candidate" in compose
+    assert "Dockerfile.web.clinical-candidate" in source_build
+    assert "Dockerfile.migrate.clinical-candidate" in source_build
     assert "clinical-socket-init.sh" in compose
     assert "internal: true" in compose
     assert "responseDigest" in control
@@ -84,7 +85,7 @@ def test_clinical_e2e_proves_clean_descendant_sources_and_exact_post_cardinality
 
 
 def test_clinical_e2e_uses_current_hrh_build_provenance_and_atomic_policy_refresh():
-    compose = (HARNESS / "compose.yaml").read_text(encoding="utf-8")
+    compose = (HARNESS / "compose.source-build.yaml").read_text(encoding="utf-8")
     runner = (ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py").read_text(encoding="utf-8")
     control = (HARNESS / "control.py").read_text(encoding="utf-8")
 
@@ -94,10 +95,40 @@ def test_clinical_e2e_uses_current_hrh_build_provenance_and_atomic_policy_refres
     assert 'CLINICAL_E2E_HRH_ROOT' in runner
     assert 'CLINICAL_E2E_HRH_ROOT must name a clean HRH checkout' in runner
     assert r'C:\dev' not in runner
-    assert '"CLINICAL_HRH_BUILD_SHA": HRH_SHA' in runner
+    assert "CLINICAL_HRH_BUILD_SHA=HRH_SHA" in runner
     assert "sealed_compose_environment" in runner
     assert "SAFE_COMPOSE_PROCESS_ENV" in runner
     assert "env=sealed_compose_environment()" in runner
     assert "no published HRH registry digest, SBOM, provenance attestation, or no-rebuild verification" in runner
     assert "os.replace" in control
     assert 'command == "policy-digest"' in control
+
+
+def test_published_hrh_overlay_has_no_source_build_or_fallback_surface():
+    published_path = HARNESS / "compose.published-hrh.yaml"
+    published_text = published_path.read_text(encoding="utf-8")
+    published = yaml.safe_load(published_text)
+
+    assert set(published["services"]) == {"hrh", "hrh-migrate"}
+    assert "CLINICAL_HRH_ROOT" not in published_text
+    for service, variable in (("hrh", "CLINICAL_HRH_WEB_IMAGE"), ("hrh-migrate", "CLINICAL_HRH_MIGRATE_IMAGE")):
+        config = published["services"][service]
+        assert config["image"] == "${" + variable + ":?required}"
+        assert config["pull_policy"] == "never"
+        assert "build" not in config
+        assert "volumes" not in config
+    assert "context:" not in published_text
+    assert "dockerfile:" not in published_text.lower()
+
+
+def test_published_hrh_runner_verifies_before_pull_and_disables_compose_pull():
+    runner = (ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py").read_text(encoding="utf-8")
+
+    assert runner.index("verify_hrh_published_candidate.py") < runner.index("def pull_published_hrh_subjects")
+    assert 'compose_args[1:1] = ["--pull", "never"]' in runner
+    assert '"docker", "pull", str(subjects[role])' in runner
+    assert 'published_hrh_container_evidence("hrh-migrate", "migrate", completed=True)' in runner
+    assert 'published_hrh_container_evidence("hrh", "web")' in runner
+    assert '"CLINICAL_E2E_HRH_ROOT" in os.environ' in runner
+    assert 'published HRH mode forbids CLINICAL_E2E_HRH_ROOT' in runner
+    assert '"DOCKER_CONFIG"' not in runner.split("SAFE_COMPOSE_PROCESS_ENV =", 1)[1].split(")", 1)[0]

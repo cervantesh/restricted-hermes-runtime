@@ -1,0 +1,33 @@
+services:
+  hrh-migrate:
+    build:
+      context: ${CLINICAL_HRH_ROOT:?required}
+      dockerfile: Dockerfile.migrate.clinical-candidate
+    environment:
+      DATABASE_URL: postgresql://hrh:${CLINICAL_HRH_DB_PASSWORD:?required}@hrh-postgres:5432/hrh
+    depends_on:
+      hrh-postgres: {condition: service_healthy}
+    networks: [hrh_backend]
+
+  hrh:
+    build:
+      context: ${CLINICAL_HRH_ROOT:?required}
+      dockerfile: Dockerfile.web.clinical-candidate
+      args:
+        BUILD_SHA: ${CLINICAL_HRH_BUILD_SHA:?required}
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      DATABASE_URL: postgresql://hrh:${CLINICAL_HRH_DB_PASSWORD:?required}@hrh-postgres:5432/hrh
+      SESSION_SECRET: ${CLINICAL_HRH_SESSION_SECRET:?required}
+      ENCRYPTION_KEY: ${CLINICAL_HRH_ENCRYPTION_KEY:?required}
+      HRH_SURFACE: portal
+      SEED_DEMO_DATA: "false"
+      OTEL_ENABLED: "false"
+      CLOUD_MONITORING_ENABLED: "false"
+      PROMETHEUS_ENABLED: "false"
+      LOG_LEVEL: error
+    depends_on:
+      hrh-migrate: {condition: service_completed_successfully}
+    networks: [hrh_backend]
+

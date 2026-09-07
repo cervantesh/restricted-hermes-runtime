@@ -1,0 +1,30 @@
+# Source-free applies to HRH web and migrations only. The controller and
+# restricted runtime remain source-built by the common composition.
+services:
+  hrh-migrate:
+    image: ${CLINICAL_HRH_MIGRATE_IMAGE:?required}
+    pull_policy: never
+    environment:
+      DATABASE_URL: postgresql://hrh:${CLINICAL_HRH_DB_PASSWORD:?required}@hrh-postgres:5432/hrh
+    depends_on:
+      hrh-postgres: {condition: service_healthy}
+    networks: [hrh_backend]
+
+  hrh:
+    image: ${CLINICAL_HRH_WEB_IMAGE:?required}
+    pull_policy: never
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      DATABASE_URL: postgresql://hrh:${CLINICAL_HRH_DB_PASSWORD:?required}@hrh-postgres:5432/hrh
+      SESSION_SECRET: ${CLINICAL_HRH_SESSION_SECRET:?required}
+      ENCRYPTION_KEY: ${CLINICAL_HRH_ENCRYPTION_KEY:?required}
+      HRH_SURFACE: portal
+      SEED_DEMO_DATA: "false"
+      OTEL_ENABLED: "false"
+      CLOUD_MONITORING_ENABLED: "false"
+      PROMETHEUS_ENABLED: "false"
+      LOG_LEVEL: error
+    depends_on:
+      hrh-migrate: {condition: service_completed_successfully}
+    networks: [hrh_backend]
