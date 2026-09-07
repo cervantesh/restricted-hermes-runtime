@@ -24,7 +24,8 @@ from cryptography.x509.oid import NameOID
 
 
 ROOT = Path(__file__).resolve().parents[2]
-HRH_ROOT = Path(os.environ.get("CLINICAL_E2E_HRH_ROOT", r"C:\dev\Health-Record-Hub-wt-restricted-hermes-clinical-current")).resolve()
+HRH_ROOT_VALUE = os.environ.get("CLINICAL_E2E_HRH_ROOT")
+HRH_ROOT = Path(HRH_ROOT_VALUE).resolve() if HRH_ROOT_VALUE else None
 HARNESS = ROOT / "tests" / "deployment" / "clinical-composed-e2e"
 COMPOSE_FILE = HARNESS / "compose.yaml"
 MM_IMAGE = "mattermost/mattermost-team-edition:11.7.10@sha256:84a041d836bf6fbf6a9a78ab699fa5ebe5437bfb6a514b5afad4121fa3800696"
@@ -114,6 +115,8 @@ def make_certificates() -> None:
 
 
 def prepare() -> None:
+    if HRH_ROOT is None:
+        raise RuntimeError("CLINICAL_E2E_HRH_ROOT must name a clean HRH checkout")
     runtime_head = run("git", "rev-parse", "HEAD").stdout.strip()
     runtime_tree = run("git", "rev-parse", "HEAD^{tree}").stdout.strip()
     hrh_head = run("git", "-C", str(HRH_ROOT), "rev-parse", "HEAD").stdout.strip()
