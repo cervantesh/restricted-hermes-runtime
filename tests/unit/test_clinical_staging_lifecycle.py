@@ -1030,3 +1030,44 @@ def test_restore_argument_contract_and_backup_path_cannot_overlap_private_state(
     ])
     assert parsed.command == "restore"
     assert parsed.expected_manifest_sha256 == "a" * 64
+
+
+def test_volume_transfer_helper_is_pinned_networkless_and_never_uses_socket(tmp_path: Path):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    backup = tmp_path / "backup"
+    runtime.mkdir()
+    hrh.mkdir()
+    backup.mkdir()
+    (backup / module.BACKUP_VOLUME_DIR).mkdir()
+
+    class FakeShell:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, *args, **_kwargs):
+            self.calls.append(args)
+            if args[:3] == ("docker", "run", "--rm") and "/source" in " ".join(args):
+                archive = backup / module.BACKUP_VOLUME_DIR / "hrh_secret.tar"
+                with tarfile.open(archive, "w") as opened:
+                    info = tarfile.TarInfo("secret")
+                    info.size = 1
+                    opened.addfile(info, __import__("io").BytesIO(b"x"))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    shell = FakeShell()
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, shell=shell)
+    staging._backup_volume("hrh_secret", module.volume_names(project)["hrh_secret"], backup)
+    staging._restore_volume("hrh_secret", module.volume_names(project)["hrh_secret"], backup)
+    assert len(shell.calls) == 2
+    for call in shell.calls:
+        assert "--network" in call and call[call.index("--network") + 1] == "none"
+        assert "--read-only" in call
+        assert "--cap-drop" in call and call[call.index("--cap-drop") + 1] == "ALL"
+        assert "--entrypoint" in call and call[call.index("--entrypoint") + 1] == "sh"
+        assert module.RECOVERY_HELPER_IMAGE in call
+    with pytest.raises(module.SafetyError, match="allowlist"):
+        staging._backup_volume("clinical_socket", module.volume_names(project)["clinical_socket"], backup)

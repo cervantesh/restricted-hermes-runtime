@@ -7,7 +7,6 @@ import base64
 import hashlib
 import http.client
 import ipaddress
-import io
 import json
 import os
 import posixpath
@@ -1327,10 +1326,11 @@ class ClinicalStaging:
         self.shell.run(
             "docker", "run", "--rm", "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+            "--entrypoint", "sh",
             "--mount", f"type=volume,src={volume},dst=/source,readonly",
             "--mount", f"type=bind,src={backup_dir},dst=/backup",
             RECOVERY_HELPER_IMAGE,
-            "sh", "-ec", f"tar --numeric-owner -C /source -cf {archive} .",
+            "-ec", f"tar --numeric-owner -C /source -cf {archive} .",
             cwd=self.runtime, timeout=1200,
         )
         inspect_safe_tar(backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar", require_regular_file=True)
@@ -1437,10 +1437,11 @@ class ClinicalStaging:
         self.shell.run(
             "docker", "run", "--rm", "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+            "--entrypoint", "sh",
             "--mount", f"type=volume,src={volume},dst=/destination",
             "--mount", f"type=bind,src={backup_dir},dst=/backup,readonly",
             RECOVERY_HELPER_IMAGE,
-            "sh", "-ec", f"tar --numeric-owner -C /destination -xf {archive}",
+            "-ec", f"tar --numeric-owner -C /destination -xf {archive}",
             cwd=self.runtime, timeout=1200,
         )
 
