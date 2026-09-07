@@ -123,6 +123,12 @@ archive is fsynced before the manifest is written; the manifest is fsynced
 before `COMPLETE`, and `COMPLETE` is fsynced before the temporary directory is
 atomically published. A partial directory is never a restore input.
 
+The one-shot archive helper has no network, a read-only root filesystem and
+all capabilities dropped except `DAC_OVERRIDE`. It runs as root only because
+the exact source volumes and the private `0700` bind require controlled access
+to preserve numeric ownership; it receives only one named source/destination
+volume and the bundle bind for that invocation.
+
 Before Docker state or the destination state directory is changed, `restore`
 requires the exact member allowlist, completion marker, external manifest hash,
 safe non-link tar members, marker/source identity, every member hash and an
