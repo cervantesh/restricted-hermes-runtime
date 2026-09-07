@@ -282,8 +282,8 @@ def restricted_container_control_evidence() -> dict[str, object]:
     inspected: dict[str, object] = {}
     identities: dict[str, dict[str, object]] = {}
     expected = {
-        "clinical-adapter": {"uid": 10008, "gid": 20007, "groups": [20006]},
-        "ingress": {"uid": 10007, "gid": 20005, "groups": [20000, 20001, 20006]},
+        "clinical-adapter": {"uid": 10008, "gid": 20007, "groups": [20006, 20007]},
+        "ingress": {"uid": 10007, "gid": 20005, "groups": [20000, 20001, 20005, 20006]},
     }
     identity_probe = (
         "import json,os; "
