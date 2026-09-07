@@ -604,6 +604,12 @@ class Ingress:
         self.executor = SerializedDeliveryExecutor(self)
 
     def preflight(self) -> None:
+        # Recover every durable delivery claim before any fallible remote
+        # identity/channel/roster dependency. A restart must not retain an
+        # encrypted IN_FLIGHT payload merely because Mattermost is unavailable.
+        # The outbox verifies all rows during this transition, so corruption
+        # still aborts preflight fail-closed.
+        self.outbox.stale_inflight_to_ambiguous()
         self._bot_identity()
         clinical_channels = {item["channel_id"] for item in self.policy.values.get("clinical_bindings", [])}
         if any(channel_id not in clinical_channels for channel_id in self.policy.values["allowed_channel_ids"]):
@@ -616,7 +622,6 @@ class Ingress:
             else:
                 self._private_channel(channel_id)
                 self._member(channel_id, self.policy.values["bot_user_id"])
-        self.outbox.stale_inflight_to_ambiguous()
         self.executor.drain()
 
     def _readiness_binding(self) -> None:

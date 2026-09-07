@@ -2015,6 +2015,29 @@ def test_restart_after_ready_attempts_one_post_and_after_inflight_never_retries(
     final.close()
 
 
+def test_preflight_outbox_corruption_fails_before_remote_identity(tmp_path):
+    service, rest, _conversation = ingress(tmp_path)
+    source = post()
+    record, _ = service.outbox.reserve(
+        service._envelope(source, service._authorize_source(source)),
+        payload_capacity=1000, tombstone_capacity=1000,
+    )
+    service.outbox._connection.execute(
+        "UPDATE records SET auth_tag=? WHERE record_tag=?", (b"tampered", record.record_tag)
+    )
+    original_get_me = rest.get_me
+    calls = []
+
+    def tracked_get_me(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_get_me(*args, **kwargs)
+
+    rest.get_me = tracked_get_me
+    with pytest.raises(ContractError):
+        service.preflight()
+    assert calls == []
+
+
 def test_recovery_readiness_uses_the_exact_preflight_binding_before_uds_or_post(tmp_path):
     service, rest, conversation = ingress(tmp_path)
     source = post()

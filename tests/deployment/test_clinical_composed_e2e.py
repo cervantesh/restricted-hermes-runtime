@@ -398,6 +398,9 @@ def main() -> None:
         print("clinical_composed_e2e debug_outbox=" + control("outbox-summary", check=False).stdout.strip(), file=sys.stderr)
         print("clinical_composed_e2e debug_grants=" + control("grant-count", check=False).stdout.strip(), file=sys.stderr)
         raise
+    known_success = json.loads(control("grant-evidence", "success").stdout)
+    if known_success["audits"].get("restricted_hermes_delivery_reauthorized", 0) != 1:
+        raise RuntimeError("known delivery did not obtain exactly one authorization")
     boundaries = network_and_surface_controls()
     phase("identity-controls")
     control("send", "denied", "denied_dm", "018f22bb-414d-7cc4-b5a4-83cc8ec92cb1", "actor-cross")
@@ -423,12 +426,12 @@ def main() -> None:
     control("send", "actor", "actor_dm", "018f22bb-414d-7cc4-b5a4-83cc8ec92cb1", "source-deleted")
     wait_grants(before)
     wait_delivery_delay()
-    ready_records = [row for row in paused_outbox_snapshot() if row.get("state") == "READY"]
-    if len(ready_records) != 1:
-        raise RuntimeError("source-deletion barrier did not isolate exactly one READY outbox record")
-    source_before = ready_records[0]
+    in_flight_records = [row for row in paused_outbox_snapshot() if row.get("state") == "IN_FLIGHT"]
+    if len(in_flight_records) != 1:
+        raise RuntimeError("source-deletion barrier did not isolate exactly one IN_FLIGHT outbox record")
+    source_before = in_flight_records[0]
     if source_before.get("reason") != "" or source_before.get("nonce_erased") or source_before.get("ciphertext_erased"):
-        raise RuntimeError("source-deletion READY record did not retain its encrypted payload")
+        raise RuntimeError("source-deletion IN_FLIGHT record did not retain its encrypted payload")
     source_record_tag = source_before.get("record_tag")
     if not isinstance(source_record_tag, str) or len(source_record_tag) != 64:
         raise RuntimeError("source-deletion READY record tag was invalid")
@@ -442,8 +445,8 @@ def main() -> None:
     source_after = terminal_records[0]
     expected_after = {
         "record_tag": source_record_tag,
-        "state": "BLOCKED",
-        "reason": "current_authorization_rejected",
+        "state": "AMBIGUOUS",
+        "reason": "delivery_authorization_unknown",
         "generation": int(source_before["generation"]) + 1,
         "nonce_erased": True,
         "ciphertext_erased": True,
@@ -453,6 +456,9 @@ def main() -> None:
             "source deletion did not produce the observed terminal contract: "
             + json.dumps(source_after, sort_keys=True)
         )
+    source_delivery = json.loads(control("grant-evidence", "source-deleted").stdout)
+    if source_delivery["audits"].get("restricted_hermes_delivery_reauthorized", 0) != 1:
+        raise RuntimeError("source-deletion unknown delivery did not obtain exactly one authorization")
     phase("crash-retry")
     control("mutate", "reset")
     before = int(control("grant-count").stdout.strip())
@@ -469,12 +475,34 @@ def main() -> None:
     before_crash = json.loads(control("grant-evidence", "crash-retry").stdout)
     if before_crash["audits"].get("restricted_hermes_next_appointment_read_authorized") != 1 or before_crash["audits"].get("restricted_hermes_next_appointment_read_completed") != 1:
         raise RuntimeError("crash window did not follow exactly one durable clinical read")
+    crash_records = [row for row in paused_outbox_snapshot() if row.get("state") == "IN_FLIGHT"]
+    if len(crash_records) != 1:
+        raise RuntimeError("crash window did not isolate exactly one IN_FLIGHT outbox record")
+    crash_before = crash_records[0]
+    crash_record_tag = crash_before.get("record_tag")
+    if not isinstance(crash_record_tag, str) or len(crash_record_tag) != 64:
+        raise RuntimeError("crash IN_FLIGHT record tag was invalid")
     compose("kill", "ingress")
     control("mutate", "drop-crash-delay", timeout=60)
     compose("up", "--detach", "ingress")
     wait_ingress()
-    control("expect", "crash-retry", "reply", timeout=60)
+    wait_delivery_reauthorized("crash-retry")
+    control("expect", "crash-retry", "no-reply", timeout=60)
     after_recovery = json.loads(control("grant-evidence", "crash-retry").stdout)
+    crash_after_rows = paused_outbox_snapshot(crash_record_tag)
+    if len(crash_after_rows) != 1:
+        raise RuntimeError("crash terminal record was not found by exact tag")
+    crash_after = crash_after_rows[0]
+    expected_crash_after = {
+        "record_tag": crash_record_tag,
+        "state": "AMBIGUOUS",
+        "reason": "restart_in_flight",
+        "generation": int(crash_before["generation"]) + 1,
+        "nonce_erased": True,
+        "ciphertext_erased": True,
+    }
+    if crash_after != expected_crash_after:
+        raise RuntimeError("crash recovery did not erase the unknown delivery: " + json.dumps(crash_after, sort_keys=True))
     crash_invariants = {
         "response_digest_equal": after_recovery["response_digest"] == before_crash["response_digest"],
         "read_authorized": after_recovery["audits"].get("restricted_hermes_next_appointment_read_authorized", 0),
@@ -486,9 +514,9 @@ def main() -> None:
         "response_digest_equal": True,
         "read_authorized": 1,
         "read_completed": 1,
-        # The first server-side reauthorization commits after the client is
-        # killed; recovery must obtain a second fresh authorization before post.
-        "delivery_reauthorized": 2,
+        # The server-side authorization can commit after the client crashes,
+        # but the durable claim fences recovery from asking a second time.
+        "delivery_reauthorized": 1,
     }:
         raise RuntimeError(
             "crash recovery invariant mismatch: " + json.dumps(crash_invariants, sort_keys=True)
@@ -508,6 +536,8 @@ def main() -> None:
         "source_deleted": int(control("post-count", "source-deleted").stdout.strip()),
         **{label: int(control("post-count", label).stdout.strip()) for label in denied_labels},
     }
+    if post_counts["valid"] != 1 or post_counts["recovered"] != 0 or post_counts["source_deleted"] != 0:
+        raise RuntimeError("known/unknown delivery post-count contract failed: " + json.dumps(post_counts, sort_keys=True))
     phase("evidence")
     scan_logs()
     evidence = {
@@ -527,8 +557,10 @@ def main() -> None:
             "before": source_before,
             "after": source_after,
         },
+        "known_success": known_success,
+        "crash_unknown": {"before": crash_before, "after": crash_after},
         "post_counts": post_counts,
-        "scenarios": {"valid": "pass", "actor_cross": "deny", "channel_cross": "deny", "patient_cross": "deny", "unbound": "deny", "disabled": "deny", "missing_each_permission": "deny", "revoked_before_delivery": "zero-post", "source_deleted_before_delivery": "blocked-zero-post", "swapped_digest": "deny", "crash_retry": "stable-result", "logs": "no synthetic identifiers"},
+        "scenarios": {"valid": "one-authorization-one-post", "actor_cross": "deny", "channel_cross": "deny", "patient_cross": "deny", "unbound": "deny", "disabled": "deny", "missing_each_permission": "deny", "revoked_before_delivery": "zero-post", "source_deleted_before_delivery": "ambiguous-zero-post", "swapped_digest": "deny", "crash_retry": "ambiguous-zero-post", "logs": "no synthetic identifiers"},
         "residual_limitations": [
             "Synthetic data and a test CA were used; this is technical conformance evidence, not a compliance certification.",
             "The run exercised Linux containers and the pinned Mattermost ESR image, not a production deployment or host-level operating-system controls.",

@@ -609,6 +609,32 @@ def test_crash_after_clinical_delivery_claim_never_reauthorizes_or_posts_after_r
     reopened.close()
 
 
+def test_restart_claim_is_erased_before_remote_preflight_failure(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    source = rest.posts[ROOT]
+    record_tag = service.outbox.record_tag(service._clinical_envelope(source, PATIENT))
+
+    clinical.reauthorize_delivery = lambda _request: (_ for _ in ()).throw(KeyboardInterrupt)
+    with pytest.raises(KeyboardInterrupt):
+        service.handle(event(source, channel_type="D"))
+    claimed = service.outbox.get(record_tag)
+    assert claimed is not None and claimed.state is DeliveryState.IN_FLIGHT
+
+    service.outbox.close()
+    rest.get_me = lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError)
+    reopened = MattermostOutbox.open(
+        tmp_path / "outbox", tmp_path / "outbox.key",
+        expected_fingerprint=service.policy.values["outbox_key_fingerprint"],
+    )
+    replacement = Ingress(service.policy, rest, conversation, reopened, clinical=clinical)
+    with pytest.raises(TimeoutError):
+        replacement.preflight()
+    durable = reopened.get(record_tag)
+    assert durable is not None and durable.state is DeliveryState.AMBIGUOUS
+    assert durable.reason == "restart_in_flight" and durable.envelope is None
+    reopened.close()
+
+
 def test_clinical_post_timeout_after_reauthorization_is_ambiguous_and_erased(tmp_path):
     service, rest, conversation, clinical = clinical_ingress(tmp_path)
     source = rest.posts[ROOT]
