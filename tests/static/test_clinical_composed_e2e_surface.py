@@ -8,6 +8,19 @@ ROOT = Path(__file__).resolve().parents[2]
 HARNESS = ROOT / "tests" / "deployment" / "clinical-composed-e2e"
 
 
+def test_clinical_composed_e2e_wrapper_selects_a_portable_python_interpreter():
+    wrapper = (
+        ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "command -v python3" in wrapper
+    assert "elif command -v python" in wrapper
+    assert wrapper.index("command -v python3") < wrapper.index("elif command -v python")
+    assert 'exec "$python_bin"' in wrapper
+    assert 'exec python "$root/tests/deployment/test_clinical_composed_e2e.py"' not in wrapper
+    assert "clinical-composed-e2e: DENIED python-unavailable" in wrapper
+
+
 def test_clinical_composed_e2e_is_a_pinned_real_boundary_harness():
     compose = (HARNESS / "compose.yaml").read_text(encoding="utf-8")
     runner = (ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py").read_text(encoding="utf-8")
