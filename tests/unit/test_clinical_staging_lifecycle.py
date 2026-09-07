@@ -168,6 +168,38 @@ def test_init_rejects_unclosed_candidate_dockerfile_before_compose(tmp_path: Pat
     assert not state.exists()
 
 
+def test_compose_interpolation_uses_sealed_environment_not_ambient_hrh_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "sealed-hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    sealed_root = hrh.as_posix()
+    (state / "compose.env").write_text(
+        f"CLINICAL_HRH_ROOT={sealed_root}\nCLINICAL_STAGING_PROJECT={project}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLINICAL_HRH_ROOT", "/ambient-poison")
+    monkeypatch.setenv("CLINICAL_UNDECLARED", "ambient-poison")
+    captured: dict[str, object] = {}
+
+    class CapturingShell:
+        def run(self, *args, **kwargs):
+            captured["args"] = args
+            captured["env"] = kwargs["env"]
+            return SimpleNamespace(stdout="", returncode=0)
+
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, shell=CapturingShell())
+    staging.compose("config", "--quiet")
+
+    assert "--env-file" in captured["args"]
+    assert captured["env"]["CLINICAL_HRH_ROOT"] == sealed_root
+    assert "CLINICAL_UNDECLARED" not in captured["env"]
+
+
 def test_destructive_volume_guard_rejects_missing_labels_and_unexpected_project_volume():
     module = load_module()
     project = "clinicalstagingdemo"

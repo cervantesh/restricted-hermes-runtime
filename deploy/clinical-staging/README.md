@@ -1,5 +1,9 @@
 # Synthetic clinical staging lifecycle
 
+The wrapper validates the exact pinned base-image references in the selected
+HRH candidate Dockerfiles before Compose runs. It does not claim hermetic
+inputs: Docker frontend and APK resolution remain owned by HRH #2103.
+
 This wrapper turns the existing composed clinical acceptance witness into a
 stable, operator-driven **synthetic-only** local Linux environment. It reuses
 the real Mattermost, restricted ingress, clinical adapter and Health-Record-Hub

@@ -342,9 +342,14 @@ def _controls(service: str, inspected: dict[str, Any]) -> dict[str, bool]:
 
 def _probe(image_id: str, container_id: str, host: str, port: int, *, resolve_only: bool = False) -> bool:
     operation = "socket.getaddrinfo(" + repr(host) + "," + str(port) + ")" if resolve_only else "socket.create_connection((" + repr(host) + "," + str(port) + "), 2).close()"
-    program = "import socket,sys\ntry:\n " + operation + "\nexcept OSError:\n sys.exit(1)"
+    program = "import socket,sys\ntry:\n " + operation + "\nexcept OSError:\n print('denied'); sys.exit(73)\nprint('reachable')"
     result = _run("docker", "run", "--rm", "--network", f"container:{container_id}", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=8m", "--entrypoint", "python", image_id, "-c", program, timeout=15)
-    return result.returncode == 0
+    output = result.stdout.strip()
+    if result.returncode == 0 and output == "reachable":
+        return True
+    if result.returncode == 73 and output == "denied":
+        return False
+    raise ReceiptError("network probe did not produce an expected outcome")
 
 
 def _endpoints(ipv4: str, ipv6: str, dns_name: str, metadata_name: str, port: int) -> dict[str, tuple[str, int]]:

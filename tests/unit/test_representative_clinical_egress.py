@@ -4,6 +4,7 @@ import importlib.util
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -198,6 +199,23 @@ def test_red_dns_proof_requires_resolution_and_tcp_reachability(monkeypatch):
 
     assert result == {"controlled_dns": False}
     assert calls == [False, True]
+
+
+@pytest.mark.parametrize("returncode, output", [(125, "denied\n"), (126, "denied\n"), (127, "denied\n"), (0, ""), (73, ""), (73, "other\n")])
+def test_probe_rejects_docker_runtime_errors_and_malformed_outcomes(monkeypatch, returncode, output):
+    module = load_module()
+    monkeypatch.setattr(module, "_run", lambda *_args, **_kwargs: SimpleNamespace(returncode=returncode, stdout=output))
+
+    with pytest.raises(module.ReceiptError, match="expected outcome"):
+        module._probe("sha256:" + "a" * 64, "a" * 64, "controlled-probe", 80)
+
+
+def test_probe_accepts_only_explicit_program_outcomes(monkeypatch):
+    module = load_module()
+    monkeypatch.setattr(module, "_run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="reachable\n"))
+    assert module._probe("sha256:" + "a" * 64, "a" * 64, "controlled-probe", 80) is True
+    monkeypatch.setattr(module, "_run", lambda *_args, **_kwargs: SimpleNamespace(returncode=73, stdout="denied\n"))
+    assert module._probe("sha256:" + "a" * 64, "a" * 64, "controlled-probe", 80) is False
 
 
 @pytest.mark.parametrize("outcome", ["connected", "refused", "timeout"])

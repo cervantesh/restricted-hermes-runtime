@@ -46,6 +46,11 @@ STATE_LABEL = "io.cervantesh.restricted-runtime.state-id"
 SYNTHETIC_LABEL = "io.cervantesh.restricted-runtime.synthetic-clinical"
 PROJECT_RE = re.compile(r"^clinicalstaging[a-z0-9]{1,32}$")
 FROM_RE = re.compile(r"^\s*FROM\s+(?:--platform=\S+\s+)?(?P<image>\S+)", re.MULTILINE | re.IGNORECASE)
+COMPOSE_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+SAFE_COMPOSE_PROCESS_ENV = (
+    "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG",
+    "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR",
+)
 VOLUME_KEYS = (
     "mattermost_db", "mattermost_data", "mattermost_tls", "hrh_db",
     "hrh_tls", "hrh_secret", "clinical_config", "clinical_socket",
@@ -103,12 +108,14 @@ class Shell:
         self,
         *args: str,
         cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
         check: bool = True,
         timeout: int = 600,
     ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
             args,
             cwd=cwd,
+            env=dict(env) if env is not None else None,
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -614,8 +621,27 @@ class ClinicalStaging:
             "--file", str(self.overlay),
         )
 
+    def _sealed_compose_environment(self) -> dict[str, str]:
+        try:
+            lines = self.env_file.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise SafetyError("sealed compose environment is unavailable") from exc
+        sealed: dict[str, str] = {}
+        for line in lines:
+            if not line or "=" not in line:
+                raise SafetyError("sealed compose environment is malformed")
+            key, value = line.split("=", 1)
+            if not COMPOSE_ENV_RE.fullmatch(key) or key in sealed:
+                raise SafetyError("sealed compose environment is malformed")
+            sealed[key] = value
+        if not sealed:
+            raise SafetyError("sealed compose environment is empty")
+        process = {key: os.environ[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in os.environ}
+        process.update(sealed)
+        return process
+
     def compose(self, *args: str, check: bool = True, timeout: int = 1200) -> subprocess.CompletedProcess[str]:
-        return self.shell.run(*self._compose_args(), *args, cwd=self.runtime, check=check, timeout=timeout)
+        return self.shell.run(*self._compose_args(), *args, cwd=self.runtime, env=self._sealed_compose_environment(), check=check, timeout=timeout)
 
     def control(self, *args: str, timeout: int = 600) -> str:
         result = self.compose(
