@@ -179,7 +179,13 @@ def provision_initial_mattermost_admin() -> None:
         if existing:
             return
         raise RuntimeError("Mattermost initial administrator bootstrap failed") from None
-    if not isinstance(user, dict) or not isinstance(user.get("id"), str):
+    roles = user.get("roles") if isinstance(user, dict) else None
+    if (
+        not isinstance(user, dict)
+        or not isinstance(user.get("id"), str)
+        or not isinstance(roles, str)
+        or "system_admin" not in roles.split()
+    ):
         raise RuntimeError("Mattermost initial administrator bootstrap failed")
 
 

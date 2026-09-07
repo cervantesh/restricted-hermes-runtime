@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -154,3 +155,71 @@ def test_controller_initial_admin_conflict_is_idempotent_but_other_failures_are_
         module.provision_initial_mattermost_admin()
     assert str(raised.value) == "Mattermost initial administrator bootstrap failed"
     assert "PASSWORD_SECRET_CANARY_9159" not in str(raised.value)
+
+
+def test_controller_fails_closed_if_initial_api_response_is_not_an_administrator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_control()
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "admin_password").write_text("PASSWORD_SECRET_CANARY_9159\n", encoding="ascii")
+    monkeypatch.setattr(module, "SEED", seed)
+    monkeypatch.setattr(module, "_mm_context", lambda: object())
+    monkeypatch.setattr(
+        module,
+        "request",
+        lambda *_args, **_kwargs: ({"id": "nonadmin", "roles": "system_user"}, {}),
+    )
+
+    with pytest.raises(RuntimeError, match="initial administrator bootstrap failed"):
+        module.provision_initial_mattermost_admin()
+
+
+def test_cli_never_renders_command_error_text(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    module = load_staging()
+    canary = "STDERR_SECRET_CANARY_9159"
+
+    class FakeStaging:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def status(self):
+            raise module.CommandError(canary)
+
+    monkeypatch.setattr(module, "ClinicalStaging", FakeStaging)
+    assert module.main([
+        "--hrh-root", "/synthetic/hrh",
+        "--state-dir", "/synthetic/clinicalstagingsecret.synthetic-clinical-staging",
+        "--project", "clinicalstagingsecret",
+        "status",
+    ]) == 2
+    assert capsys.readouterr().err == "clinical_staging outcome=denied reason=command_failed\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mode/ownership contract is Linux-only")
+def test_initial_admin_password_cleanup_is_strict_and_interruption_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_staging()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / "clinicalstagingsecret.synthetic-clinical-staging"
+    seed = state / "seed"
+    runtime.mkdir()
+    hrh.mkdir()
+    seed.mkdir(parents=True)
+    password = seed / "admin_password"
+    password.write_text("PASSWORD_SECRET_CANARY_9159\n", encoding="ascii")
+    password.chmod(0o600)
+    monkeypatch.setattr(module, "fsync_directory", lambda _path: None)
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingsecret", 18443)
+
+    staging._erase_initial_admin_password()
+    assert not password.exists()
+
+    password.write_text("PASSWORD_SECRET_CANARY_9159\n", encoding="ascii")
+    password.chmod(0o644)
+    with pytest.raises(module.SafetyError, match="mode-0600"):
+        staging._erase_initial_admin_password()
+    assert password.exists()
