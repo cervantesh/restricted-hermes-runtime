@@ -123,14 +123,18 @@ archive is fsynced before the manifest is written; the manifest is fsynced
 before `COMPLETE`, and `COMPLETE` is fsynced before the temporary directory is
 atomically published. A partial directory is never a restore input.
 
-The one-shot archive helper has no network, a read-only root filesystem and
-all capabilities dropped except `DAC_OVERRIDE`. It runs as root only because
-the exact source volumes and the private `0700` bind require controlled access
-to preserve numeric ownership; it receives only one named source/destination
-volume and the bundle bind for that invocation. A fixed per-volume UID would
-not be safe or sufficient: existing data may have arbitrary persisted service
-ownership, so it cannot universally traverse the source tree or preserve the
-numeric owner metadata required by this cold format.
+The one-shot archive helper has no network, a read-only root filesystem,
+`no-new-privileges`, no Docker socket, and only its two exact mounts. Backup
+gets only `DAC_OVERRIDE`, which is required to read persisted service-owned
+files and write the private `0700` bundle bind. Restore gets exactly
+`DAC_OVERRIDE` plus `CHOWN`: the real cold-restore witness proved that tar
+cannot restore PostgreSQL's archived numeric UID/GID without `CHOWN`. A fixed
+per-volume UID would not be safe or sufficient: existing data may have
+arbitrary persisted service ownership, so it cannot universally traverse the
+source tree or preserve the numeric owner metadata required by this cold
+format. The helper is always root only for that bounded transfer; it receives
+only one named source/destination volume and the bundle bind for that
+invocation.
 
 Before Docker state or the destination state directory is changed, `restore`
 requires the exact member allowlist, completion marker, external manifest hash,
