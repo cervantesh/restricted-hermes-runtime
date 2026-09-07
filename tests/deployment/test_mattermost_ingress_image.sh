@@ -2,6 +2,10 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+if [[ "${RESTRICTED_PUBLISHED_CANDIDATE:-}" == "1" && -z "${RESTRICTED_MATTERMOST_IMAGE_DIGEST:-}" ]]; then
+  printf '%s\n' 'published candidate requires an immutable digest' >&2
+  exit 64
+fi
 image="${RESTRICTED_MATTERMOST_IMAGE_DIGEST:-${RESTRICTED_MATTERMOST_IMAGE_TAG:-restricted-mattermost-ingress-closure:sg-mattermost-004}}"
 if [[ -n "${RESTRICTED_MATTERMOST_IMAGE_DIGEST:-}" ]]; then
   if [[ "$image" != *@sha256:* ]]; then

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a candidate manifest from workflow-generated immutable subject receipts."""
+"""Build a manifest only from hashed, workflow-produced verification receipts."""
 from __future__ import annotations
 
 import argparse
@@ -9,24 +9,37 @@ import re
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
-LOCKS = {
-    "restricted-mattermost-ingress": "requirements/immutable/mattermost-ingress.txt",
-    "restricted-clinical-adapter": "requirements/immutable/clinical-adapter.txt",
-}
+LOCKS = {"restricted-mattermost-ingress": "requirements/immutable/mattermost-ingress.txt", "restricted-clinical-adapter": "requirements/immutable/clinical-adapter.txt"}
 LINE = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s]+)\s+--hash=sha256:([0-9a-f]{64})$")
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _load(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise SystemExit(f"{path}: expected object")
+    return value
 
 
 def lock_record(name: str) -> dict[str, Any]:
     relative = LOCKS[name]
     content = (ROOT / relative).read_bytes()
-    artifacts: list[dict[str, str]] = []
+    artifacts = []
     for raw in content.decode("utf-8").splitlines():
         match = LINE.fullmatch(raw.strip())
         if match:
             artifacts.append({"name": match.group(1), "version": match.group(2), "sha256": match.group(3)})
     return {"path": relative, "sha256": hashlib.sha256(content).hexdigest(), "artifacts": artifacts}
+
+
+def _reference(path: Path) -> dict[str, str]:
+    if path.is_absolute():
+        raise SystemExit("verification receipt paths must be relative to the repository root")
+    return {"receipt": path.as_posix(), "receipt_sha256": _sha(path)}
 
 
 def main() -> int:
@@ -35,47 +48,42 @@ def main() -> int:
     parser.add_argument("--run-url", required=True)
     parser.add_argument("--subject-dir", type=Path, required=True)
     parser.add_argument("--test-receipts", type=Path, required=True)
+    parser.add_argument("--verification-dir", type=Path, required=True)
+    parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--external-subjects", type=Path)
     args = parser.parse_args()
-    receipts = json.loads(args.test_receipts.read_text(encoding="utf-8"))
-    if not isinstance(receipts, dict):
-        raise SystemExit("test receipts must be an object keyed by subject name")
+    receipts = _load(args.test_receipts)
+    evidence = _load(args.evidence)
+    if (evidence.get("source_revision") != args.source_revision or evidence.get("workflow_run_url") != args.run_url
+            or evidence.get("phi_authorized") is not False or evidence.get("deployment_conformant") is not False):
+        raise SystemExit("candidate evidence is not bound or contains an authorization/conformance claim")
     subjects: list[dict[str, Any]] = []
     for name in LOCKS:
-        source = json.loads((args.subject_dir / f"{name}.json").read_text(encoding="utf-8"))
-        digest = source["digest"]
-        verification = {
-            "verified": True,
-            "repository": "cervantesh/restricted-hermes-runtime",
-            "workflow": ".github/workflows/immutable-candidate.yml",
-            "subject_digest": digest,
-        }
-        subject = {
-            "name": name,
-            "image": source["image"],
-            "digest": digest,
-            "platform": "linux/amd64",
-            "base_materials": source["base_materials"],
-            "dependency_lock": lock_record(name),
-            "sbom": {"format": "spdxjson", "subject_digest": digest, "verification": verification},
-            "provenance": {"subject_digest": digest, "verification": verification},
-            "tests": receipts.get(name, []),
-        }
-        subjects.append(subject)
-    manifest: dict[str, Any] = {
-        "schema_version": "restricted-runtime-immutable-candidate.v1",
-        "source_revision": args.source_revision,
-        "platform": "linux/amd64",
-        "workflow": {
-            "repository": "cervantesh/restricted-hermes-runtime",
-            "path": ".github/workflows/immutable-candidate.yml",
-            "run_url": args.run_url,
-        },
-        "subjects": subjects,
-    }
+        source = _load(args.subject_dir / f"{name}.json")
+        digest = source.get("digest")
+        image = source.get("image")
+        attestation_path = args.verification_dir / f"{name}.attestations.json"
+        platform_path = args.verification_dir / f"{name}.platform.json"
+        attestation = _load(attestation_path)
+        platform = _load(platform_path)
+        if (attestation.get("image") != image or attestation.get("digest") != digest
+                or attestation.get("source_revision") != args.source_revision or attestation.get("workflow_run_url") != args.run_url
+                or platform.get("image") != image or platform.get("subject_digest") != digest
+                or platform.get("source_revision") != args.source_revision or platform.get("workflow_run_url") != args.run_url):
+            raise SystemExit(f"{name}: verification receipt is not bound to the published subject")
+        attestation_ref = _reference(attestation_path)
+        platform_ref = _reference(platform_path)
+        subjects.append({
+            "name": name, "image": image, "digest": digest, "platform": "linux/amd64",
+            "base_materials": source["base_materials"], "dependency_lock": lock_record(name),
+            "sbom": {"format": "spdxjson", "subject_digest": digest, "verification": {**attestation_ref, "subject_digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.run_url, "predicate_type": "https://spdx.dev/Document"}},
+            "provenance": {"subject_digest": digest, "verification": {**attestation_ref, "subject_digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.run_url, "predicate_type": "https://slsa.dev/provenance/v1"}},
+            "platform_receipt": platform_ref, "tests": receipts.get(name, []),
+        })
+    manifest: dict[str, Any] = {"schema_version": "restricted-runtime-immutable-candidate.v1", "source_revision": args.source_revision, "platform": "linux/amd64", "workflow": {"repository": "cervantesh/restricted-hermes-runtime", "path": ".github/workflows/immutable-candidate.yml", "run_url": args.run_url}, "subjects": subjects, "evidence": evidence}
     if args.external_subjects:
-        manifest["external_subjects"] = json.loads(args.external_subjects.read_text(encoding="utf-8"))
+        manifest["external_subjects"] = _load(args.external_subjects)
     args.output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0
 
