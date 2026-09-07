@@ -25,6 +25,10 @@ def receipt(module):
         "schema": module.SCHEMA,
         "synthetic_non_phi_only": True,
         "runtime": {"head": HEAD, "tree": TREE},
+        "staging": {
+            "marker_sha256": "c" * 64,
+            "initialized_images": {"ingress": "sha256:" + "a" * 64, "clinical-adapter": "sha256:" + "b" * 64},
+        },
         "host": {"kernel": "6.8.0-test", "architecture": "x86_64"},
         "docker": {"server_version": "27.5.1", "compose_version": "v2.31.0"},
         "services": {
@@ -47,7 +51,12 @@ def receipt(module):
                 "denied_internal": {"mattermost": True},
             },
         },
-        "red_witness": {"detected": True, "cleanup_complete": True},
+        "red_witness": {
+            "proof_sha256": {"ingress": "d" * 64, "clinical-adapter": "e" * 64},
+            "green": {service: {name: True for name in module.DENIED_CLASSES} for service in module.POLICIES},
+            "cleanup": {"network_absent": True, "sink_absent": True},
+            "metadata_scope": "synthetic-controlled-only",
+        },
     }
 
 
@@ -65,15 +74,16 @@ def test_valid_candidate_bound_receipt_verifies_and_contains_no_probe_content():
 @pytest.mark.parametrize(
     "mutate, expected",
     [
-        (lambda value, module: value["services"]["ingress"]["denied"].update(direct_ipv4=False), "denied probe"),
-        (lambda value, module: value["services"]["clinical-adapter"]["denied"].pop("direct_ipv6"), "denied classes"),
+        (lambda value, module: value["services"]["ingress"]["denied"].update(controlled_ipv4=False), "denied probe"),
+        (lambda value, module: value["services"]["clinical-adapter"]["denied"].pop("controlled_ipv6"), "denied classes"),
         (lambda value, module: value["services"]["ingress"].update(proxy_environment_absent=False), "proxy"),
         (lambda value, module: value["services"]["ingress"].update(networks=["mattermost_edge", "escape"]), "networks"),
         (lambda value, module: value["services"]["ingress"]["controls"].update(mount_destinations_exact=False), "mounts or capabilities"),
-        (lambda value, module: value["services"]["ingress"].update(image_id="sha256:" + "g" * 64), "image"),
+        (lambda value, module: value["services"]["ingress"].update(image_id="sha256:" + "f" * 64), "initialized image"),
         (lambda value, module: value["runtime"].update(head="f" * 40), "runtime head"),
         (lambda value, module: value["runtime"].update(tree="e" * 40), "runtime tree"),
-        (lambda value, module: value["red_witness"].update(cleanup_complete=False), "cleanup"),
+        (lambda value, module: value["red_witness"]["cleanup"].update(network_absent=False), "cleanup"),
+        (lambda value, module: value["red_witness"]["proof_sha256"].pop("ingress"), "proof"),
     ],
 )
 def test_verifier_rejects_each_required_negative_control(mutate, expected):
@@ -115,9 +125,53 @@ def test_receipt_builder_records_only_classes_booleans_versions_and_hashes():
         docker_version="27.5.1",
         compose_version="v2.31.0",
         observations=observations,
-        red_detected=True,
-        cleanup_complete=True,
+        marker_sha256="c" * 64,
+        initialized_images={"ingress": "sha256:" + "a" * 64, "clinical-adapter": "sha256:" + "b" * 64},
+        proof_sha256={"ingress": "d" * 64, "clinical-adapter": "e" * 64},
+        green={service: {name: True for name in module.DENIED_CLASSES} for service in module.POLICIES},
+        cleanup={"network_absent": True, "sink_absent": True},
     )
 
     assert module.verify_receipt(value, expected_head=HEAD, expected_tree=TREE) == []
-    assert set(value) == {"schema", "synthetic_non_phi_only", "runtime", "host", "docker", "services", "red_witness"}
+    assert set(value) == {"schema", "synthetic_non_phi_only", "runtime", "staging", "host", "docker", "services", "red_witness"}
+
+
+def test_builder_rejects_a_syntactically_valid_swapped_container_image():
+    module = load_module()
+    observations = receipt(module)["services"]
+    observations["ingress"]["image_id"] = "sha256:" + "f" * 64
+
+    with pytest.raises(module.ReceiptError, match="initialized image"):
+        module.build_receipt(
+            head=HEAD, tree=TREE, kernel="6.8.0-test", architecture="x86_64", docker_version="27.5.1", compose_version="v2.31.0",
+            observations=observations, marker_sha256="c" * 64,
+            initialized_images={"ingress": "sha256:" + "a" * 64, "clinical-adapter": "sha256:" + "b" * 64},
+            proof_sha256={"ingress": "d" * 64, "clinical-adapter": "e" * 64},
+            green={service: {name: True for name in module.DENIED_CLASSES} for service in module.POLICIES},
+            cleanup={"network_absent": True, "sink_absent": True},
+        )
+
+
+def test_actual_container_image_must_match_the_initialized_marker_before_probing():
+    module = load_module()
+
+    with pytest.raises(module.ReceiptError, match="image identity"):
+        module._service_observation(
+            "ingress", "a" * 64, {"Image": "sha256:" + "f" * 64}, "clinicalstagingdemo",
+            {name: ("controlled-probe", 80) for name in module.DENIED_CLASSES}, "sha256:" + "a" * 64,
+        )
+
+
+def test_red_dns_proof_requires_resolution_and_tcp_reachability(monkeypatch):
+    module = load_module()
+    calls = []
+
+    def probe(_image, _container, _host, _port, *, resolve_only=False):
+        calls.append(resolve_only)
+        return not resolve_only
+
+    monkeypatch.setattr(module, "_probe", probe)
+    result = module._probe_results("sha256:" + "a" * 64, "a" * 64, {"controlled_dns": ("controlled-probe", 80)}, reachable=True)
+
+    assert result == {"controlled_dns": False}
+    assert calls == [False, True]
