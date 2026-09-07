@@ -11,7 +11,8 @@ def test_cold_recovery_drill_exercises_real_wrapper_and_causal_controls():
     for invariant in (
         "source deletion did not produce the erased terminal record",
         "already delivered work was delivered again after restore",
-        "reauthorized more than once",
+        "unexpected reauthorization count",
+        "not delivered exactly once",
         "cold-isolation",
         "cold-expired",
         "restored Compose logs or exported evidence leaked synthetic fixture content",

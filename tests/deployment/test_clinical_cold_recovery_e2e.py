@@ -133,8 +133,16 @@ def main() -> None:
             ready_evidence_after = json.loads(restored.control("grant-evidence", "cold-ready"))
             reauthorized_before = ready_evidence_before["audits"].get("restricted_hermes_delivery_reauthorized", 0)
             reauthorized_after = ready_evidence_after["audits"].get("restricted_hermes_delivery_reauthorized", 0)
-            if reauthorized_after - reauthorized_before > 1:
-                raise RuntimeError("restored READY item was reauthorized more than once")
+            reauthorization_delta = reauthorized_after - reauthorized_before
+            # The source generation can commit its in-flight authorization
+            # immediately before the cold fence.  Recovery deliberately gets a
+            # second fresh authorization before its one post (the established
+            # crash-retry contract allows that pair), but must never retry it
+            # beyond that bounded window.
+            if reauthorization_delta not in {1, 2}:
+                raise RuntimeError("restored READY item had an unexpected reauthorization count")
+            if int(restored.control("post-count", "cold-ready")) != 1:
+                raise RuntimeError("restored READY item was not delivered exactly once")
 
             if int(restored.control("post-count", "cold-already-delivered")) != delivered_before:
                 raise RuntimeError("already delivered work was delivered again after restore")
@@ -184,7 +192,7 @@ def main() -> None:
                 "source_deletion_before": source_before,
                 "source_deletion_after": source_after,
                 "delivered_count_before_after": delivered_before,
-                "ready_reauthorization_delta": reauthorized_after - reauthorized_before,
+                "ready_reauthorization_delta": reauthorization_delta,
                 "elapsed_seconds": round(time.monotonic() - started, 3),
                 "nonclaims": ["not PHI", "not production", "not a compliance certification"],
             }
