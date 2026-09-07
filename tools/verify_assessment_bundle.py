@@ -38,11 +38,12 @@ SECRET_PATTERNS = (
 ROOT_KEYS = frozenset({"schema_version", "scope", "candidate_id", "sources", "subjects", "producer", "policy", "controls", "dependencies", "nonclaims", "files"})
 SPECIAL_FILES = frozenset({"README.md", "assessment.manifest.json", "verify_assessment_bundle.py"})
 PROFILE = "restricted-clinical-candidate.v1"
-REQUIRED_SOURCES = frozenset({"health-record-hub-contract", "health-record-hub-publication", "restricted-edge", "restricted-runtime"})
+REQUIRED_SOURCES = frozenset({"governance-contract", "health-record-hub-contract", "health-record-hub-publication", "restricted-edge", "restricted-runtime"})
 REQUIRED_SUBJECTS = frozenset({"health-record-hub-migration", "health-record-hub-web", "restricted-clinical-adapter", "restricted-mattermost-ingress"})
 REQUIRED_DEPENDENCIES = frozenset({"immutable-images", "representative-host-input"})
-REQUIRED_GATES = frozenset({"clinical-composition", "cold-recovery", "governance-decision", "hrh-publication", "immutable-application-subjects", "independent-review", "representative-host"})
+REQUIRED_GATES = frozenset({"bounded-inputs", "clinical-composition", "cold-recovery", "governance-decision", "hrh-publication", "immutable-application-subjects", "independent-review", "representative-host"})
 GATE_EVIDENCE = {
+    "bounded-inputs": ("evidence/bounded-inputs.json",),
     "clinical-composition": ("contracts/clinical-composition.json", "evidence/clinical-receipt.json"),
     "cold-recovery": ("evidence/cold-recovery.json",),
     "governance-decision": ("governance/risk-map.json",),
@@ -52,6 +53,7 @@ GATE_EVIDENCE = {
     "representative-host": ("evidence/representative-host.json",),
 }
 GATE_DEPENDENCIES = {
+    "bounded-inputs": (),
     "clinical-composition": ("immutable-images",),
     "cold-recovery": (),
     "governance-decision": (),
@@ -62,6 +64,16 @@ GATE_DEPENDENCIES = {
 }
 PROFILE_FILES = frozenset({path for paths in GATE_EVIDENCE.values() for path in paths})
 HOST_OBSERVATIONS = ("backup-recovery", "dns", "effective-host-runtime", "ingress-ports", "ipv4", "ipv6", "logging-audit-sinks", "metadata-endpoints", "mounts", "patch-baseline", "principals-iam-denials", "proxy-env", "secret-mounts-rotation", "time-source", "trust-roots")
+BOUNDED_INPUT_CLASSIFICATIONS = {
+    "delivery-reauthorization-pr18": "bounded-delivery-reauthorization",
+    "representative-container-egress-pr19": "bounded-synthetic-container",
+    "secret-boundary-pr15": "bounded-secret-boundary",
+}
+BOUNDED_INPUT_CI_RUN_URLS = {
+    "delivery-reauthorization-pr18": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/34104221878",
+    "representative-container-egress-pr19": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/34109706405",
+    "secret-boundary-pr15": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/34101476120",
+}
 README_CONTENT = "# Restricted clinical assessment bundle\n\nSYNTHETIC_NON_PHI_ONLY. Machine evidence determines verification; this README cannot determine readiness.\n"
 ROOT_KEYS = ROOT_KEYS | {"profile"}
 
@@ -272,13 +284,14 @@ def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, d
     core = {"scope", "outcome", "sources", "subjects", "producer", "policy"}
     required_fields = {
         "contracts/clinical-composition.json": core | {"claim_id"},
+        "evidence/bounded-inputs.json": core | {"inputs"},
         "evidence/clinical-receipt.json": core | {"negative_controls"},
-        "evidence/cold-recovery.json": core | {"manifest_sha256"},
+        "evidence/cold-recovery.json": core | {"manifest_sha256", "recovery_receipt_sha256"},
         "evidence/hrh-publication.json": core | {"publication_receipt_sha256", "verification_receipt_sha256"},
         "evidence/representative-host.json": core | {"observations"},
         "governance/risk-map.json": core | {"risk_owner", "risks"},
         "independent-review/findings.json": core | {"reviewer_id", "authority", "conflict_statement", "findings", "technical_go_no_go"},
-        "subjects/images.json": core,
+        "subjects/images.json": core | {"edge_candidate_manifest_sha256"},
     }
     for path, required in required_fields.items():
         evidence = json_records.get(path)
@@ -294,7 +307,12 @@ def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, d
             and evidence.get("policy") == policy
         )
         if outcome == "NOT_VERIFIED":
-            expected = core | ({"observations"} if path == "evidence/representative-host.json" else {"reason"})
+            if path == "evidence/representative-host.json":
+                expected = core | {"observations"}
+            elif path == "subjects/images.json":
+                expected = core | {"reason", "edge_candidate_manifest_sha256"}
+            else:
+                expected = core | {"reason"}
             if set(evidence) != expected or not common_is_bound:
                 _error(errors, f"evidence {path}: NOT_VERIFIED must contain only the closed binding")
             if path != "evidence/representative-host.json" and (
@@ -303,7 +321,12 @@ def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, d
             ):
                 _error(errors, f"evidence {path}: NOT_VERIFIED needs a closed reason")
         elif outcome == "NOT_APPLICABLE":
-            expected = core | ({"observations"} if path == "evidence/representative-host.json" else {"rationale"})
+            if path == "evidence/representative-host.json":
+                expected = core | {"observations"}
+            elif path == "subjects/images.json":
+                expected = core | {"rationale", "edge_candidate_manifest_sha256"}
+            else:
+                expected = core | {"rationale"}
             rationale_is_closed = path == "evidence/representative-host.json" or (isinstance(evidence.get("rationale"), str) and IDENTIFIER.fullmatch(evidence["rationale"]))
             if set(evidence) != expected or not common_is_bound or not rationale_is_closed:
                 _error(errors, f"evidence {path}: NOT_APPLICABLE needs only a closed rationale")
@@ -318,6 +341,37 @@ def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, d
     images = json_records.get("subjects/images.json", {})
     if images.get("outcome") in {"PASS", "FAIL"} and images.get("subjects") != subjects:
         _error(errors, "evidence subject inventory: exact four-subject binding required")
+    if images.get("outcome") in {"PASS", "FAIL", "NOT_VERIFIED", "NOT_APPLICABLE"} and (
+        not isinstance(images.get("edge_candidate_manifest_sha256"), str)
+        or not SHA256.fullmatch(images["edge_candidate_manifest_sha256"])
+    ):
+        _error(errors, "evidence subject inventory: edge candidate manifest sha256 required")
+    bounded = json_records.get("evidence/bounded-inputs.json", {})
+    if bounded.get("outcome") in {"PASS", "FAIL"}:
+        inputs = _ordered_records(bounded.get("inputs"), field="id", errors=errors, context="evidence bounded inputs")
+        if {item.get("id") for item in inputs} != set(BOUNDED_INPUT_CLASSIFICATIONS):
+            _error(errors, "evidence bounded inputs: exact three-input inventory required")
+        for item in inputs:
+            identifier = item.get("id")
+            hosted_ci = _mapping(item.get("hosted_ci"))
+            if (
+                set(item) != {"id", "source_revision", "source_tree", "evidence_artifact_sha256", "hosted_ci", "classification"}
+                or not isinstance(item.get("source_revision"), str)
+                or not GIT_OBJECT.fullmatch(item["source_revision"])
+                or not isinstance(item.get("source_tree"), str)
+                or not GIT_OBJECT.fullmatch(item["source_tree"])
+                or not isinstance(item.get("evidence_artifact_sha256"), str)
+                or not SHA256.fullmatch(item["evidence_artifact_sha256"])
+                or item.get("classification") != BOUNDED_INPUT_CLASSIFICATIONS.get(identifier)
+                or hosted_ci is None
+                or set(hosted_ci) != {"run_url", "head_sha", "receipt_sha256", "conclusion"}
+                or hosted_ci.get("run_url") != BOUNDED_INPUT_CI_RUN_URLS.get(identifier)
+                or hosted_ci.get("head_sha") != item.get("source_revision")
+                or not isinstance(hosted_ci.get("receipt_sha256"), str)
+                or not SHA256.fullmatch(hosted_ci["receipt_sha256"])
+                or hosted_ci.get("conclusion") != "PASS"
+            ):
+                _error(errors, f"evidence bounded input {identifier!r}: closed provenance or classification mismatch")
     host = json_records.get("evidence/representative-host.json", {})
     observations = host.get("observations")
     exact_host_inventory = (
@@ -350,8 +404,11 @@ def _verify_profile_evidence(manifest: dict[str, Any], json_records: dict[str, d
     if publication.get("outcome") in {"PASS", "FAIL"} and any(not isinstance(publication.get(field), str) or not SHA256.fullmatch(publication[field]) for field in ("publication_receipt_sha256", "verification_receipt_sha256")):
         _error(errors, "evidence HRH publication: external publication and verification receipt sha256 bindings required")
     recovery = json_records.get("evidence/cold-recovery.json", {})
-    if recovery.get("outcome") in {"PASS", "FAIL"} and (not isinstance(recovery.get("manifest_sha256"), str) or not SHA256.fullmatch(recovery["manifest_sha256"])):
-        _error(errors, "evidence cold recovery: immutable manifest sha256 required")
+    if recovery.get("outcome") in {"PASS", "FAIL"}:
+        if not isinstance(recovery.get("manifest_sha256"), str) or not SHA256.fullmatch(recovery["manifest_sha256"]):
+            _error(errors, "evidence cold recovery: immutable manifest sha256 required")
+        if not isinstance(recovery.get("recovery_receipt_sha256"), str) or not SHA256.fullmatch(recovery["recovery_receipt_sha256"]):
+            _error(errors, "evidence cold recovery: recovery receipt sha256 required")
     review = json_records.get("independent-review/findings.json", {})
     if review.get("outcome") in {"PASS", "FAIL"} and (any(not isinstance(review.get(key), str) or not IDENTIFIER.fullmatch(review[key]) for key in ("reviewer_id", "authority", "conflict_statement")) or not isinstance(review.get("findings"), list) or not review["findings"] or any(not isinstance(item, str) or not IDENTIFIER.fullmatch(item) for item in review["findings"]) or review.get("technical_go_no_go") != ("GO" if review.get("outcome") == "PASS" else "NO_GO")):
         _error(errors, "evidence independent review: identity/authority/conflict/findings/go-no-go required")
