@@ -1,0 +1,3 @@
+# Dockerfile.clinical-adapter has no third-party runtime dependencies.
+# The package itself is installed with --no-deps --no-build-isolation, which
+# prevents pip from resolving project dependencies or creating a build env.
