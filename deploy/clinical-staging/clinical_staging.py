@@ -108,8 +108,13 @@ class Shell:
             errors="replace",
         )
         if check and result.returncode:
-            detail = (result.stdout + result.stderr)[-1600:]
-            raise CommandError(f"{args[0]} exited {result.returncode}: {detail}")
+            # Child output can contain credentials (or values derived from them).
+            # Do not turn it into operator/CI output by copying it into the
+            # exception.  This wrapper deliberately keeps no secondary
+            # diagnostic receipt: its only public contract is a fixed command
+            # class and exit code.
+            command = Path(args[0]).name if args and Path(args[0]).name in {"docker", "git"} else "child"
+            raise CommandError(f"command failed: {command} exit={result.returncode}")
         return result
 
     def git(self, cwd: Path, *args: str) -> str:
@@ -712,6 +717,35 @@ class ClinicalStaging:
         self.compose("build", "ingress", "clinical-adapter", timeout=2400)
         self.compose("build", "controller", "hrh-migrate", "hrh", timeout=2400)
 
+    def _provision_initial_mattermost_admin(self) -> None:
+        """Create the initial admin inside the provisioner boundary.
+
+        The controller reads the mode-0600 seed file from its private,
+        read-only mount and sends the password only as the HTTPS request body.
+        The host never reads it for a child command, so neither host argv nor
+        Docker's container command metadata receives the value.
+        """
+        self.control("create-initial-admin", timeout=180)
+
+    def _erase_initial_admin_password(self) -> None:
+        """Discard the bootstrap-only secret after a successful full init.
+
+        A stopped/interrupted initialization keeps the mode-0600 file so the
+        same initializing marker can resume.  Once the lifecycle is ready it
+        is no longer needed.  A rename-safe unlink is enough here: the parent
+        state directory is operator-owned mode 0700, and an interruption can
+        leave only the original protected file or no file at all.
+        """
+        password = self.state_dir / "seed" / "admin_password"
+        try:
+            metadata = password.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise SafetyError("bootstrap password artifact is not an operator-owned mode-0600 regular file")
+        password.unlink()
+        fsync_directory(password.parent)
+
     def init(self) -> dict[str, Any]:
         self._require_linux()
         frame = verify_source_frame(self.runtime, self.hrh, self.shell)
@@ -738,14 +772,7 @@ class ClinicalStaging:
             raise CommandError("HRH migration did not complete successfully")
         self.compose("up", "--detach", "mattermost", timeout=600)
         self.control("wait-mm")
-        password = (self.state_dir / "seed" / "admin_password").read_text(encoding="ascii")
-        created = self.compose(
-            "exec", "--no-TTY", "mattermost", "/mattermost/bin/mmctl", "--local", "user", "create",
-            "--email", "admin@clinical.invalid", "--username", "clinicaladmin", "--password", password,
-            "--system-admin", "--email-verified", "--disable-welcome-email", "--quiet", check=False,
-        )
-        if created.returncode and "already exists" not in (created.stdout + created.stderr).lower():
-            raise CommandError("synthetic Mattermost administrator bootstrap failed")
+        self._provision_initial_mattermost_admin()
         self.control("bootstrap-mm")
         self.control("seed-hrh")
         self.control("policy", "clinical-e1", "3600")
@@ -766,7 +793,9 @@ class ClinicalStaging:
         marker["lifecycle"] = "ready"
         self._write_marker(marker)
         self.up()
-        return self.status()
+        result = self.status()
+        self._erase_initial_admin_password()
+        return result
 
     def up(self) -> dict[str, Any]:
         self._require_linux()
