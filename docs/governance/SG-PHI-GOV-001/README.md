@@ -10,13 +10,17 @@ It is separate from runtime code and technical test receipts.
 2. Freeze one candidate first: record exact source SHAs, contract/policy
    digests, OCI image digests, Mattermost and Health-Record-Hub revisions,
    provider/model/region, dependency locks, base images, and deployment SHA.
-   Compute the final record and evidence-manifest digests before collecting
-   signatures; changing either invalidates every signature.
+   Compute the Decision Payload digest and evidence-manifest digest before
+   collecting signatures. The payload is sections 1–9 only; section 10 is the
+   signature envelope. Adding signatures does not change the payload, while any
+   payload or evidence-manifest change invalidates every signature.
 3. Fill only the bounded clinical flow. A broader workflow requires its own
    reviewed contract; do not widen this record silently.
-   Before the pilot gate closes, all identifiers, patients, users, channels,
-   fixtures, and test records must be synthetic and unrelated to real people or
-   production records.
+   Candidate validation and staging may continue under `NO-GO`, but all
+   identifiers, patients, users, channels, fixtures, and test records must be
+   synthetic and unrelated to real people or production records until a valid
+   external decision exists. `NO-GO` blocks starting the controlled pilot; it
+   does not block synthetic staging.
 4. Attach product-controlled receipts, then obtain an independent review of the
    same immutable candidate. Green CI or a historical review is not enough.
    The reviewer must be independent of the author, operator, and approver.
@@ -32,7 +36,9 @@ It is separate from runtime code and technical test receipts.
 7. Record residual risks and preserve the nonclaims. Every unresolved field is
    a failed gate.
 8. Select `NO-GO`, `GO WITH CONDITIONS`, or `GO`. Section 9 is authoritative:
-   any absence, rejection, `NO-GO`, or pending condition forces `NO-GO` for PHI.
+   any absence, rejection, `NO-GO`, or pending condition forces `NO-GO` for the
+   controlled pilot. Any permitted pilot data class or PHI scope comes only
+   from verifiable external decisions; this record never enables it.
    `ACCEPT WITH CONDITIONS` cannot close a blocker or coexist with `GO` while a
    condition is open. A recorded `GO` only registers compatible external
    decisions with matching scope; this record never grants authority.
