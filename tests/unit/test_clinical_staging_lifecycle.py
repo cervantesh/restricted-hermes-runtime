@@ -1157,7 +1157,7 @@ def test_volume_transfer_helper_is_pinned_networkless_and_never_uses_socket(tmp_
         assert module.RECOVERY_HELPER_IMAGE in call
     assert shell.calls[0][-1] == "tar --numeric-owner -C /source -cf /backup/volumes/hrh_secret.tar ."
     assert shell.calls[1][-1] == "tar --numeric-owner -C /destination -xf /backup/volumes/hrh_secret.tar"
-    mounts = [call[index + 1] for index, value in enumerate(shell.calls[0][:-1]) if value == "--mount"]
+    mounts = [shell.calls[0][index + 1] for index, value in enumerate(shell.calls[0][:-1]) if value == "--mount"]
     module.verify_recovery_helper_boundary(shell.calls[0], source_mount=mounts[0], backup_mount=mounts[1])
     extra_capability = list(shell.calls[0])
     extra_capability[extra_capability.index(module.RECOVERY_HELPER_IMAGE):extra_capability.index(module.RECOVERY_HELPER_IMAGE)] = [
