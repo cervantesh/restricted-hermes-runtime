@@ -29,14 +29,23 @@ from cryptography.x509.oid import NameOID
 
 
 RUNTIME_BASE_SHA = "41464aee8748f857153ba2b47377515d4847d210"
-REQUIRED_HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"
-REQUIRED_HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"
+REQUIRED_HRH_SHA = "e30a4f968de6727519f49c08369f561fdf269ec5"
+REQUIRED_HRH_TREE = "7fb2543a2ceb1649f05c467b38708d1404106659"
+HRH_WEB_CANDIDATE_DOCKERFILE = "Dockerfile.web.clinical-candidate"
+HRH_MIGRATE_CANDIDATE_DOCKERFILE = "Dockerfile.migrate.clinical-candidate"
+HRH_NODE_BASE = "node:24-alpine@sha256:4caaaf42195bcd6f6f3559a413b20cb8f8ad089e231ee874cf7701643966689f"
+HRH_MIGRATE_BASE = "alpine:3.21@sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339"
+HRH_CANDIDATE_BASES = {
+    HRH_WEB_CANDIDATE_DOCKERFILE: (HRH_NODE_BASE, HRH_NODE_BASE, HRH_NODE_BASE),
+    HRH_MIGRATE_CANDIDATE_DOCKERFILE: (HRH_MIGRATE_BASE,),
+}
 SCHEMA = "restricted-synthetic-clinical-staging.v1"
 MARKER_NAME = "staging-state.json"
 PROJECT_LABEL = "io.cervantesh.restricted-runtime.project"
 STATE_LABEL = "io.cervantesh.restricted-runtime.state-id"
 SYNTHETIC_LABEL = "io.cervantesh.restricted-runtime.synthetic-clinical"
 PROJECT_RE = re.compile(r"^clinicalstaging[a-z0-9]{1,32}$")
+FROM_RE = re.compile(r"^\s*FROM\s+(?:--platform=\S+\s+)?(?P<image>\S+)", re.MULTILINE | re.IGNORECASE)
 VOLUME_KEYS = (
     "mattermost_db", "mattermost_data", "mattermost_tls", "hrh_db",
     "hrh_tls", "hrh_secret", "clinical_config", "clinical_socket",
@@ -276,6 +285,19 @@ def verify_source_frame(runtime: Path, hrh: Path, shell: Any) -> dict[str, str]:
         "hrh_head": hrh_head,
         "hrh_tree": hrh_tree,
     }
+
+
+def verify_hrh_candidate_build_inputs(hrh: Path) -> None:
+    """Fail before Compose when the frozen HRH build recipes are not closed."""
+    for name, expected in HRH_CANDIDATE_BASES.items():
+        try:
+            images = tuple(match.group("image") for match in FROM_RE.finditer((hrh / name).read_text(encoding="utf-8")))
+        except OSError as exc:
+            raise SafetyError("candidate HRH Dockerfile is unavailable") from exc
+        if not images or any("@sha256:" not in image for image in images):
+            raise SafetyError("candidate HRH Dockerfile contains a mutable base")
+        if images != expected:
+            raise SafetyError("candidate HRH Dockerfile base digest differs from the frozen contract")
 
 
 def verify_destructive_volumes(
@@ -715,6 +737,7 @@ class ClinicalStaging:
     def init(self) -> dict[str, Any]:
         self._require_linux()
         frame = verify_source_frame(self.runtime, self.hrh, self.shell)
+        verify_hrh_candidate_build_inputs(self.hrh)
         if self.state_dir.exists() and (self.state_dir / MARKER_NAME).exists():
             marker = read_marker(self.state_dir, self.project)
             if marker["lifecycle"] != "initializing":

@@ -68,5 +68,8 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert "dropped capabilities" in runbook
     assert "no-new-privileges" in runbook
     assert 'RUNTIME_BASE_SHA = "41464aee8748f857153ba2b47377515d4847d210"' in script
-    assert 'REQUIRED_HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"' in script
-    assert 'REQUIRED_HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"' in script
+    assert 'REQUIRED_HRH_SHA = "e30a4f968de6727519f49c08369f561fdf269ec5"' in script
+    assert 'REQUIRED_HRH_TREE = "7fb2543a2ceb1649f05c467b38708d1404106659"' in script
+    assert "Dockerfile.web.clinical-candidate" in script
+    assert "Dockerfile.migrate.clinical-candidate" in script
+    assert "verify_hrh_candidate_build_inputs(self.hrh)" in script

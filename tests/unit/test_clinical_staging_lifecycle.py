@@ -126,6 +126,48 @@ def test_source_frame_requires_clean_runtime_ancestry_and_exact_clean_hrh(tmp_pa
         module.verify_source_frame(runtime, hrh, fake)
 
 
+def _write_candidate_dockerfiles(module, hrh: Path, *, web_bases: tuple[str, ...] | None = None,
+                                 migrate_bases: tuple[str, ...] | None = None) -> None:
+    for name, bases in (
+        (module.HRH_WEB_CANDIDATE_DOCKERFILE, web_bases or module.HRH_CANDIDATE_BASES[module.HRH_WEB_CANDIDATE_DOCKERFILE]),
+        (module.HRH_MIGRATE_CANDIDATE_DOCKERFILE, migrate_bases or module.HRH_CANDIDATE_BASES[module.HRH_MIGRATE_CANDIDATE_DOCKERFILE]),
+    ):
+        (hrh / name).write_text("\n".join(f"FROM {image} AS stage{index}" for index, image in enumerate(bases)) + "\n", encoding="utf-8")
+
+
+def test_candidate_dockerfile_preflight_requires_exact_pinned_base_contract(tmp_path: Path):
+    module = load_module()
+    hrh = tmp_path / "hrh"
+    hrh.mkdir()
+    _write_candidate_dockerfiles(module, hrh)
+
+    module.verify_hrh_candidate_build_inputs(hrh)
+    _write_candidate_dockerfiles(module, hrh, web_bases=("node:24-alpine",) * 3)
+    with pytest.raises(module.SafetyError, match="mutable base"):
+        module.verify_hrh_candidate_build_inputs(hrh)
+    _write_candidate_dockerfiles(module, hrh, web_bases=("node:24-alpine@sha256:" + "0" * 64,) * 3)
+    with pytest.raises(module.SafetyError, match="base digest"):
+        module.verify_hrh_candidate_build_inputs(hrh)
+
+
+def test_init_rejects_unclosed_candidate_dockerfile_before_compose(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    _write_candidate_dockerfiles(module, hrh, web_bases=("node:24-alpine",) * 3)
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingdemo", 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: {"runtime_head": "a" * 40, "runtime_tree": "b" * 40, "hrh_head": module.REQUIRED_HRH_SHA, "hrh_tree": module.REQUIRED_HRH_TREE})
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: pytest.fail("Compose must not run before candidate Dockerfile preflight"))
+
+    with pytest.raises(module.SafetyError, match="mutable base"):
+        staging.init()
+    assert not state.exists()
+
+
 def test_destructive_volume_guard_rejects_missing_labels_and_unexpected_project_volume():
     module = load_module()
     project = "clinicalstagingdemo"

@@ -33,8 +33,8 @@ MM_IMAGE = "mattermost/mattermost-team-edition:11.7.10@sha256:84a041d836bf6fbf6a
 PG_IMAGE = "postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f"
 NGINX_IMAGE = "nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284"
 RUNTIME_PRODUCT_SHA = "8049dd7612176b33e65ef19f61f5699aef7e0a28"
-HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"
-HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"
+HRH_SHA = "e30a4f968de6727519f49c08369f561fdf269ec5"
+HRH_TREE = "7fb2543a2ceb1649f05c467b38708d1404106659"
 PROJECT = f"clinicale2e{os.getpid()}_{int(time.time())}"
 STATE = Path(tempfile.mkdtemp(prefix="clinical-composed-e2e-"))
 SEED = STATE / "seed"
