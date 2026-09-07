@@ -494,6 +494,7 @@ def main() -> None:
         "residual_limitations": [
             "Synthetic data and a test CA were used; this is technical conformance evidence, not a compliance certification.",
             "The run exercised Linux containers and the pinned Mattermost ESR image, not a production deployment or host-level operating-system controls.",
+            "The HRH service was built from the clean head/tree source frame; no published HRH registry digest, SBOM, provenance attestation, or no-rebuild verification is claimed.",
         ],
     }
     (EVIDENCE / "report.json").write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
