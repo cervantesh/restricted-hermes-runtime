@@ -159,8 +159,11 @@ def test_separate_trust_declaration_and_four_signed_statements_are_required(tmp_
             if "spdxjson" in args
             else "https://slsa.dev/provenance/v1"
         )
+        payload = base64.b64encode(
+            json.dumps(signed_statement(receipt, role, predicate)).encode()
+        ).decode()
         return subprocess.CompletedProcess(
-            args, 0, json.dumps([signed_statement(receipt, role, predicate)]), ""
+            args, 0, json.dumps([{"payload": payload}]), ""
         )
 
     docker_config = tmp_path / "docker"
@@ -320,6 +323,17 @@ def test_verification_summary_contains_identity_hashes_but_no_credentials(
     assert result["phi_authorized"] is False
     assert credential not in rendered
     assert "never-publish-this" not in rendered
+
+
+def test_registry_native_retention_resolution_can_bind_the_exact_digest(tmp_path):
+    tool = load_tool()
+    trust, receipt, key = fixture(tmp_path)
+    receipt["subjects"][0]["retention_evidence"]["registry_resolution"] = (
+        "projects/example/locations/us-east4/repositories/containers/"
+        "dockerImages/web/versions/sha256:" + "1" * 64
+    )
+
+    tool.validate_candidate(trust, receipt, key.read_bytes())
 
 
 @pytest.mark.parametrize(

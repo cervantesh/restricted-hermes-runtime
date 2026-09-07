@@ -134,7 +134,15 @@ def validate_candidate(trust_value: object, receipt_value: object, public_key: b
         retention = _mapping(item.get("retention_evidence"), f"receipt {role} retention evidence is required")
         _closed(retention, {"tag", "subject", "registry_resolution"}, f"receipt {role} retention evidence")
         expected_tag = item["image"].split("@", 1)[0] + f":keep-clinical-{trust['build_source_revision']}-{role}"
-        _require(retention.get("tag") == expected_tag and retention.get("subject") == item["image"] and retention.get("registry_resolution") == item["image"], f"receipt {role} retention evidence does not bind the exact subject")
+        expected_digest = item["image"].split("@", 1)[1]
+        resolution = retention.get("registry_resolution")
+        _require(
+            retention.get("tag") == expected_tag
+            and retention.get("subject") == item["image"]
+            and isinstance(resolution, str)
+            and resolution.endswith(expected_digest),
+            f"receipt {role} retention evidence does not bind the exact subject",
+        )
         _require(item.get("retention_tag") == expected_tag.rsplit(":", 1)[1], f"receipt {role} retention tag is invalid")
         for field, (predicate, _) in PREDICATES.items():
             attestation = _mapping(item.get(field), f"receipt {role} {field} is required")
@@ -186,7 +194,11 @@ def _statements(value: object) -> list[dict[str, Any]]:
         try:
             return _statements(json.loads(value))
         except json.JSONDecodeError:
-            return []
+            try:
+                decoded = base64.b64decode(value, validate=True).decode("utf-8")
+                return _statements(json.loads(decoded))
+            except (ValueError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError):
+                return []
     if isinstance(value, list):
         for item in value:
             found.extend(_statements(item))
@@ -246,13 +258,18 @@ def verify_attestations(
     for role in ("web", "migrate"):
         subject = candidate["subjects"][role]["image"]
         for field, (_, cosign_type) in PREDICATES.items():
-            args = [
-                "docker", "run", "--rm", "--volume", mount_config,
-                "--volume", mount_key, COSIGN_IMAGE,
-                "verify-attestation", "--output", "json", "--key",
-                "/trust/public.pem", "--type", cosign_type,
-                "--check-claims=true", subject,
-            ]
+            args = ["docker", "run", "--rm"]
+            if hasattr(os, "getuid"):
+                args.extend(("--user", f"{os.getuid()}:{os.getgid()}"))
+            args.extend(
+                [
+                    "--env", "DOCKER_CONFIG=/home/nonroot/.docker",
+                    "--volume", mount_config, "--volume", mount_key,
+                    COSIGN_IMAGE, "verify-attestation", "--output", "json",
+                    "--key", "/trust/public.pem", "--type", cosign_type,
+                    "--check-claims=true", subject,
+                ]
+            )
             result = runner(args, text=True, capture_output=True, check=False, timeout=300, env=sealed_docker_environment())
             _require(result.returncode == 0, f"{role} {field} cryptographic verification failed")
             try:
