@@ -91,6 +91,22 @@ def phase(name: str) -> None:
     print(f"clinical_composed_e2e phase={name}", flush=True)
 
 
+def require_success(result: subprocess.CompletedProcess[str], operation: str) -> None:
+    """Raise a public, content-free failure for a failed child operation."""
+    if result.returncode:
+        raise RuntimeError(f"clinical composed E2E failed: {operation} exit={result.returncode}")
+
+
+def emit_public_debug(label: str, *_discarded: subprocess.CompletedProcess[str]) -> None:
+    """Keep public CI diagnostics useful without copying child output.
+
+    Compose and controller children can read the synthetic seed.  Their raw
+    stdout, stderr, and logs are therefore intentionally not diagnostic
+    material for a public test stream.
+    """
+    print(f"clinical_composed_e2e debug={label} details=omitted", file=sys.stderr)
+
+
 def make_certificates() -> None:
     now = datetime.now(UTC)
     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -411,12 +427,7 @@ def main() -> None:
     wait_hrh_postgres()
     compose("up", "--detach", "hrh-migrate", timeout=600)
     migrated = compose("wait", "hrh-migrate", check=False, timeout=600)
-    if migrated.returncode:
-        logs = compose("logs", "--no-color", "hrh-migrate", check=False).stdout[-2400:]
-        raise RuntimeError(
-            "HRH migration container did not complete successfully: "
-            f"wait_exit={migrated.returncode}; wait={(migrated.stdout + migrated.stderr)[-800:]}; logs={logs}"
-        )
+    require_success(migrated, "hrh-migrate")
     phase("servers")
     compose("up", "--detach", "mattermost", timeout=300)
     control("wait-mm")
@@ -441,8 +452,7 @@ def main() -> None:
         control("expect", "success", "reply", timeout=60)
     except RuntimeError:
         compose("stop", "ingress", check=False)
-        print("clinical_composed_e2e debug_outbox=" + control("outbox-summary", check=False).stdout.strip(), file=sys.stderr)
-        print("clinical_composed_e2e debug_grants=" + control("grant-count", check=False).stdout.strip(), file=sys.stderr)
+        emit_public_debug("valid-command")
         raise
     boundaries = network_and_surface_controls()
     phase("identity-controls")
@@ -508,9 +518,7 @@ def main() -> None:
         wait_grants(before)
     except RuntimeError:
         compose("stop", "ingress", check=False)
-        print("clinical_composed_e2e crash_debug=" + control("clinical-db-summary", check=False).stdout.strip(), file=sys.stderr)
-        print("clinical_composed_e2e crash_outbox=" + control("outbox-summary", check=False).stdout.strip(), file=sys.stderr)
-        print(compose("logs", "--no-color", "ingress", "clinical-adapter", "hrh", check=False).stdout[-2400:], file=sys.stderr)
+        emit_public_debug("crash-retry")
         raise
     before_crash = json.loads(control("grant-evidence", "crash-retry").stdout)
     if before_crash["audits"].get("restricted_hermes_next_appointment_read_authorized") != 1 or before_crash["audits"].get("restricted_hermes_next_appointment_read_completed") != 1:

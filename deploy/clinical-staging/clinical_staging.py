@@ -236,7 +236,7 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         or value["volumes"] != volume_names(project)
         or not re.fullmatch(r"[a-f0-9]{32}", value["state_id"])
         or not re.fullmatch(r"[a-f0-9]{64}", value["compose_env_sha256"])
-        or value["lifecycle"] not in {"initializing", "ready", "stopped"}
+        or value["lifecycle"] not in {"initializing", "finalizing", "ready", "stopped"}
         or not isinstance(value["expected_images"], dict)
     ):
         raise SafetyError("staging marker does not match the requested synthetic target")
@@ -296,9 +296,9 @@ def verify_destructive_volumes(
     for name in discovered:
         if any(discovered[name].get(key) != value for key, value in required.items()):
             raise SafetyError(f"volume label mismatch: {name}")
-    if lifecycle in {"ready", "stopped"} and set(discovered) != expected:
-        raise SafetyError("ready/stopped staging requires the exact volume set")
-    if lifecycle not in {"initializing", "ready", "stopped"}:
+    if lifecycle in {"finalizing", "ready", "stopped"} and set(discovered) != expected:
+        raise SafetyError("finalizing/ready/stopped staging requires the exact volume set")
+    if lifecycle not in {"initializing", "finalizing", "ready", "stopped"}:
         raise SafetyError("unknown lifecycle for destructive volume verification")
     return sorted(discovered)
 
@@ -329,14 +329,14 @@ def verify_destructive_resources(
     duplicates = sorted({service for service in services if services.count(service) > 1})
     if duplicates:
         raise SafetyError("duplicate project service containers: " + ", ".join(duplicates))
-    if lifecycle in {"ready", "stopped"}:
+    if lifecycle in {"finalizing", "ready", "stopped"}:
         if "controller" in services:
-            raise SafetyError("controller must be absent from ready/stopped staging")
+            raise SafetyError("controller must be absent from finalizing/ready/stopped staging")
         expected_services = set(LONG_RUNNING_SERVICES) | set(ONE_SHOT_SERVICES)
         if set(services) != expected_services:
-            raise SafetyError("ready/stopped staging requires the exact service set")
+            raise SafetyError("finalizing/ready/stopped staging requires the exact service set")
         if set(networks) != allowed_networks:
-            raise SafetyError("ready/stopped staging requires the exact network set")
+            raise SafetyError("finalizing/ready/stopped staging requires the exact network set")
     elif lifecycle != "initializing":
         raise SafetyError("unknown lifecycle for destructive resource verification")
     return sorted(containers), sorted(networks)
@@ -681,14 +681,7 @@ class ClinicalStaging:
         self.control("create-initial-admin", timeout=180)
 
     def _erase_initial_admin_password(self) -> None:
-        """Discard the bootstrap-only secret after a successful full init.
-
-        A stopped/interrupted initialization keeps the mode-0600 file so the
-        same initializing marker can resume.  Once the lifecycle is ready it
-        is no longer needed.  A rename-safe unlink is enough here: the parent
-        state directory is operator-owned mode 0700, and an interruption can
-        leave only the original protected file or no file at all.
-        """
+        """Discard the bootstrap-only secret while the marker is finalizing."""
         password = self.state_dir / "seed" / "admin_password"
         try:
             metadata = password.stat(follow_symlinks=False)
@@ -699,13 +692,29 @@ class ClinicalStaging:
         password.unlink()
         fsync_directory(password.parent)
 
+    def _finalize_initialization(self, marker: dict[str, Any]) -> None:
+        """Durably complete the one-way bootstrap-secret cleanup protocol.
+
+        ``finalizing`` is deliberately not an operational lifecycle.  It is a
+        recoverable checkpoint after every service has started, but before the
+        marker can advertise ``ready``.  An interrupt before unlink leaves the
+        protected seed and a finalizing marker; an interrupt after unlink but
+        before the atomic ready marker leaves only that finalizing marker.  A
+        subsequent ``init`` repeats this idempotent finalizer and cannot leave
+        a ready staging target with a reusable bootstrap secret.
+        """
+        self._require_lifecycle(marker, "initialization finalization", {"finalizing"})
+        self._erase_initial_admin_password()
+        marker["lifecycle"] = "ready"
+        self._write_marker(marker)
+
     @serialized_lifecycle
     def init(self) -> dict[str, Any]:
         self._require_linux()
         frame = verify_source_frame(self.runtime, self.hrh, self.shell)
         if self.state_dir.exists() and (self.state_dir / MARKER_NAME).exists():
             marker = read_marker(self.state_dir, self.project)
-            if marker["lifecycle"] != "initializing":
+            if marker["lifecycle"] not in {"initializing", "finalizing"}:
                 raise SafetyError("staging target is already initialized")
             verify_effective_env(self.state_dir, marker)
             if any(marker[key] != value for key, value in frame.items()):
@@ -716,6 +725,9 @@ class ClinicalStaging:
         state_stat = self.state_dir.stat()
         if state_stat.st_uid != os.getuid() or stat.S_IMODE(state_stat.st_mode) != 0o700:
             raise SafetyError("state directory must be owned by the operator with mode 0700")
+        if marker["lifecycle"] == "finalizing":
+            self._finalize_initialization(marker)
+            return self.up()
         self._create_volumes(marker)
         self.compose("config", "--quiet")
         self._build_images()
@@ -744,12 +756,10 @@ class ClinicalStaging:
         self.control("wait-mm")
         self.control("wait-hrh")
         marker["expected_images"] = self._built_images()
-        marker["lifecycle"] = "ready"
+        marker["lifecycle"] = "finalizing"
         self._write_marker(marker)
-        self.up()
-        result = self.status()
-        self._erase_initial_admin_password()
-        return result
+        self._finalize_initialization(marker)
+        return self.up()
 
     @serialized_lifecycle
     def up(self) -> dict[str, Any]:
