@@ -12,7 +12,9 @@ import hashlib
 import importlib.util
 import json
 import sys
+import tarfile
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -22,6 +24,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 STAGING_PATH = ROOT / "deploy" / "clinical-staging" / "clinical_staging.py"
 CODEC_PATH = ROOT / "deploy" / "clinical-staging" / "clinical_backup_bundle.py"
+VERIFIER_PATH = ROOT / "tools" / "verify_hrh_published_candidate.py"
 
 BACKUP_SCHEMA = "restricted-synthetic-clinical-cold-backup-receipt-published.v1"
 MECHANICAL_SCHEMA = "restricted-synthetic-clinical-cold-restore-published.v1"
@@ -98,6 +101,21 @@ def _sha(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _public_evidence_tar() -> tuple[bytes, str]:
+    verifier = _load(VERIFIER_PATH, "receipt_fixture_published_verifier")
+    names = (*verifier.EVIDENCE_FILES, "SHA256SUMS.json", "trust.json", "verification.json")
+    stream = BytesIO()
+    with tarfile.open(fileobj=stream, mode="w:") as archive:
+        for name in sorted(names):
+            payload = _canonical({"synthetic": name})
+            info = tarfile.TarInfo(name)
+            info.size, info.uid, info.gid, info.mode, info.mtime = len(payload), 0, 0, 0o600, 0
+            archive.addfile(info, BytesIO(payload))
+    ownership = [{"name": name, "kind": "file", "uid": 0, "gid": 0, "mode": 0o600}
+                 for name in sorted(names)]
+    return stream.getvalue(), hashlib.sha256(_canonical({"entries": ownership})).hexdigest()
+
+
 def _published_fixture() -> dict[str, Any]:
     recipient = "age106z8cqt3xncqk4r8qzv9zjvtjeupz2nyepc45y63ft3l4v0yxauqvn082m"
     runtime_source = {"runtime_head": "1" * 40, "runtime_tree": "2" * 40}
@@ -159,7 +177,11 @@ def _published_fixture() -> dict[str, Any]:
     }
     identity_bytes = _canonical(identity)
     capsule_bytes = b"synthetic-age-ciphertext"
-    public_evidence = {"sha256": "4" * 64, "size": 2048, "ownership_sha256": "5" * 64}
+    public_evidence_bytes, public_evidence_ownership = _public_evidence_tar()
+    public_evidence = {
+        "sha256": hashlib.sha256(public_evidence_bytes).hexdigest(),
+        "size": len(public_evidence_bytes), "ownership_sha256": public_evidence_ownership,
+    }
     members = {
         "backup-identity.json": {"sha256": hashlib.sha256(identity_bytes).hexdigest(),
                                  "size": len(identity_bytes), "ownership_sha256": "6" * 64},
@@ -204,6 +226,7 @@ def _published_fixture() -> dict[str, Any]:
         "restore_trust": restore_trust,
         "restore_trust_sha256": _sha(restore_trust),
         "capsule_bytes": capsule_bytes, "current_marker": current_marker,
+        "public_evidence_bytes": public_evidence_bytes,
     }
 
 
@@ -314,6 +337,29 @@ def _expected_published_backup(fixture: Mapping[str, Any]) -> dict[str, Any]:
         "effective_images": identity["effective_images"], "excluded_volume": "clinical_socket",
         "backed_up_at": "2026-08-01T12:30:00Z", "nonclaims": BACKUP_NONCLAIMS,
     }
+
+
+def test_published_authority_fixture_is_independently_self_consistent() -> None:
+    fixture = _published_fixture()
+    for trust in (fixture["backup_trust"], fixture["restore_trust"]):
+        hashes = [item["recipient_sha256"] for item in trust["recipients"]]
+        assert hashes == sorted(hashes)
+        for recipient in trust["recipients"]:
+            assert recipient["recipient_sha256"] == hashlib.sha256(
+                (recipient["recipient"] + "\n").encode("ascii")
+            ).hexdigest()
+    assert fixture["identity"]["recovery_trust_sha256"] == hashlib.sha256(
+        fixture["backup_trust_bytes"]
+    ).hexdigest()
+    assert fixture["manifest"]["backup_identity_sha256"] == hashlib.sha256(
+        fixture["identity_bytes"]
+    ).hexdigest()
+    assert fixture["manifest_sha256"] == hashlib.sha256(fixture["manifest_bytes"]).hexdigest()
+    with tarfile.open(fileobj=BytesIO(fixture["public_evidence_bytes"]), mode="r:") as archive:
+        verifier = _load(VERIFIER_PATH, "receipt_fixture_inventory_verifier")
+        assert {member.name for member in archive.getmembers()} == {
+            *verifier.EVIDENCE_FILES, "SHA256SUMS.json", "trust.json", "verification.json"
+        }
 
 
 def test_source_v1_causal_receipt_remains_exact_under_frozen_inputs(
@@ -641,13 +687,22 @@ def test_published_causal_receipt_hashes_exact_mechanical_bytes() -> None:
 def _exercise_published_finalizer(
     staging_module, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     fixture: Mapping[str, Any], mechanical_bytes: bytes,
+    marker_overrides: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[tuple[tuple[Any, ...], dict[str, Any]]], Path]:
     project = fixture["identity"]["project"]
     runtime = tmp_path / "runtime"
     state = tmp_path / f"{project}.synthetic-clinical-staging"
     runtime.mkdir(); (state / "evidence" / "recovery").mkdir(parents=True)
     marker = dict(fixture["current_marker"], state_dir=str(state.resolve()))
+    marker.update(marker_overrides or {})
     staging_module.write_json_atomic(state / staging_module.MARKER_NAME, marker, mode=0o600)
+    public = tmp_path / "public-backup"
+    public.mkdir()
+    (public / "backup-identity.json").write_bytes(fixture["identity_bytes"])
+    (public / "backup-manifest.json").write_bytes(fixture["manifest_bytes"])
+    (public / "public-evidence.tar").write_bytes(fixture["public_evidence_bytes"])
+    (public / "recovery-trust.json").write_bytes(fixture["backup_trust_bytes"])
+    (public / "COMPLETE").write_bytes(b"complete\n")
     mechanical_path = state / "evidence" / "recovery" / f"restore-{fixture['manifest_sha256']}.json"
     mechanical_path.write_bytes(mechanical_bytes)
     calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
@@ -673,7 +728,11 @@ def _exercise_published_finalizer(
 
     monkeypatch.setattr(staging_module, "datetime", FrozenDateTime)
     receipt = staging.finalize_cold_recovery_verification(
-        fixture["manifest_sha256"], {name: True for name in CAUSAL_CHECKS}
+        fixture["manifest_sha256"], {name: True for name in CAUSAL_CHECKS},
+        backup_dir=public,
+        expected_mechanical_receipt_sha256=hashlib.sha256(
+            _canonical(_published_mechanical(fixture))
+        ).hexdigest(),
     )
     return receipt, calls, state / "evidence" / "recovery" / f"verified-restore-{fixture['manifest_sha256']}.json"
 
@@ -688,42 +747,61 @@ def test_published_finalizer_consumes_bound_builder_and_persists_exact_receipt(
         staging_module, tmp_path, monkeypatch, fixture, mechanical_bytes
     )
     assert len(calls) == 1, "U4R RED: the reachable finalizer bypassed the published receipt builder"
-    evidence = repr(calls[0])
-    for binding in (
-        fixture["manifest_sha256"], fixture["manifest"]["backup_identity_sha256"],
-        fixture["manifest"]["recovery_capsule"]["ciphertext_sha256"],
-        fixture["identity"]["recovery_trust_sha256"], fixture["restore_trust_sha256"],
-    ):
-        assert binding in evidence
+    args, kwargs = calls[0]
+    assert len(args) == 1  # the existing BackupContract dependency
+    assert kwargs["manifest"] == fixture["manifest"]
+    assert kwargs["identity"] == fixture["identity"]
+    assert kwargs["current_marker"]["state_id"] == fixture["current_marker"]["state_id"]
+    assert kwargs["mechanical_receipt_bytes"] == mechanical_bytes
+    assert kwargs["expected_manifest_sha256"] == fixture["manifest_sha256"]
+    assert kwargs["expected_mechanical_receipt_sha256"] == hashlib.sha256(mechanical_bytes).hexdigest()
     expected_bytes = _canonical(_expected_published_causal(fixture, mechanical_bytes))
     assert receipt == json.loads(expected_bytes)
     assert artifact.read_bytes() == _persisted(json.loads(expected_bytes))
 
 
 @pytest.mark.parametrize(
-    ("field", "replacement"),
+    ("target", "field", "replacement"),
     (
-        ("backup_identity_sha256", "0" * 64), ("capsule_id", "0" * 32),
-        ("capsule_ciphertext_sha256", "0" * 64),
-        ("backup_recovery_trust_sha256", "0" * 64), ("backup_recovery_policy_epoch", 9),
-        ("restore_recovery_trust_sha256", "0" * 64), ("restore_recovery_policy_epoch", 9),
-        ("restore_recipient_status", "active"), ("recipient_sha256", "0" * 64),
-        ("project", "clinicalstagingother"), ("state_id", "0" * 32),
-        ("runtime_source", {"runtime_head": "0" * 40, "runtime_tree": "2" * 40}),
-        ("hrh_candidate", {}), ("effective_images", {}),
+        ("mechanical", "manifest_sha256", "0" * 64),
+        ("mechanical", "backup_identity_sha256", "0" * 64),
+        ("mechanical", "capsule_id", "0" * 32),
+        ("mechanical", "capsule_ciphertext_sha256", "0" * 64),
+        ("mechanical", "backup_recovery_trust_sha256", "0" * 64),
+        ("mechanical", "backup_recovery_policy_epoch", 9),
+        ("mechanical", "restore_recovery_trust_sha256", "0" * 64),
+        ("mechanical", "restore_recovery_policy_epoch", 9),
+        ("mechanical", "restore_recipient_status", "active"),
+        ("mechanical", "recipient_sha256", "0" * 64),
+        ("mechanical", "excluded_volume", "other"),
+        ("mechanical", "synthetic_only", False),
+        ("mechanical", "verification", "causal_e2e_verified"),
+        ("mechanical", "nonclaims", ["not production"]),
+        ("mechanical", "status_observed_at", "2026-08-01T12:29:00+00:00"),
+        ("mechanical", "restored_at", "not-a-timestamp"),
+        ("marker", "project", "clinicalstagingother"),
+        ("marker", "state_id", "0" * 32),
+        ("marker", "runtime_head", "0" * 40),
+        ("marker", "hrh_candidate", {}), ("marker", "effective_images", {}),
     ),
 )
 def test_published_finalizer_rejects_each_substituted_binding_without_artifact(
-    field: str, replacement: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    target: str, field: str, replacement: Any,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     staging_module = _load(STAGING_PATH, f"clinical_staging_substitution_{field}")
     fixture = _published_fixture()
     mechanical = _published_mechanical(fixture)
-    mechanical[field] = replacement
+    marker_overrides = None
+    if target == "mechanical":
+        mechanical[field] = replacement
+    else:
+        marker_overrides = {field: replacement}
     artifact = tmp_path / f"{fixture['identity']['project']}.synthetic-clinical-staging" / "evidence" / "recovery" / f"verified-restore-{fixture['manifest_sha256']}.json"
     with pytest.raises(staging_module.SafetyError):
         _exercise_published_finalizer(
-            staging_module, tmp_path, monkeypatch, fixture, _canonical(mechanical)
+            staging_module, tmp_path, monkeypatch, fixture, _canonical(mechanical),
+            marker_overrides=marker_overrides,
         )
     assert not artifact.exists()
 
