@@ -157,16 +157,67 @@ def _overlap(left: Path, right: Path) -> bool:
             return False
 
 
-def _require_trusted_parent(path: Path) -> tuple[int, int, int, int]:
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED") from exc
-    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+def _trusted_directory_metadata(
+    metadata: os.stat_result, *, allowed_modes: frozenset[int] | None,
+) -> tuple[int, int, int, int]:
+    mode = stat.S_IMODE(metadata.st_mode)
+    if not stat.S_ISDIR(metadata.st_mode):
         raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
-    if os.name == "posix" and (metadata.st_uid not in {0, os.geteuid()} or metadata.st_mode & 0o022):
-        raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
+    if os.name == "posix":
+        if metadata.st_uid not in {0, os.geteuid()}:
+            raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
+        if allowed_modes is not None and mode not in allowed_modes:
+            raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
+        if allowed_modes is None and mode & 0o022:
+            raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
     return metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid
+
+
+def _open_trusted_directory(
+    path: Path, *, allowed_modes: frozenset[int] | None = None,
+) -> tuple[int | None, tuple[int, int, int, int]]:
+    """Open a directory component-by-component and retain its Linux authority."""
+    descriptor: int | None = None
+    try:
+        if os.name == "posix":
+            absolute = path.absolute()
+            descriptor = os.open(
+                absolute.anchor,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            for component in absolute.parts[1:]:
+                if component in {"", ".", ".."}:
+                    raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
+                next_descriptor = os.open(
+                    component,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = next_descriptor
+            metadata = os.fstat(descriptor)
+        else:
+            metadata = path.lstat()
+            if path.is_symlink():
+                raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
+        return descriptor, _trusted_directory_metadata(metadata, allowed_modes=allowed_modes)
+    except CapsuleError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED") from exc
+
+
+def _require_trusted_parent(
+    path: Path, *, allowed_modes: frozenset[int] | None = None,
+) -> tuple[int, int, int, int]:
+    descriptor, token = _open_trusted_directory(path, allowed_modes=allowed_modes)
+    if descriptor is not None:
+        os.close(descriptor)
+    return token
 
 
 def _reject_inode_aliases(paths: list[Path]) -> None:
@@ -278,9 +329,14 @@ def snapshot_declared_member(source: Path, destination: Path, *, declared_size: 
     if destination.exists():
         raise CapsuleError("RECOVERY_OUTPUT_EXISTS")
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(source, flags)
+    except FileNotFoundError as exc:
+        raise CapsuleError("RECOVERY_CAPSULE_MISSING") from exc
+    except OSError as exc:
+        raise CapsuleError("RECOVERY_CAPSULE_MISMATCH") from exc
+    try:
         with os.fdopen(fd, "rb") as handle:
             before = os.fstat(handle.fileno())
             if not stat.S_ISREG(before.st_mode) or before.st_size != declared_size:
@@ -302,9 +358,6 @@ def snapshot_declared_member(source: Path, destination: Path, *, declared_size: 
                     raise CapsuleError("RECOVERY_CAPSULE_MISMATCH")
                 output.flush()
                 os.fsync(output.fileno())
-    except FileNotFoundError as exc:
-        destination.unlink(missing_ok=True)
-        raise CapsuleError("RECOVERY_CAPSULE_MISSING") from exc
     except CapsuleError:
         destination.unlink(missing_ok=True)
         raise
@@ -684,9 +737,30 @@ def run_sealer(
         raise CapsuleError("RECOVERY_OUTPUT_EXISTS")
     partial = output.parent / f".{output.name}.partial-{os.urandom(8).hex()}"
     output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    process: subprocess.Popen[bytes] | None = None
+
+    def terminate_group() -> None:
+        if process is None:
+            return
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    deadline = time.monotonic() + timeout_seconds
     try:
         if runner is not None:
-            completed = runner([str(executable), *arguments], input=stdin, capture_output=True, env=dict(environment), timeout=timeout_seconds)
+            completed = runner(
+                [str(executable), *arguments], input=stdin, capture_output=True,
+                env=dict(environment), timeout=max(0.0, deadline - time.monotonic()),
+            )
             if completed.returncode != 0:
                 raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
             data = completed.stdout
@@ -696,12 +770,22 @@ def run_sealer(
                 os.fsync(handle.fileno())
             result_sha256, result_size = _sha(data), len(data)
         else:
-            with partial.open("xb") as output_stream:
-                kwargs: dict[str, Any] = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL, "env": dict(environment)}
+            descriptor = os.open(
+                partial,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "w+b") as output_stream:
+                kwargs: dict[str, Any] = {
+                    "stdin": subprocess.PIPE,
+                    "stdout": output_stream,
+                    "stderr": subprocess.DEVNULL,
+                    "env": dict(environment),
+                }
                 if os.name == "posix":
                     kwargs["start_new_session"] = True
                 process = subprocess.Popen([str(executable), *arguments], **kwargs)
-                digest, size, failures = hashlib.sha256(), 0, []
+                failures: list[BaseException] = []
 
                 def feed() -> None:
                     try:
@@ -711,46 +795,38 @@ def run_sealer(
                     except (BrokenPipeError, OSError) as exc:
                         failures.append(exc)
 
-                def drain() -> None:
-                    nonlocal size
-                    try:
-                        assert process.stdout is not None
-                        while chunk := process.stdout.read(64 * 1024):
-                            output_stream.write(chunk)
-                            digest.update(chunk)
-                            size += len(chunk)
-                    except OSError as exc:
-                        failures.append(exc)
-
-                workers = [threading.Thread(target=feed), threading.Thread(target=drain)]
-                for worker in workers:
-                    worker.start()
+                feeder = threading.Thread(target=feed)
+                feeder.start()
                 try:
-                    process.wait(timeout=timeout_seconds)
+                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
-                    if os.name == "posix":
-                        os.killpg(process.pid, signal.SIGKILL)
-                    else:
-                        process.kill()
-                    process.wait()
+                    terminate_group()
                     raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from None
-                for worker in workers:
-                    worker.join(timeout_seconds)
-                if any(worker.is_alive() for worker in workers) or failures:
+                feeder.join(max(0.0, deadline - time.monotonic()))
+                if feeder.is_alive() or failures:
+                    terminate_group()
                     raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
                 if process.returncode:
+                    terminate_group()
                     raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
                 output_stream.flush()
                 os.fsync(output_stream.fileno())
-            result_sha256, result_size = digest.hexdigest(), size
+                output_stream.seek(0)
+                digest, result_size = hashlib.sha256(), 0
+                while chunk := output_stream.read(64 * 1024):
+                    digest.update(chunk)
+                    result_size += len(chunk)
+                result_sha256 = digest.hexdigest()
         os.chmod(partial, 0o600)
         os.replace(partial, output)
         _fsync_directory(output.parent)
         return {"sha256": result_sha256, "size": result_size, "stderr": b""}
     except CapsuleError:
+        terminate_group()
         partial.unlink(missing_ok=True)
         raise
     except (OSError, subprocess.SubprocessError) as exc:
+        terminate_group()
         partial.unlink(missing_ok=True)
         raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from exc
 
@@ -925,6 +1001,7 @@ def prepare_published_restore(
     if any(_overlap(left, right) for index, left in enumerate(paths) for right in paths[index + 1:]):
         raise CapsuleError("published recovery paths overlap")
     _reject_inode_aliases(paths)
+    _require_trusted_parent(public_dir, allowed_modes=frozenset({0o700, 0o750}))
     _require_trusted_parent(staging.state_dir.parent)
     for parent in {staging.state_dir.parent, public_dir.parent, capsule_path.parent}:
         reconcile_owned_staging(parent, project=staging.project)
@@ -1051,38 +1128,88 @@ def publish_recovery_pair(
 ) -> dict[str, Any]:
     if public_dir.exists() or capsule_path.exists():
         raise CapsuleError("RECOVERY_OUTPUT_EXISTS")
-    public_parent_token = _require_trusted_parent(public_dir.parent)
-    capsule_parent_token = _require_trusted_parent(capsule_path.parent)
+    public_modes = frozenset({0o700, 0o750})
+    capsule_modes = frozenset({0o700})
+    public_parent_fd, public_parent_token = _open_trusted_directory(
+        public_dir.parent, allowed_modes=public_modes,
+    )
+    try:
+        capsule_parent_fd, capsule_parent_token = _open_trusted_directory(
+            capsule_path.parent, allowed_modes=capsule_modes,
+        )
+    except Exception:
+        if public_parent_fd is not None:
+            os.close(public_parent_fd)
+        raise
     run_id = os.urandom(16).hex()
     stage = capsule_path.parent / f".capsule-run-{run_id}"
     public_run_id = os.urandom(16).hex()
     public_stage = public_dir.parent / f".capsule-run-{public_run_id}"
-    capsule_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    stage.mkdir(mode=0o700)
-    _write_fsynced(stage / ".clinical-recovery-owner.json", _canonical(_owner(stage, project=public_identity["project"], run_id=run_id, mode="backup")))
-    public_stage.mkdir(mode=0o700)
-    _write_fsynced(public_stage / ".clinical-recovery-owner.json", _canonical(_owner(public_stage, project=public_identity["project"], run_id=public_run_id, mode="backup")))
+    try:
+        if capsule_parent_fd is None:
+            stage.mkdir(mode=0o700)
+        else:
+            os.mkdir(stage.name, mode=0o700, dir_fd=capsule_parent_fd)
+        _write_fsynced(stage / ".clinical-recovery-owner.json", _canonical(_owner(stage, project=public_identity["project"], run_id=run_id, mode="backup")))
+        _fsync_directory(stage)
+        if capsule_parent_fd is None:
+            _fsync_directory(capsule_path.parent)
+        else:
+            os.fsync(capsule_parent_fd)
+        if public_parent_fd is None:
+            public_stage.mkdir(mode=0o700)
+        else:
+            os.mkdir(public_stage.name, mode=0o700, dir_fd=public_parent_fd)
+        _write_fsynced(public_stage / ".clinical-recovery-owner.json", _canonical(_owner(public_stage, project=public_identity["project"], run_id=public_run_id, mode="backup")))
+        _fsync_directory(public_stage)
+        if public_parent_fd is None:
+            _fsync_directory(public_dir.parent)
+        else:
+            os.fsync(public_parent_fd)
+    except Exception:
+        _remove_private_tree(stage)
+        _remove_private_tree(public_stage)
+        if capsule_parent_fd is not None:
+            os.close(capsule_parent_fd)
+        if public_parent_fd is not None:
+            os.close(public_parent_fd)
+        raise
     temp_capsule = stage / "capsule.age"
     temp_public = public_stage / "public"
     try:
         trust = parse_recovery_trust(recovery_trust, now=datetime.now(UTC))
         recipient = select_backup_recipient(trust, now=datetime.now(UTC))
         sealer = snapshot_sealer(sealer, stage / "sealer", trust["sealer_sha256"])
+        if _require_trusted_parent(capsule_path.parent, allowed_modes=capsule_modes) != capsule_parent_token:
+            raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
+        if _require_trusted_parent(public_dir.parent, allowed_modes=public_modes) != public_parent_token:
+            raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
         result = encrypt_private_capsule(sealer=sealer, recipient=recipient["recipient"], plaintext=private_plaintext, output=temp_capsule, timeout_seconds=30, environment={})
         observer("CAPSULE_CIPHERTEXT_FSYNCED")
-        capsule_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if _require_trusted_parent(capsule_path.parent) != capsule_parent_token:
+        if _require_trusted_parent(capsule_path.parent, allowed_modes=capsule_modes) != capsule_parent_token:
             raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
-        os.replace(temp_capsule, capsule_path)
+        if capsule_parent_fd is None:
+            os.replace(temp_capsule, capsule_path)
+        else:
+            os.replace(temp_capsule, capsule_path.name, dst_dir_fd=capsule_parent_fd)
         observer("CAPSULE_PUBLISHED")
-        _fsync_directory(capsule_path.parent)
+        if capsule_parent_fd is None:
+            _fsync_directory(capsule_path.parent)
+        else:
+            os.fsync(capsule_parent_fd)
         observer("CAPSULE_PARENT_FSYNCED")
         build_public_bundle(temp_public, public_identity=public_identity, recovery_trust=recovery_trust, evidence=evidence or {}, capsule_sha256=result["sha256"], capsule_size=result["size"], observer=observer)
-        if _require_trusted_parent(public_dir.parent) != public_parent_token:
+        if _require_trusted_parent(public_dir.parent, allowed_modes=public_modes) != public_parent_token:
             raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
-        os.replace(temp_public, public_dir)
+        if public_parent_fd is None:
+            os.replace(temp_public, public_dir)
+        else:
+            os.replace(temp_public, public_dir.name, dst_dir_fd=public_parent_fd)
         observer("PUBLIC_PUBLISHED")
-        _fsync_directory(public_dir.parent)
+        if public_parent_fd is None:
+            _fsync_directory(public_dir.parent)
+        else:
+            os.fsync(public_parent_fd)
         observer("PUBLIC_PARENT_FSYNCED")
         final_manifest_raw = read_bounded_regular(public_dir / "backup-manifest.json", limit=1024 * 1024, code="RECOVERY_PUBLICATION_INCOMPLETE")
         declared = parse_closed_json(
@@ -1105,6 +1232,10 @@ def publish_recovery_pair(
         _remove_private_tree(stage)
         if public_stage.exists():
             _remove_private_tree(public_stage)
+        if capsule_parent_fd is not None:
+            os.close(capsule_parent_fd)
+        if public_parent_fd is not None:
+            os.close(public_parent_fd)
 
 
 def finish_published_backup(
@@ -1118,8 +1249,8 @@ def finish_published_backup(
     paths = [private_root, public_dir, recovery_trust_path, recovery_sealer, capsule_path, staging.state_dir, staging.runtime]
     if getattr(staging, "hrh", None) is not None:
         paths.append(staging.hrh)
-    _require_trusted_parent(public_dir.parent)
-    _require_trusted_parent(capsule_path.parent)
+    _require_trusted_parent(public_dir.parent, allowed_modes=frozenset({0o700, 0o750}))
+    _require_trusted_parent(capsule_path.parent, allowed_modes=frozenset({0o700}))
     if any(_overlap(left, right) for index, left in enumerate(paths) for right in paths[index + 1:]):
         raise CapsuleError("published recovery paths overlap or have unavailable parents")
     _reject_inode_aliases(paths)
