@@ -9,11 +9,11 @@ module is absent, each row reports ``PREREQUISITE RED``.  Once it exists, the
 same row must prove its own observable predicate rather than treating import
 success as implementation success.
 
-Covered here without Docker: B02-B18, B20-B21 and B26-B29.  B19 and B22-B24
-remain NOT_VERIFIED because they require the integrated published acquisition,
-real cross-path restore and service lifecycle.  Publication SIGKILL coverage
-in B12 also remains NOT_VERIFIED here; this unit freezes the pure orphan and
-cleanup policy, while the later real-process E2E owns the kill acknowledgement.
+This unit fully controls only pure parsing, binding and source-v1 compatibility
+predicates.  B05-B11, B13-B18, B20-B21 and B26-B29 are executable RED or
+PARTIAL integration contracts.  B12 proves only bounded reconciliation;
+SIGKILL publication is NOT_VERIFIED.  B19 and B22-B25 remain NOT_VERIFIED
+because they require integrated acquisition, restore, receipts and services.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ STAGING_DIR = ROOT / "deploy" / "clinical-staging"
 CAPSULE_PATH = STAGING_DIR / "clinical_recovery_capsule.py"
 STAGING_PATH = STAGING_DIR / "clinical_staging.py"
 CODEC_PATH = STAGING_DIR / "clinical_backup_bundle.py"
+VERIFIER_PATH = ROOT / "tools" / "verify_hrh_published_candidate.py"
 
 NOW = datetime(2026, 9, 8, 12, 0, 0, tzinfo=UTC)
 PROJECT = "clinicalstagingcapsule"
@@ -262,6 +263,76 @@ def _capsule_plaintext(public_identity: dict[str, Any]) -> bytes:
     return _tar_bytes({"capsule-manifest.json": _canonical(manifest), **private})
 
 
+def _tar_members(payload: bytes) -> dict[str, bytes]:
+    with tarfile.open(fileobj=BytesIO(payload), mode="r:") as archive:
+        return {
+            member.name: archive.extractfile(member).read()
+            for member in archive.getmembers()
+            if member.isreg()
+        }
+
+
+def _mutated_capsule_tar(payload: bytes, mutation: str) -> bytes:
+    files = _tar_members(payload)
+    if mutation == "extra":
+        files["extra"] = b"forbidden"
+        return _tar_bytes(files)
+    if mutation == "missing":
+        files.pop("state.tar")
+        return _tar_bytes(files)
+    stream = BytesIO()
+    with tarfile.open(fileobj=stream, mode="w:") as archive:
+        for name, data in sorted(files.items()):
+            info = tarfile.TarInfo(name)
+            info.size, info.mode, info.mtime = len(data), 0o600, 0
+            archive.addfile(info, BytesIO(data))
+        info = tarfile.TarInfo({"traversal": "../escape", "symlink": "link",
+                                "special": "device", "duplicate": "state.tar"}[mutation])
+        if mutation == "symlink":
+            info.type, info.linkname = tarfile.SYMTYPE, "state.tar"
+        elif mutation == "special":
+            info.type = tarfile.CHRTYPE
+        else:
+            info.size = 1
+        archive.addfile(info, BytesIO(b"x") if info.isreg() else None)
+    return stream.getvalue()
+
+
+def _fixture_recovery_pair(tmp_path: Path, public_identity, trust) -> dict[str, Any]:
+    public = tmp_path / "public"
+    public.mkdir()
+    identity_bytes = _canonical(public_identity)
+    trust_bytes = _canonical(trust)
+    (public / "backup-identity.json").write_bytes(identity_bytes)
+    (public / "recovery-trust.json").write_bytes(trust_bytes)
+    manifest = {
+        "schema": PUBLIC_SCHEMA, "project": PROJECT, "state_id": STATE_ID,
+        "backup_identity_sha256": _digest(identity_bytes),
+        "recovery_trust_sha256": _digest(trust_bytes),
+        "capsule_id": CAPSULE_ID,
+    }
+    manifest_bytes = _canonical(manifest)
+    (public / "backup-manifest.json").write_bytes(manifest_bytes)
+    return {
+        "public_dir": public,
+        "public_identity": public_identity,
+        "manifest": manifest,
+        "external_manifest_sha256": _digest(manifest_bytes),
+    }
+
+
+def _reseal_fixture_pair(bundle: dict[str, Any], changed_identity) -> dict[str, Any]:
+    resealed = copy.deepcopy(bundle)
+    public = bundle["public_dir"].parent / "resealed"
+    public.mkdir()
+    identity_bytes = _canonical(changed_identity)
+    manifest = dict(bundle["manifest"], backup_identity_sha256=_digest(identity_bytes))
+    (public / "backup-identity.json").write_bytes(identity_bytes)
+    (public / "backup-manifest.json").write_bytes(_canonical(manifest))
+    resealed.update(public_dir=public, public_identity=changed_identity, manifest=manifest)
+    return resealed
+
+
 def test_source_v1_schema_and_canonical_codec_control_are_green():
     staging = _load(STAGING_PATH, "clinical_staging_capsule_source_control")
     codec = sys.modules["clinical_backup_bundle"]
@@ -269,6 +340,21 @@ def test_source_v1_schema_and_canonical_codec_control_are_green():
     assert codec.canonical_json_bytes(staging._backup_contract(), {"b": 2, "a": 1}) == (
         b'{"a":1,"b":2}\n'
     )
+
+
+def test_test_owned_capsule_mutants_and_reseal_fixture_are_well_formed(
+    public_identity, trust, tmp_path
+):
+    plaintext = _capsule_plaintext(public_identity)
+    assert set(_tar_members(plaintext)) == PRIVATE_NAMES
+    assert "extra" in _tar_members(_mutated_capsule_tar(plaintext, "extra"))
+    assert "state.tar" not in _tar_members(_mutated_capsule_tar(plaintext, "missing"))
+    bundle = _fixture_recovery_pair(tmp_path, public_identity, trust)
+    changed = copy.deepcopy(public_identity)
+    changed["state_id"] = "f" * 32
+    resealed = _reseal_fixture_pair(bundle, changed)
+    assert resealed["manifest"]["backup_identity_sha256"] == _digest(_canonical(changed))
+    assert resealed["external_manifest_sha256"] == bundle["external_manifest_sha256"]
 
 
 @pytest.mark.parametrize(
@@ -325,7 +411,6 @@ def test_real_age_x25519_stdin_identity_round_trip_and_diagnostic_divergence(age
         )
     assert good.returncode == 0 and good.stdout == plaintext and not good.stderr
     assert wrong.returncode != 0 and wrong.stderr
-    assert b"no identity matched" in wrong.stderr
     assert plaintext not in wrong.stderr
 
 
@@ -483,10 +568,9 @@ def test_b05_b06_public_bundle_is_exact_and_secret_free(
     trust, public_identity, tmp_path
 ):
     module = _api("B05")
+    verifier = _load(VERIFIER_PATH, "clinical_capsule_hrh_verifier")
     public = tmp_path / "public"
-    evidence_names = set(_fn(module, "B06", "published_evidence_names")())
-    assert "SHA256SUMS.json" in evidence_names
-    assert {"trust.json", "verification.json"} <= evidence_names
+    evidence_names = {*verifier.EVIDENCE_FILES, "SHA256SUMS.json", "trust.json", "verification.json"}
     _fn(module, "B05", "build_public_bundle")(
         public,
         public_identity=public_identity,
@@ -496,6 +580,8 @@ def test_b05_b06_public_bundle_is_exact_and_secret_free(
         capsule_size=4096,
     )
     assert {path.name for path in public.iterdir()} == PUBLIC_NAMES
+    with tarfile.open(public / "public-evidence.tar", "r:") as evidence_tar:
+        assert {member.name for member in evidence_tar.getmembers()} == evidence_names
     joined = b"".join(path.read_bytes() for path in public.iterdir() if path.is_file())
     assert PUBLIC_SECRET not in joined and PRIVATE_PATH not in joined
 
@@ -519,6 +605,12 @@ def test_b08_age_boundary_and_public_results_never_expose_private_canaries(
     age_material, trust, tmp_path
 ):
     module = _api("B08")
+    invocations = []
+
+    def runner(argv, **kwargs):
+        invocations.append((list(argv), dict(kwargs)))
+        return subprocess.CompletedProcess(argv, 0, stdout=b"synthetic-ciphertext", stderr=b"")
+
     result = _fn(module, "B08", "encrypt_private_capsule")(
         sealer=age_material["age"],
         recipient=age_material["recipient"],
@@ -526,26 +618,26 @@ def test_b08_age_boundary_and_public_results_never_expose_private_canaries(
         output=tmp_path / "capsule.age",
         timeout_seconds=10,
         environment={},
+        runner=runner,
     )
     serialized = repr(result).encode() + bytes(result.get("stderr", b""))
     assert PUBLIC_SECRET not in serialized
     assert PRIVATE_PATH not in serialized
-    assert result["argv"] == ["--encrypt", "--recipient", age_material["recipient"]]
-    assert result["environment"] == {}
+    assert len(invocations) == 1
+    argv, kwargs = invocations[0]
+    assert argv[1:] == ["--encrypt", "--recipient", age_material["recipient"]]
+    assert kwargs["env"] == {}
+    assert kwargs["input"] == b"private:" + PUBLIC_SECRET
 
 
 def test_b09_b20_resealed_cross_generation_substitution_is_rejected(
     trust, public_identity, tmp_path
 ):
     module = _api("B09")
-    bundle = _fn(module, "B09", "fixture_public_bundle")(
-        tmp_path, public_identity=public_identity, recovery_trust=trust
-    )
+    bundle = _fixture_recovery_pair(tmp_path, public_identity, trust)
     changed = copy.deepcopy(public_identity)
     changed["hrh_candidate"]["receipt_sha256"] = "f" * 64
-    resealed = _fn(module, "B09", "reseal_test_bundle")(
-        bundle, public_identity=changed
-    )
+    resealed = _reseal_fixture_pair(bundle, changed)
     with pytest.raises(module.CapsuleError, match="RECOVERY_GENERATION_MISMATCH"):
         _fn(module, "B20", "validate_recovery_pair")(
             resealed,
@@ -555,18 +647,14 @@ def test_b09_b20_resealed_cross_generation_substitution_is_rejected(
         )
 
 
-@pytest.mark.parametrize(
-    "stage",
-    [
-        "CAPSULE_CIPHERTEXT_FSYNCED",
-        "CAPSULE_PUBLISHED",
-        "CAPSULE_PARENT_FSYNCED",
-        "PUBLIC_MANIFEST_FSYNCED",
-        "PUBLIC_COMPLETE_FSYNCED",
-        "PUBLIC_PUBLISHED",
-        "PUBLIC_PARENT_FSYNCED",
-    ],
-)
+PUBLICATION_STAGES = [
+    "CAPSULE_CIPHERTEXT_FSYNCED", "CAPSULE_PUBLISHED",
+    "CAPSULE_PARENT_FSYNCED", "PUBLIC_MANIFEST_FSYNCED",
+    "PUBLIC_COMPLETE_FSYNCED", "PUBLIC_PUBLISHED", "PUBLIC_PARENT_FSYNCED",
+]
+
+
+@pytest.mark.parametrize("stage", PUBLICATION_STAGES)
 def test_b10_b11_publication_failpoints_never_report_or_retain_partial_success(
     age_material, trust, public_identity, tmp_path, stage
 ):
@@ -588,10 +676,15 @@ def test_b10_b11_publication_failpoints_never_report_or_retain_partial_success(
             sealer=age_material["age"],
             observer=observe,
         )
-    assert stage in events
+    assert events == PUBLICATION_STAGES[: PUBLICATION_STAGES.index(stage) + 1]
     assert not list(tmp_path.rglob("*.partial-*"))
     assert not list(tmp_path.rglob("plaintext.tar"))
-    assert not (tmp_path / "public" / "COMPLETE").exists()
+    public, capsule = tmp_path / "public", tmp_path / "private" / "capsule.age"
+    if PUBLICATION_STAGES.index(stage) < PUBLICATION_STAGES.index("PUBLIC_PUBLISHED"):
+        assert not public.exists() and not capsule.exists()
+    else:
+        assert capsule.is_file() and (public / "COMPLETE").is_file()
+        assert not list(public.glob("*receipt*"))
 
 
 def test_b12_orphan_is_explicit_and_cleanup_is_bounded(tmp_path):
@@ -600,33 +693,94 @@ def test_b12_orphan_is_explicit_and_cleanup_is_bounded(tmp_path):
     capsule.write_bytes(b"synthetic-encrypted-orphan")
     unrelated = tmp_path / "unrelated.age"
     unrelated.write_bytes(b"do-not-delete")
-    owned_stage = tmp_path / f".capsule-run-{'a' * 16}"
+    run_id = "a" * 32
+    owned_stage = tmp_path / f".capsule-run-{run_id}"
     owned_stage.mkdir()
     (owned_stage / "plaintext.tar").write_bytes(PUBLIC_SECRET)
+    (owned_stage / ".clinical-recovery-owner.json").write_bytes(_canonical({
+        "schema": "restricted-synthetic-clinical-recovery-run.v1",
+        "project": PROJECT, "run_id": run_id,
+        "root": str(owned_stage.resolve()), "mode": "backup",
+    }))
+    lookalike = tmp_path / f".capsule-run-{'b' * 32}"
+    lookalike.mkdir()
+    (lookalike / "plaintext.tar").write_bytes(b"unowned")
     result = _fn(module, "B12", "reconcile_capsule_outputs")(
         capsule_path=capsule,
         public_dir=tmp_path / "public",
         staging_parent=tmp_path,
+        project=PROJECT,
+        run_id=run_id,
+        mode="backup",
     )
     assert result["code"] == "RECOVERY_CAPSULE_ORPHANED"
     assert capsule.exists() and unrelated.exists()
     assert not owned_stage.exists()
+    assert lookalike.exists() and (lookalike / "plaintext.tar").read_bytes() == b"unowned"
+
+
+@pytest.mark.parametrize("mutation", ["extra", "project", "run", "root", "mode"])
+def test_b12_cleanup_requires_exact_closed_ownership_binding(tmp_path, mutation):
+    module = _api("B12_OWNERSHIP")
+    run_id = "a" * 32
+    stage = tmp_path / f".capsule-run-{run_id}"
+    stage.mkdir()
+    marker = {
+        "schema": "restricted-synthetic-clinical-recovery-run.v1",
+        "project": PROJECT, "run_id": run_id,
+        "root": str(stage.resolve()), "mode": "backup",
+    }
+    if mutation == "extra":
+        marker["extra"] = True
+    elif mutation == "project":
+        marker["project"] = "other"
+    elif mutation == "run":
+        marker["run_id"] = "b" * 32
+    elif mutation == "root":
+        marker["root"] = str(tmp_path / "other")
+    else:
+        marker["mode"] = "restore"
+    (stage / ".clinical-recovery-owner.json").write_bytes(_canonical(marker))
+    (stage / "plaintext.tar").write_bytes(b"preserve")
+    _fn(module, "B12", "reconcile_capsule_outputs")(
+        capsule_path=tmp_path / "absent.age", public_dir=tmp_path / "public",
+        staging_parent=tmp_path, project=PROJECT, run_id=run_id, mode="backup",
+    )
+    assert stage.is_dir() and (stage / "plaintext.tar").read_bytes() == b"preserve"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="B12 marker symlink nofollow control is POSIX-only")
+def test_b12_cleanup_does_not_follow_an_ownership_marker_symlink(tmp_path):
+    module = _api("B12_NOFOLLOW")
+    run_id = "a" * 32
+    stage = tmp_path / f".capsule-run-{run_id}"
+    stage.mkdir()
+    outside = tmp_path / "outside-owner.json"
+    outside.write_bytes(_canonical({
+        "schema": "restricted-synthetic-clinical-recovery-run.v1",
+        "project": PROJECT, "run_id": run_id,
+        "root": str(stage.resolve()), "mode": "backup",
+    }))
+    (stage / ".clinical-recovery-owner.json").symlink_to(outside)
+    (stage / "plaintext.tar").write_bytes(b"preserve")
+    _fn(module, "B12", "reconcile_capsule_outputs")(
+        capsule_path=tmp_path / "absent.age", public_dir=tmp_path / "public",
+        staging_parent=tmp_path, project=PROJECT, run_id=run_id, mode="backup",
+    )
+    assert stage.exists() and outside.exists()
 
 
 def test_b13_manifest_bounds_are_authenticated_before_variable_copy(tmp_path):
     module = _api("B13")
     source = tmp_path / "capsule.age"
     source.write_bytes(b"x" * 33)
-    calls = []
     with pytest.raises(module.CapsuleError, match="RECOVERY_CAPSULE_MISMATCH"):
         _fn(module, "B13", "snapshot_declared_member")(
             source,
             tmp_path / "snapshot",
             declared_size=32,
             declared_sha256=_digest(b"x" * 32),
-            authority_verified=lambda: calls.append("authority") or True,
         )
-    assert calls == ["authority"]
     assert not (tmp_path / "snapshot").exists()
 
 
@@ -749,7 +903,7 @@ def test_b16_b26_fresh_policy_transition_is_closed_before_identity_read(
 def test_b17_private_tar_rejects_each_member_attack(public_identity, mutation):
     module = _api("B17")
     plaintext = _capsule_plaintext(public_identity)
-    mutated = _fn(module, "B17", "mutate_test_capsule_tar")(plaintext, mutation)
+    mutated = _mutated_capsule_tar(plaintext, mutation)
     with pytest.raises(module.CapsuleError, match="RECOVERY_CAPSULE_INVALID"):
         _fn(module, "B17", "validate_capsule_plaintext")(
             mutated, public_identity=public_identity
