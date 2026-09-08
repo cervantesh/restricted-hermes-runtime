@@ -23,7 +23,7 @@ from typing import Any, Callable
 
 
 COSIGN_IMAGE = "gcr.io/projectsigstore/cosign:v2.5.3@sha256:920845e07017a9abe50a0e5a4b883cbc761228691ea80ebb16661b522e71a0bd"
-TRUST_SCHEMA = "restricted-runtime-hrh-trust.v1"
+TRUST_SCHEMA = "restricted-runtime-hrh-trust.v2"
 TRUST_KEYS = {
     "schema_version", "clinical_contract_revision", "build_source_revision",
     "platform", "publisher_identity", "kms_key_version",
@@ -39,6 +39,21 @@ PREDICATES = {
     "sbom": ("https://spdx.dev/Document/v2.3", "spdxjson"),
     "provenance": ("https://slsa.dev/provenance/v1", "slsaprovenance1"),
 }
+EVIDENCE_FILES = tuple(sorted((
+    "candidate-receipt.json", "candidate-receipt.sig",
+    "cleanup-policies.raw.json", "cleanup-policy-observation.json",
+    "kms-public.pem",
+    *(
+        f"{role}.{name}"
+        for role in ("web", "migrate")
+        for name in (
+            "attachment.manifest.json", "attestation-retention-evidence.json",
+            "downloaded-attestations.json", "material-evidence.json",
+            "provenance.json", "retention-evidence.json", "runtime-identity.json",
+            "spdx.json", "subject.config.json", "subject.manifest.json",
+        )
+    ),
+)))
 SAFE_DOCKER_ENV = (
     "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT",
     "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR",
@@ -90,9 +105,10 @@ def validate_candidate(trust_value: object, receipt_value: object, public_key: b
     _require(isinstance(trust["kms_key_version"], str) and KMS_VERSION.fullmatch(trust["kms_key_version"]), "trust KMS key must be an exact version")
     _require(isinstance(trust["kms_public_key_sha256"], str) and SHA256.fullmatch(trust["kms_public_key_sha256"]), "trust public-key SHA-256 is invalid")
     subjects = _mapping(trust["subjects"], "trust subjects must be an object")
-    _closed(subjects, {"web", "migrate"}, "trust subjects")
+    _closed(subjects, {"web", "migrate", "evidence"}, "trust subjects")
     for role in ("web", "migrate"):
         _image(subjects[role], role)
+    _image(subjects["evidence"], "evidence")
     _require(subjects["web"] != subjects["migrate"], "web and migrate subjects must be distinct")
     _require(_hash(public_key) == trust["kms_public_key_sha256"], "public key does not match the separate trust declaration")
 
@@ -114,14 +130,14 @@ def validate_candidate(trust_value: object, receipt_value: object, public_key: b
     by_role: dict[str, dict[str, Any]] = {}
     for value in receipt_subjects:
         item = _mapping(value, "receipt subject must be an object")
-        _closed(item, {"role", "image", "platform", "runtime_identity", "material_evidence", "retention_evidence", "retention_tag", "sbom", "provenance"}, "receipt subject")
+        _closed(item, {"role", "image", "platform", "runtime_identity", "material_evidence", "retention_evidence", "attestation_retention_evidence", "retention_tag", "sbom", "provenance"}, "receipt subject")
         role = item.get("role")
         _require(role in {"web", "migrate"} and role not in by_role, "receipt roles must be exactly web and migrate")
         by_role[role] = item
     _require(set(by_role) == {"web", "migrate"}, "receipt roles must be exactly web and migrate")
     for role, expected_identity in (("web", "10001:10001"), ("migrate", "10002:10002")):
         item = by_role[role]
-        _image(item.get("image"), role)
+        match = _image(item.get("image"), role)
         _require(item.get("image") == subjects[role], f"receipt {role} subject differs from trust declaration")
         _require(item.get("platform") == platform, f"receipt {role} platform differs from trust declaration")
         identity = _mapping(item.get("runtime_identity"), f"receipt {role} runtime identity is required")
@@ -134,7 +150,7 @@ def validate_candidate(trust_value: object, receipt_value: object, public_key: b
         _require(all(isinstance(material.get(name), str) and SHA256.fullmatch(material[name]) for name in required_materials), f"receipt {role} material evidence is incomplete")
         retention = _mapping(item.get("retention_evidence"), f"receipt {role} retention evidence is required")
         _closed(retention, {"tag", "subject", "registry_resolution"}, f"receipt {role} retention evidence")
-        expected_tag = item["image"].split("@", 1)[0] + f":keep-clinical-{trust['build_source_revision']}-{role}"
+        expected_tag = item["image"].split("@", 1)[0] + f":keep-clinical-img-{match.group('digest')}"
         expected_digest = item["image"].split("@", 1)[1]
         resolution = retention.get("registry_resolution")
         _require(
@@ -145,6 +161,23 @@ def validate_candidate(trust_value: object, receipt_value: object, public_key: b
             f"receipt {role} retention evidence does not bind the exact subject",
         )
         _require(item.get("retention_tag") == expected_tag.rsplit(":", 1)[1], f"receipt {role} retention tag is invalid")
+        attachment = _mapping(item.get("attestation_retention_evidence"), f"receipt {role} attestation retention evidence is required")
+        _closed(attachment, {"role", "subject", "attachment_reference", "attachment_subject", "attachment_manifest_digest", "tag", "registry_resolution"}, f"receipt {role} attestation retention evidence")
+        attachment_digest = attachment.get("attachment_manifest_digest")
+        _require(isinstance(attachment_digest, str) and re.fullmatch(r"sha256:[a-f0-9]{64}", attachment_digest), f"receipt {role} attachment manifest digest is invalid")
+        attachment_hex = attachment_digest.split(":", 1)[1]
+        repository = item["image"].split("@", 1)[0]
+        _require(
+            attachment.get("role") == role
+            and attachment.get("subject") == item["image"]
+            and attachment.get("attachment_reference")
+            == f"{repository}:sha256-{match.group('digest')}.att"
+            and attachment.get("attachment_subject") == f"{repository}@{attachment_digest}"
+            and attachment.get("tag") == f"{repository}:keep-clinical-att-{attachment_hex}"
+            and isinstance(attachment.get("registry_resolution"), str)
+            and attachment["registry_resolution"].endswith(attachment_digest),
+            f"receipt {role} attestation retention evidence does not bind the exact attachment",
+        )
         for field, (predicate, _) in PREDICATES.items():
             attestation = _mapping(item.get(field), f"receipt {role} {field} is required")
             _closed(attestation, {"subject", "predicate_type", "verification"}, f"receipt {role} {field}")
@@ -276,10 +309,13 @@ def verify_attestations(
     docker_config: Path,
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    validated_snapshot: bool = False,
 ) -> dict[str, Any]:
     """Use pinned Cosign and a mounted private Docker config; no token enters argv."""
     registries = {candidate["subjects"][role]["image"].split("/", 1)[0] for role in ("web", "migrate")}
-    docker_config_bytes = validate_docker_config(docker_config, registries=registries)
+    docker_config_bytes = None
+    if not validated_snapshot:
+        docker_config_bytes = validate_docker_config(docker_config, registries=registries)
     verified = 0
     with tempfile.TemporaryDirectory(prefix="hrh-candidate-key-") as key_directory_value:
         key_directory = Path(key_directory_value)
@@ -290,9 +326,11 @@ def verify_attestations(
             stream.write(public_key)
         if os.name != "nt":
             key_path.chmod(0o600)
-        config_snapshot = _materialize_docker_config(
-            docker_config_bytes, key_directory / "docker"
-        )
+        config_snapshot = docker_config
+        if docker_config_bytes is not None:
+            config_snapshot = _materialize_docker_config(
+                docker_config_bytes, key_directory / "docker"
+            )
         mount_config = f"{config_snapshot}:/home/nonroot/.docker:ro"
         mount_key = f"{key_path}:/trust/public.pem:ro"
         for role in ("web", "migrate"):
@@ -315,7 +353,54 @@ def verify_attestations(
                 statements = _parse_cosign_envelopes(result.stdout)
                 _require(any(_statement_matches(statement, candidate, role, field) for statement in statements), f"{role} {field} verified payload does not bind the exact signed candidate contract")
                 verified += 1
-    return {"verified_predicates": verified}
+    return {
+        "verified_predicates": sorted(
+            f"{role}:{field}"
+            for role in ("web", "migrate")
+            for field in PREDICATES
+        )
+    }
+
+
+def verify_receipt_signature(
+    receipt_bytes: bytes,
+    signature_bytes: bytes,
+    public_key: bytes,
+    docker_config_snapshot: Path,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> None:
+    """Verify the signature over the exact retained receipt bytes."""
+    with tempfile.TemporaryDirectory(prefix="hrh-receipt-signature-") as value:
+        directory = Path(value)
+        if os.name != "nt":
+            directory.chmod(0o700)
+        key = directory / "public.pem"
+        receipt = directory / "candidate-receipt.json"
+        signature = directory / "candidate-receipt.sig"
+        _write_private(key, public_key)
+        _write_private(receipt, receipt_bytes)
+        _write_private(signature, signature_bytes)
+        args = ["docker", "run", "--rm"]
+        if hasattr(os, "getuid"):
+            args.extend(("--user", f"{os.getuid()}:{os.getgid()}"))
+        args.extend(
+            [
+                "--env", "DOCKER_CONFIG=/run/docker",
+                "--volume", f"{docker_config_snapshot}:/run/docker:ro",
+                "--volume", f"{key}:/trust/public.pem:ro",
+                "--volume", f"{receipt}:/evidence/candidate-receipt.json:ro",
+                "--volume", f"{signature}:/evidence/candidate-receipt.sig:ro",
+                COSIGN_IMAGE, "verify-blob", "--key", "/trust/public.pem",
+                "--signature", "/evidence/candidate-receipt.sig",
+                "/evidence/candidate-receipt.json",
+            ]
+        )
+        result = runner(
+            args, text=True, capture_output=True, check=False, timeout=300,
+            env=sealed_docker_environment(),
+        )
+        _require(result.returncode == 0, "candidate receipt signature verification failed")
 
 
 def _read_regular_snapshot(path: Path, name: str) -> bytes:
@@ -340,72 +425,167 @@ def _parse_snapshot(data: bytes, name: str) -> object:
         raise CandidateVerificationError(f"{name} is unreadable") from exc
 
 
+def read_evidence_snapshot(directory: Path) -> dict[str, bytes]:
+    """Read and verify the producer's exact closed evidence bundle once."""
+    _require(not directory.is_symlink(), "evidence directory must not be a symlink")
+    directory = directory.resolve()
+    _require(directory.is_dir(), "evidence directory must be a real directory")
+    expected = {*EVIDENCE_FILES, "SHA256SUMS.json"}
+    try:
+        names = {path.name for path in directory.iterdir()}
+    except OSError as exc:
+        raise CandidateVerificationError("evidence directory is unreadable") from exc
+    _require(names == expected, "evidence directory fields must be the exact producer allowlist")
+    snapshots = {
+        name: _read_regular_snapshot(directory / name, f"evidence {name}")
+        for name in expected
+    }
+    manifest = _mapping(
+        _parse_snapshot(snapshots["SHA256SUMS.json"], "evidence hash manifest"),
+        "evidence hash manifest must be an object",
+    )
+    _closed(manifest, {"schema_version", "files"}, "evidence hash manifest")
+    _require(manifest["schema_version"] == 1, "unsupported evidence hash manifest")
+    entries = manifest["files"]
+    _require(isinstance(entries, list), "evidence hash manifest files must be a list")
+    _require(
+        [entry.get("path") if isinstance(entry, dict) else None for entry in entries]
+        == list(EVIDENCE_FILES),
+        "evidence hash manifest must list the sorted allowlist exactly once",
+    )
+    for entry in entries:
+        item = _mapping(entry, "evidence hash entry must be an object")
+        _closed(item, {"path", "sha256", "size"}, "evidence hash entry")
+        _require(
+            isinstance(item["path"], str)
+            and item["path"] in EVIDENCE_FILES
+            and isinstance(item["sha256"], str)
+            and SHA256.fullmatch(item["sha256"]) is not None
+            and isinstance(item["size"], int)
+            and not isinstance(item["size"], bool)
+            and item["size"] >= 0,
+            "evidence hash entry values are invalid",
+        )
+        data = snapshots[item["path"]]
+        _require(
+            item["sha256"] == _hash(data) and item["size"] == len(data),
+            f"evidence hash mismatch: {item['path']}",
+        )
+    return snapshots
+
+
+def validate_evidence_content(
+    snapshots: dict[str, bytes], candidate: dict[str, Any]
+) -> None:
+    """Bind retained role evidence to the exact signed receipt fields."""
+    for role in ("web", "migrate"):
+        subject = candidate["subjects"][role]
+        for suffix, field in (
+            ("runtime-identity.json", "runtime_identity"),
+            ("material-evidence.json", "material_evidence"),
+            ("retention-evidence.json", "retention_evidence"),
+            ("attestation-retention-evidence.json", "attestation_retention_evidence"),
+        ):
+            retained = _parse_snapshot(
+                snapshots[f"{role}.{suffix}"], f"retained {role} {suffix}"
+            )
+            _require(
+                retained == subject[field],
+                f"retained {role} {suffix} differs from the exact receipt",
+            )
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    with path.open("xb") as stream:
+        stream.write(data)
+    if os.name != "nt":
+        path.chmod(0o600)
+
+
 def verify_files(
     trust_path: Path,
-    receipt_path: Path,
-    public_key_path: Path,
+    evidence_directory: Path,
     docker_config: Path,
     *,
     docker_config_snapshot: Path | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
     trust_bytes = _read_regular_snapshot(trust_path, "trust declaration")
-    receipt_bytes = _read_regular_snapshot(receipt_path, "candidate receipt")
-    public_key_bytes = _read_regular_snapshot(public_key_path, "public key")
+    evidence = read_evidence_snapshot(evidence_directory)
+    receipt_bytes = evidence["candidate-receipt.json"]
+    signature_bytes = evidence["candidate-receipt.sig"]
+    public_key_bytes = evidence["kms-public.pem"]
     candidate = validate_candidate(
         _parse_snapshot(trust_bytes, "trust declaration"),
         _parse_snapshot(receipt_bytes, "candidate receipt"),
         public_key_bytes,
     )
+    validate_evidence_content(evidence, candidate)
     registries = {
         candidate["subjects"][role]["image"].split("/", 1)[0]
         for role in ("web", "migrate")
     }
     docker_config_bytes = validate_docker_config(docker_config, registries=registries)
-    active_docker_config = docker_config
+
+    def verify(active_config: Path) -> dict[str, Any]:
+        verify_receipt_signature(
+            receipt_bytes, signature_bytes, public_key_bytes, active_config,
+            runner=runner,
+        )
+        attestations = verify_attestations(
+            candidate, public_key_bytes, active_config, runner=runner,
+            validated_snapshot=True,
+        )
+        return {
+            "schema_version": "restricted-runtime-hrh-verification.v2",
+            "trust_sha256": _hash(trust_bytes),
+            "receipt_sha256": _hash(receipt_bytes),
+            "receipt_signature_sha256": _hash(signature_bytes),
+            "evidence_manifest_sha256": _hash(evidence["SHA256SUMS.json"]),
+            "kms_public_key_sha256": _hash(public_key_bytes),
+            "subjects": candidate["trust"]["subjects"],
+            **attestations,
+        }
+
     if docker_config_snapshot is not None:
-        active_docker_config = _materialize_docker_config(
+        active = _materialize_docker_config(
             docker_config_bytes, docker_config_snapshot
         )
-    result = verify_attestations(candidate, public_key_bytes, active_docker_config)
-    return {
-        "schema_version": "restricted-runtime-hrh-verification.v1",
-        "mode": "published",
-        "clinical_contract_revision": candidate["trust"]["clinical_contract_revision"],
-        "build_source_revision": candidate["trust"]["build_source_revision"],
-        "platform": candidate["trust"]["platform"],
-        "publisher_identity": candidate["trust"]["publisher_identity"],
-        "kms_key_version": candidate["trust"]["kms_key_version"],
-        "public_key_sha256": candidate["public_key_sha256"],
-        "subjects": candidate["trust"]["subjects"],
-        "receipt_sha256": _hash(receipt_bytes),
-        "trust_declaration_sha256": _hash(trust_bytes),
-        **result,
-        "git_ancestry_recomputed": False,
-        "phi_authorized": False,
-        "deployment_conformant": False,
+        return verify(active)
+    with tempfile.TemporaryDirectory(prefix="hrh-candidate-run-") as value:
+        parent = Path(value)
+        if os.name != "nt":
+            parent.chmod(0o700)
+        active = _materialize_docker_config(docker_config_bytes, parent / "docker")
+        return verify(active)
+
+
+def canonical_verification_bytes(result: dict[str, Any]) -> bytes:
+    expected = {
+        "schema_version", "trust_sha256", "receipt_sha256",
+        "receipt_signature_sha256", "evidence_manifest_sha256",
+        "kms_public_key_sha256", "subjects", "verified_predicates",
     }
+    _closed(result, expected, "verification identity")
+    return json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trust", type=Path, required=True)
-    parser.add_argument("--receipt", type=Path, required=True)
-    parser.add_argument("--public-key", type=Path, required=True)
+    parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--docker-config", type=Path, required=True)
-    parser.add_argument("--docker-config-snapshot", type=Path)
     args = parser.parse_args()
     try:
         result = verify_files(
             args.trust,
-            args.receipt,
-            args.public_key,
+            args.evidence,
             args.docker_config,
-            docker_config_snapshot=args.docker_config_snapshot,
         )
     except (CandidateVerificationError, OSError) as exc:
         print(f"HRH published candidate: DENIED: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    sys.stdout.buffer.write(canonical_verification_bytes(result) + b"\n")
     return 0
 
 
