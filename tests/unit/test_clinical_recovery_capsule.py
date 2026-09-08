@@ -25,11 +25,13 @@ import hashlib
 import importlib.util
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from io import BytesIO
@@ -1500,3 +1502,243 @@ def test_restore_rejects_capsule_inside_state_root_before_snapshot(tmp_path, mon
             now=NOW,
         )
     assert effects == [], "overlapping restore paths reached the snapshot boundary"
+
+
+def test_sealer_stdout_is_the_wrapper_opened_exclusive_file(tmp_path, monkeypatch):
+    module = _api("B08_DIRECT_STDOUT")
+    real_popen = subprocess.Popen
+    observed = {}
+
+    def capture_popen(*args, **kwargs):
+        observed["stdout"] = kwargs.get("stdout")
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "Popen", capture_popen)
+    output = tmp_path / "sealed"
+    module.run_sealer(
+        executable=Path(sys.executable),
+        arguments=("-c", "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())"),
+        stdin=b"synthetic private",
+        output=output,
+        timeout_seconds=5,
+        environment=dict(os.environ),
+    )
+    assert observed["stdout"] != subprocess.PIPE
+    assert callable(getattr(observed["stdout"], "fileno", None))
+    assert output.read_bytes() == b"synthetic private"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group and monotonic deadline witness is POSIX-only")
+def test_sealer_kills_retained_grandchild_within_one_deadline(tmp_path):
+    module = _api("B29_RETAINED_STDOUT")
+    script, pidfile = tmp_path / "fork.py", tmp_path / "pids"
+    script.write_text(
+        "import os,sys,time\n"
+        "child=os.fork()\n"
+        "if child==0:\n"
+        "    time.sleep(60)\n"
+        "else:\n"
+        "    open(sys.argv[1],'w').write(f'{os.getpgrp()} {child}')\n"
+        "    os._exit(0)\n",
+        encoding="utf-8",
+    )
+    timeout = 0.3
+    started = time.monotonic()
+    group = child = None
+    alive = False
+    try:
+        with pytest.raises(module.CapsuleError, match="^RECOVERY_SEALER_UNAVAILABLE$"):
+            module.run_sealer(
+                executable=Path(sys.executable),
+                arguments=(str(script), str(pidfile)),
+                stdin=b"x" * (8 * 1024 * 1024),
+                output=tmp_path / "sealed",
+                timeout_seconds=timeout,
+                environment=dict(os.environ),
+            )
+        elapsed = time.monotonic() - started
+        group, child = map(int, pidfile.read_text(encoding="utf-8").split())
+        try:
+            os.kill(child, 0)
+            alive = True
+        except ProcessLookupError:
+            pass
+    finally:
+        if alive and group is not None:
+            os.killpg(group, signal.SIGKILL)
+    assert not alive, "retained sealer process group survived wrapper failure"
+    assert elapsed <= timeout + 0.2, "sealer used more than one monotonic timeout budget"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exact trusted-parent mode witness is POSIX-only")
+def test_publication_requires_exact_capsule_and_public_parent_modes(
+    trust, public_identity, tmp_path, monkeypatch
+):
+    module = _api("B11_EXACT_PARENT_MODES")
+    attempts = ((0o755, 0o750), (0o700, 0o711))
+    for index, (capsule_mode, public_mode) in enumerate(attempts):
+        root = tmp_path / str(index)
+        capsule_parent, public_parent = root / "capsule", root / "public"
+        capsule_parent.mkdir(parents=True)
+        public_parent.mkdir()
+        capsule_parent.chmod(capsule_mode)
+        public_parent.chmod(public_mode)
+        effects = []
+        monkeypatch.setattr(
+            module,
+            "snapshot_sealer",
+            lambda *_args, **_kwargs: effects.append("sealer") or tmp_path / "age",
+        )
+        with pytest.raises(module.CapsuleError):
+            module.publish_recovery_pair(
+                public_dir=public_parent / "bundle",
+                capsule_path=capsule_parent / "capsule.age",
+                public_identity=public_identity,
+                recovery_trust=_canonical(trust),
+                private_plaintext=b"private",
+                sealer=tmp_path / "age",
+            )
+        assert effects == [], "invalid parent mode reached the sealer boundary"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="parent rename-to-symlink witness is POSIX-only")
+def test_parent_swap_cannot_redirect_private_staging(
+    trust, public_identity, tmp_path, monkeypatch
+):
+    module = _api("B11_PARENT_SWAP")
+    capsule_parent, public_parent = tmp_path / "capsule", tmp_path / "public"
+    capsule_parent.mkdir(mode=0o700)
+    public_parent.mkdir(mode=0o700)
+    redirected = []
+
+    def swap_parent(_source, run_dir, *_args, **_kwargs):
+        stage = run_dir.parent
+        moved, attacker = tmp_path / "capsule-moved", tmp_path / "attacker"
+        capsule_parent.rename(moved)
+        attacker.mkdir(mode=0o700)
+        (attacker / stage.name).mkdir(mode=0o700)
+        capsule_parent.symlink_to(attacker, target_is_directory=True)
+        return tmp_path / "age"
+
+    def observe_private_output(**kwargs):
+        kwargs["output"].write_bytes(b"redirected-private")
+        redirected.append(kwargs["output"].resolve())
+        raise module.CapsuleError("synthetic stop")
+
+    monkeypatch.setattr(module, "snapshot_sealer", swap_parent)
+    monkeypatch.setattr(module, "encrypt_private_capsule", observe_private_output)
+    with pytest.raises(module.CapsuleError):
+        module.publish_recovery_pair(
+            public_dir=public_parent / "bundle",
+            capsule_path=capsule_parent / "capsule.age",
+            public_identity=public_identity,
+            recovery_trust=_canonical(trust),
+            private_plaintext=b"private",
+            sealer=tmp_path / "age",
+        )
+    assert redirected == [], "private bytes reached a substituted output parent"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="intermediate directory symlink witness is POSIX-only")
+def test_restore_rejects_symlinked_public_root_before_snapshot(tmp_path, monkeypatch):
+    module = _api("B13_INTERMEDIATE_SYMLINK")
+    state, runtime, real_public = tmp_path / "state", tmp_path / "runtime", tmp_path / "real-public"
+    state.mkdir()
+    runtime.mkdir()
+    real_public.mkdir()
+    public = tmp_path / "public"
+    public.symlink_to(real_public, target_is_directory=True)
+    staging = type(
+        "Staging",
+        (),
+        {"state_dir": state, "runtime": runtime, "hrh": None, "project": PROJECT},
+    )()
+    effects = []
+
+    def reject_if_read(*_args, **_kwargs):
+        effects.append("snapshot-read")
+        raise module.CapsuleError("synthetic stop")
+
+    monkeypatch.setattr(module, "read_bounded_regular", reject_if_read)
+    with pytest.raises(module.CapsuleError):
+        module.prepare_published_restore(
+            staging,
+            public,
+            tmp_path / "capsule.age",
+            tmp_path / "trust.json",
+            tmp_path / "age",
+            "a" * 64,
+            now=NOW,
+        )
+    assert effects == [], "symlinked public root reached snapshot reads"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fsync fd ordering witness uses /proc/self/fd")
+def test_owner_marker_durability_reaches_output_parent_before_sealing(
+    trust, public_identity, tmp_path, monkeypatch
+):
+    module = _api("B12_OUTPUT_PARENT_FSYNC")
+    public_parent, capsule_parent = tmp_path / "public", tmp_path / "capsule"
+    public_parent.mkdir(mode=0o700)
+    capsule_parent.mkdir(mode=0o700)
+    events = []
+    real_fsync = os.fsync
+
+    def observe_fsync(descriptor):
+        try:
+            events.append(Path(os.readlink(f"/proc/self/fd/{descriptor}")))
+        except OSError:
+            pass
+        real_fsync(descriptor)
+
+    durable = {"value": False}
+
+    def stop_at_seal(**_kwargs):
+        markers = [path for path in events if path.name == ".clinical-recovery-owner.json"]
+        durable["value"] = len(markers) == 2 and all(
+            marker.parent in events[events.index(marker) + 1 :]
+            and marker.parent.parent in events[events.index(marker.parent) + 1 :]
+            for marker in markers
+        )
+        raise module.CapsuleError("synthetic stop")
+
+    monkeypatch.setattr(module.os, "fsync", observe_fsync)
+    monkeypatch.setattr(module, "snapshot_sealer", lambda source, *_args, **_kwargs: source)
+    monkeypatch.setattr(module, "encrypt_private_capsule", stop_at_seal)
+    with pytest.raises(module.CapsuleError):
+        module.publish_recovery_pair(
+            public_dir=public_parent / "bundle",
+            capsule_path=capsule_parent / "capsule.age",
+            public_identity=public_identity,
+            recovery_trust=_canonical(trust),
+            private_plaintext=b"private",
+            sealer=tmp_path / "age",
+        )
+    assert durable["value"], "owner durability stopped at the stage instead of its output parent"
+
+
+def test_destination_disappearance_is_not_misreported_as_missing_capsule(
+    tmp_path, monkeypatch
+):
+    module = _api("B15_NARROW_MISSING")
+    source = tmp_path / "capsule.age"
+    destination = tmp_path / "run" / "capsule.age"
+    source.write_bytes(b"ciphertext")
+    real_fdopen = os.fdopen
+    removed = {"value": False}
+
+    def remove_destination_parent(descriptor, *args, **kwargs):
+        handle = real_fdopen(descriptor, *args, **kwargs)
+        if not removed["value"]:
+            destination.parent.rmdir()
+            removed["value"] = True
+        return handle
+
+    monkeypatch.setattr(module.os, "fdopen", remove_destination_parent)
+    with pytest.raises(module.CapsuleError, match="^RECOVERY_CAPSULE_MISMATCH$"):
+        module.snapshot_declared_member(
+            source,
+            destination,
+            declared_size=10,
+            declared_sha256=_digest(b"ciphertext"),
+        )
