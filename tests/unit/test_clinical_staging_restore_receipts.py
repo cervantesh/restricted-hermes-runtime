@@ -574,8 +574,19 @@ def test_reachable_published_backup_consumes_receipt_builder(
     monkeypatch.setattr(staging, "_backup_volume", lambda key, _name, target: (target / "volumes" / f"{key}.tar").write_bytes(b"volume"))
     monkeypatch.setattr(staging_module, "fsync_directory", lambda _path: None)
     monkeypatch.setattr(staging_module, "build_backup_manifest", lambda *_args: fixture["manifest"])
+    monkeypatch.setattr(
+        staging_module.hrh_mode, "_verifier",
+        lambda _runtime: type("Verifier", (), {"EVIDENCE_FILES": ()}),
+    )
+    def finish(*_args, receipt_builder, **_kwargs):
+        return receipt_builder()
+
+    monkeypatch.setattr(staging_module.recovery_codec, "finish_published_backup", finish)
     backup = tmp_path / "published-backup"
-    receipt = staging.backup(backup)
+    receipt = staging.backup(
+        backup, recovery_trust=tmp_path / "trust.json",
+        recovery_sealer=tmp_path / "age", recovery_capsule=tmp_path / "capsule.age",
+    )
     assert len(calls) == 1, "U4R RED: reachable published backup bypassed its receipt builder"
     assert receipt == _expected_published_backup(fixture)
 
@@ -729,7 +740,26 @@ def test_reachable_published_restore_consumes_builder_and_persists_exact_receipt
     monkeypatch.setattr(staging, "_start_restored_stack", lambda: None)
     monkeypatch.setattr(staging, "status", lambda **_kwargs: {"observed_at": "2026-08-01T12:29:00Z"})
     monkeypatch.setattr(staging_module, "fsync_directory", lambda _path: None)
-    receipt = staging.restore(backup, fixture["manifest_sha256"])
+    prepared = {"synthetic": True}
+    monkeypatch.setattr(staging_module.recovery_codec, "prepare_published_restore", lambda *_args, **_kwargs: prepared)
+    monkeypatch.setattr(
+        staging_module.hrh_mode, "acquire_published_candidate",
+        lambda *_args, **_kwargs: type("Acquisition", (), {"candidate": fixture["identity"]["hrh_candidate"]})(),
+    )
+
+    def restore(*_args, receipt_builder, **_kwargs):
+        receipt = receipt_builder()
+        receipt_dir = state / "evidence" / "recovery"
+        receipt_dir.mkdir(parents=True)
+        (receipt_dir / f"restore-{fixture['manifest_sha256']}.json").write_bytes(_canonical(receipt))
+        return receipt
+
+    monkeypatch.setattr(staging_module.recovery_codec, "restore_published_backup", restore)
+    receipt = staging.restore(
+        backup, fixture["manifest_sha256"], recovery_trust=tmp_path / "trust.json",
+        recovery_sealer=tmp_path / "age", recovery_capsule=tmp_path / "capsule.age",
+        recovery_identity_reader=lambda: b"synthetic\n",
+    )
     assert len(calls) == 1, "U4R RED: reachable published restore bypassed its receipt builder"
     expected_bytes = _canonical(_published_mechanical(fixture))
     assert receipt == json.loads(expected_bytes)
