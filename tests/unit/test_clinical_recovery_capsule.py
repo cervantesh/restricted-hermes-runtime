@@ -135,7 +135,8 @@ def _digest(data: bytes) -> str:
 
 
 def _member(data: bytes) -> dict[str, Any]:
-    return {"sha256": _digest(data), "size": len(data), "ownership_sha256": SHA}
+    ownership = _canonical({"uid": 0, "gid": 0, "mode": 0o600})
+    return {"sha256": _digest(data), "size": len(data), "ownership_sha256": _digest(ownership)}
 
 
 @contextmanager
@@ -263,9 +264,18 @@ def _tar_bytes(files: dict[str, bytes], order: tuple[str, ...] | None = None) ->
 
 
 def _capsule_plaintext(public_identity: dict[str, Any]) -> bytes:
-    private = {"state.tar": b"private-state:" + PUBLIC_SECRET + b":" + PRIVATE_PATH}
+    private = {
+        "state.tar": _tar_bytes(
+            {"synthetic-state": b"private-state:" + PUBLIC_SECRET + b":" + PRIVATE_PATH}
+        )
+    }
     private.update(
-        {f"volumes/{name}.tar": f"private-volume:{name}".encode() for name in VOLUME_KEYS}
+        {
+            f"volumes/{name}.tar": _tar_bytes(
+                {"synthetic-volume": f"private-volume:{name}".encode()}
+            )
+            for name in VOLUME_KEYS
+        }
     )
     manifest = {
         "schema": CAPSULE_SCHEMA,
