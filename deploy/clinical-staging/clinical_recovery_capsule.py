@@ -363,11 +363,13 @@ def build_capsule_plaintext(private_root: Path, *, public_identity: Mapping[str,
     return _tar_bytes({"capsule-manifest.json": _canonical(manifest), **files}, PRIVATE_NAMES)
 
 
-def load_public_evidence(state_dir: Path) -> dict[str, bytes]:
+def load_public_evidence(state_dir: Path, verifier_evidence_names: tuple[str, ...]) -> dict[str, bytes]:
     root = state_dir / "evidence" / "hrh-published"
     try:
-        names = {path.name for path in root.iterdir() if path.is_file() and path.name not in {"trust.json", "verification.json"}}
-        order = (*sorted(names - {"SHA256SUMS.json"}), "SHA256SUMS.json", "trust.json", "verification.json")
+        order = (*verifier_evidence_names, "SHA256SUMS.json", "trust.json", "verification.json")
+        entries = list(root.iterdir())
+        if {path.name for path in entries} != set(order) or any(path.is_symlink() or not path.is_file() for path in entries):
+            raise CapsuleError("RECOVERY_EVIDENCE_UNAVAILABLE")
         return {name: read_bounded_regular(root / name, limit=16 * 1024 * 1024, code="RECOVERY_EVIDENCE_UNAVAILABLE") for name in order}
     except OSError as exc:
         raise CapsuleError("RECOVERY_EVIDENCE_UNAVAILABLE") from exc
@@ -687,6 +689,7 @@ def finish_published_backup(
     staging: Any, private_root: Path, marker: Mapping[str, Any], public_dir: Path, *,
     recovery_trust_path: Path | None, recovery_sealer: Path | None, capsule_path: Path | None,
     contract: Any, receipt_builder: Callable[..., Mapping[str, Any]], now: datetime,
+    verifier_evidence_names: tuple[str, ...],
 ) -> Mapping[str, Any]:
     if recovery_trust_path is None or recovery_sealer is None or capsule_path is None:
         raise CapsuleError("published backup requires the complete recovery boundary")
@@ -698,7 +701,7 @@ def finish_published_backup(
         marker, recovery_trust=trust_bytes, sealer_sha256=trust["sealer_sha256"], capsule_id=capsule_id,
     )
     plaintext = build_capsule_plaintext(private_root, public_identity=identity)
-    evidence = load_public_evidence(staging.state_dir)
+    evidence = load_public_evidence(staging.state_dir, verifier_evidence_names)
     try:
         result = publish_recovery_pair(
             public_dir=public_dir, capsule_path=capsule_path, public_identity=identity,
@@ -742,6 +745,8 @@ def restore_published_backup(
     run = staging.state_dir.parent / f".capsule-run-{os.urandom(16).hex()}"
     run.mkdir(mode=0o700)
     plaintext_path, capsule_snapshot = run / "plaintext.tar", run / "capsule.age"
+    target: Path | None = None
+    published_state = False
     try:
         snapshot_declared_member(
             capsule_path, capsule_snapshot,
@@ -783,6 +788,7 @@ def restore_published_backup(
         if hashlib.sha256((target / "compose.env").read_bytes()).hexdigest() != identity["compose_env_sha256"]:
             raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
         os.replace(target, staging.state_dir)
+        published_state = True
         staging._create_volumes(marker)
         for key in VOLUME_KEYS:
             staging._restore_volume(key, marker["volumes"][key], private)
@@ -802,7 +808,13 @@ def restore_published_backup(
         receipt_bytes = _canonical(receipt)
         write_private_atomic(receipt_dir / f"restore-{expected_manifest_sha256}.json", receipt_bytes)
         return dict(receipt, mechanical_receipt_sha256=_sha(receipt_bytes))
+    except Exception:
+        if published_state:
+            staging._contain_failed_restore()
+        raise
     finally:
         for item in identity_holder:
             del item
         _remove_private_tree(run)
+        if target is not None and target.exists():
+            _remove_private_tree(target)

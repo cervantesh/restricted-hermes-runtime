@@ -1566,7 +1566,7 @@ class ClinicalStaging:
                 self._assert_unmounted_backup_volumes(marker["volumes"])
                 self._backup_volume(key, marker["volumes"][key], temporary)
             if self.mode_plan.mode == "published" and recovery_trust is not None:
-                return recovery_codec.finish_published_backup(self, temporary, marker, backup_dir, recovery_trust_path=recovery_trust, recovery_sealer=recovery_sealer, capsule_path=recovery_capsule, contract=_backup_contract(), receipt_builder=_codec_build_backup_receipt, now=datetime.now(UTC))
+                return recovery_codec.finish_published_backup(self, temporary, marker, backup_dir, recovery_trust_path=recovery_trust, recovery_sealer=recovery_sealer, capsule_path=recovery_capsule, contract=_backup_contract(), receipt_builder=_codec_build_backup_receipt, now=datetime.now(UTC), verifier_evidence_names=hrh_mode._verifier(self.runtime).EVIDENCE_FILES)
             fsync_directory(temporary / BACKUP_VOLUME_DIR)
             manifest = build_backup_manifest(marker, self.state_dir, temporary)
             write_backup_manifest(temporary, manifest)
@@ -1658,6 +1658,15 @@ class ClinicalStaging:
         self.control("wait-hrh")
         self.compose("up", "--detach", "ingress", timeout=600)
 
+    def _contain_failed_restore(self) -> None:
+        try:
+            marker = read_marker(self.state_dir, self.project)
+            marker["lifecycle"] = "recovering"
+            self._write_marker(marker)
+            self.compose("stop", *LONG_RUNNING_SERVICES, check=False)
+        except Exception:
+            pass
+
     @_serialized_mutator
     def restore(self, backup_dir: Path, expected_manifest_sha256: str, *, renew_tls: bool = False, recovery_trust: Path | None = None, recovery_sealer: Path | None = None, recovery_capsule: Path | None = None, recovery_identity_reader: Any = None) -> dict[str, Any]:
         """Restore only a fully validated cold bundle into a clean destination."""
@@ -1744,16 +1753,7 @@ class ClinicalStaging:
             return receipt
         except Exception as exc:
             if published_state:
-                # A failed post-start verification must remain non-operational.
-                # `destroy` accepts recovering state and reuses the exact
-                # resource allowlists for bounded cleanup.
-                try:
-                    failed_marker = read_marker(self.state_dir, self.project)
-                    failed_marker["lifecycle"] = "recovering"
-                    self._write_marker(failed_marker)
-                    self.compose("stop", *LONG_RUNNING_SERVICES, check=False)
-                except Exception:
-                    pass
+                self._contain_failed_restore()
                 raise SafetyError(
                     "restore failed after controlled recovery state was published; run destroy before retrying"
                 ) from exc
