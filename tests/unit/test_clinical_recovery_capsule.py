@@ -9,11 +9,13 @@ module is absent, each row reports ``PREREQUISITE RED``.  Once it exists, the
 same row must prove its own observable predicate rather than treating import
 success as implementation success.
 
-This unit fully controls only pure parsing, binding and source-v1 compatibility
-predicates.  B05-B11, B13-B18, B20-B21 and B26-B29 are executable RED or
-PARTIAL integration contracts.  B12 proves only bounded reconciliation;
-SIGKILL publication is NOT_VERIFIED.  B19 and B22-B25 remain NOT_VERIFIED
-because they require integrated acquisition, restore, receipts and services.
+This unit owns executable RED predicates B02-B03, B05-B07, B09, B11,
+B16-B18, B20-B21 and B27-B28.  B04, B08, B10, B12-B15, B26 and B29 are
+PARTIAL: B12 still needs the real SIGKILL publication witness, B13 does not
+prove the integrated caller authenticated the public manifest first, B14 does
+not exercise a stalled stdin acquisition deadline, and B29 is POSIX-only.
+B19 and B22-B25 are NOT_VERIFIED because they require integrated acquisition,
+cross-path restore, receipts and service lifecycle effects.
 """
 
 from __future__ import annotations
@@ -82,6 +84,20 @@ PRIVATE_NAMES = {
 }
 PUBLIC_SECRET = b"SYNTHETIC-CREDENTIAL-MUST-NOT-BE-PUBLIC"
 PRIVATE_PATH = b"/synthetic/private/identity/path"
+EXECUTABLE_RED_ROWS = {
+    "B02", "B03", "B05", "B06", "B07", "B09", "B11", "B16", "B17",
+    "B18", "B20", "B21", "B27", "B28",
+}
+PARTIAL_ROWS = {"B04", "B08", "B10", "B12", "B13", "B14", "B15", "B26", "B29"}
+NOT_VERIFIED_ROWS = {"B19", "B22", "B23", "B24", "B25"}
+assert EXECUTABLE_RED_ROWS | PARTIAL_ROWS | NOT_VERIFIED_ROWS == {
+    f"B{index:02}" for index in range(2, 30)
+}
+assert not (
+    EXECUTABLE_RED_ROWS & PARTIAL_ROWS
+    or EXECUTABLE_RED_ROWS & NOT_VERIFIED_ROWS
+    or PARTIAL_ROWS & NOT_VERIFIED_ROWS
+)
 
 
 def _load(path: Path, name: str) -> ModuleType:
@@ -231,10 +247,10 @@ def public_identity(trust):
     }
 
 
-def _tar_bytes(files: dict[str, bytes]) -> bytes:
+def _tar_bytes(files: dict[str, bytes], order: tuple[str, ...] | None = None) -> bytes:
     stream = BytesIO()
     with tarfile.open(fileobj=stream, mode="w:") as archive:
-        for name in sorted(files):
+        for name in order if order is not None else sorted(files):
             data = files[name]
             info = tarfile.TarInfo(name)
             info.size = len(data)
@@ -247,7 +263,7 @@ def _tar_bytes(files: dict[str, bytes]) -> bytes:
 
 
 def _capsule_plaintext(public_identity: dict[str, Any]) -> bytes:
-    private = {"state.tar": b"private-state:" + PUBLIC_SECRET}
+    private = {"state.tar": b"private-state:" + PUBLIC_SECRET + b":" + PRIVATE_PATH}
     private.update(
         {f"volumes/{name}.tar": f"private-volume:{name}".encode() for name in VOLUME_KEYS}
     )
@@ -303,18 +319,52 @@ def _fixture_recovery_pair(tmp_path: Path, public_identity, trust) -> dict[str, 
     public.mkdir()
     identity_bytes = _canonical(public_identity)
     trust_bytes = _canonical(trust)
+    verifier = _load(VERIFIER_PATH, "clinical_capsule_pair_verifier")
+    evidence_order = (
+        *verifier.EVIDENCE_FILES,
+        "SHA256SUMS.json",
+        "trust.json",
+        "verification.json",
+    )
+    evidence_files = {
+        name: f"synthetic-public-evidence:{name}\n".encode()
+        for name in evidence_order
+    }
+    evidence_bytes = _tar_bytes(evidence_files, evidence_order)
+    capsule_bytes = b"synthetic-age-ciphertext-without-private-fixture-bytes"
+    capsule_path = tmp_path / "private.age"
+    capsule_path.write_bytes(capsule_bytes)
     (public / "backup-identity.json").write_bytes(identity_bytes)
     (public / "recovery-trust.json").write_bytes(trust_bytes)
+    (public / "public-evidence.tar").write_bytes(evidence_bytes)
+    identity_member = _member(identity_bytes)
+    evidence_member = _member(evidence_bytes)
+    trust_member = _member(trust_bytes)
     manifest = {
-        "schema": PUBLIC_SCHEMA, "project": PROJECT, "state_id": STATE_ID,
+        "schema": PUBLIC_SCHEMA,
+        "synthetic_only": True,
+        "complete": True,
         "backup_identity_sha256": _digest(identity_bytes),
         "recovery_trust_sha256": _digest(trust_bytes),
-        "capsule_id": CAPSULE_ID,
+        "public_evidence": dict(evidence_member),
+        "recovery_capsule": {
+            "capsule_id": CAPSULE_ID,
+            "ciphertext_sha256": _digest(capsule_bytes),
+            "ciphertext_size": len(capsule_bytes),
+        },
+        "members": {
+            "backup-identity.json": identity_member,
+            "public-evidence.tar": evidence_member,
+            "recovery-trust.json": trust_member,
+        },
     }
     manifest_bytes = _canonical(manifest)
     (public / "backup-manifest.json").write_bytes(manifest_bytes)
+    (public / "COMPLETE").write_bytes(b"complete\n")
     return {
         "public_dir": public,
+        "capsule_path": capsule_path,
+        "capsule_bytes": capsule_bytes,
         "public_identity": public_identity,
         "manifest": manifest,
         "external_manifest_sha256": _digest(manifest_bytes),
@@ -326,10 +376,20 @@ def _reseal_fixture_pair(bundle: dict[str, Any], changed_identity) -> dict[str, 
     public = bundle["public_dir"].parent / "resealed"
     public.mkdir()
     identity_bytes = _canonical(changed_identity)
-    manifest = dict(bundle["manifest"], backup_identity_sha256=_digest(identity_bytes))
+    for name in ("public-evidence.tar", "recovery-trust.json", "COMPLETE"):
+        (public / name).write_bytes((bundle["public_dir"] / name).read_bytes())
+    manifest = copy.deepcopy(bundle["manifest"])
+    manifest["backup_identity_sha256"] = _digest(identity_bytes)
+    manifest["members"]["backup-identity.json"] = _member(identity_bytes)
+    manifest_bytes = _canonical(manifest)
     (public / "backup-identity.json").write_bytes(identity_bytes)
-    (public / "backup-manifest.json").write_bytes(_canonical(manifest))
-    resealed.update(public_dir=public, public_identity=changed_identity, manifest=manifest)
+    (public / "backup-manifest.json").write_bytes(manifest_bytes)
+    resealed.update(
+        public_dir=public,
+        public_identity=changed_identity,
+        manifest=manifest,
+        external_manifest_sha256=_digest(manifest_bytes),
+    )
     return resealed
 
 
@@ -354,7 +414,39 @@ def test_test_owned_capsule_mutants_and_reseal_fixture_are_well_formed(
     changed["state_id"] = "f" * 32
     resealed = _reseal_fixture_pair(bundle, changed)
     assert resealed["manifest"]["backup_identity_sha256"] == _digest(_canonical(changed))
-    assert resealed["external_manifest_sha256"] == bundle["external_manifest_sha256"]
+    assert resealed["external_manifest_sha256"] == _digest(
+        (resealed["public_dir"] / "backup-manifest.json").read_bytes()
+    )
+    assert resealed["external_manifest_sha256"] != bundle["external_manifest_sha256"]
+    assert set(bundle["manifest"]) == {
+        "schema", "synthetic_only", "complete", "backup_identity_sha256",
+        "recovery_trust_sha256", "public_evidence", "recovery_capsule", "members",
+    }
+    assert set(bundle["manifest"]["members"]) == {
+        "backup-identity.json", "public-evidence.tar", "recovery-trust.json",
+    }
+    manifest = bundle["manifest"]
+    public = bundle["public_dir"]
+    assert manifest["schema"] == PUBLIC_SCHEMA
+    assert manifest["synthetic_only"] is True and manifest["complete"] is True
+    assert manifest["public_evidence"] == manifest["members"]["public-evidence.tar"]
+    assert manifest["backup_identity_sha256"] == _digest(
+        (public / "backup-identity.json").read_bytes()
+    )
+    assert manifest["recovery_trust_sha256"] == _digest(
+        (public / "recovery-trust.json").read_bytes()
+    )
+    for name, declaration in manifest["members"].items():
+        actual = (public / name).read_bytes()
+        assert declaration == _member(actual)
+    capsule = bundle["capsule_bytes"]
+    assert manifest["recovery_capsule"] == {
+        "capsule_id": CAPSULE_ID,
+        "ciphertext_sha256": _digest(capsule),
+        "ciphertext_size": len(capsule),
+    }
+    assert {path.name for path in public.iterdir()} == PUBLIC_NAMES
+    assert (public / "COMPLETE").read_bytes() == b"complete\n"
 
 
 @pytest.mark.parametrize(
@@ -570,7 +662,12 @@ def test_b05_b06_public_bundle_is_exact_and_secret_free(
     module = _api("B05")
     verifier = _load(VERIFIER_PATH, "clinical_capsule_hrh_verifier")
     public = tmp_path / "public"
-    evidence_names = {*verifier.EVIDENCE_FILES, "SHA256SUMS.json", "trust.json", "verification.json"}
+    evidence_names = (
+        *verifier.EVIDENCE_FILES,
+        "SHA256SUMS.json",
+        "trust.json",
+        "verification.json",
+    )
     _fn(module, "B05", "build_public_bundle")(
         public,
         public_identity=public_identity,
@@ -581,7 +678,11 @@ def test_b05_b06_public_bundle_is_exact_and_secret_free(
     )
     assert {path.name for path in public.iterdir()} == PUBLIC_NAMES
     with tarfile.open(public / "public-evidence.tar", "r:") as evidence_tar:
-        assert {member.name for member in evidence_tar.getmembers()} == evidence_names
+        members = evidence_tar.getmembers()
+        names = [member.name for member in members]
+        assert names == list(evidence_names)
+        assert len(names) == len(set(names))
+        assert all(member.isreg() for member in members)
     joined = b"".join(path.read_bytes() for path in public.iterdir() if path.is_file())
     assert PUBLIC_SECRET not in joined and PRIVATE_PATH not in joined
 
@@ -614,7 +715,7 @@ def test_b08_age_boundary_and_public_results_never_expose_private_canaries(
     result = _fn(module, "B08", "encrypt_private_capsule")(
         sealer=age_material["age"],
         recipient=age_material["recipient"],
-        plaintext=b"private:" + PUBLIC_SECRET,
+        plaintext=b"private:" + PUBLIC_SECRET + b":" + PRIVATE_PATH,
         output=tmp_path / "capsule.age",
         timeout_seconds=10,
         environment={},
@@ -627,10 +728,10 @@ def test_b08_age_boundary_and_public_results_never_expose_private_canaries(
     argv, kwargs = invocations[0]
     assert argv[1:] == ["--encrypt", "--recipient", age_material["recipient"]]
     assert kwargs["env"] == {}
-    assert kwargs["input"] == b"private:" + PUBLIC_SECRET
+    assert kwargs["input"] == b"private:" + PUBLIC_SECRET + b":" + PRIVATE_PATH
 
 
-def test_b09_b20_resealed_cross_generation_substitution_is_rejected(
+def test_b09_resealed_pair_cannot_replace_external_manifest_authority(
     trust, public_identity, tmp_path
 ):
     module = _api("B09")
@@ -638,10 +739,27 @@ def test_b09_b20_resealed_cross_generation_substitution_is_rejected(
     changed = copy.deepcopy(public_identity)
     changed["hrh_candidate"]["receipt_sha256"] = "f" * 64
     resealed = _reseal_fixture_pair(bundle, changed)
+    with pytest.raises(module.CapsuleError):
+        _fn(module, "B09", "validate_recovery_pair")(
+            resealed,
+            expected_manifest_sha256=bundle["external_manifest_sha256"],
+            fresh_trust=_canonical(trust),
+            acquired_generation=changed["hrh_candidate"],
+        )
+
+
+def test_b20_resealed_pair_rejects_only_acquired_generation_mismatch(
+    trust, public_identity, tmp_path
+):
+    module = _api("B20")
+    bundle = _fixture_recovery_pair(tmp_path, public_identity, trust)
+    changed = copy.deepcopy(public_identity)
+    changed["hrh_candidate"]["receipt_sha256"] = "f" * 64
+    resealed = _reseal_fixture_pair(bundle, changed)
     with pytest.raises(module.CapsuleError, match="RECOVERY_GENERATION_MISMATCH"):
         _fn(module, "B20", "validate_recovery_pair")(
             resealed,
-            expected_manifest_sha256=bundle["external_manifest_sha256"],
+            expected_manifest_sha256=resealed["external_manifest_sha256"],
             fresh_trust=_canonical(trust),
             acquired_generation=public_identity["hrh_candidate"],
         )
@@ -679,12 +797,19 @@ def test_b10_b11_publication_failpoints_never_report_or_retain_partial_success(
     assert events == PUBLICATION_STAGES[: PUBLICATION_STAGES.index(stage) + 1]
     assert not list(tmp_path.rglob("*.partial-*"))
     assert not list(tmp_path.rglob("plaintext.tar"))
+    assert not list(tmp_path.rglob(".clinical-recovery-owner.json"))
+    assert not list(tmp_path.rglob(".capsule-run-*"))
     public, capsule = tmp_path / "public", tmp_path / "private" / "capsule.age"
     if PUBLICATION_STAGES.index(stage) < PUBLICATION_STAGES.index("PUBLIC_PUBLISHED"):
         assert not public.exists() and not capsule.exists()
     else:
         assert capsule.is_file() and (public / "COMPLETE").is_file()
         assert not list(public.glob("*receipt*"))
+    for artifact in tmp_path.rglob("*"):
+        if artifact.is_file() and artifact != capsule:
+            retained = artifact.read_bytes()
+            assert PUBLIC_SECRET not in retained
+            assert PRIVATE_PATH not in retained
 
 
 def test_b12_orphan_is_explicit_and_cleanup_is_bounded(tmp_path):
@@ -771,6 +896,8 @@ def test_b12_cleanup_does_not_follow_an_ownership_marker_symlink(tmp_path):
 
 
 def test_b13_manifest_bounds_are_authenticated_before_variable_copy(tmp_path):
+    # PARTIAL: this freezes the bounded snapshot itself.  The integrated
+    # restore caller must still prove manifest authentication happens first.
     module = _api("B13")
     source = tmp_path / "capsule.age"
     source.write_bytes(b"x" * 33)
@@ -797,6 +924,7 @@ def test_b13_manifest_bounds_are_authenticated_before_variable_copy(tmp_path):
     ],
 )
 def test_b14_identity_input_is_one_bounded_native_record(payload):
+    # PARTIAL: stalled acquisition and its deadline require the stdin wrapper.
     module = _api("B14")
     with pytest.raises(module.CapsuleError, match="RECOVERY_CAPSULE_UNAVAILABLE"):
         _fn(module, "B14", "validate_identity_input")(payload)
