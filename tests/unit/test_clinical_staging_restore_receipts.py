@@ -1031,6 +1031,58 @@ def test_published_finalizer_rejects_substituted_public_bundle_against_external_
     assert not artifact.exists()
 
 
+def test_published_restore_rejects_conflicting_target_before_capsule_or_hrh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging_module = _load(STAGING_PATH, "clinical_staging_restore_target_order_red")
+    fixture = _published_fixture()
+    project = fixture["identity"]["project"]
+    runtime = tmp_path / "runtime"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    backup = tmp_path / "backup"
+    runtime.mkdir()
+    state.mkdir()
+    backup.mkdir()
+    (state / "conflict").write_bytes(b"occupied")
+    effects = []
+    staging = staging_module.ClinicalStaging(
+        runtime,
+        None,
+        state,
+        project,
+        18443,
+        mode_plan=staging_module.hrh_mode.HRHModePlan("restore", "published"),
+    )
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging_module, "validate_backup_path", lambda path, **_kwargs: path)
+    monkeypatch.setattr(
+        staging_module.recovery_codec,
+        "prepare_published_restore",
+        lambda *_args, **_kwargs: effects.append("capsule") or {"prepared": True},
+    )
+    monkeypatch.setattr(
+        staging_module.hrh_mode,
+        "acquire_published_candidate",
+        lambda *_args, **_kwargs: effects.append("hrh")
+        or type("Acquisition", (), {"candidate": fixture["identity"]["hrh_candidate"]})(),
+    )
+    monkeypatch.setattr(
+        staging_module.recovery_codec,
+        "restore_published_backup",
+        lambda *_args, **_kwargs: staging._require_empty_restore_destination(),
+    )
+    with pytest.raises(staging_module.SafetyError):
+        staging.restore(
+            backup,
+            fixture["manifest_sha256"],
+            recovery_trust=tmp_path / "trust.json",
+            recovery_sealer=tmp_path / "age",
+            recovery_capsule=tmp_path / "capsule.age",
+            recovery_identity_reader=lambda: b"synthetic\n",
+        )
+    assert effects == [], "capsule or HRH work began before target emptiness was established"
+
+
 @pytest.mark.parametrize(
     ("mutant", "reason"),
     (

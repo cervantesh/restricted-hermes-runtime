@@ -1206,3 +1206,296 @@ def test_b29_hung_sealer_is_group_terminated_and_all_partials_removed(
             environment={},
         )
     assert not output.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="special-file and fd metadata witnesses are POSIX-only")
+def test_b13_declared_snapshot_requires_one_stable_regular_file(tmp_path, monkeypatch):
+    module = _api("B13_STABLE_FD")
+    with pytest.raises(module.CapsuleError, match="^RECOVERY_CAPSULE_MISMATCH$"):
+        _fn(module, "B13_STABLE_FD", "snapshot_declared_member")(
+            Path("/dev/null"),
+            tmp_path / "special-snapshot",
+            declared_size=0,
+            declared_sha256=_digest(b""),
+        )
+    source = tmp_path / "source"
+    source.write_bytes(b"stable")
+    source.chmod(0o600)
+    real_open = os.open
+
+    def mutate_after_open(path, flags):
+        descriptor = real_open(path, flags)
+        source.chmod(0o640)
+        return descriptor
+
+    monkeypatch.setattr(module.os, "open", mutate_after_open)
+    with pytest.raises(module.CapsuleError, match="^RECOVERY_CAPSULE_MISMATCH$"):
+        _fn(module, "B13_STABLE_FD", "snapshot_declared_member")(
+            source,
+            tmp_path / "changed-snapshot",
+            declared_size=6,
+            declared_sha256=_digest(b"stable"),
+        )
+
+
+def test_restore_taxonomy_distinguishes_missing_capsule_and_untrusted_sealer(tmp_path):
+    module = _api("B15_TAXONOMY")
+    with pytest.raises(module.CapsuleError, match="^RECOVERY_CAPSULE_MISSING$"):
+        _fn(module, "B15_TAXONOMY", "snapshot_declared_member")(
+            tmp_path / "missing.age",
+            tmp_path / "snapshot.age",
+            declared_size=1,
+            declared_sha256=_digest(b"x"),
+        )
+    sealer = tmp_path / "age"
+    sealer.write_bytes(b"substituted")
+    sealer.chmod(0o700)
+    with pytest.raises(module.CapsuleError, match="^RECOVERY_SEALER_UNTRUSTED$"):
+        _fn(module, "B15_TAXONOMY", "snapshot_sealer")(
+            sealer, tmp_path / "run", _digest(b"expected")
+        )
+
+
+def test_b12_candidate_scan_stops_at_the_ninth_entry(tmp_path, monkeypatch):
+    module = _api("B12_SCAN_BOUND")
+    for index in range(10):
+        (tmp_path / f".capsule-run-{index:032x}").mkdir()
+    entries = tuple(tmp_path.iterdir())
+    path_type = type(tmp_path)
+    real_iterdir = path_type.iterdir
+
+    def bounded_iterdir(path):
+        if path != tmp_path:
+            yield from real_iterdir(path)
+            return
+        for index, entry in enumerate(entries):
+            if index == 9:
+                raise AssertionError("enumerated beyond the ninth candidate")
+            yield entry
+
+    monkeypatch.setattr(path_type, "iterdir", bounded_iterdir)
+    with pytest.raises(module.CapsuleError, match="^RECOVERY_STAGING_UNAVAILABLE$"):
+        _fn(module, "B12_SCAN_BOUND", "reconcile_owned_staging")(
+            tmp_path, project=PROJECT
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="durable owner fd witness uses /proc/self/fd")
+def test_b12_owner_markers_are_durable_before_private_sealing(
+    trust, public_identity, tmp_path, monkeypatch
+):
+    module = _api("B12_DURABLE_OWNER")
+    public_parent, capsule_parent = tmp_path / "public-parent", tmp_path / "capsule-parent"
+    public_parent.mkdir()
+    capsule_parent.mkdir()
+    events = []
+    real_fsync = os.fsync
+
+    def observe_fsync(descriptor):
+        try:
+            events.append(Path(os.readlink(f"/proc/self/fd/{descriptor}")))
+        except OSError:
+            pass
+        real_fsync(descriptor)
+
+    observed = {"durable": False}
+
+    def stop_after_owner_check(**_kwargs):
+        markers = [path for path in events if path.name == ".clinical-recovery-owner.json"]
+        observed["durable"] = len(markers) == 2 and all(
+            marker.parent in events[events.index(marker) + 1 :] for marker in markers
+        )
+        raise module.CapsuleError("synthetic stop")
+
+    monkeypatch.setattr(module.os, "fsync", observe_fsync)
+    monkeypatch.setattr(module, "snapshot_sealer", lambda source, *_args, **_kwargs: source)
+    monkeypatch.setattr(module, "encrypt_private_capsule", stop_after_owner_check)
+    with pytest.raises(module.CapsuleError):
+        module.publish_recovery_pair(
+            public_dir=public_parent / "bundle",
+            capsule_path=capsule_parent / "capsule.age",
+            public_identity=public_identity,
+            recovery_trust=_canonical(trust),
+            private_plaintext=b"synthetic private",
+            sealer=tmp_path / "age",
+        )
+    assert observed["durable"], "private sealing began before both owner markers and parents were fsynced"
+
+
+def test_b11_manifest_failpoint_precedes_complete_visibility(
+    trust, public_identity, tmp_path, monkeypatch
+):
+    module = _api("B11_EXACT_STAGE")
+    public_parent, capsule_parent = tmp_path / "public-parent", tmp_path / "capsule-parent"
+    public_parent.mkdir()
+    capsule_parent.mkdir()
+    monkeypatch.setattr(module, "snapshot_sealer", lambda source, *_args, **_kwargs: source)
+
+    def seal(**kwargs):
+        kwargs["output"].write_bytes(b"ciphertext")
+        return {"sha256": _digest(b"ciphertext"), "size": 10, "stderr": b""}
+
+    monkeypatch.setattr(module, "encrypt_private_capsule", seal)
+    observed = []
+
+    def inspect_boundary(stage):
+        observed.append(stage)
+        if stage == "PUBLIC_MANIFEST_FSYNCED":
+            staged = next(public_parent.glob(".capsule-run-*/public"))
+            assert (staged / "backup-manifest.json").is_file()
+            assert not (staged / "COMPLETE").exists()
+
+    module.publish_recovery_pair(
+        public_dir=public_parent / "bundle",
+        capsule_path=capsule_parent / "capsule.age",
+        public_identity=public_identity,
+        recovery_trust=_canonical(trust),
+        private_plaintext=b"synthetic private",
+        sealer=tmp_path / "age",
+        observer=inspect_boundary,
+    )
+    assert "PUBLIC_COMPLETE_FSYNCED" in observed
+
+
+def test_default_sealer_hashes_without_rereading_private_output(tmp_path, monkeypatch):
+    module = _api("B08_STREAM_HASH")
+
+    def forbid_reread(*_args, **_kwargs):
+        raise AssertionError("private sealer output was reread into memory")
+
+    monkeypatch.setattr(module, "read_bounded_regular", forbid_reread)
+    output = tmp_path / "sealed"
+    result = module.run_sealer(
+        executable=Path(sys.executable),
+        arguments=("-c", "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())"),
+        stdin=b"synthetic private",
+        output=output,
+        timeout_seconds=5,
+        environment=dict(os.environ),
+    )
+    assert output.read_bytes() == b"synthetic private"
+    assert result["sha256"] == _digest(b"synthetic private")
+
+
+def test_restore_zeroes_mutable_identity_after_sealer_failure(
+    age_material, tmp_path, monkeypatch
+):
+    module = _api("B08_ZERO_IDENTITY")
+    run = tmp_path / "run"
+    run.mkdir()
+    candidate = {"synthetic": "candidate"}
+    identity = {"hrh_candidate": candidate, "recipient_sha256": "a" * 64}
+    captured = []
+    prepared = {
+        "run": run,
+        "fresh_trust": b"fresh\n",
+        "capsule": tmp_path / "capsule.age",
+        "sealer": tmp_path / "age",
+        "result": {"identity": identity, "manifest": {}, "archived_trust": b"archived\n"},
+    }
+    staging = type("Staging", (), {"state_dir": tmp_path / "state"})()
+    monkeypatch.setattr(module, "parse_recovery_trust", lambda *_args, **_kwargs: {})
+
+    def authorize(*_args, identity_reader, **_kwargs):
+        identity_reader()
+        return {}
+
+    def fail_decrypt(*_args, identity, **_kwargs):
+        captured.append(identity)
+        raise module.CapsuleError("synthetic stop")
+
+    monkeypatch.setattr(module, "authorize_restore_trust", authorize)
+    monkeypatch.setattr(module, "decrypt_private_capsule", fail_decrypt)
+    with pytest.raises(module.CapsuleError):
+        module.restore_published_backup(
+            staging,
+            tmp_path / "public",
+            "b" * 64,
+            recovery_trust_path=tmp_path / "trust",
+            recovery_sealer=tmp_path / "age",
+            capsule_path=tmp_path / "capsule.age",
+            identity_reader=lambda: age_material["identity"].splitlines()[-1] + b"\n",
+            acquired_generation=candidate,
+            contract=object(),
+            receipt_builder=lambda *_args, **_kwargs: {},
+            renew_tls=False,
+            now=NOW,
+            prepared=prepared,
+        )
+    assert len(captured) == 1 and isinstance(captured[0], bytearray)
+    assert captured[0] and not any(captured[0]), "identity buffer was not zeroed on failure"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="trusted-parent ownership and mode witness is POSIX-only")
+def test_backup_rejects_world_writable_capsule_parent_before_inputs(tmp_path, monkeypatch):
+    module = _api("B11_TRUSTED_PARENT")
+    paths = {
+        name: tmp_path / name
+        for name in ("runtime", "state", "private-root", "public-parent", "capsule-parent")
+    }
+    for path in paths.values():
+        path.mkdir()
+    paths["capsule-parent"].chmod(0o777)
+    staging = type(
+        "Staging",
+        (),
+        {
+            "runtime": paths["runtime"],
+            "state_dir": paths["state"],
+            "hrh": None,
+            "project": PROJECT,
+        },
+    )()
+    effects = []
+
+    def reject_if_read(*_args, **_kwargs):
+        effects.append("input-read")
+        raise module.CapsuleError("synthetic stop")
+
+    monkeypatch.setattr(module, "read_bounded_regular", reject_if_read)
+    with pytest.raises(module.CapsuleError):
+        module.finish_published_backup(
+            staging,
+            paths["private-root"],
+            {},
+            paths["public-parent"] / "bundle",
+            recovery_trust_path=tmp_path / "trust.json",
+            recovery_sealer=tmp_path / "age",
+            capsule_path=paths["capsule-parent"] / "capsule.age",
+            contract=object(),
+            receipt_builder=lambda *_args, **_kwargs: {},
+            now=NOW,
+            verifier_evidence_names=(),
+        )
+    assert effects == [], "untrusted output parent was accepted far enough to read inputs"
+
+
+def test_restore_rejects_capsule_inside_state_root_before_snapshot(tmp_path, monkeypatch):
+    module = _api("B13_RESTORE_DISJOINT")
+    state, runtime, public = tmp_path / "state", tmp_path / "runtime", tmp_path / "public"
+    state.mkdir()
+    runtime.mkdir()
+    public.mkdir()
+    staging = type(
+        "Staging",
+        (),
+        {"state_dir": state, "runtime": runtime, "hrh": None, "project": PROJECT},
+    )()
+    effects = []
+
+    def reject_if_read(*_args, **_kwargs):
+        effects.append("snapshot-read")
+        raise module.CapsuleError("synthetic stop")
+
+    monkeypatch.setattr(module, "read_bounded_regular", reject_if_read)
+    with pytest.raises(module.CapsuleError):
+        module.prepare_published_restore(
+            staging,
+            public,
+            state / "capsule.age",
+            tmp_path / "trust.json",
+            tmp_path / "age",
+            "a" * 64,
+            now=NOW,
+        )
+    assert effects == [], "overlapping restore paths reached the snapshot boundary"
