@@ -1555,7 +1555,7 @@ class ClinicalStaging:
         temporary = backup_dir.parent / f".{backup_dir.name}.partial-{secrets.token_hex(8)}"
         if self.mode_plan.mode == "published" and recovery_trust is not None:
             recovery_codec.reconcile_owned_staging(backup_dir.parent, project=self.project)
-            private_builder = lambda: recovery_codec.build_private_backup_inputs(self, temporary, marker, volume_directory=BACKUP_VOLUME_DIR, state_archive=BACKUP_STATE_ARCHIVE, volume_keys=BACKED_UP_VOLUME_KEYS, create_state=create_state_archive)
+            private_builder = functools.partial(recovery_codec.build_private_backup_inputs, self, temporary, marker, volume_directory=BACKUP_VOLUME_DIR, state_archive=BACKUP_STATE_ARCHIVE, volume_keys=BACKED_UP_VOLUME_KEYS, create_state=create_state_archive)
             return recovery_codec.finish_published_backup(self, temporary, marker, backup_dir, recovery_trust_path=recovery_trust, recovery_sealer=recovery_sealer, capsule_path=recovery_capsule, contract=_backup_contract(), receipt_builder=_codec_build_backup_receipt, now=datetime.now(UTC), verifier_evidence_names=hrh_mode._verifier(self.runtime).EVIDENCE_FILES, private_builder=private_builder)
         try:
             temporary.mkdir(mode=0o700)
@@ -1672,6 +1672,7 @@ class ClinicalStaging:
         if self.mode_plan.mode == "published" and recovery_trust is not None:
             prepared = None
             try:
+                self._require_empty_restore_destination()
                 prepared = recovery_codec.prepare_published_restore(self, backup_dir, recovery_capsule, recovery_trust, recovery_sealer, expected_manifest_sha256, now=datetime.now(UTC))
                 try:
                     acquisition = hrh_mode.acquire_published_candidate(self.runtime, self.mode_plan.published_inputs, operator_lock_path(self.state_dir, self.project).parent, runner=subprocess.run, snapshot_key=self.project)
