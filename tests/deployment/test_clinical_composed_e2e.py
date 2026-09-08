@@ -52,8 +52,7 @@ ENV_FILE = STATE / "compose.env"
 CANDIDATE_MANIFEST = os.environ.get("RESTRICTED_IMMUTABLE_CANDIDATE_MANIFEST")
 PUBLISHED_HRH_INPUTS = {
     "trust": os.environ.get("CLINICAL_E2E_HRH_TRUST_DECLARATION"),
-    "receipt": os.environ.get("CLINICAL_E2E_HRH_RECEIPT"),
-    "public_key": os.environ.get("CLINICAL_E2E_HRH_PUBLIC_KEY"),
+    "evidence": os.environ.get("CLINICAL_E2E_HRH_EVIDENCE"),
     "docker_config": os.environ.get("CLINICAL_E2E_HRH_DOCKER_CONFIG"),
 }
 
@@ -81,6 +80,35 @@ CREATED = False
 SOURCE_FRAME: dict[str, str] = {}
 PUBLISHED_HRH_VERIFICATION: dict[str, object] | None = None
 ACTIVE_HRH_DOCKER_CONFIG: Path | None = None
+
+
+def published_candidate_verifier():
+    path = ROOT / "tools" / "verify_hrh_published_candidate.py"
+    spec = importlib.util.spec_from_file_location("_clinical_e2e_hrh_verifier", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("published HRH verifier is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def snapshot_published_inputs(verifier) -> tuple[Path, Path, dict[str, object]]:
+    snapshot = STATE / "published-input-snapshot"
+    snapshot.mkdir(mode=0o700)
+    trust_bytes = verifier._read_regular_snapshot(
+        Path(PUBLISHED_HRH_INPUTS["trust"]), "trust declaration"
+    )
+    evidence_bytes = verifier.read_evidence_snapshot(Path(PUBLISHED_HRH_INPUTS["evidence"]))
+    trust_path = snapshot / "trust.json"
+    trust_path.write_bytes(trust_bytes)
+    evidence_path = snapshot / "evidence"
+    evidence_path.mkdir(mode=0o700)
+    for name, value in evidence_bytes.items():
+        (evidence_path / name).write_bytes(value)
+    trust = verifier._parse_snapshot(trust_bytes, "trust declaration")
+    if not isinstance(trust, dict):
+        raise RuntimeError("published HRH trust declaration is malformed")
+    return trust_path, evidence_path, trust
 
 
 def selected_compose_files() -> tuple[Path, Path]:
@@ -229,26 +257,20 @@ def prepare() -> None:
         missing = sorted(name for name, value in PUBLISHED_HRH_INPUTS.items() if not value)
         if missing:
             raise RuntimeError("published HRH inputs are incomplete: " + ",".join(missing))
-        verify = run(
-            sys.executable, str(ROOT / "tools" / "verify_hrh_published_candidate.py"),
-            "--trust", str(PUBLISHED_HRH_INPUTS["trust"]),
-            "--receipt", str(PUBLISHED_HRH_INPUTS["receipt"]),
-            "--public-key", str(PUBLISHED_HRH_INPUTS["public_key"]),
-            "--docker-config", str(PUBLISHED_HRH_INPUTS["docker_config"]),
-            "--docker-config-snapshot", str(STATE / "private-docker-config"),
-            env={key: os.environ[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in os.environ},
-            timeout=1500,
+        verifier = published_candidate_verifier()
+        trust_path, evidence_path, trust = snapshot_published_inputs(verifier)
+        PUBLISHED_HRH_VERIFICATION = verifier.verify_files(
+            trust_path,
+            evidence_path,
+            Path(PUBLISHED_HRH_INPUTS["docker_config"]),
+            docker_config_snapshot=STATE / "private-docker-config",
         )
-        try:
-            PUBLISHED_HRH_VERIFICATION = json.loads(verify.stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("published HRH verification returned malformed evidence") from exc
         ACTIVE_HRH_DOCKER_CONFIG = STATE / "private-docker-config"
         if not (ACTIVE_HRH_DOCKER_CONFIG / "config.json").is_file():
             raise RuntimeError("published HRH Docker config snapshot is unavailable")
         SOURCE_FRAME.update(
-            hrh_clinical_contract_revision=str(PUBLISHED_HRH_VERIFICATION["clinical_contract_revision"]),
-            hrh_build_source_revision=str(PUBLISHED_HRH_VERIFICATION["build_source_revision"]),
+            hrh_clinical_contract_revision=str(trust["clinical_contract_revision"]),
+            hrh_build_source_revision=str(trust["build_source_revision"]),
         )
     SEED.mkdir()
     EVIDENCE.mkdir()

@@ -28,7 +28,11 @@ def test_staging_overlay_publishes_only_hardened_loopback_passthrough():
         assert compose["networks"][network]["internal"] is True
     assert services["controller"]["profiles"] == ["provision"]
     assert services["controller"]["restart"] == "no"
-    assert services["hrh"]["build"]["args"]["BUILD_SHA"] == "${CLINICAL_HRH_BUILD_SHA:?required}"
+    assert "build" not in services["hrh"]
+    source = yaml.safe_load(
+        (ROOT / "tests" / "deployment" / "clinical-composed-e2e" / "compose.source-build.yaml").read_text(encoding="utf-8")
+    )
+    assert source["services"]["hrh"]["build"]["args"]["BUILD_SHA"] == "${CLINICAL_HRH_BUILD_SHA:?required}"
 
 
 def test_passthrough_configuration_is_fixed_secretless_l4():

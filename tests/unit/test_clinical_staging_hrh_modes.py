@@ -634,3 +634,294 @@ def test_u2_published_environment_requires_mapping(pure_mode, tmp_path, environm
     with pytest.raises(pure_mode.ModeError, match="environment mapping"):
         pure_mode.plan_hrh_mode("init", ["--hrh-mode", "published", *_publication_arguments(tmp_path)],
             environment=environment)
+
+
+def _fake_published_verifier(tmp_path, calls):
+    trust = {
+        "clinical_contract_revision": "c" * 40,
+        "build_source_revision": "d" * 40,
+        "platform": {"os": "linux", "architecture": "amd64"},
+        "publisher_identity": "synthetic@example.invalid",
+        "kms_key_version": "projects/test/locations/global/keyRings/test/cryptoKeys/test/cryptoKeyVersions/1",
+        "kms_public_key_sha256": "1" * 64,
+        "subjects": {
+            "web": "registry.invalid/hrh/web@sha256:" + "2" * 64,
+            "migrate": "registry.invalid/hrh/migrate@sha256:" + "3" * 64,
+            "evidence": "registry.invalid/hrh/evidence@sha256:" + "4" * 64,
+        },
+    }
+    receipt = b"{}"
+    files = {"candidate-receipt.json": receipt, "kms-public.pem": b"public"}
+
+    def verify_files(trust_path, evidence, docker_config, *, docker_config_snapshot, runner):
+        calls.append(("verify", docker_config_snapshot))
+        docker_config_snapshot.mkdir()
+        (docker_config_snapshot / "config.json").write_text('{"auths":{}}')
+        return {
+            "schema_version": "restricted-runtime-hrh-verification.v2",
+            "trust_sha256": "5" * 64,
+            "receipt_sha256": "6" * 64,
+            "receipt_signature_sha256": "7" * 64,
+            "evidence_manifest_sha256": "8" * 64,
+            "kms_public_key_sha256": "1" * 64,
+            "subjects": trust["subjects"],
+            "verified_predicates": ["migrate:provenance", "web:provenance"],
+        }
+
+    return SimpleNamespace(
+        _read_regular_snapshot=lambda path, name: json.dumps(trust).encode(),
+        read_evidence_snapshot=lambda path: files,
+        _parse_snapshot=lambda data, name: trust if name == "trust declaration" else {},
+        validate_candidate=lambda *args: {"trust": trust},
+        verify_files=verify_files,
+        sealed_docker_environment=lambda: {"PATH": "synthetic"},
+        canonical_verification_bytes=lambda result: json.dumps(result, sort_keys=True).encode(),
+        CandidateVerificationError=ValueError,
+    )
+
+
+def test_a07_a09_acquisition_uses_one_private_config_and_deletes_it(pure_mode, tmp_path):
+    calls = []
+    verifier = _fake_published_verifier(tmp_path, calls)
+    inputs = pure_mode.PublishedInputs(tmp_path / "trust", tmp_path / "evidence", tmp_path / "docker")
+
+    def runner(args, **kwargs):
+        assert "credential-sentinel" not in repr((args, kwargs))
+        calls.append((tuple(args[1:3]), Path(kwargs["env"]["DOCKER_CONFIG"])))
+        if args[2] == "inspect":
+            subject = args[-1]
+            stdout = json.dumps([{
+                "Id": "sha256:" + ("a" if "/web@" in subject else "b") * 64,
+                "RepoDigests": [subject], "Os": "linux", "Architecture": "amd64",
+            }])
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+    result = pure_mode.acquire_published_candidate(
+        ROOT, inputs, tmp_path / "snapshots", runner=runner, verifier=verifier,
+    )
+    configs = {path for _, path in calls}
+    assert len(configs) == 1
+    assert not next(iter(configs)).exists()
+    assert [entry[0] for entry in calls] == [
+        "verify", ("image", "pull"), ("image", "inspect"),
+        ("image", "pull"), ("image", "inspect"),
+    ]
+    assert set(result.effective_images) == {"hrh", "hrh-migrate"}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="run-owned cleanup is a Linux operator contract")
+def test_a09_next_acquisition_removes_only_bounded_same_project_orphan(pure_mode, tmp_path):
+    parent = tmp_path / "snapshots"
+    parent.mkdir(mode=0o700)
+    orphan = parent / f".published-acquire-{PROJECT}-{'a' * 16}"
+    orphan.mkdir(mode=0o700)
+    (orphan / "credential-sentinel").write_text("private")
+    other = parent / f".published-acquire-otherproject-{'b' * 16}"
+    other.mkdir(mode=0o700)
+    calls = []
+    verifier = _fake_published_verifier(tmp_path, calls)
+    inputs = pure_mode.PublishedInputs(tmp_path / "trust", tmp_path / "evidence", tmp_path / "docker")
+
+    def runner(args, **kwargs):
+        subject = args[-1]
+        raw = json.dumps([{"Id": "sha256:" + "a" * 64, "RepoDigests": [subject], "Os": "linux", "Architecture": "amd64"}])
+        return subprocess.CompletedProcess(args, 0, raw if args[2] == "inspect" else "", "")
+
+    pure_mode.acquire_published_candidate(ROOT, inputs, parent, runner=runner, verifier=verifier, snapshot_key=PROJECT)
+    assert not orphan.exists() and other.exists()
+
+
+def test_a10_published_marker_is_closed_and_role_specific(pure_mode, tmp_path):
+    calls = []
+    verifier = _fake_published_verifier(tmp_path, calls)
+    inputs = pure_mode.PublishedInputs(tmp_path / "trust", tmp_path / "evidence", tmp_path / "docker")
+
+    def runner(args, **kwargs):
+        subject = args[-1]
+        raw = json.dumps([{"Id": "sha256:" + "a" * 64, "RepoDigests": [subject], "Os": "linux", "Architecture": "amd64"}])
+        return subprocess.CompletedProcess(args, 0, raw if args[2] == "inspect" else "", "")
+
+    acquired = pure_mode.acquire_published_candidate(ROOT, inputs, tmp_path / "runs", runner=runner, verifier=verifier)
+    state = tmp_path / f"{PROJECT}.synthetic-clinical-staging"
+    volumes = {"v": "synthetic"}
+    marker = pure_mode.new_published_marker(
+        project=PROJECT, state_dir=state, state_id="a" * 32, env_sha256="b" * 64,
+        runtime_head="c" * 40, runtime_tree="d" * 40, volumes=volumes, acquisition=acquired,
+    )
+    assert pure_mode.validate_published_marker(marker, project=PROJECT, state_dir=state, expected_volumes=volumes) == marker
+    marker["unknown"] = True
+    with pytest.raises(pure_mode.ModeError, match="unknown"):
+        pure_mode.validate_published_marker(marker, project=PROJECT, state_dir=state, expected_volumes=volumes)
+
+
+def test_a10_status_rechecks_container_and_local_image_identity(pure_mode):
+    subjects = {"hrh": "registry.invalid/hrh/web@sha256:" + "2" * 64,
+                "hrh-migrate": "registry.invalid/hrh/migrate@sha256:" + "3" * 64}
+    effective = {service: {"subject": subject, "repo_digest": subject,
+                           "image_id": "sha256:" + ("a" if service == "hrh" else "b") * 64,
+                           "platform": {"os": "linux", "architecture": "amd64"}}
+                 for service, subject in subjects.items()}
+    containers = {service: {"Image": value["image_id"], "Config": {"Image": value["subject"]}}
+                  for service, value in effective.items()}
+
+    def runner(args, **kwargs):
+        expected = effective["hrh" if "/web@" in args[-1] else "hrh-migrate"]
+        raw = json.dumps([{"Id": expected["image_id"], "RepoDigests": [expected["subject"]],
+                           "Os": "linux", "Architecture": "amd64"}])
+        assert "DOCKER_CONFIG" not in kwargs["env"]
+        return subprocess.CompletedProcess(args, 0, raw, "")
+
+    pure_mode.verify_effective_containers({"effective_images": effective}, containers, runner=runner)
+    containers["hrh"]["Config"]["Image"] = subjects["hrh-migrate"]
+    with pytest.raises(pure_mode.ModeError, match="container identity"):
+        pure_mode.verify_effective_containers({"effective_images": effective}, containers, runner=runner)
+
+
+def test_a12_published_up_forces_pull_never(module, tmp_path, monkeypatch):
+    plan = module.hrh_mode.HRHModePlan("up", "published")
+    staging = module.ClinicalStaging(ROOT, None, _paths(tmp_path)[0], PROJECT, 18443, mode_plan=plan)
+    calls = []
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(module, "persistent_operator_lock", lambda *args: nullcontext())
+    monkeypatch.setattr(module, "_exclusive_operator_lock", lambda *args: nullcontext())
+    monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: {"lifecycle": "ready"})
+    monkeypatch.setattr(staging, "compose", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(staging, "control", lambda *args, **kwargs: "")
+    monkeypatch.setattr(staging, "status", lambda: {"ok": True})
+    assert staging.up() == {"ok": True}
+    assert calls == [("up", "--pull", "never", "--detach", *module.ONE_SHOT_SERVICES, *module.LONG_RUNNING_SERVICES)]
+
+
+def test_a07_a11_published_init_publishes_marker_before_volumes_and_stops_on_migration(module, tmp_path, monkeypatch):
+    state = _paths(tmp_path)[0]
+    inputs = module.hrh_mode.plan_hrh_mode("init", ["--hrh-mode", "published", *_publication_arguments(tmp_path)], environment={}).published_inputs
+    plan = module.hrh_mode.HRHModePlan("init", "published", published_inputs=inputs)
+    staging = module.ClinicalStaging(ROOT, None, state, PROJECT, 18443, mode_plan=plan)
+    acquired = SimpleNamespace(candidate={"subjects": {"web": "web", "migrate": "migrate"}}, effective_images={})
+    marker = {"lifecycle": "initializing", "volumes": {}, "state_id": "a" * 32}
+    order = []
+    owner = os.getuid() if hasattr(os, "getuid") else 0
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(module, "persistent_operator_lock", lambda *args: nullcontext())
+    monkeypatch.setattr(module, "_exclusive_operator_lock", lambda *args: nullcontext())
+    monkeypatch.setattr(module.hrh_mode, "verify_runtime_frame", lambda *args, **kwargs: {"runtime_head": "c" * 40, "runtime_tree": "d" * 40})
+    monkeypatch.setattr(module.hrh_mode, "acquire_published_candidate", lambda *args, **kwargs: acquired)
+
+    def publish(*args):
+        order.append("marker")
+        state.mkdir()
+        return marker
+
+    monkeypatch.setattr(staging, "_prepare_new_state", publish)
+    monkeypatch.setattr(staging, "_reconcile_owned_initialization_orphans", lambda: None)
+    monkeypatch.setattr(staging, "_create_volumes", lambda value: order.append("volumes"))
+    monkeypatch.setattr(staging, "_build_images", lambda: order.append("build"))
+    monkeypatch.setattr(staging, "control", lambda *args, **kwargs: order.append(("control", args)) or "")
+    monkeypatch.setattr(module.stat, "S_IMODE", lambda mode: 0o700)
+    monkeypatch.setattr(module.os, "getuid", lambda: owner, raising=False)
+
+    def compose(*args, **kwargs):
+        order.append(("compose", args))
+        return subprocess.CompletedProcess(args, 1 if args[:2] == ("wait", "hrh-migrate") else 0, "", "")
+
+    monkeypatch.setattr(staging, "compose", compose)
+    with pytest.raises(module.CommandError, match="migration"):
+        staging.init()
+    assert order[:2] == ["marker", "volumes"]
+    assert [item[1] for item in order if isinstance(item, tuple) and item[0] == "control"] == [("seed-volumes",)]
+    starts = [item[1] for item in order if isinstance(item, tuple) and item[0] == "compose" and item[1][:1] == ("up",)]
+    assert starts == [("up", "--detach", "mattermost-postgres", "hrh-postgres", "hrh-migrate")]
+
+
+def test_a17_creation_rejects_marker_mode_swap_before_resources(module, tmp_path, monkeypatch):
+    state = _paths(tmp_path)[0]
+    state.mkdir()
+    (state / module.MARKER_NAME).write_text("{}")
+    inputs = module.hrh_mode.plan_hrh_mode("init", ["--hrh-mode", "published", *_publication_arguments(tmp_path)], environment={}).published_inputs
+    staging = module.ClinicalStaging(ROOT, None, state, PROJECT, 18443, mode_plan=module.hrh_mode.HRHModePlan("init", "published", published_inputs=inputs))
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(module, "persistent_operator_lock", lambda *args: nullcontext())
+    monkeypatch.setattr(module, "_exclusive_operator_lock", lambda *args: nullcontext())
+    monkeypatch.setattr(module.hrh_mode, "verify_runtime_frame", lambda *args, **kwargs: {"runtime_head": "c" * 40, "runtime_tree": "d" * 40})
+    monkeypatch.setattr(module.hrh_mode, "acquire_published_candidate", lambda *args, **kwargs: SimpleNamespace(candidate={}, effective_images={}))
+    monkeypatch.setattr(module, "read_marker", lambda *args: {"schema": module.SCHEMA, "lifecycle": "initializing"})
+    monkeypatch.setattr(staging, "_create_volumes", lambda *args: pytest.fail("mode swap reached resources"))
+    with pytest.raises(module.SafetyError, match="mode changed"):
+        staging.init()
+
+
+@pytest.mark.parametrize("command", ["init", "status"])
+def test_a02_duplicate_global_hrh_root_is_rejected(module, tmp_path, command):
+    args = _argv(tmp_path, command, with_root=True)
+    args[2:2] = ["--hrh-root", str(tmp_path / "other-hrh")]
+    with pytest.raises(SystemExit):
+        module.parse_args(args)
+
+
+@pytest.mark.parametrize("lifecycle", ["stopped", "renewing_tls", "tls_prepared"])
+def test_a03_mutator_rebinds_fresh_marker_inside_lock(module, tmp_path, monkeypatch, lifecycle):
+    state, hrh = _paths(tmp_path)
+    markers = iter([
+        {"schema": module.SCHEMA, "lifecycle": "ready", "state_id": "a" * 32},
+        {"schema": module.SCHEMA, "lifecycle": lifecycle, "state_id": "b" * 32},
+    ])
+    monkeypatch.setattr(module, "read_marker", lambda *args: next(markers))
+    staging = module.ClinicalStaging(ROOT, hrh, state, PROJECT, 18443, persisted_command="status")
+    monkeypatch.setattr(module, "persistent_operator_lock", lambda *args: nullcontext())
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: staging._locked_marker)
+    with pytest.raises(module.SafetyError, match="status rejects"):
+        staging.status()
+
+
+def test_a03_mutator_uses_fresh_generation_not_constructor_generation(module, tmp_path, monkeypatch):
+    state, hrh = _paths(tmp_path)
+    markers = iter([
+        {"schema": module.SCHEMA, "lifecycle": "ready", "state_id": "a" * 32},
+        {"schema": module.SCHEMA, "lifecycle": "ready", "state_id": "b" * 32},
+    ])
+    monkeypatch.setattr(module, "read_marker", lambda *args: next(markers))
+    staging = module.ClinicalStaging(ROOT, hrh, state, PROJECT, 18443, persisted_command="stop")
+    monkeypatch.setattr(module, "persistent_operator_lock", lambda *args: nullcontext())
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: staging._locked_marker)
+    monkeypatch.setattr(staging, "compose", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""))
+    written = []
+    monkeypatch.setattr(staging, "_write_marker", lambda marker: written.append(dict(marker)))
+    monkeypatch.setattr(module, "write_json_atomic", lambda *args, **kwargs: None)
+    assert staging.stop()["state_id"] == "b" * 32
+    assert written[0]["state_id"] == "b" * 32
+
+
+def test_a03_destroy_uses_fresh_generation_inside_lock(module, tmp_path, monkeypatch):
+    state, hrh = _paths(tmp_path)
+    markers = iter([
+        {"schema": module.SCHEMA, "lifecycle": "ready", "state_id": "a" * 32},
+        {"schema": module.SCHEMA, "lifecycle": "stopped", "state_id": "b" * 32},
+    ])
+    monkeypatch.setattr(module, "read_marker", lambda *args: next(markers))
+    staging = module.ClinicalStaging(ROOT, hrh, state, PROJECT, 18443, persisted_command="destroy")
+    monkeypatch.setattr(module, "persistent_operator_lock", lambda *args: nullcontext())
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_destroy_resources", lambda: None)
+    monkeypatch.setattr(staging, "_assert_destroyed_absent", lambda: None)
+    monkeypatch.setattr(module.shutil, "rmtree", lambda *args, **kwargs: None)
+    assert staging.destroy()["state_id"] == "b" * 32
+
+
+def test_a08_every_published_compose_up_injects_pull_never(module, tmp_path):
+    class CaptureShell:
+        def __init__(self): self.args = None
+        def run(self, *args, **kwargs):
+            self.args = args
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+    shell = CaptureShell()
+    staging = module.ClinicalStaging(ROOT, None, _paths(tmp_path)[0], PROJECT, 18443, shell=shell, mode_plan=module.hrh_mode.HRHModePlan("init", "published"))
+    staging.state_dir.mkdir()
+    staging.env_file.write_text("CLINICAL_TEST=value\n")
+    staging.compose("up", "--detach", "hrh-postgres", "hrh-migrate")
+    index = shell.args.index("up")
+    assert shell.args[index:index + 3] == ("up", "--pull", "never")
