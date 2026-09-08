@@ -26,6 +26,7 @@ suites. Config rendering does not build, pull, start or access a Docker daemon.
 
 from __future__ import annotations
 
+import atexit
 from contextlib import nullcontext
 import hashlib
 import importlib.util
@@ -925,3 +926,86 @@ def test_a08_every_published_compose_up_injects_pull_never(module, tmp_path):
     staging.compose("up", "--detach", "hrh-postgres", "hrh-migrate")
     index = shell.args.index("up")
     assert shell.args[index:index + 3] == ("up", "--pull", "never")
+
+
+def _composed_e2e_runner():
+    path = ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py"
+    spec = importlib.util.spec_from_file_location("clinical_composed_e2e_u3c", path)
+    assert spec is not None and spec.loader is not None
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    atexit.unregister(runner.cleanup)
+    shutil.rmtree(runner.STATE)
+    return runner
+
+
+def test_u3c_closed_u1_subjects_pull_only_web_and_migrate_with_one_snapshot(tmp_path, monkeypatch):
+    runner = _composed_e2e_runner()
+    runner.HRH_MODE = "published"
+    runner.STATE = tmp_path / "state"
+    runner.SEED = runner.STATE / "seed"
+    runner.EVIDENCE = runner.STATE / "evidence"
+    runner.ENV_FILE = runner.STATE / "compose.env"
+    runner.PUBLISHED_HRH_INPUTS = {
+        "trust": str(tmp_path / "trust.json"),
+        "evidence": str(tmp_path / "evidence"),
+        "docker_config": str(tmp_path / "caller-docker-config"),
+    }
+    subjects = {
+        "web": "registry.example/web@sha256:" + "1" * 64,
+        "migrate": "registry.example/migrate@sha256:" + "2" * 64,
+        "evidence": "registry.example/evidence@sha256:" + "3" * 64,
+    }
+    trust = {"clinical_contract_revision": "4" * 40, "build_source_revision": "5" * 40}
+    verification_calls, pull_calls = [], []
+
+    class Verifier:
+        def verify_files(self, trust_path, evidence_path, docker_config, **kwargs):
+            verification_calls.append((trust_path, evidence_path, docker_config, kwargs))
+            snapshot = kwargs["docker_config_snapshot"]
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_text("{}")
+            return {"subjects": subjects}
+
+    def fake_run(*args, **kwargs):
+        if args[:2] == ("git", "rev-parse"):
+            return subprocess.CompletedProcess(args, 0, "6" * 40 + "\n", "")
+        if args[:2] == ("git", "pull"):
+            pytest.fail("prepare cannot pull")
+        if args[:2] == ("docker", "pull"):
+            pull_calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.delenv("CLINICAL_E2E_HRH_ROOT", raising=False)
+    monkeypatch.setattr(runner, "published_candidate_verifier", Verifier)
+    monkeypatch.setattr(runner, "snapshot_published_inputs", lambda verifier: (tmp_path / "snap-trust", tmp_path / "snap-evidence", trust))
+    monkeypatch.setattr(runner, "make_certificates", lambda: None)
+    monkeypatch.setattr(runner, "run", fake_run)
+
+    runner.prepare()
+    runner.pull_published_hrh_subjects()
+
+    assert len(verification_calls) == 1
+    snapshot = runner.STATE / "private-docker-config"
+    assert verification_calls[0][3]["docker_config_snapshot"] == snapshot
+    assert [call[0][2] for call in pull_calls] == [subjects["web"], subjects["migrate"]]
+    assert all(call[1]["env"]["DOCKER_CONFIG"] == str(snapshot) for call in pull_calls)
+    assert all(call[0][2] != subjects["evidence"] for call in pull_calls)
+
+
+@pytest.mark.parametrize("mutation", ["missing-evidence", "extra-subject"])
+def test_u3c_pull_rejects_nonclosed_u1_subject_sets(tmp_path, monkeypatch, mutation):
+    runner = _composed_e2e_runner()
+    runner.HRH_MODE = "published"
+    runner.ACTIVE_HRH_DOCKER_CONFIG = tmp_path / "private-docker-config"
+    subjects = {
+        "web": "registry.example/web@sha256:" + "1" * 64,
+        "migrate": "registry.example/migrate@sha256:" + "2" * 64,
+        "evidence": "registry.example/evidence@sha256:" + "3" * 64,
+    }
+    subjects.pop("evidence") if mutation == "missing-evidence" else subjects.update(extra="unexpected")
+    runner.PUBLISHED_HRH_VERIFICATION = {"subjects": subjects}
+    monkeypatch.setattr(runner, "run", lambda *args, **kwargs: pytest.fail("invalid subjects reached Docker"))
+
+    with pytest.raises(RuntimeError, match="subject set is malformed"):
+        runner.pull_published_hrh_subjects()

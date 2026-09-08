@@ -108,6 +108,7 @@ def test_published_pull_uses_exact_subjects_and_private_config_only(monkeypatch,
         "subjects": {
             "web": "registry.example/web@sha256:" + "1" * 64,
             "migrate": "registry.example/migrate@sha256:" + "2" * 64,
+            "evidence": "registry.example/evidence@sha256:" + "3" * 64,
         }
     }
     calls = []

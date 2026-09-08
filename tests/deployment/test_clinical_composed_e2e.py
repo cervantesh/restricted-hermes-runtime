@@ -551,7 +551,7 @@ def pull_published_hrh_subjects() -> None:
     if not PUBLISHED_HRH_VERIFICATION:
         raise RuntimeError("published HRH subjects were not verified before pull")
     subjects = PUBLISHED_HRH_VERIFICATION.get("subjects")
-    if not isinstance(subjects, dict) or set(subjects) != {"web", "migrate"}:
+    if not isinstance(subjects, dict) or set(subjects) != {"web", "migrate", "evidence"}:
         raise RuntimeError("published HRH subject set is malformed")
     for role in ("web", "migrate"):
         run("docker", "pull", str(subjects[role]), env=registry_docker_environment(), timeout=600)
