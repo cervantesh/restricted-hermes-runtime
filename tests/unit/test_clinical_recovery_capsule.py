@@ -830,6 +830,7 @@ def test_b10_b11_publication_failpoints_never_report_or_retain_partial_success(
     age_material, trust, public_identity, tmp_path, stage
 ):
     module = _api("B10")
+    (tmp_path / "private").mkdir(mode=0o700)
     events = []
 
     def observe(candidate):
