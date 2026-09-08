@@ -180,7 +180,13 @@ def _workloads(
                 "workload-subject-binding",
             )
         else:
-            _require(image_digest is None, "source-build-subject")
+            # Source-build authority comes from the local build inputs, not an
+            # approved-subject map.  A registry-pinned infrastructure image can
+            # still have an observed immutable digest in the effective runtime.
+            _require(
+                image_digest is None or _digest(image_digest),
+                "source-build-subject",
+            )
         built.append(
             {
                 "service": service,

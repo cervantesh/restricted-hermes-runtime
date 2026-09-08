@@ -224,6 +224,38 @@ def test_source_build_and_published_are_exact_distinct_modes(builder):
             build(builder, changed, changed)
 
 
+def test_source_build_accepts_mixed_local_and_pinned_observed_digests(builder):
+    source = inputs("source-build")
+    pinned = "sha256:" + "d" * 64
+    source["workloads"][0]["image_digest"] = pinned
+
+    pair = build(builder, source, source)
+    value = decoded(pair, BEFORE)
+    retained = {row["service"]: row for row in value["workloads"]}
+    assert retained["ingress"]["image_digest"] == pinned
+    assert retained["hrh"]["image_digest"] is None
+    assert source["approved_subjects"] == {}
+
+    error = getattr(builder, "GenerationError", ValueError)
+    for invalid in (
+        "registry.example/clinical/ingress:latest",
+        "sha256:" + "D" * 64,
+        "sha256:" + "d" * 63,
+        "sha512:" + "d" * 64,
+        "",
+        7,
+    ):
+        changed = deepcopy(source)
+        changed["workloads"][0]["image_digest"] = invalid
+        with pytest.raises(error):
+            build(builder, changed, changed)
+
+    asserted = deepcopy(source)
+    asserted["approved_subjects"] = {"ingress": INGRESS_SUBJECT}
+    with pytest.raises(error):
+        build(builder, asserted, asserted)
+
+
 def test_workloads_and_networks_are_uniquely_and_stably_sorted(builder):
     forward = inputs()
     reverse = deepcopy(forward)
