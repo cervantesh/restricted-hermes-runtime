@@ -49,7 +49,7 @@ PROJECT = "clinicalstagingw2mode"
 SOURCE_HEAD = "e30a4f968de6727519f49c08369f561fdf269ec5"
 SOURCE_TREE = "7fb2543a2ceb1649f05c467b38708d1404106659"
 PUBLISHED_FLAGS = ("--hrh-trust", "--hrh-evidence", "--hrh-docker-config")
-ORDINARY = ("up", "status", "stop", "backup", "destroy", "renew-tls", "refresh-policy", "reset")
+ORDINARY = ("up", "status", "stop", "backup", "destroy", "renew-tls", "refresh-policy", "reset", "finalize-cold-recovery-verification")
 
 
 @pytest.fixture
@@ -77,6 +77,9 @@ def _argv(tmp_path, command, *, with_root=False, extra=()):
         args += ["--expected-manifest-sha256", "a" * 64]
     if command == "refresh-policy":
         args += ["--epoch", "synthetic-w2-epoch"]
+    if command == "finalize-cold-recovery-verification":
+        args += ["--backup-dir", str(tmp_path / "backup"), "--expected-manifest-sha256", "a" * 64,
+                 "--expected-mechanical-receipt-sha256", "b" * 64, "--causal-check", "artifacts_clean"]
     return args + list(extra)
 
 
