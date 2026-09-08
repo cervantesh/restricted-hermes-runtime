@@ -13,8 +13,8 @@ import tempfile
 from typing import Any
 
 from verify_assessment_bundle import (
-    MAX_FILE_BYTES, MAX_FILES, MAX_TOTAL_BYTES, PROFILE_FILES, README_CONTENT, SAFE_FILE, SCHEMA, SCOPE,
-    _secret_bearing, _safe_relative, canonical_json, verify,
+    MAX_FILE_BYTES, MAX_FILES, MAX_TOTAL_BYTES, README_CONTENT, SAFE_FILE, SCHEMA, SCOPE,
+    _secret_bearing, _safe_relative, canonical_json, profile_files, verify,
 )
 
 
@@ -139,7 +139,7 @@ def _declared_files(declaration: dict[str, Any]) -> list[str]:
         if relative is None or not SAFE_FILE.fullmatch(relative):
             _die("declaration files must use the closed content allowlist")
         paths.append(relative)
-    if paths != sorted(paths) or len(set(paths)) != len(paths) or set(paths) != PROFILE_FILES or len(paths) + 2 > MAX_FILES:
+    if paths != sorted(paths) or len(set(paths)) != len(paths) or set(paths) != profile_files(declaration) or len(paths) + 2 > MAX_FILES:
         _die("declaration files must be uniquely sorted and bounded")
     return paths
 

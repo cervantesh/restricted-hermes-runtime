@@ -20,9 +20,11 @@ generated synthetic fixtures.
 - Linux with Docker Engine and Compose v2.
 - A clean runtime checkout descending from
   `41464aee8748f857153ba2b47377515d4847d210`.
-- A clean Health-Record-Hub checkout at exactly
-  `e30a4f968de6727519f49c08369f561fdf269ec5`, with tree
+- For the default source-build mode, a clean Health-Record-Hub checkout at
+  exactly `e30a4f968de6727519f49c08369f561fdf269ec5`, with tree
   `7fb2543a2ceb1649f05c467b38708d1404106659`.
+- For explicit published mode, an independent trust declaration, a reconstructed
+  closed evidence directory, and a private read-only registry Docker config.
 - A fresh absolute state directory outside either repository. Its basename must
   be `<project>.synthetic-clinical-staging`.
 - A project matching `clinicalstaging[a-z0-9]{1,32}`.
@@ -60,13 +62,31 @@ directory. Its Mattermost certificate covers both the internal DNS name and the
 advertised loopback IPv4 address; `status` verifies the advertised IP endpoint
 from the host before it writes evidence.
 
-The operator lifecycle intentionally remains source-build only. Every lifecycle
-command uses the common composition, exactly one HRH service overlay
-(`compose.source-build.yaml`), and the staging overlay. The separate
-source-free published-candidate witness described in
-`docs/design/source-free-hrh-candidate-consumption.md` is not an operator
-staging mode: adopting it here also requires a persisted candidate trust and
-verification contract, rather than only selecting another Compose file.
+Source-build remains the default and requires `--hrh-root`. Published delivery
+is selected only during `init`; it rejects an HRH checkout and requires exactly
+three independent inputs:
+
+```bash
+python "$tool" --state-dir "$state" --project "$project" init \
+  --hrh-mode published \
+  --hrh-trust /private/operator/trust.json \
+  --hrh-evidence /private/operator/reconstructed-evidence \
+  --hrh-docker-config /private/operator/registry-reader
+```
+
+Published initialization snapshots and verifies the closed evidence through
+the runtime verifier, reuses one private Docker-config snapshot to pull both
+exact digest subjects, verifies their effective image IDs, repository digests,
+and platform, then deletes the credential snapshot before publishing state.
+Its Compose starts use `--pull never`; there is no HRH checkout, build context,
+source mount, mutable tag, or fallback. The runtime/controller remains built
+from this runtime checkout.
+
+After initialization, `status`, `stop`, `up`, `destroy`, `renew-tls`, and
+`refresh-policy` infer the delivery mode from the closed marker; do not repeat
+`--hrh-mode` or published input paths. Published `backup`, `restore`, and
+`reset` remain unsupported and fail closed pending the separate recovery
+contract. Source-build backup and restore behavior is unchanged.
 
 `init` builds from the exact clean sources, initializes the external volumes,
 runs the root controller only through `docker compose run --rm`, and then
@@ -78,6 +98,48 @@ controller helper, and restarts only ingress after the pair verifies. An
 interruption can leave ingress stopped with a fail-closed mismatched pair;
 rerunning `refresh-policy` safely replaces and verifies both files before the
 restart.
+
+### Cold synthetic TLS renewal
+
+The synthetic CA and both server certificates last 30 days. The CA signing key
+is not retained. `renew-tls` therefore replaces the complete CA/leaf generation,
+not only a leaf certificate, and deliberately leaves the candidate **stopped**:
+
+```bash
+python deploy/clinical-staging/clinical_staging.py \
+  --hrh-root "$hrh" --state-dir "$state" --project "$project" renew-tls
+# Then run the normal `up` command and require its authenticated status checks.
+```
+
+Use it on an initialized ready/stopped stack with its exact Compose resources.
+It can repair expiration but rejects missing, malformed, mismatched, or linked
+certificate material. It holds the existing project operator lock, durably
+records `renewing_tls`, stops all workload services and verifies cold quiescence
+before preparing a new generation. `tls_prepared` fixes the candidate bytes
+before the one-shot controller updates both TLS volumes and the ingress CA.
+The controller verifies installed bytes/ownership/modes; host publication and
+the content-safe `evidence/tls-renewal.json` receipt precede the final atomic
+`stopped` marker. No workload is restarted by renewal.
+
+This is **operational atomicity while cold**, not a cross-volume filesystem
+transaction or zero-downtime CA rollover. During incomplete renewal, `up`,
+`status`, and `backup` reject the non-operational marker. Repeating `renew-tls`
+retries the same validated prepared generation; corruption of that generation
+fails closed rather than silently replacing it. An unexpected running/root
+controller or unprovable quiescence is not automatically bypassed. Do not edit
+markers; use bounded `destroy` if safe recovery cannot be established.
+
+To restore a backup whose certificates have expired, use the existing restore
+arguments plus `--renew-tls`. It restores all volumes, proves they are unmounted,
+and completes renewal **before** `_start_restored_stack` can start any workload.
+Default restore behavior is unchanged. An interrupted restore still remains
+`recovering` and requires its existing destroy-before-retry procedure. TLS
+renewal does not refresh expired clinical policies or change identities,
+credentials, outbox keys, application images, or source/published-HRH selection.
+Backups contain private key material and remain private synthetic artifacts.
+
+The bounded [verification record](../../docs/evidence/clinical-staging-tls-renewal.md)
+distinguishes real Linux/TLS witnesses from simulated application startup.
 
 `reset` and `destroy` are destructive. Both reread the closed state marker,
 recheck the current source frame, discover volumes by both the staging and

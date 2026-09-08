@@ -675,6 +675,11 @@ def main() -> None:
     command = sys.argv[1]
     if command == "seed-volumes":
         seed_volumes()
+    elif command == "renew-tls":
+        from clinical_tls import install_generation
+        if len(sys.argv) != 3 or not re.fullmatch(r"[a-f0-9]{64}", sys.argv[2]):
+            raise RuntimeError("invalid TLS renewal arguments")
+        print(json.dumps(install_generation(SEED / "tls-next", sys.argv[2], MM_TLS, HRH_TLS, INGRESS), sort_keys=True))
     elif command == "wait-mm":
         wait_https(MM_BASE, _mm_context(), "/system/ping")
     elif command == "wait-hrh":

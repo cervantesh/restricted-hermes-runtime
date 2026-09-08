@@ -22,22 +22,21 @@ import subprocess
 import sys
 import tarfile
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
 
 
 _STAGING_MODULE_DIR = str(Path(__file__).resolve().parent)
 if _STAGING_MODULE_DIR not in sys.path:
     sys.path.insert(0, _STAGING_MODULE_DIR)
 from clinical_operator_lock import OperatorLockError, operator_lock_path, persistent_operator_lock
-
+import clinical_hrh_mode as hrh_mode
+from clinical_tls import TlsError, generate_material as _certificate_material, renew as _renew_tls
 
 RUNTIME_BASE_SHA = "41464aee8748f857153ba2b47377515d4847d210"
 REQUIRED_HRH_SHA = "e30a4f968de6727519f49c08369f561fdf269ec5"
@@ -145,7 +144,12 @@ def _serialized_mutator(method):
     def wrapped(self, *args, **kwargs):
         try:
             with persistent_operator_lock(self.state_dir, self.project):
-                return method(self, *args, **kwargs)
+                if self._persisted_command is not None:
+                    self._bind_fresh_marker()
+                try:
+                    return method(self, *args, **kwargs)
+                finally:
+                    self._locked_marker = None
         except OperatorLockError as exc:
             raise SafetyError(str(exc)) from exc
     return wrapped
@@ -420,6 +424,14 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SafetyError("closed staging marker is missing or invalid") from exc
+    if isinstance(value, dict) and value.get("schema") == hrh_mode.PUBLISHED_MARKER_SCHEMA:
+        try:
+            return hrh_mode.validate_published_marker(
+                value, project=project, state_dir=state_dir,
+                expected_volumes=volume_names(project),
+            )
+        except hrh_mode.ModeError as exc:
+            raise SafetyError(str(exc)) from exc
     expected_keys = {
         "schema", "synthetic_only", "project", "state_dir", "state_id",
         "compose_env_sha256", "lifecycle", "runtime_head", "runtime_tree",
@@ -436,7 +448,7 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         or value["volumes"] != volume_names(project)
         or not re.fullmatch(r"[a-f0-9]{32}", value["state_id"])
         or not re.fullmatch(r"[a-f0-9]{64}", value["compose_env_sha256"])
-        or value["lifecycle"] not in {"initializing", "finalizing", "recovering", "ready", "stopped"}
+        or value["lifecycle"] not in {"initializing", "finalizing", "recovering", "ready", "stopped", "renewing_tls", "tls_prepared"}
         or not isinstance(value["expected_images"], dict)
     ):
         raise SafetyError("staging marker does not match the requested synthetic target")
@@ -631,7 +643,7 @@ def verify_destructive_volumes(
             raise SafetyError(f"volume label mismatch: {name}")
     if lifecycle in {"finalizing", "ready", "stopped"} and set(discovered) != expected:
         raise SafetyError("finalizing/ready/stopped staging requires the exact volume set")
-    if lifecycle not in {"initializing", "finalizing", "recovering", "ready", "stopped"}:
+    if lifecycle not in {"initializing", "finalizing", "recovering", "ready", "stopped", "renewing_tls", "tls_prepared"}:
         raise SafetyError("unknown lifecycle for destructive volume verification")
     return sorted(discovered)
 
@@ -682,7 +694,7 @@ def verify_destructive_resources(
                 raise SafetyError("stopped staging requires the exact service set or no resources")
             if set(networks) != allowed_networks:
                 raise SafetyError("stopped staging requires the exact network set or no resources")
-    elif lifecycle == "recovering":
+    elif lifecycle in {"recovering", "renewing_tls", "tls_prepared"}:
         # A failed restore is deliberately non-operational and may have only a
         # bounded partial stack.  It remains eligible solely for controlled
         # destroy; `up` never accepts this lifecycle.
@@ -866,67 +878,21 @@ def verify_restricted_container_controls(
     return evidence
 
 
-def _certificate_material(seed: Path) -> None:
-    now = datetime.now(UTC)
-    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic clinical staging CA")])
-    ca = (
-        x509.CertificateBuilder()
-        .subject_name(ca_name)
-        .issuer_name(ca_name)
-        .public_key(ca_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(minutes=5))
-        .not_valid_after(now + timedelta(days=30))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
-        .sign(ca_key, hashes.SHA256())
-    )
-
-    def server(host: str, *, include_loopback_ip: bool = False) -> tuple[bytes, bytes]:
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        names: list[x509.GeneralName] = [x509.DNSName(host)]
-        if include_loopback_ip:
-            names.append(x509.IPAddress(ipaddress.ip_address("127.0.0.1")))
-        cert = (
-            x509.CertificateBuilder()
-            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
-            .issuer_name(ca.subject)
-            .public_key(key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(now - timedelta(minutes=5))
-            .not_valid_after(now + timedelta(days=30))
-            .add_extension(x509.SubjectAlternativeName(names), critical=False)
-            .sign(ca_key, hashes.SHA256())
-        )
-        return (
-            cert.public_bytes(serialization.Encoding.PEM),
-            key.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption(),
-            ),
-        )
-
-    material = {"ca.crt": ca.public_bytes(serialization.Encoding.PEM)}
-    for host, prefix in (("mattermost", "mattermost"), ("hrh-tls", "hrh-tls")):
-        material[f"{prefix}.crt"], material[f"{prefix}.key"] = server(
-            host, include_loopback_ip=host == "mattermost"
-        )
-    for name, raw in material.items():
-        path = seed / name
-        path.write_bytes(raw)
-        path.chmod(0o600)
-
-
 class ClinicalStaging:
-    def __init__(self, runtime: Path, hrh: Path, state_dir: Path, project: str, port: int, shell: Shell | None = None):
+    def __init__(self, runtime: Path, hrh: Path | None, state_dir: Path, project: str, port: int, shell: Shell | None = None, mode_plan: hrh_mode.HRHModePlan | None = None, persisted_command: str | None = None):
         self.runtime = runtime.resolve()
-        self.hrh = hrh.resolve()
+        marker = read_marker(state_dir, project) if persisted_command is not None else None
+        if marker is not None:
+            mode_plan = hrh_mode.persisted_plan(persisted_command, hrh, marker, os.environ)
+        self.mode_plan = mode_plan or hrh_mode.HRHModePlan("init", "source-build", source_root=hrh)
+        self._persisted_command, self._locked_marker = persisted_command, None
+        self.hrh = hrh.resolve() if hrh is not None else None
         self.project = validate_project(project)
+        forbidden = (self.runtime,) if self.hrh is None else (self.runtime, self.hrh)
         self.state_dir = validate_state_path(
             state_dir,
             project,
-            forbidden_roots=(self.runtime, self.hrh),
+            forbidden_roots=forbidden,
         )
         if not 1024 <= port <= 65535:
             raise SafetyError("Mattermost loopback port must be 1024..65535")
@@ -938,12 +904,11 @@ class ClinicalStaging:
             / "tests"
             / "deployment"
             / "clinical-composed-e2e"
-            / "compose.source-build.yaml"
+            / self.mode_plan.overlay
         )
         self.overlay = self.runtime / "deploy" / "clinical-staging" / "compose.yaml"
         self.harness = self.runtime / "tests" / "deployment" / "clinical-composed-e2e"
         self.env_file = self.state_dir / "compose.env"
-
     def _require_linux(self) -> None:
         if os.name != "posix" or not sys.platform.startswith("linux"):
             raise SafetyError("operator staging lifecycle is supported only on local Linux")
@@ -976,7 +941,14 @@ class ClinicalStaging:
         return process
 
     def compose(self, *args: str, check: bool = True, timeout: int = 1200) -> subprocess.CompletedProcess[str]:
+        args = hrh_mode.compose_arguments(self.mode_plan, args)
         return self.shell.run(*self._compose_args(), *args, cwd=self.runtime, env=self._sealed_compose_environment(), check=check, timeout=timeout)
+
+    def _bind_fresh_marker(self) -> None:
+        marker = read_marker(self.state_dir, self.project)
+        self.mode_plan = hrh_mode.persisted_plan(self._persisted_command, self.hrh, marker, os.environ)
+        self.hrh_overlay = self.runtime / "tests" / "deployment" / "clinical-composed-e2e" / self.mode_plan.overlay
+        self._locked_marker = marker
 
     def control(self, *args: str, timeout: int = 600) -> str:
         result = self.compose(
@@ -997,17 +969,22 @@ class ClinicalStaging:
             "CLINICAL_HRH_DB_PASSWORD": secrets.token_hex(24),
             "CLINICAL_HRH_SESSION_SECRET": secrets.token_hex(32),
             "CLINICAL_HRH_ENCRYPTION_KEY": secrets.token_hex(32),
-            "CLINICAL_HRH_ROOT": self.hrh.as_posix(),
             "CLINICAL_HARNESS": self.harness.as_posix(),
             "CLINICAL_SEED": effective_seed.as_posix(),
             "CLINICAL_INGRESS_IMAGE": f"restricted-clinical-ingress:{self.project}",
             "CLINICAL_ADAPTER_IMAGE": f"restricted-clinical-adapter:{self.project}",
             "CLINICAL_POLICY_PUBLIC_KEY": policy_public,
-            "CLINICAL_HRH_BUILD_SHA": marker["hrh_head"],
             "CLINICAL_STAGING_PROJECT": self.project,
             "CLINICAL_STAGING_STATE_ID": marker["state_id"],
             "CLINICAL_STAGING_PORT": str(self.port),
         }
+        if self.mode_plan.mode == "source-build":
+            values.update(CLINICAL_HRH_ROOT=self.hrh.as_posix(), CLINICAL_HRH_BUILD_SHA=marker["hrh_head"])
+        else:
+            values.update(
+                CLINICAL_HRH_WEB_IMAGE=marker["hrh_candidate"]["subjects"]["web"],
+                CLINICAL_HRH_MIGRATE_IMAGE=marker["hrh_candidate"]["subjects"]["migrate"],
+            )
         values.update({f"CLINICAL_VOLUME_{key.upper()}": name for key, name in marker["volumes"].items()})
         return values
 
@@ -1097,7 +1074,7 @@ class ClinicalStaging:
         for orphan in self._owned_initialization_orphans():
             self._remove_owned_initialization_orphan(orphan)
 
-    def _prepare_new_state(self, frame: Mapping[str, str]) -> dict[str, Any]:
+    def _prepare_new_state(self, frame: Mapping[str, str], acquisition: hrh_mode.PublishedAcquisition | None = None) -> dict[str, Any]:
         self._reconcile_owned_initialization_orphans()
         if self.state_dir.exists():
             if any(self.state_dir.iterdir()):
@@ -1108,13 +1085,13 @@ class ClinicalStaging:
         try:
             (temporary / "evidence").mkdir(mode=0o700)
             self._seed_material(temporary)
-            marker = new_marker(
-                project=self.project,
-                state_dir=self.state_dir,
-                state_id=secrets.token_hex(16),
-                env_sha256="0" * 64,
-                **frame,
+            marker = (
+                new_marker(project=self.project, state_dir=self.state_dir, state_id=secrets.token_hex(16), env_sha256="0" * 64, **frame)
+                if acquisition is None else
+                hrh_mode.new_published_marker(project=self.project, state_dir=self.state_dir, state_id=secrets.token_hex(16), env_sha256="0" * 64, volumes=volume_names(self.project), acquisition=acquisition, **frame)
             )
+            if acquisition is not None:
+                hrh_mode.retain_published_evidence(temporary / "evidence", acquisition)
             values = self._env_values(marker, seed_root=temporary)
             env_raw = self._env_bytes(values)
             marker["compose_env_sha256"] = hashlib.sha256(env_raw).hexdigest()
@@ -1137,7 +1114,8 @@ class ClinicalStaging:
         # controller is FROM the locally tagged ingress image, so its build
         # cannot share a parallel Compose phase with ingress.
         self.compose("build", "ingress", "clinical-adapter", timeout=2400)
-        self.compose("build", "controller", "hrh-migrate", "hrh", timeout=2400)
+        services = ("controller", "hrh-migrate", "hrh") if self.mode_plan.build_hrh else ("controller",)
+        self.compose("build", *services, timeout=2400)
 
     def _provision_initial_mattermost_admin(self) -> None:
         """Create the initial admin inside the provisioner boundary.
@@ -1180,9 +1158,22 @@ class ClinicalStaging:
     @_serialized_mutator
     def init(self) -> dict[str, Any]:
         self._require_linux()
-        frame = verify_source_frame(self.runtime, self.hrh, self.shell)
-        verify_hrh_candidate_build_inputs(self.hrh)
-        self.state_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.mode_plan.mode == "source-build":
+            self.state_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            frame = verify_source_frame(self.runtime, self.hrh, self.shell)
+            verify_hrh_candidate_build_inputs(self.hrh)
+            acquisition = None
+        else:
+            try:
+                frame = hrh_mode.verify_runtime_frame(self.runtime, self.shell, base_sha=RUNTIME_BASE_SHA)
+                acquisition = hrh_mode.acquire_published_candidate(
+                    self.runtime, self.mode_plan.published_inputs,
+                    operator_lock_path(self.state_dir, self.project).parent,
+                    runner=subprocess.run, snapshot_key=self.project,
+                )
+            except hrh_mode.ModeError as exc:
+                raise SafetyError(str(exc)) from exc
+            self.state_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         # Kernel advisory locking is released on SIGKILL.  It serializes both
         # abandoned-temp cleanup and pre-rename seed reconciliation, so a
         # second operator cannot observe or remove a live initializer's state.
@@ -1190,13 +1181,20 @@ class ClinicalStaging:
             self._reconcile_owned_initialization_orphans()
             if self.state_dir.exists() and (self.state_dir / MARKER_NAME).exists():
                 marker = read_marker(self.state_dir, self.project)
+                if marker.get("schema", SCHEMA) != (SCHEMA if self.mode_plan.mode == "source-build" else hrh_mode.PUBLISHED_MARKER_SCHEMA):
+                    raise SafetyError("initializing marker mode changed after selection")
                 if marker["lifecycle"] not in {"initializing", "finalizing"}:
                     raise SafetyError("staging target is already initialized")
                 verify_effective_env(self.state_dir, marker)
                 if any(marker[key] != value for key, value in frame.items()):
                     raise SafetyError("initializing marker source frame changed")
+                if acquisition is not None and (
+                    marker["hrh_candidate"] != acquisition.candidate
+                    or marker["effective_images"] != acquisition.effective_images
+                ):
+                    raise SafetyError("published resume candidate differs from initialized identity")
             else:
-                marker = self._prepare_new_state(frame)
+                marker = self._prepare_new_state(frame, acquisition)
             state_stat = self.state_dir.stat()
             if state_stat.st_uid != os.getuid() or stat.S_IMODE(state_stat.st_mode) != 0o700:
                 raise SafetyError("state directory must be owned by the operator with mode 0700")
@@ -1230,18 +1228,19 @@ class ClinicalStaging:
             self.compose("up", "--detach", *ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
             self.control("wait-mm")
             self.control("wait-hrh")
-            marker["expected_images"] = self._built_images()
+            if self.mode_plan.mode == "source-build":
+                marker["expected_images"] = self._built_images()
             marker["lifecycle"] = "finalizing"
             self._write_marker(marker)
             self._finalize_initialization(marker)
             return self.up()
-
     @_serialized_mutator
     def up(self) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
         self._require_lifecycle(marker, "up", {"ready", "stopped"})
-        self.compose("up", "--detach", *ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
+        pull = ("--pull", "never") if self.mode_plan.compose_pull_policy else ()
+        self.compose("up", *pull, "--detach", *ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
         self.control("wait-mm")
         self.control("wait-hrh")
         if marker["lifecycle"] == "stopped":
@@ -1250,9 +1249,16 @@ class ClinicalStaging:
         return self.status()
 
     def _verify_marker_and_source(self) -> dict[str, Any]:
-        marker = read_marker(self.state_dir, self.project)
+        marker = self._locked_marker or read_marker(self.state_dir, self.project)
         verify_effective_env(self.state_dir, marker)
-        frame = verify_source_frame(self.runtime, self.hrh, self.shell)
+        try:
+            frame = (
+                verify_source_frame(self.runtime, self.hrh, self.shell)
+                if marker["schema"] == SCHEMA else
+                hrh_mode.verify_runtime_frame(self.runtime, self.shell, base_sha=RUNTIME_BASE_SHA)
+            )
+        except hrh_mode.ModeError as exc:
+            raise SafetyError(str(exc)) from exc
         for key, value in frame.items():
             if marker[key] != value:
                 raise SafetyError(f"current source frame differs from initialized {key}")
@@ -1362,6 +1368,7 @@ class ClinicalStaging:
                 raise SafetyError("Mattermost ingress did not become authenticated-ready in time")
             time.sleep(0.25)
 
+    @_serialized_mutator
     def status(self, *, _allow_recovering: bool = False) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
@@ -1396,15 +1403,20 @@ class ClinicalStaging:
             raise SafetyError("current Mattermost ingress start time is unavailable")
         self._wait_for_authenticated_ingress(ingress_started_at)
         current_images = self._built_images()
-        if not marker["expected_images"] or current_images != marker["expected_images"]:
-            raise SafetyError("running service image identities differ from initialized receipt")
+        if marker.get("schema", SCHEMA) == SCHEMA:
+            if not marker["expected_images"] or current_images != marker["expected_images"]:
+                raise SafetyError("running service image identities differ from initialized receipt")
+        else:
+            try:
+                hrh_mode.verify_effective_containers(marker, all_inspected)
+            except hrh_mode.ModeError as exc:
+                raise SafetyError(str(exc)) from exc
         evidence = {
-            "schema": SCHEMA,
+            "schema": marker.get("schema", SCHEMA),
             "synthetic_only": True,
             "project": self.project,
             "state_id": marker["state_id"],
-            "source": {key: marker[key] for key in ("runtime_head", "runtime_tree", "hrh_head", "hrh_tree")},
-            "built_images": current_images,
+            "source": {key: marker[key] for key in (("runtime_head", "runtime_tree", "hrh_head", "hrh_tree") if marker.get("schema", SCHEMA) == SCHEMA else ("runtime_head", "runtime_tree"))},
             "compose_env_sha256": marker["compose_env_sha256"],
             "policy_digest": self.control("policy-digest"),
             "lifecycle": marker["lifecycle"],
@@ -1418,9 +1430,25 @@ class ClinicalStaging:
             "nonclaims": ["not HIPAA", "not PHI-authorized", "not production"],
             "observed_at": datetime.now(UTC).isoformat(),
         }
+        evidence["built_images" if marker.get("schema", SCHEMA) == SCHEMA else "effective_images"] = current_images if marker.get("schema", SCHEMA) == SCHEMA else marker["effective_images"]
         self._assert_no_controller()
         write_json_atomic(self.state_dir / "evidence" / "status.json", evidence, mode=0o600)
         return evidence
+
+    @_serialized_mutator
+    def renew_tls(self) -> dict[str, Any]:
+        self._require_linux()
+        marker = self._verify_marker_and_source()
+        self._require_lifecycle(marker, "renew-tls", {"ready", "stopped", "renewing_tls", "tls_prepared"})
+        return self._renew_tls_material(marker)
+
+    def _renew_tls_material(self, marker: dict[str, Any], *, restoring: bool = False) -> dict[str, Any]:
+        try:
+            return _renew_tls(self, marker, LONG_RUNNING_SERVICES, restoring=restoring)
+        except TlsError as exc:
+            raise SafetyError(str(exc)) from exc
+        except (OSError, ValueError) as exc:
+            raise SafetyError("TLS renewal failed with incomplete state") from exc
 
     @_serialized_mutator
     def refresh_policy(self, epoch: str) -> dict[str, Any]:
@@ -1447,7 +1475,7 @@ class ClinicalStaging:
             raise CommandError("Compose could not stop every required staging service")
         marker["lifecycle"] = "stopped"
         self._write_marker(marker)
-        evidence = {"schema": SCHEMA, "project": self.project, "state_id": marker["state_id"], "lifecycle": "stopped", "observed_at": datetime.now(UTC).isoformat()}
+        evidence = {"schema": marker["schema"], "project": self.project, "state_id": marker["state_id"], "lifecycle": "stopped", "observed_at": datetime.now(UTC).isoformat()}
         write_json_atomic(self.state_dir / "evidence" / "last-transition.json", evidence, mode=0o600)
         return evidence
 
@@ -1539,6 +1567,7 @@ class ClinicalStaging:
         """Create an atomically published, cold-only backup.  No overwrite exists."""
         self._require_linux()
         marker = self._verify_marker_and_source()
+        self._require_lifecycle(marker, "backup", {"stopped"})
         self._verify_cold_quiescence(marker)
         backup_dir = validate_backup_path(
             backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime, self.hrh),
@@ -1676,7 +1705,7 @@ class ClinicalStaging:
         self.compose("up", "--detach", "ingress", timeout=600)
 
     @_serialized_mutator
-    def restore(self, backup_dir: Path, expected_manifest_sha256: str) -> dict[str, Any]:
+    def restore(self, backup_dir: Path, expected_manifest_sha256: str, *, renew_tls: bool = False) -> dict[str, Any]:
         """Restore only a fully validated cold bundle into a clean destination."""
         self._require_linux()
         backup_dir = validate_backup_path(
@@ -1716,6 +1745,8 @@ class ClinicalStaging:
             self._create_volumes(marker)
             for key in BACKED_UP_VOLUME_KEYS:
                 self._restore_volume(key, marker["volumes"][key], snapshot)
+            if renew_tls:
+                self._renew_tls_material(marker, restoring=True)
             # The excluded transport socket is recreated empty by _create_volumes;
             # clinical-socket-init rebuilds its socket during the ordered startup.
             self._start_restored_stack()
@@ -1888,10 +1919,10 @@ class ClinicalStaging:
     @_serialized_mutator
     def destroy(self) -> dict[str, Any]:
         self._require_linux()
-        marker = read_marker(self.state_dir, self.project)
+        marker = self._locked_marker or read_marker(self.state_dir, self.project)
         self._destroy_resources()
         self._assert_destroyed_absent()
-        result = {"schema": SCHEMA, "project": self.project, "state_id": marker["state_id"], "lifecycle": "destroyed"}
+        result = {"schema": marker["schema"], "project": self.project, "state_id": marker["state_id"], "lifecycle": "destroyed"}
         shutil.rmtree(self.state_dir)
         return result
 
@@ -1899,35 +1930,57 @@ class ClinicalStaging:
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-root", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--hrh-root", type=Path, required=True)
+    hrh_mode.add_root_argument(parser)
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--port", type=int, default=18443)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("init", "up", "status", "stop", "reset", "destroy"):
-        sub.add_parser(name)
+    creation = []
+    for name in ("init", "up", "status", "stop", "reset", "destroy", "renew-tls"):
+        child = sub.add_parser(name)
+        if name == "init":
+            creation.append(child)
     refresh = sub.add_parser("refresh-policy")
     refresh.add_argument("--epoch", required=True)
     backup = sub.add_parser("backup")
     backup.add_argument("--backup-dir", type=Path, required=True)
     restore = sub.add_parser("restore")
+    creation.append(restore)
     restore.add_argument("--backup-dir", type=Path, required=True)
     restore.add_argument("--expected-manifest-sha256", required=True)
-    return parser.parse_args(argv)
-
-
+    restore.add_argument("--renew-tls", action="store_true", help="renew synthetic TLS while restored workloads are still stopped")
+    for child in creation:
+        hrh_mode.add_creation_arguments(child)
+    parsed = parser.parse_args(argv)
+    if parsed.command in {"init", "restore"} and parsed.hrh_mode is None:
+        parsed.hrh_mode = "source-build"
+    return parsed
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
-    staging = ClinicalStaging(args.runtime_root, args.hrh_root, args.state_dir, args.project, args.port)
     try:
+        creation = args.command in {"init", "restore"}
+        marker = read_marker(args.state_dir, args.project) if creation and (args.state_dir / MARKER_NAME).exists() else None
+        plan = hrh_mode.plan_hrh_mode(args.command, hrh_mode.mode_tokens(args), marker_schema=marker and marker["schema"], marker_lifecycle=marker and marker["lifecycle"], environment=os.environ) if creation else None
+        staging = ClinicalStaging(
+            args.runtime_root, plan.source_root if plan else args.hrh_root, args.state_dir,
+            args.project, args.port, mode_plan=plan,
+            persisted_command=None if creation else args.command,
+        )
+        if args.command in {"backup", "restore"} and staging.mode_plan.mode == "published":
+            raise SafetyError("published backup and restore execution are pending the closed U4 backup contract")
         if args.command == "refresh-policy":
             result = staging.refresh_policy(args.epoch)
         elif args.command == "backup":
             result = staging.backup(args.backup_dir)
         elif args.command == "restore":
-            result = staging.restore(args.backup_dir, args.expected_manifest_sha256)
+            result = staging.restore(args.backup_dir, args.expected_manifest_sha256, renew_tls=args.renew_tls)
+        elif args.command == "renew-tls":
+            result = staging.renew_tls()
         else:
             result = getattr(staging, args.command)()
+    except hrh_mode.ModeError as exc:
+        print(f"clinical_staging outcome=denied reason={exc}", file=sys.stderr)
+        return 2
     except CommandError:
         # CommandError is a boundary type: never let a future child-output
         # regression become public just because this CLI renders its message.
@@ -1938,7 +1991,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 2
     print(json.dumps(result, sort_keys=True))
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

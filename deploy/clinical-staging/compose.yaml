@@ -28,9 +28,6 @@ services:
     labels: *staging-labels
   hrh:
     labels: *staging-labels
-    build:
-      args:
-        BUILD_SHA: ${CLINICAL_HRH_BUILD_SHA:?required}
   hrh-tls:
     labels: *staging-labels
   clinical-socket-init:
@@ -43,6 +40,8 @@ services:
     profiles: ["provision"]
     restart: "no"
     entrypoint: ["python", "/harness/control.py"]
+    volumes:
+      - ../../../deploy/clinical-staging/clinical_tls.py:/harness/clinical_tls.py:ro
     labels: *staging-labels
 
 networks:
