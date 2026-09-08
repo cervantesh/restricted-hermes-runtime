@@ -425,3 +425,189 @@ def test_a18_source_reset_preserves_destroy_then_reinitialize(module, tmp_path, 
     assert module.main(_argv(tmp_path, "reset", with_root=True)) == 0
     assert json.loads(capsys.readouterr().out) == {"built_images": {}, "synthetic_only": True}
     assert actions == ["destroy", "init"]
+
+
+# U2 tests intentionally exercise only the pure decision boundary. The real
+# operator parser/process and effective-Compose witnesses above stay RED until
+# the integrator owns their wiring. A marker header here represents input from
+# the future closed marker reader, not proof of a valid published generation.
+@pytest.fixture
+def pure_mode(monkeypatch):
+    path = STAGING.with_name("clinical_hrh_mode.py")
+    spec = importlib.util.spec_from_file_location("clinical_hrh_mode_u2", path)
+    assert spec is not None and spec.loader is not None
+    loaded = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, loaded)
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+@pytest.mark.parametrize("command", ["init", "restore"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_u2_source_creation_preserves_default_and_overlay(pure_mode, tmp_path, command, explicit):
+    options = ["--hrh-root", str(tmp_path / "not-yet-read")]
+    if explicit:
+        options += ["--hrh-mode", "source-build"]
+    plan = pure_mode.plan_hrh_mode(command, options)
+    assert plan.mode == "source-build"
+    assert plan.source_root == tmp_path / "not-yet-read"
+    assert plan.published_inputs is None
+    assert plan.overlay == "compose.source-build.yaml"
+    assert plan.build_hrh is True
+    assert plan.acquire_hrh is False
+    assert plan.compose_pull_policy is None
+    assert not plan.source_root.exists()
+
+
+@pytest.mark.parametrize("command", ["init", "restore", *ORDINARY])
+def test_u2_every_source_command_requires_explicit_root(pure_mode, command):
+    header = {"marker_schema": pure_mode.SOURCE_MARKER_SCHEMA} if command in ORDINARY else {}
+    with pytest.raises(pure_mode.ModeError, match="--hrh-root"):
+        pure_mode.plan_hrh_mode(command, (), environment={"CLINICAL_HRH_ROOT": "ambient-root"}, **header)
+
+
+@pytest.mark.parametrize("command", ["init", "restore"])
+def test_u2_published_creation_requires_exact_inputs_and_overlay(pure_mode, tmp_path, command):
+    plan = pure_mode.plan_hrh_mode(command, ["--hrh-mode", "published", *_publication_arguments(tmp_path)])
+    assert plan.mode == "published" and plan.source_root is None
+    assert plan.published_inputs.trust == tmp_path / "trust.json"
+    assert plan.published_inputs.evidence == tmp_path / "evidence"
+    assert plan.published_inputs.docker_config == tmp_path / "docker-reader"
+    assert plan.overlay == "compose.published-hrh.yaml"
+    assert plan.build_hrh is False and plan.acquire_hrh is True
+    assert plan.compose_pull_policy == "never"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("command", ["init", "restore"])
+@pytest.mark.parametrize("flag", PUBLISHED_FLAGS)
+def test_u2_published_creation_rejects_each_missing_path(pure_mode, tmp_path, command, flag):
+    options = _publication_arguments(tmp_path)
+    index = options.index(flag)
+    del options[index:index + 2]
+    with pytest.raises(pure_mode.ModeError, match=flag):
+        pure_mode.plan_hrh_mode(command, ["--hrh-mode", "published", *options])
+
+
+@pytest.mark.parametrize("mode", ["source", "Published", "SOURCE-BUILD", "", " published"])
+def test_u2_exact_modes_only(pure_mode, mode):
+    with pytest.raises(pure_mode.ModeError, match="--hrh-mode"):
+        pure_mode.plan_hrh_mode("init", ["--hrh-mode", mode, "--hrh-root", "synthetic-root"])
+
+
+@pytest.mark.parametrize("flag", ["--hrh-mode", "--hrh-root", *PUBLISHED_FLAGS])
+@pytest.mark.parametrize("equals", [False, True])
+def test_u2_duplicate_option_is_not_last_writer_wins(pure_mode, tmp_path, flag, equals):
+    first = "published" if flag == "--hrh-mode" else "synthetic-first"
+    second = [f"{flag}=synthetic-second"] if equals else [flag, "synthetic-second"]
+    with pytest.raises(pure_mode.ModeError, match="duplicate"):
+        pure_mode.plan_hrh_mode("init", [flag, first, *second])
+
+
+@pytest.mark.parametrize("flag", ["--hrh", "--hrh-tr", "--hrh-receipt", "--hrh-signature", "--hrh-public-key"])
+def test_u2_unknown_option_cannot_create_duplicate_authority(pure_mode, flag):
+    with pytest.raises(pure_mode.ModeError, match="unsupported"):
+        pure_mode.plan_hrh_mode("init", [flag, "synthetic-private-path"])
+
+
+@pytest.mark.parametrize("command", ["init", "restore"])
+@pytest.mark.parametrize("flag", PUBLISHED_FLAGS)
+def test_u2_source_creation_rejects_acquisition_inputs(pure_mode, command, flag):
+    with pytest.raises(pure_mode.ModeError, match="source-build"):
+        pure_mode.plan_hrh_mode(command, ["--hrh-root", "source", flag, "private-input"])
+
+
+@pytest.mark.parametrize("command", ORDINARY)
+@pytest.mark.parametrize("flag", ["--hrh-mode", *PUBLISHED_FLAGS])
+def test_u2_ordinary_commands_reject_second_authority(pure_mode, command, flag):
+    with pytest.raises(pure_mode.ModeError, match="ordinary"):
+        pure_mode.plan_hrh_mode(command, [flag, "published"], marker_schema=pure_mode.PUBLISHED_MARKER_SCHEMA)
+
+
+@pytest.mark.parametrize("command", ORDINARY)
+def test_u2_ordinary_source_plan_uses_marker_not_environment(pure_mode, command):
+    plan = pure_mode.plan_hrh_mode(command, ["--hrh-root", "synthetic-source"],
+        marker_schema=pure_mode.SOURCE_MARKER_SCHEMA,
+        environment={"CLINICAL_E2E_HRH_MODE": "published", "CLINICAL_HRH_MODE": "published"})
+    assert plan.mode == "source-build" and plan.acquire_hrh is False
+    assert plan.overlay == "compose.source-build.yaml"
+
+
+@pytest.mark.parametrize("command", [name for name in ORDINARY if name != "reset"])
+def test_u2_ordinary_published_plan_has_no_acquisition(pure_mode, command):
+    plan = pure_mode.plan_hrh_mode(command, (), marker_schema=pure_mode.PUBLISHED_MARKER_SCHEMA,
+        marker_lifecycle="ready", environment={"CLINICAL_HRH_MODE": "source-build"})
+    assert plan.mode == "published" and plan.source_root is None
+    assert plan.published_inputs is None and plan.acquire_hrh is False
+    assert plan.compose_pull_policy == "never"
+
+
+@pytest.mark.parametrize("schema", [None, "", "source-build", "published", "restricted-synthetic-clinical-staging.v2"])
+def test_u2_missing_or_unknown_marker_schema_never_defaults_to_source(pure_mode, schema):
+    with pytest.raises(pure_mode.ModeError, match="marker"):
+        pure_mode.plan_hrh_mode("status", ["--hrh-root", "synthetic"], marker_schema=schema)
+
+
+@pytest.mark.parametrize("command", ["init", "restore", "status"])
+@pytest.mark.parametrize("root_source", ["argument", "environment", "empty-environment"])
+def test_u2_published_rejects_any_source_root_authority(pure_mode, tmp_path, command, root_source):
+    options = ["--hrh-mode", "published", *_publication_arguments(tmp_path)] if command != "status" else []
+    environment = {}
+    if root_source == "argument":
+        options += ["--hrh-root", "source"]
+    else:
+        environment["CLINICAL_HRH_ROOT"] = "" if root_source == "empty-environment" else "source"
+    header = {"marker_schema": pure_mode.PUBLISHED_MARKER_SCHEMA} if command == "status" else {}
+    with pytest.raises(pure_mode.ModeError, match="HRH root"):
+        pure_mode.plan_hrh_mode(command, options, environment=environment, **header)
+
+
+def test_u2_environment_cannot_supply_published_acquisition(pure_mode):
+    environment = {name: "ambient-secret-path" for name in (
+        "CLINICAL_HRH_TRUST", "CLINICAL_HRH_EVIDENCE", "CLINICAL_HRH_DOCKER_CONFIG")}
+    with pytest.raises(pure_mode.ModeError, match="--hrh-trust"):
+        pure_mode.plan_hrh_mode("init", ["--hrh-mode", "published"], environment=environment)
+
+
+def test_u2_published_reset_is_denied_with_recovery_direction(pure_mode):
+    with pytest.raises(pure_mode.ModeError, match="destroy.*init/restore"):
+        pure_mode.plan_hrh_mode("reset", (), marker_schema=pure_mode.PUBLISHED_MARKER_SCHEMA)
+
+
+@pytest.mark.parametrize("lifecycle", ["initializing", "finalizing"])
+def test_u2_published_resume_requires_explicit_fresh_inputs(pure_mode, tmp_path, lifecycle):
+    header = {"marker_schema": pure_mode.PUBLISHED_MARKER_SCHEMA, "marker_lifecycle": lifecycle}
+    with pytest.raises(pure_mode.ModeError, match="explicit.*published"):
+        pure_mode.plan_hrh_mode("init", (), **header)
+    with pytest.raises(pure_mode.ModeError, match="--hrh-trust"):
+        pure_mode.plan_hrh_mode("init", ["--hrh-mode", "published"], **header)
+    plan = pure_mode.plan_hrh_mode("init", ["--hrh-mode", "published", *_publication_arguments(tmp_path)], **header)
+    assert plan.acquire_hrh is True
+    with pytest.raises(pure_mode.ModeError, match="resume"):
+        pure_mode.plan_hrh_mode("up", (), **header)
+
+
+@pytest.mark.parametrize("lifecycle", [None, "ready", "stopped", "recovering", "renewing_tls", "tls_prepared", "unknown"])
+def test_u2_published_init_cannot_resume_an_unapproved_lifecycle(pure_mode, tmp_path, lifecycle):
+    with pytest.raises(pure_mode.ModeError, match="resume"):
+        pure_mode.plan_hrh_mode("init", ["--hrh-mode", "published", *_publication_arguments(tmp_path)],
+            marker_schema=pure_mode.PUBLISHED_MARKER_SCHEMA, marker_lifecycle=lifecycle)
+
+
+def test_u2_existing_generation_cannot_switch_modes(pure_mode, tmp_path):
+    with pytest.raises(pure_mode.ModeError, match="marker"):
+        pure_mode.plan_hrh_mode("init", ["--hrh-mode", "published", *_publication_arguments(tmp_path)],
+            marker_schema=pure_mode.SOURCE_MARKER_SCHEMA, marker_lifecycle="initializing")
+
+
+def test_u2_planning_never_resolves_paths_or_invokes_children(pure_mode, tmp_path, monkeypatch):
+    def denied(*args, **kwargs):
+        pytest.fail("pure mode planning performed filesystem or process I/O")
+
+    monkeypatch.setattr(Path, "resolve", denied)
+    monkeypatch.setattr(Path, "stat", denied)
+    monkeypatch.setattr(Path, "open", denied)
+    monkeypatch.setattr(subprocess, "run", denied)
+    plan = pure_mode.plan_hrh_mode("restore", ["--hrh-mode", "published", *_publication_arguments(tmp_path)])
+    assert plan.acquire_hrh is True
+    assert "docker-reader" not in repr(plan)
