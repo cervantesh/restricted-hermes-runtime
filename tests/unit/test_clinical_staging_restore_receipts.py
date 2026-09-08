@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 import tarfile
 from datetime import UTC, datetime
@@ -568,6 +569,104 @@ def test_reachable_published_backup_consumes_receipt_builder(
     assert receipt == _expected_published_backup(fixture)
 
 
+def _published_backup_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module_name: str,
+):
+    staging_module = _load(STAGING_PATH, module_name)
+    fixture = _published_fixture()
+    project = fixture["identity"]["project"]
+    runtime = tmp_path / "runtime"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    state.mkdir()
+    marker = dict(
+        fixture["current_marker"],
+        state_dir=str(state.resolve()),
+        lifecycle="stopped",
+    )
+    effects: list[str] = []
+    staging = staging_module.ClinicalStaging(
+        runtime, None, state, project, 18443,
+        mode_plan=staging_module.hrh_mode.HRHModePlan("backup", "published"),
+    )
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
+    monkeypatch.setattr(staging, "_verify_cold_quiescence", lambda _marker: None)
+    monkeypatch.setattr(
+        staging_module.hrh_mode,
+        "_verifier",
+        lambda _runtime: type("Verifier", (), {"EVIDENCE_FILES": ()}),
+    )
+    monkeypatch.setattr(
+        staging_module,
+        "create_state_archive",
+        lambda _state, path: (effects.append("archive"), path.write_bytes(b"state")),
+    )
+    monkeypatch.setattr(
+        staging,
+        "compose",
+        lambda *_args, **_kwargs: effects.append("docker"),
+    )
+    monkeypatch.setattr(staging, "_assert_unmounted_backup_volumes", lambda _volumes: None)
+    monkeypatch.setattr(
+        staging,
+        "_backup_volume",
+        lambda key, _name, target: (
+            effects.append(f"volume:{key}"),
+            (target / "volumes" / f"{key}.tar").write_bytes(b"volume"),
+        ),
+    )
+    trust = tmp_path / "invalid-recovery-trust.json"
+    trust.write_bytes(b"{}\n")
+    return staging_module, staging, trust, effects
+
+
+def test_published_backup_validates_trust_before_archive_or_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging_module, staging, trust, effects = _published_backup_boundary(
+        tmp_path, monkeypatch, "clinical_staging_backup_preflight_red",
+    )
+    with pytest.raises((staging_module.SafetyError, staging_module.recovery_codec.CapsuleError)):
+        staging.backup(
+            tmp_path / "public-backup",
+            recovery_trust=trust,
+            recovery_sealer=tmp_path / "age",
+            recovery_capsule=tmp_path / "capsule.age",
+        )
+    assert effects == []
+
+
+def test_next_published_backup_reconciles_an_owned_stale_private_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging_module, staging, trust, _effects = _published_backup_boundary(
+        tmp_path, monkeypatch, "clinical_staging_backup_reconcile_red",
+    )
+    run_id = "4" * 32
+    stale = tmp_path / f".capsule-run-{run_id}"
+    stale.mkdir(mode=0o700)
+    owner = staging_module.recovery_codec._owner(
+        stale, project=staging.project, run_id=run_id, mode="backup",
+    )
+    (stale / ".clinical-recovery-owner.json").write_bytes(_canonical(owner))
+    (stale / "plaintext.tar").write_bytes(b"synthetic-private")
+    os.utime(stale, (1, 1))
+    monkeypatch.setattr(
+        staging_module.recovery_codec,
+        "finish_published_backup",
+        lambda *_args, **_kwargs: {"synthetic_only": True},
+    )
+
+    staging.backup(
+        tmp_path / "public-backup",
+        recovery_trust=trust,
+        recovery_sealer=tmp_path / "age",
+        recovery_capsule=tmp_path / "capsule.age",
+    )
+    assert not stale.exists()
+
+
 def test_reachable_published_restore_consumes_builder_and_persists_exact_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -771,6 +870,23 @@ def test_published_finalizer_consumes_bound_builder_and_persists_exact_receipt(
     expected_bytes = _canonical(_expected_published_causal(fixture, mechanical_bytes))
     assert receipt == json.loads(expected_bytes)
     assert artifact.read_bytes() == _persisted(json.loads(expected_bytes))
+
+
+def test_published_finalizer_rejects_invalid_complete_before_causal_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging_module = _load(STAGING_PATH, "clinical_staging_missing_complete_red")
+    fixture = _published_fixture()
+    mechanical_bytes = _canonical(_published_mechanical(fixture))
+    with pytest.raises(staging_module.SafetyError):
+        _exercise_published_finalizer(
+            staging_module,
+            tmp_path,
+            monkeypatch,
+            fixture,
+            mechanical_bytes,
+            public_member_overrides={"COMPLETE": b"incomplete\n"},
+        )
 
 
 @pytest.mark.parametrize(

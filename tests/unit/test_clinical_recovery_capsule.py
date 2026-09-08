@@ -561,6 +561,48 @@ def test_b02_complete_published_restore_interface_is_parseable(tmp_path):
     assert parsed.recovery_identity_stdin is True
 
 
+def test_b02_published_restore_rejects_missing_identity_declaration(tmp_path):
+    staging = _load(STAGING_PATH, "clinical_staging_b02_identity_required")
+    argv = [
+        "--state-dir", str(tmp_path / "state"),
+        "--project", PROJECT,
+        "restore",
+        "--backup-dir", str(tmp_path / "public"),
+        "--expected-manifest-sha256", "a" * 64,
+        "--hrh-mode", "published",
+        "--hrh-trust", str(tmp_path / "hrh-trust.json"),
+        "--hrh-evidence", str(tmp_path / "hrh-evidence"),
+        "--hrh-docker-config", str(tmp_path / "docker-config.json"),
+        "--recovery-trust", str(tmp_path / "recovery-trust.json"),
+        "--recovery-sealer", str(tmp_path / "age"),
+        "--recovery-capsule", str(tmp_path / "private.age"),
+    ]
+    with pytest.raises(SystemExit):
+        staging.parse_args(argv)
+
+
+def test_b29_default_sealer_path_does_not_use_the_legacy_capture_runner(
+    tmp_path, monkeypatch
+):
+    class LegacyCaptureRunnerReached(RuntimeError):
+        pass
+
+    def legacy_capture_runner(*_args, **_kwargs):
+        raise LegacyCaptureRunnerReached
+
+    monkeypatch.setattr(subprocess, "run", legacy_capture_runner)
+    module = _load(CAPSULE_PATH, "clinical_recovery_capsule_default_sealer_red")
+    with pytest.raises(module.CapsuleError):
+        module.encrypt_private_capsule(
+            sealer=tmp_path / "missing-age",
+            recipient="age1synthetic",
+            plaintext=b"synthetic-private",
+            output=tmp_path / "capsule.age",
+            timeout_seconds=0.1,
+            environment={},
+        )
+
+
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "extra"])
 def test_b02_backup_options_are_exact_and_duplicate_rejecting(tmp_path, mutation):
     staging = _load(STAGING_PATH, f"clinical_staging_b02_{mutation}")
@@ -1025,6 +1067,24 @@ def test_b16_b26_fresh_policy_transition_is_closed_before_identity_read(
     assert reads == []
 
 
+def test_b16_fresh_policy_cannot_replace_the_archived_sealer(trust):
+    module = _api("B16")
+    archived = copy.deepcopy(trust)
+    fresh = copy.deepcopy(trust)
+    fresh["policy_epoch"] += 1
+    fresh["sealer_sha256"] = "f" * 64
+    reads = []
+    with pytest.raises(module.CapsuleError, match="RECOVERY_TRUST_MISMATCH"):
+        module.authorize_restore_trust(
+            _canonical(archived),
+            _canonical(fresh),
+            recipient_sha256=trust["recipients"][0]["recipient_sha256"],
+            now=NOW,
+            identity_reader=lambda: reads.append(True),
+        )
+    assert reads == []
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["traversal", "symlink", "special", "duplicate", "extra", "missing"],
@@ -1037,6 +1097,41 @@ def test_b17_private_tar_rejects_each_member_attack(public_identity, mutation):
         _fn(module, "B17", "validate_capsule_plaintext")(
             mutated, public_identity=public_identity
         )
+
+
+def test_b17_nested_volume_tar_is_validated_before_restore(public_identity, tmp_path):
+    module = _api("B17")
+    private_root = tmp_path / "private"
+    (private_root / "volumes").mkdir(parents=True)
+    safe_inner = _tar_bytes({"payload": b"synthetic"})
+    (private_root / "state.tar").write_bytes(safe_inner)
+    for key in VOLUME_KEYS:
+        (private_root / "volumes" / f"{key}.tar").write_bytes(safe_inner)
+
+    plaintext = module.build_capsule_plaintext(
+        private_root, public_identity=public_identity
+    )
+    module.validate_capsule_plaintext(plaintext, public_identity=public_identity)
+
+    files = _tar_members(plaintext)
+    unsafe = BytesIO()
+    with tarfile.open(fileobj=unsafe, mode="w:") as archive:
+        payload = b"escape"
+        member = tarfile.TarInfo("../escape")
+        member.size, member.uid, member.gid, member.mode, member.mtime = (
+            len(payload), 0, 0, 0o600, 0
+        )
+        archive.addfile(member, BytesIO(payload))
+    target = f"volumes/{VOLUME_KEYS[0]}.tar"
+    files[target] = unsafe.getvalue()
+    manifest = json.loads(files["capsule-manifest.json"])
+    manifest["members"][target]["sha256"] = _digest(files[target])
+    manifest["members"][target]["size"] = len(files[target])
+    files["capsule-manifest.json"] = _canonical(manifest)
+    mutated = _tar_bytes(files, tuple(module.PRIVATE_NAMES))
+
+    with pytest.raises(module.CapsuleError, match="RECOVERY_CAPSULE_INVALID"):
+        module.validate_capsule_plaintext(mutated, public_identity=public_identity)
 
 
 @pytest.mark.parametrize(
