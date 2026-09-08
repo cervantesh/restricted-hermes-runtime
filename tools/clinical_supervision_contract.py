@@ -205,8 +205,12 @@ def _canonical_object(raw: bytes) -> dict[str, Any]:
     return value
 
 
-def _jsonl(raw: bytes, code: str) -> list[dict[str, Any]]:
-    _require(isinstance(raw, bytes) and bool(raw) and raw.endswith(b"\n"), code)
+def _jsonl(raw: bytes, code: str, *, allow_empty: bool = False) -> list[dict[str, Any]]:
+    _require(isinstance(raw, bytes), code)
+    if raw == b"":
+        _require(allow_empty, code)
+        return []
+    _require(raw.endswith(b"\n"), code)
     lines = raw.splitlines(keepends=True)
     _require(bool(lines) and all(line != b"\n" for line in lines), code)
     return [_canonical_object(line) for line in lines]
@@ -298,7 +302,7 @@ def _file_inventory(
         _require(_relative_path(path), "witness-file-path")
         _require(
             _sha(row["sha256"])
-            and _integer(row["size"])
+            and _integer(row["size"], minimum=0 if path in {EVENTS, DELIVERIES} else 1)
             and row["size"] <= 1_048_576
             and _text(row["media_type"]),
             "witness-file-values",
@@ -437,9 +441,13 @@ def _events(
             "sequence-floor",
         )
         floors[key] = value
+    _require(
+        set(floors) == {(candidate_id, service) for service in services},
+        "sequence-floor",
+    )
     events: dict[str, dict[str, Any]] = {}
     last = dict(floors)
-    for item in _jsonl(raw, "event-stream"):
+    for item in _jsonl(raw, "event-stream", allow_empty=True):
         event = _closed(item, _EVENT_KEYS, "event-fields")
         _require(
             event["schema"] == "restricted-clinical-supervision-event.v1",
@@ -464,7 +472,7 @@ def _events(
             "event-id",
         )
         key = (candidate_id, event["service"])
-        _require(event["transition_sequence"] > last.get(key, 0), "event-sequence-order")
+        _require(event["transition_sequence"] > last[key], "event-sequence-order")
         last[key] = event["transition_sequence"]
         _require(event["event_id"] not in events, "event-duplicate")
         events[event["event_id"]] = event
@@ -476,10 +484,11 @@ def _deliveries(
     *,
     events: Mapping[str, dict[str, Any]],
     retained_by_hash: Mapping[str, bytes],
+    expected_sink_ids_sha256: set[str],
 ) -> None:
     attempts: dict[tuple[str, str, int], dict[str, Any]] = {}
     highest: dict[tuple[str, str], int] = {}
-    for item in _jsonl(raw, "delivery-stream"):
+    for item in _jsonl(raw, "delivery-stream", allow_empty=True):
         delivery = _closed(item, _DELIVERY_KEYS, "delivery-fields")
         _require(
             delivery["schema"] == "restricted-clinical-supervision-delivery.v1",
@@ -488,7 +497,11 @@ def _deliveries(
         _require(_sha(delivery["event_id"]), "delivery-event")
         event = events.get(delivery["event_id"])
         _require(event is not None, "delivery-event")
-        _require(_sha(delivery["sink_id_sha256"]), "delivery-sink")
+        _require(
+            _sha(delivery["sink_id_sha256"])
+            and delivery["sink_id_sha256"] in expected_sink_ids_sha256,
+            "delivery-sink",
+        )
         _require(_integer(delivery["attempt"]), "delivery-attempt")
         attempted = _timestamp(delivery["attempted_at"])
         completed = _timestamp(delivery["completed_at"])
@@ -589,6 +602,7 @@ def validate_witness(
     expected_profile_sha256: str,
     expected_services: Iterable[str],
     sequence_floor: Mapping[tuple[str, str], int],
+    expected_sink_ids_sha256: Iterable[str],
 ) -> None:
     """Validate a supervision witness against independently supplied bytes."""
     _require(not isinstance(expected_services, (str, bytes)), "expected-services")
@@ -604,6 +618,16 @@ def validate_witness(
         "expected-services",
     )
     _sorted_unique(services, "expected-service-order")
+    _require(
+        not isinstance(expected_sink_ids_sha256, (str, bytes)),
+        "expected-sinks",
+    )
+    try:
+        sink_ids = list(expected_sink_ids_sha256)
+    except TypeError:
+        raise ContractError("expected-sinks") from None
+    _require(bool(sink_ids) and all(_sha(value) for value in sink_ids), "expected-sinks")
+    _sorted_unique(sink_ids, "expected-sinks")
     expected_old = _canonical_object(expected_before)
     expected_new = _canonical_object(expected_after)
     candidate_id = expected_old.get("candidate_id")
@@ -689,5 +713,6 @@ def validate_witness(
     )
     _transition(expected_old, expected_new, operation, events, after_hash)
     _deliveries(
-        retained_files[DELIVERIES], events=events, retained_by_hash=by_hash
+        retained_files[DELIVERIES], events=events, retained_by_hash=by_hash,
+        expected_sink_ids_sha256=set(sink_ids),
     )

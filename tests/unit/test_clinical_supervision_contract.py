@@ -2,8 +2,8 @@
 
 Contract: docs/design/clinical-supervision-contract.v1.md at 3810cc1c.
 
-This suite covers only SL11, SL14, and SL16-SL21.  SL01-SL10, SL12-SL13,
-and SL15 require Docker/runtime effects and remain explicitly NOT_VERIFIED in
+This suite covers only SL11 and SL16-SL21. SL14 restart-persistent deduplication,
+SL01-SL10, SL12-SL13, and SL15 require durable/runtime effects and remain NOT_VERIFIED in
 the valid packet.  The fixtures are synthetic and prove neither a host effect
 nor readiness for PHI, production, or compliance.
 """
@@ -26,7 +26,7 @@ AFTER = "platform/generation.after.json"
 EVENTS = "platform/supervision-events.v1.jsonl"
 DELIVERIES = "platform/supervision-deliveries.v1.jsonl"
 DELIVERY_PROOF = "platform/proofs/delivery-1.json"
-COVERED_ROWS = {"SL11", "SL14", *(f"SL{index:02}" for index in range(16, 22))}
+COVERED_ROWS = {"SL11", *(f"SL{index:02}" for index in range(16, 22))}
 ROW_PROOFS = {row: f"platform/proofs/{row.lower()}.json" for row in COVERED_ROWS}
 CANDIDATE = "sha256:" + "1" * 64
 CONTRACT_HASH = "2" * 64
@@ -40,6 +40,7 @@ NOT_VERIFIED_ROWS = {
     *(f"SL{index:02}" for index in range(1, 11)),
     "SL12",
     "SL13",
+    "SL14",
     "SL15",
     *(f"SH{index:02}" for index in range(1, 6)),
 }
@@ -259,7 +260,11 @@ def packet():
         "expected_host_baseline_sha256": HOST_HASH,
         "expected_profile_sha256": PROFILE_HASH,
         "expected_services": ("ingress", "lifecycle-observer"),
-        "sequence_floor": {(CANDIDATE, "ingress"): 0},
+        "sequence_floor": {
+            (CANDIDATE, "ingress"): 0,
+            (CANDIDATE, "lifecycle-observer"): 0,
+        },
+        "expected_sink_ids_sha256": (sink,),
     }
     return witness, retained, expected
 
@@ -332,7 +337,7 @@ def test_every_log_sink_requires_an_effective_finite_bound(parser):
             parser.validate_log_inventory(required, changed)
 
 
-def test_events_deduplicate_by_bound_transition_not_forever(parser):
+def test_events_deduplicate_within_one_retained_stream(parser):
     value = packet()
     assert validate(parser, value) is None  # positive control prevents blanket rejection
 
@@ -348,6 +353,28 @@ def test_events_deduplicate_by_bound_transition_not_forever(parser):
     second = make_event(first["generation_sha256"], sequence=2, event_class="recovered", outcome="SUCCEEDED")
     retained[EVENTS] = jsonl([first, second])
     validate(parser, next_transition)
+
+
+def test_zero_byte_event_and_delivery_streams_represent_no_attempt(parser):
+    value = packet()
+    value[1][EVENTS] = b""
+    value[1][DELIVERIES] = b""
+    value[1].pop(DELIVERY_PROOF)
+    validate(parser, value)
+
+
+def test_every_service_stream_requires_an_independent_sequence_floor(parser):
+    missing = packet()
+    missing[2]["sequence_floor"].pop((CANDIDATE, "lifecycle-observer"))
+    assert_rejected(parser, missing, match="sequence-floor")
+
+    undeclared = packet()
+    undeclared[2]["sequence_floor"][(CANDIDATE, "mattermost")] = 0
+    assert_rejected(parser, undeclared, match="sequence-floor")
+
+    implicit_new_stream = packet()
+    implicit_new_stream[2]["sequence_floor"].pop((CANDIDATE, "ingress"))
+    assert_rejected(parser, implicit_new_stream, match="sequence-floor")
 
 
 def test_supervision_evidence_requires_exact_frame_and_closed_events(parser):
@@ -594,3 +621,16 @@ def test_acknowledgment_binds_exact_event_sink_attempt_result_and_proof(parser):
     second["completed_at"] = "2026-09-07T12:01:02.000Z"
     duplicate_attempt[1][DELIVERIES] = jsonl([first, second])
     assert_rejected(parser, duplicate_attempt)
+
+
+def test_matched_delivery_and_proof_cannot_invent_an_unapproved_sink(parser):
+    changed = packet()
+    arbitrary_sink = "f" * 64
+    proof = json.loads(changed[1][DELIVERY_PROOF])
+    proof["sink_id_sha256"] = arbitrary_sink
+    changed[1][DELIVERY_PROOF] = canonical(proof)
+    delivery = json.loads(changed[1][DELIVERIES].decode())
+    delivery["sink_id_sha256"] = arbitrary_sink
+    delivery["proof_sha256"] = sha256(changed[1][DELIVERY_PROOF])
+    changed[1][DELIVERIES] = jsonl([delivery])
+    assert_rejected(parser, changed, match="delivery-sink")
