@@ -695,6 +695,7 @@ def test_b04_sealer_is_snapshotted_from_one_open_file_before_path_substitution(
     module = _api("B04")
     source = tmp_path / "age"
     source.write_bytes(age_material["age"].read_bytes())
+    source.chmod(0o700)
     expected = _digest(source.read_bytes())
 
     def opener(path, flags):
