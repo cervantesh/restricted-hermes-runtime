@@ -78,17 +78,23 @@ def add_finalizer_arguments(parser: argparse.ArgumentParser) -> None:
 
 def dispatch_recovery_command(staging: Any, args: argparse.Namespace) -> Any:
     if args.command == "backup":
+        if (staging.mode_plan.mode == "published") != (args.recovery_trust is not None):
+            raise CapsuleError("recovery options must exactly match published mode")
         return staging.backup(
             args.backup_dir, recovery_trust=args.recovery_trust,
             recovery_sealer=args.recovery_sealer, recovery_capsule=args.recovery_capsule,
         )
     if args.command == "restore":
+        if (staging.mode_plan.mode == "published") != (args.recovery_trust is not None):
+            raise CapsuleError("recovery options must exactly match published mode")
         return staging.restore(
             args.backup_dir, args.expected_manifest_sha256, renew_tls=args.renew_tls,
             recovery_trust=args.recovery_trust, recovery_sealer=args.recovery_sealer,
             recovery_capsule=args.recovery_capsule,
             recovery_identity_reader=(lambda: sys.stdin.buffer.read(4097)) if args.recovery_identity_stdin else None,
         )
+    if len(args.causal_check) != len(set(args.causal_check)):
+        raise CapsuleError("causal checks must not be duplicated")
     checks = {name: True for name in args.causal_check}
     return staging.finalize_cold_recovery_verification(
         args.expected_manifest_sha256, checks, backup_dir=args.backup_dir,
