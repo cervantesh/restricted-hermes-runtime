@@ -375,7 +375,9 @@ def test_source_v1_causal_receipt_remains_exact_under_frozen_inputs(
     project = "clinicalstagingdemo"
     runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
     state = tmp_path / f"{project}.synthetic-clinical-staging"
-    runtime.mkdir(); hrh.mkdir(); (state / "evidence" / "recovery").mkdir(parents=True)
+    runtime.mkdir()
+    hrh.mkdir()
+    (state / "evidence" / "recovery").mkdir(parents=True)
     marker = staging_module.new_marker(
         project=project, state_dir=state, state_id="8" * 32,
         env_sha256="2" * 64, runtime_head="1" * 40, runtime_tree="2" * 40,
@@ -425,7 +427,11 @@ def test_source_v1_backup_receipt_remains_exact_with_normalized_path(
     project = "clinicalstagingdemo"
     runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
     state = tmp_path / f"{project}.synthetic-clinical-staging"
-    runtime.mkdir(); hrh.mkdir(); state.mkdir(); (state / "seed").mkdir(); (state / "evidence").mkdir()
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / "seed").mkdir()
+    (state / "evidence").mkdir()
     (state / "compose.env").write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
     marker = staging_module.new_marker(
         project=project, state_dir=state, state_id="8" * 32,
@@ -470,7 +476,9 @@ def test_source_v1_mechanical_receipt_remains_exact_under_frozen_inputs(
         tmp_path / "backup",
         tmp_path / "snapshot",
     )
-    runtime.mkdir(); hrh.mkdir(); backup.mkdir()
+    runtime.mkdir()
+    hrh.mkdir()
+    backup.mkdir()
     compose_bytes = b"CLINICAL_SYNTHETIC=true\n"
     marker = staging_module.new_marker(
         project=project, state_dir=state, state_id="8" * 32,
@@ -539,7 +547,10 @@ def test_reachable_published_backup_consumes_receipt_builder(
     project = fixture["identity"]["project"]
     runtime = tmp_path / "runtime"
     state = tmp_path / f"{project}.synthetic-clinical-staging"
-    runtime.mkdir(); state.mkdir(); (state / "seed").mkdir(); (state / "evidence").mkdir()
+    runtime.mkdir()
+    state.mkdir()
+    (state / "seed").mkdir()
+    (state / "evidence").mkdir()
     (state / "compose.env").write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
     marker = dict(fixture["current_marker"], state_dir=str(state.resolve()), lifecycle="stopped")
     calls = []
@@ -677,7 +688,8 @@ def test_reachable_published_restore_consumes_builder_and_persists_exact_receipt
         tmp_path / "runtime", tmp_path / f"{project}.synthetic-clinical-staging",
         tmp_path / "backup", tmp_path / "snapshot",
     )
-    runtime.mkdir(); backup.mkdir()
+    runtime.mkdir()
+    backup.mkdir()
     marker = dict(fixture["current_marker"], state_dir=str(state.resolve()), lifecycle="stopped")
     compose_bytes = b"CLINICAL_SYNTHETIC=true\n"
     marker["compose_env_sha256"] = hashlib.sha256(compose_bytes).hexdigest()
@@ -692,7 +704,8 @@ def test_reachable_published_restore_consumes_builder_and_persists_exact_receipt
         return _published_mechanical(fixture)
 
     def make_snapshot(*_args, **_kwargs):
-        snapshot.mkdir(); (snapshot / staging_module.BACKUP_MANIFEST_NAME).write_text("{}\n")
+        snapshot.mkdir()
+        (snapshot / staging_module.BACKUP_MANIFEST_NAME).write_text("{}\n")
         return snapshot
 
     def extract(_archive, target):
@@ -798,7 +811,8 @@ def _exercise_published_finalizer(
     project = fixture["identity"]["project"]
     runtime = tmp_path / "runtime"
     state = tmp_path / f"{project}.synthetic-clinical-staging"
-    runtime.mkdir(); (state / "evidence" / "recovery").mkdir(parents=True)
+    runtime.mkdir()
+    (state / "evidence" / "recovery").mkdir(parents=True)
     marker = dict(fixture["current_marker"], state_dir=str(state.resolve()))
     marker.update(marker_overrides or {})
     staging_module.write_json_atomic(state / staging_module.MARKER_NAME, marker, mode=0o600)
