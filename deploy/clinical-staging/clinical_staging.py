@@ -8,10 +8,8 @@ from contextlib import contextmanager
 import functools
 import hashlib
 import http.client
-import ipaddress
 import json
 import os
-import posixpath
 import re
 import secrets
 import shutil
@@ -20,7 +18,6 @@ import ssl
 import stat
 import subprocess
 import sys
-import tarfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +33,8 @@ if _STAGING_MODULE_DIR not in sys.path:
     sys.path.insert(0, _STAGING_MODULE_DIR)
 from clinical_operator_lock import OperatorLockError, operator_lock_path, persistent_operator_lock
 import clinical_hrh_mode as hrh_mode
+import clinical_recovery_capsule as recovery_codec
+from clinical_recovery_capsule import add_finalizer_arguments, add_recovery_arguments, dispatch_recovery_command, validate_recovery_arguments
 from clinical_tls import TlsError, generate_material as _certificate_material, renew as _renew_tls
 
 RUNTIME_BASE_SHA = "41464aee8748f857153ba2b47377515d4847d210"
@@ -462,12 +461,18 @@ from clinical_backup_bundle import (
     _safe_archive_name as _codec_safe_archive_name,
     archive_ownership_sha256 as _codec_archive_ownership_sha256,
     build_backup_manifest as _codec_build_backup_manifest,
+    build_backup_receipt as _codec_build_backup_receipt,
+    build_causal_receipt as _codec_build_causal_receipt,
+    build_causal_receipt as _codec_validate_causal_receipt,
+    build_restore_receipt as _codec_build_restore_receipt,
     canonical_json_bytes as _codec_canonical_json_bytes,
     create_state_archive as _codec_create_state_archive,
+    extract_safe_state_archive as _codec_extract_safe_state_archive,
     file_sha256 as _codec_file_sha256,
     inspect_safe_tar as _codec_inspect_safe_tar,
     materialize_backup_snapshot as _codec_materialize_backup_snapshot,
     validate_backup_bundle as _codec_validate_backup_bundle,
+    verify_recovery_helper_boundary as _codec_verify_recovery_helper_boundary,
     write_backup_completion as _codec_write_backup_completion,
     write_backup_manifest as _codec_write_backup_manifest,
 )
@@ -516,9 +521,7 @@ def _safe_archive_name(name: str) -> str:
     return _codec_safe_archive_name(_backup_contract(), name)
 
 
-def inspect_safe_tar(
-    path: Path, *, require_regular_file: bool,
-) -> tuple[str, ...]:
+def inspect_safe_tar(path: Path, *, require_regular_file: bool) -> tuple[str, ...]:
     return _codec_inspect_safe_tar(_backup_contract(), path, require_regular_file=require_regular_file)
 
 
@@ -544,42 +547,15 @@ def write_backup_completion(backup_dir: Path) -> None:
     return _codec_write_backup_completion(_backup_contract(), backup_dir)
 
 
-def validate_backup_bundle(
-    backup_dir: Path, expected_manifest_sha256: str, project: str, state_dir: Path,
-) -> dict[str, Any]:
+def validate_backup_bundle(backup_dir: Path, expected_manifest_sha256: str, project: str, state_dir: Path) -> dict[str, Any]:
     return _codec_validate_backup_bundle(_backup_contract(), backup_dir, expected_manifest_sha256, project, state_dir)
 
 
-def materialize_backup_snapshot(
-    backup_dir: Path, snapshot_parent: Path, *, snapshot_stem: str,
-) -> Path:
+def materialize_backup_snapshot(backup_dir: Path, snapshot_parent: Path, *, snapshot_stem: str) -> Path:
     return _codec_materialize_backup_snapshot(_backup_contract(), backup_dir, snapshot_parent, snapshot_stem=snapshot_stem)
 
 
-def verify_recovery_helper_boundary(
-    command: tuple[str, ...], *, source_mount: str, backup_mount: str, capabilities: frozenset[str],
-) -> None:
-    """Fail closed if the one-shot archive helper gains any authority."""
-    if command[:3] != ("docker", "run", "--rm") or command.count("--read-only") != 1:
-        raise SafetyError("recovery helper command is not ephemeral and read-only")
-    expected_single = {
-        "--network": "none",
-        "--cap-drop": "ALL",
-        "--security-opt": "no-new-privileges:true",
-        "--user": "0:0",
-        "--entrypoint": "sh",
-    }
-    for flag, value in expected_single.items():
-        if command.count(flag) != 1 or command[command.index(flag) + 1] != value:
-            raise SafetyError("recovery helper command has an unexpected security authority")
-    cap_adds = {command[index + 1] for index, item in enumerate(command[:-1]) if item == "--cap-add"}
-    if cap_adds != capabilities or command.count("--cap-add") != len(capabilities):
-        raise SafetyError("recovery helper command has an unexpected security authority")
-    mounts = [command[index + 1] for index, item in enumerate(command[:-1]) if item == "--mount"]
-    if len(mounts) != 2 or set(mounts) != {source_mount, backup_mount}:
-        raise SafetyError("recovery helper command has an unexpected mount")
-    if "--privileged" in command or "-v" in command or "--volume" in command:
-        raise SafetyError("recovery helper command has an unexpected authority")
+verify_recovery_helper_boundary = functools.partial(_codec_verify_recovery_helper_boundary, SafetyError)
 
 
 def verify_effective_env(state_dir: Path, marker: Mapping[str, Any]) -> None:
@@ -1563,14 +1539,14 @@ class ClinicalStaging:
         fsync_file(backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar")
 
     @_serialized_mutator
-    def backup(self, backup_dir: Path) -> dict[str, Any]:
+    def backup(self, backup_dir: Path, *, recovery_trust: Path | None = None, recovery_sealer: Path | None = None, recovery_capsule: Path | None = None) -> dict[str, Any]:
         """Create an atomically published, cold-only backup.  No overwrite exists."""
         self._require_linux()
         marker = self._verify_marker_and_source()
         self._require_lifecycle(marker, "backup", {"stopped"})
         self._verify_cold_quiescence(marker)
         backup_dir = validate_backup_path(
-            backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime, self.hrh),
+            backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime,) if self.hrh is None else (self.runtime, self.hrh),
         )
         if backup_dir.exists():
             raise SafetyError("backup target must be a new directory")
@@ -1589,6 +1565,8 @@ class ClinicalStaging:
             for key in BACKED_UP_VOLUME_KEYS:
                 self._assert_unmounted_backup_volumes(marker["volumes"])
                 self._backup_volume(key, marker["volumes"][key], temporary)
+            if self.mode_plan.mode == "published" and recovery_trust is not None:
+                return recovery_codec.finish_published_backup(self, temporary, marker, backup_dir, recovery_trust_path=recovery_trust, recovery_sealer=recovery_sealer, capsule_path=recovery_capsule, contract=_backup_contract(), receipt_builder=_codec_build_backup_receipt, now=datetime.now(UTC))
             fsync_directory(temporary / BACKUP_VOLUME_DIR)
             manifest = build_backup_manifest(marker, self.state_dir, temporary)
             write_backup_manifest(temporary, manifest)
@@ -1601,6 +1579,11 @@ class ClinicalStaging:
                 shutil.rmtree(temporary)
             raise
         manifest_sha256 = file_sha256(backup_dir / BACKUP_MANIFEST_NAME)
+        if self.mode_plan.mode == "published":
+            return _codec_build_backup_receipt(
+                _backup_contract(), manifest, backup_dir, identity=marker,
+                manifest_sha256=manifest_sha256, backed_up_at=datetime.now(UTC).isoformat(),
+            )
         return {
             "schema": BACKUP_SCHEMA,
             "synthetic_only": True,
@@ -1635,36 +1618,7 @@ class ClinicalStaging:
 
     @staticmethod
     def _extract_safe_state_archive(archive_path: Path, destination: Path) -> None:
-        """Extract a previously validated regular-file archive without tarfile.extractall."""
-        try:
-            with tarfile.open(archive_path, "r:") as archive:
-                for member in archive.getmembers():
-                    name = _safe_archive_name(member.name)
-                    if not name:
-                        if member.isdir():
-                            continue
-                        raise SafetyError("backup state archive has an invalid root member")
-                    if not (member.isdir() or member.isreg()):
-                        raise SafetyError("backup state archive contains a non-regular member")
-                    target = destination.joinpath(*name.split("/"))
-                    try:
-                        target.resolve().relative_to(destination.resolve())
-                    except ValueError as exc:
-                        raise SafetyError("backup state archive escapes its destination") from exc
-                    if member.isdir():
-                        target.mkdir(mode=member.mode & 0o777, parents=True, exist_ok=False)
-                        continue
-                    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    stream = archive.extractfile(member)
-                    if stream is None:
-                        raise SafetyError("backup state archive member is unreadable")
-                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, member.mode & 0o777)
-                    with os.fdopen(fd, "wb") as output:
-                        shutil.copyfileobj(stream, output)
-                        output.flush()
-                        os.fsync(output.fileno())
-        except (OSError, tarfile.TarError) as exc:
-            raise SafetyError("could not safely restore private state") from exc
+        _codec_extract_safe_state_archive(_backup_contract(), archive_path, destination)
 
     def _restore_volume(self, key: str, volume: str, backup_dir: Path) -> None:
         if key not in BACKED_UP_VOLUME_KEYS or volume != volume_names(self.project)[key]:
@@ -1705,12 +1659,17 @@ class ClinicalStaging:
         self.compose("up", "--detach", "ingress", timeout=600)
 
     @_serialized_mutator
-    def restore(self, backup_dir: Path, expected_manifest_sha256: str, *, renew_tls: bool = False) -> dict[str, Any]:
+    def restore(self, backup_dir: Path, expected_manifest_sha256: str, *, renew_tls: bool = False, recovery_trust: Path | None = None, recovery_sealer: Path | None = None, recovery_capsule: Path | None = None, recovery_identity_reader: Any = None) -> dict[str, Any]:
         """Restore only a fully validated cold bundle into a clean destination."""
         self._require_linux()
-        backup_dir = validate_backup_path(
-            backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime, self.hrh),
-        )
+        backup_dir = validate_backup_path(backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime,) if self.hrh is None else (self.runtime, self.hrh))
+        if self.mode_plan.mode == "published" and recovery_trust is not None:
+            try:
+                recovery_codec.validate_recovery_pair({"public_dir": backup_dir, "capsule_path": recovery_capsule}, expected_manifest_sha256=expected_manifest_sha256, fresh_trust=recovery_codec.read_bounded_regular(recovery_trust, limit=1024 * 1024, code="RECOVERY_TRUST_UNAVAILABLE"), acquired_generation=None)
+                acquisition = hrh_mode.acquire_published_candidate(self.runtime, self.mode_plan.published_inputs, operator_lock_path(self.state_dir, self.project).parent, runner=subprocess.run, snapshot_key=self.project)
+                return recovery_codec.restore_published_backup(self, backup_dir, expected_manifest_sha256, recovery_trust_path=recovery_trust, recovery_sealer=recovery_sealer, capsule_path=recovery_capsule, identity_reader=recovery_identity_reader, acquired_generation=acquisition.candidate, contract=_backup_contract(), receipt_builder=_codec_build_restore_receipt, renew_tls=renew_tls, now=datetime.now(UTC))
+            except (hrh_mode.ModeError, recovery_codec.CapsuleError) as exc:
+                raise SafetyError(str(exc)) from exc
         snapshot = materialize_backup_snapshot(
             backup_dir, self.state_dir.parent, snapshot_stem=self.state_dir.name,
         )
@@ -1770,7 +1729,18 @@ class ClinicalStaging:
             }
             receipt_dir = self.state_dir / "evidence" / "recovery"
             receipt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            write_json_atomic(receipt_dir / f"restore-{expected_manifest_sha256}.json", receipt, mode=0o600)
+            if self.mode_plan.mode == "published":
+                receipt = _codec_build_restore_receipt(
+                    _backup_contract(), manifest, expected_manifest_sha256,
+                    identity=marker, restore_trust=manifest.get("restore_trust", {}),
+                    restore_trust_sha256=manifest.get("restore_trust_sha256", "0" * 64),
+                    status_observed_at=status["observed_at"], restored_at=datetime.now(UTC).isoformat(),
+                )
+            receipt_path = receipt_dir / f"restore-{expected_manifest_sha256}.json"
+            if self.mode_plan.mode == "published":
+                receipt_path.write_bytes(canonical_json_bytes(receipt))
+            else:
+                write_json_atomic(receipt_path, receipt, mode=0o600)
             return receipt
         except Exception as exc:
             if published_state:
@@ -1796,7 +1766,8 @@ class ClinicalStaging:
 
     @_serialized_mutator
     def finalize_cold_recovery_verification(
-        self, expected_manifest_sha256: str, causal_checks: Mapping[str, bool],
+        self, expected_manifest_sha256: str, causal_checks: Mapping[str, bool], *,
+        backup_dir: Path | None = None, expected_mechanical_receipt_sha256: str | None = None,
     ) -> dict[str, Any]:
         """Publish a verified receipt only after the external causal drill passes."""
         self._require_linux()
@@ -1807,6 +1778,33 @@ class ClinicalStaging:
             raise SafetyError("causal recovery verification is incomplete or invalid")
         receipt_dir = self.state_dir / "evidence" / "recovery"
         mechanical_path = receipt_dir / f"restore-{expected_manifest_sha256}.json"
+        if self.mode_plan.mode == "published":
+            if backup_dir is None or expected_mechanical_receipt_sha256 is None:
+                raise SafetyError("published causal finalization requires independent public anchors")
+            manifest_bytes = (backup_dir / BACKUP_MANIFEST_NAME).read_bytes()
+            if file_sha256(backup_dir / BACKUP_MANIFEST_NAME) != expected_manifest_sha256:
+                raise SafetyError("external manifest hash differs")
+            manifest = json.loads(manifest_bytes)
+            identity = json.loads((backup_dir / "backup-identity.json").read_bytes())
+            mechanical_bytes = mechanical_path.read_bytes()
+            if hashlib.sha256(mechanical_bytes).hexdigest() != expected_mechanical_receipt_sha256:
+                raise SafetyError("external mechanical receipt hash differs")
+            if marker["project"] != identity["project"] or marker["state_id"] != identity["state_id"] or {"runtime_head": marker["runtime_head"], "runtime_tree": marker["runtime_tree"]} != identity["runtime_source"] or marker["hrh_candidate"] != identity["hrh_candidate"] or marker["effective_images"] != identity["effective_images"]:
+                raise SafetyError("current marker differs from recovery identity")
+            validation_kwargs = dict(
+                mechanical_receipt_bytes=mechanical_bytes, manifest=manifest,
+                identity=identity, current_marker=marker, restore_trust=None,
+                restore_trust_sha256=json.loads(mechanical_bytes)["restore_recovery_trust_sha256"],
+                causal_checks=causal_checks, expected_manifest_sha256=expected_manifest_sha256,
+                expected_mechanical_receipt_sha256=expected_mechanical_receipt_sha256,
+                verified_at=datetime.now(UTC).isoformat(),
+            )
+            _codec_validate_causal_receipt(_backup_contract(), **validation_kwargs)
+            receipt = _codec_build_causal_receipt(
+                _backup_contract(), **validation_kwargs,
+            )
+            write_json_atomic(receipt_dir / f"verified-restore-{expected_manifest_sha256}.json", receipt, mode=0o600)
+            return receipt
         try:
             mechanical = json.loads(mechanical_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -1944,14 +1942,19 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     refresh.add_argument("--epoch", required=True)
     backup = sub.add_parser("backup")
     backup.add_argument("--backup-dir", type=Path, required=True)
+    add_recovery_arguments(backup, restore=False)
     restore = sub.add_parser("restore")
     creation.append(restore)
     restore.add_argument("--backup-dir", type=Path, required=True)
     restore.add_argument("--expected-manifest-sha256", required=True)
     restore.add_argument("--renew-tls", action="store_true", help="renew synthetic TLS while restored workloads are still stopped")
+    add_recovery_arguments(restore, restore=True)
+    finalize = sub.add_parser("finalize-cold-recovery-verification")
+    add_finalizer_arguments(finalize)
     for child in creation:
         hrh_mode.add_creation_arguments(child)
     parsed = parser.parse_args(argv)
+    validate_recovery_arguments(parser, parsed)
     if parsed.command in {"init", "restore"} and parsed.hrh_mode is None:
         parsed.hrh_mode = "source-build"
     return parsed
@@ -1966,19 +1969,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.project, args.port, mode_plan=plan,
             persisted_command=None if creation else args.command,
         )
-        if args.command in {"backup", "restore"} and staging.mode_plan.mode == "published":
-            raise SafetyError("published backup and restore execution are pending the closed U4 backup contract")
         if args.command == "refresh-policy":
             result = staging.refresh_policy(args.epoch)
-        elif args.command == "backup":
-            result = staging.backup(args.backup_dir)
-        elif args.command == "restore":
-            result = staging.restore(args.backup_dir, args.expected_manifest_sha256, renew_tls=args.renew_tls)
+        elif args.command in {"backup", "restore", "finalize-cold-recovery-verification"}:
+            result = dispatch_recovery_command(staging, args)
         elif args.command == "renew-tls":
             result = staging.renew_tls()
         else:
             result = getattr(staging, args.command)()
-    except hrh_mode.ModeError as exc:
+    except (hrh_mode.ModeError, recovery_codec.CapsuleError) as exc:
         print(f"clinical_staging outcome=denied reason={exc}", file=sys.stderr)
         return 2
     except CommandError:

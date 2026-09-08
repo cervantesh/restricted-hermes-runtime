@@ -613,3 +613,225 @@ def materialize_backup_snapshot(
         if snapshot.exists():
             shutil.rmtree(snapshot)
         raise
+
+
+def verify_recovery_helper_boundary(
+    error_type: type[Exception], command: tuple[str, ...], *, source_mount: str,
+    backup_mount: str, capabilities: frozenset[str],
+) -> None:
+    if command[:3] != ("docker", "run", "--rm") or command.count("--read-only") != 1:
+        raise error_type("recovery helper command is not ephemeral and read-only")
+    expected = {"--network": "none", "--cap-drop": "ALL", "--security-opt": "no-new-privileges:true", "--user": "0:0", "--entrypoint": "sh"}
+    if any(command.count(flag) != 1 or command[command.index(flag) + 1] != value for flag, value in expected.items()):
+        raise error_type("recovery helper command has an unexpected security authority")
+    cap_adds = {command[index + 1] for index, item in enumerate(command[:-1]) if item == "--cap-add"}
+    if cap_adds != capabilities or command.count("--cap-add") != len(capabilities):
+        raise error_type("recovery helper command has an unexpected security authority")
+    mounts = [command[index + 1] for index, item in enumerate(command[:-1]) if item == "--mount"]
+    if len(mounts) != 2 or set(mounts) != {source_mount, backup_mount}:
+        raise error_type("recovery helper command has an unexpected mount")
+    if any(item in command for item in ("--privileged", "-v", "--volume")):
+        raise error_type("recovery helper command has an unexpected authority")
+
+
+def extract_safe_state_archive(contract: BackupContract, archive_path: Path, destination: Path) -> None:
+    try:
+        with tarfile.open(archive_path, "r:") as archive:
+            for member in archive.getmembers():
+                name = _safe_archive_name(contract, member.name)
+                if not name:
+                    if member.isdir():
+                        continue
+                    raise contract.error_type("backup state archive has an invalid root member")
+                if not (member.isdir() or member.isreg()):
+                    raise contract.error_type("backup state archive contains a non-regular member")
+                target = destination.joinpath(*name.split("/"))
+                try:
+                    target.resolve().relative_to(destination.resolve())
+                except ValueError as exc:
+                    raise contract.error_type("backup state archive escapes its destination") from exc
+                if member.isdir():
+                    target.mkdir(mode=member.mode & 0o777, parents=True, exist_ok=False)
+                    continue
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise contract.error_type("backup state archive member is unreadable")
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, member.mode & 0o777)
+                with os.fdopen(fd, "wb") as output:
+                    shutil.copyfileobj(stream, output)
+                    output.flush()
+                    os.fsync(output.fileno())
+    except (OSError, tarfile.TarError) as exc:
+        raise contract.error_type("could not safely restore private state") from exc
+
+
+PUBLISHED_BACKUP_RECEIPT_SCHEMA = "restricted-synthetic-clinical-cold-backup-receipt-published.v1"
+PUBLISHED_RESTORE_RECEIPT_SCHEMA = "restricted-synthetic-clinical-cold-restore-published.v1"
+PUBLISHED_CAUSAL_RECEIPT_SCHEMA = "restricted-synthetic-clinical-cold-restore-verification-published.v1"
+PUBLISHED_BACKUP_NONCLAIMS = ["not a scheduled backup", "not PHI-authorized", "not production", "not a compliance certification"]
+PUBLISHED_RESTORE_NONCLAIMS = ["not a causal recovery verification", "not PHI-authorized", "not production", "not a compliance certification"]
+PUBLISHED_CAUSAL_NONCLAIMS = ["not PHI-authorized", "not production", "not a compliance certification"]
+
+
+def _published_common(
+    contract: BackupContract, manifest: Mapping[str, Any], identity: Mapping[str, Any], manifest_sha256: str,
+) -> dict[str, Any]:
+    try:
+        capsule = manifest["recovery_capsule"]
+        if manifest["backup_identity_sha256"] != hashlib.sha256(canonical_json_bytes(contract, identity)).hexdigest():
+            raise contract.error_type("published receipt identity binding differs")
+        if identity["recovery_trust_sha256"] != manifest["recovery_trust_sha256"]:
+            raise contract.error_type("published receipt trust authority differs")
+        return {
+            "project": identity["project"], "state_id": identity["state_id"],
+            "manifest_sha256": _require_sha256(contract, manifest_sha256, name="published manifest hash"),
+            "backup_identity_sha256": manifest["backup_identity_sha256"], "capsule_id": capsule["capsule_id"],
+            "capsule_ciphertext_sha256": capsule["ciphertext_sha256"],
+            "backup_recovery_trust_sha256": identity["recovery_trust_sha256"],
+            "backup_recovery_policy_epoch": identity["recovery_policy_epoch"],
+            "recipient_sha256": identity["recipient_sha256"], "runtime_source": identity["runtime_source"],
+            "hrh_candidate": identity["hrh_candidate"], "effective_images": identity["effective_images"],
+        }
+    except (KeyError, TypeError) as exc:
+        raise contract.error_type("published receipt binding is incomplete") from exc
+
+
+def build_backup_receipt(
+    contract: BackupContract, manifest: Mapping[str, Any], backup_dir: Path, *, identity: Mapping[str, Any],
+    manifest_sha256: str, backed_up_at: str,
+) -> dict[str, Any]:
+    del backup_dir
+    return {
+        "schema": PUBLISHED_BACKUP_RECEIPT_SCHEMA, "synthetic_only": True,
+        **_published_common(contract, manifest, identity, manifest_sha256), "mode": "published_backup",
+        "capsule_ciphertext_size": manifest["recovery_capsule"]["ciphertext_size"],
+        "sealer_sha256": identity["sealer_sha256"], "excluded_volume": identity["excluded_volume"],
+        "backed_up_at": backed_up_at, "nonclaims": list(PUBLISHED_BACKUP_NONCLAIMS),
+    }
+
+
+def _recipient_status(contract: BackupContract, trust: Mapping[str, Any], recipient_sha256: str) -> str:
+    recipients = trust.get("recipients")
+    if not isinstance(recipients, list):
+        raise contract.error_type("restore trust authority is invalid")
+    matches = [item for item in recipients if isinstance(item, dict) and item.get("recipient_sha256") == recipient_sha256]
+    if len(matches) != 1 or matches[0].get("status") not in {"active", "retired"}:
+        raise contract.error_type("restore trust authority does not bind recipient")
+    return matches[0]["status"]
+
+
+def build_restore_receipt(
+    contract: BackupContract, manifest: Mapping[str, Any], manifest_sha256: str, *, identity: Mapping[str, Any],
+    restore_trust: Mapping[str, Any], restore_trust_sha256: str, status_observed_at: str, restored_at: str,
+) -> dict[str, Any]:
+    return {
+        "schema": PUBLISHED_RESTORE_RECEIPT_SCHEMA, "synthetic_only": True,
+        **_published_common(contract, manifest, identity, manifest_sha256), "mode": "published_restore",
+        "restore_recovery_trust_sha256": _require_sha256(contract, restore_trust_sha256, name="restore trust hash"),
+        "restore_recovery_policy_epoch": restore_trust["policy_epoch"],
+        "restore_recipient_status": _recipient_status(contract, restore_trust, identity["recipient_sha256"]),
+        "excluded_volume": identity["excluded_volume"], "status_observed_at": status_observed_at,
+        "verification": "mechanical_restore_only", "restored_at": restored_at,
+        "nonclaims": list(PUBLISHED_RESTORE_NONCLAIMS),
+    }
+
+
+_MECHANICAL_FIELDS = {
+    "schema", "synthetic_only", "project", "state_id", "mode", "manifest_sha256", "backup_identity_sha256",
+    "capsule_id", "capsule_ciphertext_sha256", "backup_recovery_trust_sha256", "backup_recovery_policy_epoch",
+    "restore_recovery_trust_sha256", "restore_recovery_policy_epoch", "restore_recipient_status", "recipient_sha256",
+    "runtime_source", "hrh_candidate", "effective_images", "excluded_volume", "status_observed_at", "verification",
+    "restored_at", "nonclaims",
+}
+
+
+def _closed_mechanical(contract: BackupContract, raw: bytes) -> dict[str, Any]:
+    def no_duplicates(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise contract.error_type("duplicate mechanical receipt field")
+            value[key] = item
+        return value
+    try:
+        value = json.loads(raw, object_pairs_hook=no_duplicates)
+    except contract.error_type:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise contract.error_type("mechanical receipt is invalid") from exc
+    if not isinstance(value, dict) or set(value) != _MECHANICAL_FIELDS:
+        raise contract.error_type("mechanical receipt fields are not closed")
+    return value
+
+
+def _zulu(value: Any) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+        return False
+    try:
+        __import__("datetime").datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return True
+
+
+def build_causal_receipt(
+    contract: BackupContract, mechanical_receipt_bytes: bytes, manifest: Mapping[str, Any], identity: Mapping[str, Any],
+    restore_trust: Mapping[str, Any] | None, restore_trust_sha256: str, causal_checks: Mapping[str, bool], *, verified_at: str,
+    current_marker: Mapping[str, Any] | None = None, expected_manifest_sha256: str | None = None,
+    expected_mechanical_receipt_sha256: str | None = None,
+) -> dict[str, Any]:
+    mechanical = _closed_mechanical(contract, mechanical_receipt_bytes)
+    mechanical_sha256 = hashlib.sha256(mechanical_receipt_bytes).hexdigest()
+    if expected_manifest_sha256 is not None and mechanical["manifest_sha256"] != expected_manifest_sha256:
+        raise contract.error_type("mechanical receipt does not bind external manifest")
+    if expected_mechanical_receipt_sha256 is not None and mechanical_sha256 != expected_mechanical_receipt_sha256:
+        raise contract.error_type("mechanical receipt does not bind external authority")
+    if current_marker is not None:
+        marker_bindings = {
+            "project": identity["project"], "state_id": identity["state_id"],
+            "runtime_head": identity["runtime_source"]["runtime_head"],
+            "runtime_tree": identity["runtime_source"]["runtime_tree"],
+            "hrh_candidate": identity["hrh_candidate"], "effective_images": identity["effective_images"],
+        }
+        if any(current_marker.get(key) != value for key, value in marker_bindings.items()):
+            raise contract.error_type("current marker does not bind published identity")
+    common = _published_common(contract, manifest, identity, mechanical["manifest_sha256"])
+    if restore_trust is None:
+        restore_epoch = mechanical.get("restore_recovery_policy_epoch")
+        restore_status = mechanical.get("restore_recipient_status")
+    else:
+        restore_epoch = restore_trust.get("policy_epoch")
+        restore_status = _recipient_status(contract, restore_trust, identity["recipient_sha256"])
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", restore_trust_sha256)
+        or isinstance(restore_epoch, bool) or not isinstance(restore_epoch, int)
+        or restore_epoch < identity["recovery_policy_epoch"]
+        or restore_status not in {"active", "retired"}
+    ):
+        raise contract.error_type("restore trust authority is invalid")
+    expected = {
+        **common, "schema": PUBLISHED_RESTORE_RECEIPT_SCHEMA, "synthetic_only": True, "mode": "published_restore",
+        "restore_recovery_trust_sha256": restore_trust_sha256,
+        "restore_recovery_policy_epoch": restore_epoch,
+        "restore_recipient_status": restore_status,
+        "excluded_volume": identity["excluded_volume"], "verification": "mechanical_restore_only",
+        "nonclaims": PUBLISHED_RESTORE_NONCLAIMS,
+    }
+    for key, value in expected.items():
+        if mechanical.get(key) != value:
+            raise contract.error_type(f"mechanical receipt does not bind {key}")
+    if not _zulu(mechanical["status_observed_at"]) or not _zulu(mechanical["restored_at"]):
+        raise contract.error_type("mechanical receipt time authority is invalid")
+    return {
+        **{key: mechanical[key] for key in (
+            "project", "state_id", "manifest_sha256", "backup_identity_sha256", "capsule_id",
+            "capsule_ciphertext_sha256", "backup_recovery_trust_sha256", "backup_recovery_policy_epoch",
+            "restore_recovery_trust_sha256", "restore_recovery_policy_epoch", "restore_recipient_status",
+            "recipient_sha256", "runtime_source", "hrh_candidate", "effective_images",
+        )},
+        "schema": PUBLISHED_CAUSAL_RECEIPT_SCHEMA, "synthetic_only": True,
+        "mode": "published_restore_verification", "mechanical_receipt_sha256": mechanical_sha256,
+        "verification": "causal_e2e_verified", "causal_checks": dict(causal_checks), "verified_at": verified_at,
+        "nonclaims": list(PUBLISHED_CAUSAL_NONCLAIMS),
+    }

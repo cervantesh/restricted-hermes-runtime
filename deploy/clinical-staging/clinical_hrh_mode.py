@@ -33,6 +33,7 @@ PUBLISHED_MARKER_SCHEMA = "restricted-synthetic-clinical-staging-published.v1"
 CREATION_COMMANDS = frozenset({"init", "restore"})
 ORDINARY_COMMANDS = frozenset({
     "up", "status", "stop", "backup", "destroy", "renew-tls", "refresh-policy", "reset",
+    "finalize-cold-recovery-verification",
 })
 PUBLISHED_FLAGS = ("--hrh-trust", "--hrh-evidence", "--hrh-docker-config")
 _FLAGS = frozenset({"--hrh-root", "--hrh-mode", *PUBLISHED_FLAGS})

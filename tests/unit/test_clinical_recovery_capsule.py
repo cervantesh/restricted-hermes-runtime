@@ -634,6 +634,7 @@ def test_b03_recovery_trust_rejects_each_closed_boundary(trust, mutation):
         _fn(module, "B03", "parse_recovery_trust")(raw, now=NOW)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="B04 POSIX mode and rename-after-open witness is not representable on Windows")
 def test_b04_sealer_is_snapshotted_from_one_open_file_before_path_substitution(
     age_material, trust, tmp_path
 ):
