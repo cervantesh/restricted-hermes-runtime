@@ -245,6 +245,12 @@ def _remove_private_tree_from(descriptor: int | None, path: Path) -> None:
         pass
 
 
+def _descriptor_path(descriptor: int | None, fallback: Path) -> Path:
+    if descriptor is not None and sys.platform.startswith("linux"):
+        return Path(f"/proc/self/fd/{descriptor}")
+    return fallback
+
+
 def _reject_inode_aliases(paths: list[Path]) -> None:
     identities: set[tuple[int, int]] = set()
     for path in paths:
@@ -356,6 +362,9 @@ def snapshot_declared_member(source: Path, destination: Path, *, declared_size: 
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
+        initial = source.lstat()
+        if not stat.S_ISREG(initial.st_mode) or initial.st_size != declared_size:
+            raise CapsuleError("RECOVERY_CAPSULE_MISMATCH")
         fd = os.open(source, flags)
     except FileNotFoundError as exc:
         raise CapsuleError("RECOVERY_CAPSULE_MISSING") from exc
@@ -364,7 +373,10 @@ def snapshot_declared_member(source: Path, destination: Path, *, declared_size: 
     try:
         with os.fdopen(fd, "rb") as handle:
             before = os.fstat(handle.fileno())
-            if not stat.S_ISREG(before.st_mode) or before.st_size != declared_size:
+            stable = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if not stat.S_ISREG(before.st_mode) or before.st_size != declared_size or any(
+                getattr(initial, field) != getattr(before, field) for field in stable
+            ):
                 raise CapsuleError("RECOVERY_CAPSULE_MISMATCH")
             digest, remaining = hashlib.sha256(), declared_size
             with destination.open("xb") as output:
@@ -378,7 +390,6 @@ def snapshot_declared_member(source: Path, destination: Path, *, declared_size: 
                 if handle.read(1):
                     raise CapsuleError("RECOVERY_CAPSULE_MISMATCH")
                 after = os.fstat(handle.fileno())
-                stable = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_size", "st_mtime_ns", "st_ctime_ns")
                 if any(getattr(before, field) != getattr(after, field) for field in stable) or digest.hexdigest() != declared_sha256:
                     raise CapsuleError("RECOVERY_CAPSULE_MISMATCH")
                 output.flush()
@@ -754,9 +765,54 @@ def _valid_bech32(record: bytes) -> bool:
     return check == 1
 
 
+def _linux_group_has_live_members(group: int, *, deadline: float) -> bool:
+    proc = Path("/proc")
+    if not proc.is_dir():
+        raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
+    try:
+        entries = proc.iterdir()
+        for entry in entries:
+            if time.monotonic() >= deadline:
+                raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
+            if not entry.name.isdecimal():
+                continue
+            try:
+                descriptor = os.open(
+                    entry / "stat", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    raw = os.read(descriptor, 4097)
+                finally:
+                    os.close(descriptor)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from exc
+            if len(raw) > 4096:
+                raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
+            closing = raw.rfind(b")")
+            if closing < 1:
+                raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
+            fields = raw[closing + 1 :].split()
+            if len(fields) < 3 or len(fields[0]) != 1:
+                raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
+            try:
+                process_group = int(fields[2])
+            except ValueError as exc:
+                raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from exc
+            if process_group == group and fields[0] != b"Z":
+                return True
+    except CapsuleError:
+        raise
+    except OSError as exc:
+        raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from exc
+    return False
+
+
 def run_sealer(
     *, executable: Path, arguments: tuple[str, ...], stdin: bytes, output: Path,
     timeout_seconds: float, environment: Mapping[str, str], runner: Callable[..., Any] | None = None,
+    inherited_fds: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     if output.exists():
         raise CapsuleError("RECOVERY_OUTPUT_EXISTS")
@@ -770,7 +826,7 @@ def run_sealer(
         nonlocal feeder_joined
         if feeder is not None and not feeder_joined:
             feeder.join(max(0.0, deadline - time.monotonic()))
-            feeder_joined = True
+            feeder_joined = not feeder.is_alive()
 
     def terminate_group() -> None:
         if process is None:
@@ -778,8 +834,10 @@ def run_sealer(
         try:
             if os.name == "posix":
                 os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.kill()
         except (OSError, ProcessLookupError):
             pass
         try:
@@ -823,6 +881,7 @@ def run_sealer(
                 }
                 if os.name == "posix":
                     kwargs["start_new_session"] = True
+                    kwargs["pass_fds"] = inherited_fds
                 process = subprocess.Popen([str(executable), *arguments], **kwargs)
                 failures: list[BaseException] = []
 
@@ -848,23 +907,13 @@ def run_sealer(
                 if process.returncode:
                     terminate_group()
                     raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
-                if os.name == "posix":
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    except OSError as exc:
-                        raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from exc
-                    while True:
-                        try:
-                            os.killpg(process.pid, 0)
-                        except ProcessLookupError:
-                            break
-                        except OSError as exc:
-                            raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from exc
-                        if time.monotonic() >= deadline:
-                            raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
+                if sys.platform.startswith("linux") and _linux_group_has_live_members(
+                    process.pid, deadline=deadline,
+                ):
+                    terminate_group()
+                    while _linux_group_has_live_members(process.pid, deadline=deadline):
                         time.sleep(min(0.005, max(0.0, deadline - time.monotonic())))
+                    raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
                 output_stream.flush()
                 os.fsync(output_stream.fileno())
                 output_stream.seek(0)
@@ -890,8 +939,9 @@ def run_sealer(
 def encrypt_private_capsule(
     *, sealer: Path, recipient: str, plaintext: bytes, output: Path,
     timeout_seconds: float, environment: Mapping[str, str], runner: Callable[..., Any] | None = None,
+    inherited_fds: tuple[int, ...] = (),
 ) -> dict[str, Any]:
-    return run_sealer(executable=sealer, arguments=("--encrypt", "--recipient", recipient), stdin=plaintext, output=output, timeout_seconds=timeout_seconds, environment=environment, runner=runner)
+    return run_sealer(executable=sealer, arguments=("--encrypt", "--recipient", recipient), stdin=plaintext, output=output, timeout_seconds=timeout_seconds, environment=environment, runner=runner, inherited_fds=inherited_fds)
 
 
 def decrypt_private_capsule(
@@ -1057,9 +1107,25 @@ def prepare_published_restore(
     if any(_overlap(left, right) for index, left in enumerate(paths) for right in paths[index + 1:]):
         raise CapsuleError("published recovery paths overlap")
     _reject_inode_aliases(paths)
-    _require_trusted_parent(public_dir, allowed_modes=frozenset({0o700, 0o750}))
-    for source in (capsule_path, recovery_trust_path, recovery_sealer):
-        _require_trusted_parent(source.parent)
+    source_fds: list[int] = []
+    try:
+        public_fd, _public_token = _open_trusted_directory(
+            public_dir, allowed_modes=frozenset({0o700, 0o750}),
+        )
+        if public_fd is not None:
+            source_fds.append(public_fd)
+        stable_public = _descriptor_path(public_fd, public_dir)
+        stable_sources: list[Path] = []
+        for source in (capsule_path, recovery_trust_path, recovery_sealer):
+            parent_fd, _parent_token = _open_trusted_directory(source.parent)
+            if parent_fd is not None:
+                source_fds.append(parent_fd)
+            stable_sources.append(_descriptor_path(parent_fd, source.parent) / source.name)
+        stable_capsule, stable_trust, stable_sealer = stable_sources
+    except Exception:
+        for descriptor in source_fds:
+            os.close(descriptor)
+        raise
     _require_trusted_parent(staging.state_dir.parent)
     for parent in {staging.state_dir.parent, public_dir.parent, capsule_path.parent}:
         reconcile_owned_staging(parent, project=staging.project)
@@ -1070,26 +1136,26 @@ def prepare_published_restore(
         _canonical(_owner(run, project=staging.project, run_id=run_id, mode="restore"))
     )
     try:
-        manifest_raw = read_bounded_regular(public_dir / "backup-manifest.json", limit=1024 * 1024, code="RECOVERY_MANIFEST_MISMATCH")
+        manifest_raw = read_bounded_regular(stable_public / "backup-manifest.json", limit=1024 * 1024, code="RECOVERY_MANIFEST_MISMATCH")
         if _sha(manifest_raw) != expected_manifest_sha256:
             raise CapsuleError("RECOVERY_MANIFEST_MISMATCH")
         manifest = parse_closed_json(manifest_raw, document="backup manifest")
         members = manifest.get("members", {})
         snapshot = run / "public"
         snapshot.mkdir(mode=0o700)
-        snapshot_declared_member(public_dir / "COMPLETE", snapshot / "COMPLETE", declared_size=9, declared_sha256=_sha(b"complete\n"))
-        snapshot_declared_member(public_dir / "backup-manifest.json", snapshot / "backup-manifest.json", declared_size=len(manifest_raw), declared_sha256=expected_manifest_sha256)
+        snapshot_declared_member(stable_public / "COMPLETE", snapshot / "COMPLETE", declared_size=9, declared_sha256=_sha(b"complete\n"))
+        snapshot_declared_member(stable_public / "backup-manifest.json", snapshot / "backup-manifest.json", declared_size=len(manifest_raw), declared_sha256=expected_manifest_sha256)
         for name in ("backup-identity.json", "public-evidence.tar", "recovery-trust.json"):
             declaration = members.get(name, {})
-            snapshot_declared_member(public_dir / name, snapshot / name, declared_size=declaration.get("size", -1), declared_sha256=declaration.get("sha256", ""))
+            snapshot_declared_member(stable_public / name, snapshot / name, declared_size=declaration.get("size", -1), declared_sha256=declaration.get("sha256", ""))
         declared_capsule = manifest.get("recovery_capsule", {})
         capsule_snapshot = snapshot_declared_member(
-            capsule_path, run / "capsule.age", declared_size=declared_capsule.get("ciphertext_size", -1),
+            stable_capsule, run / "capsule.age", declared_size=declared_capsule.get("ciphertext_size", -1),
             declared_sha256=declared_capsule.get("ciphertext_sha256", ""),
         )
-        fresh_trust = read_bounded_regular(recovery_trust_path, limit=1024 * 1024, code="RECOVERY_TRUST_UNAVAILABLE")
+        fresh_trust = read_bounded_regular(stable_trust, limit=1024 * 1024, code="RECOVERY_TRUST_UNAVAILABLE")
         fresh = parse_recovery_trust(fresh_trust, now=now)
-        sealer = snapshot_sealer(recovery_sealer, run / "sealer", fresh["sealer_sha256"])
+        sealer = snapshot_sealer(stable_sealer, run / "sealer", fresh["sealer_sha256"])
         result = validate_recovery_pair(
             {"public_dir": snapshot, "capsule_path": capsule_snapshot}, expected_manifest_sha256=expected_manifest_sha256,
             fresh_trust=fresh_trust, acquired_generation=None,
@@ -1102,6 +1168,9 @@ def prepare_published_restore(
     except Exception:
         _remove_private_tree(run)
         raise
+    finally:
+        for descriptor in source_fds:
+            os.close(descriptor)
 
 
 def cleanup_prepared_restore(prepared: Mapping[str, Any]) -> None:
@@ -1203,13 +1272,23 @@ def publish_recovery_pair(
     stage = capsule_path.parent / f".capsule-run-{run_id}"
     public_run_id = os.urandom(16).hex()
     public_stage = public_dir.parent / f".capsule-run-{public_run_id}"
+    stage_fd = public_stage_fd = None
     try:
         if capsule_parent_fd is None:
             stage.mkdir(mode=0o700)
         else:
             os.mkdir(stage.name, mode=0o700, dir_fd=capsule_parent_fd)
-        _write_fsynced(stage / ".clinical-recovery-owner.json", _canonical(_owner(stage, project=public_identity["project"], run_id=run_id, mode="backup")))
-        _fsync_directory(stage)
+            stage_fd = os.open(
+                stage.name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=capsule_parent_fd,
+            )
+        stable_stage = _descriptor_path(stage_fd, stage)
+        _write_fsynced(stable_stage / ".clinical-recovery-owner.json", _canonical(_owner(stage, project=public_identity["project"], run_id=run_id, mode="backup")))
+        if stage_fd is None:
+            _fsync_directory(stage)
+        else:
+            os.fsync(stage_fd)
         if capsule_parent_fd is None:
             _fsync_directory(capsule_path.parent)
         else:
@@ -1218,13 +1297,26 @@ def publish_recovery_pair(
             public_stage.mkdir(mode=0o700)
         else:
             os.mkdir(public_stage.name, mode=0o700, dir_fd=public_parent_fd)
-        _write_fsynced(public_stage / ".clinical-recovery-owner.json", _canonical(_owner(public_stage, project=public_identity["project"], run_id=public_run_id, mode="backup")))
-        _fsync_directory(public_stage)
+            public_stage_fd = os.open(
+                public_stage.name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=public_parent_fd,
+            )
+        stable_public_stage = _descriptor_path(public_stage_fd, public_stage)
+        _write_fsynced(stable_public_stage / ".clinical-recovery-owner.json", _canonical(_owner(public_stage, project=public_identity["project"], run_id=public_run_id, mode="backup")))
+        if public_stage_fd is None:
+            _fsync_directory(public_stage)
+        else:
+            os.fsync(public_stage_fd)
         if public_parent_fd is None:
             _fsync_directory(public_dir.parent)
         else:
             os.fsync(public_parent_fd)
     except Exception:
+        if stage_fd is not None:
+            os.close(stage_fd)
+        if public_stage_fd is not None:
+            os.close(public_stage_fd)
         _remove_private_tree_from(capsule_parent_fd, stage)
         _remove_private_tree_from(public_parent_fd, public_stage)
         if capsule_parent_fd is not None:
@@ -1232,12 +1324,14 @@ def publish_recovery_pair(
         if public_parent_fd is not None:
             os.close(public_parent_fd)
         raise
-    temp_capsule = stage / "capsule.age"
-    temp_public = public_stage / "public"
+    stable_stage = _descriptor_path(stage_fd, stage)
+    stable_public_stage = _descriptor_path(public_stage_fd, public_stage)
+    temp_capsule = stable_stage / "capsule.age"
+    temp_public = stable_public_stage / "public"
     try:
         trust = parse_recovery_trust(recovery_trust, now=datetime.now(UTC))
         recipient = select_backup_recipient(trust, now=datetime.now(UTC))
-        sealer = snapshot_sealer(sealer, stage / "sealer", trust["sealer_sha256"])
+        sealer = snapshot_sealer(sealer, stable_stage / "sealer", trust["sealer_sha256"])
         if _require_trusted_parent(capsule_path.parent, allowed_modes=capsule_modes) != capsule_parent_token:
             raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
         if _require_trusted_parent(public_dir.parent, allowed_modes=public_modes) != public_parent_token:
@@ -1250,7 +1344,16 @@ def publish_recovery_pair(
             allowed_modes=public_modes,
         ):
             raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
-        result = encrypt_private_capsule(sealer=sealer, recipient=recipient["recipient"], plaintext=private_plaintext, output=temp_capsule, timeout_seconds=30, environment={})
+        if not _retained_directory_is_current(
+            capsule_path.parent, capsule_parent_fd, capsule_parent_token,
+            allowed_modes=capsule_modes,
+        ):
+            raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
+        result = encrypt_private_capsule(
+            sealer=sealer, recipient=recipient["recipient"], plaintext=private_plaintext,
+            output=temp_capsule, timeout_seconds=30, environment={},
+            inherited_fds=(stage_fd,) if stage_fd is not None else (),
+        )
         observer("CAPSULE_CIPHERTEXT_FSYNCED")
         if _require_trusted_parent(capsule_path.parent, allowed_modes=capsule_modes) != capsule_parent_token:
             raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
@@ -1295,6 +1398,10 @@ def publish_recovery_pair(
             capsule_path.unlink(missing_ok=True)
         raise CapsuleError("RECOVERY_PUBLICATION_INCOMPLETE") from exc
     finally:
+        if stage_fd is not None:
+            os.close(stage_fd)
+        if public_stage_fd is not None:
+            os.close(public_stage_fd)
         _remove_private_tree_from(capsule_parent_fd, stage)
         _remove_private_tree_from(public_parent_fd, public_stage)
         if capsule_parent_fd is not None:
