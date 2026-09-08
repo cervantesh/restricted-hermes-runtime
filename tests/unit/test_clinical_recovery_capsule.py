@@ -1742,3 +1742,216 @@ def test_destination_disappearance_is_not_misreported_as_missing_capsule(
             declared_size=10,
             declared_sha256=_digest(b"ciphertext"),
         )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="stdout-only descendant witness is POSIX-only")
+def test_sealer_rejects_stdout_only_descendant_before_hash_and_publish(tmp_path):
+    module = _api("B29_STDOUT_ONLY_DESCENDANT")
+    script, ready, pidfile = tmp_path / "fork.py", tmp_path / "ready", tmp_path / "pids"
+    script.write_text(
+        "import os,sys,time\n"
+        "child=os.fork()\n"
+        "if child==0:\n"
+        "    sys.stdin.buffer.read(); os.close(0)\n"
+        "    open(sys.argv[2],'w').write('ready')\n"
+        "    time.sleep(1); os.write(1,b'late')\n"
+        "else:\n"
+        "    while not os.path.exists(sys.argv[2]): time.sleep(.01)\n"
+        "    open(sys.argv[1],'w').write(f'{os.getpgrp()} {child}')\n"
+        "    os._exit(0)\n",
+        encoding="utf-8",
+    )
+    group = child = None
+    alive = False
+    try:
+        with pytest.raises(module.CapsuleError, match="^RECOVERY_SEALER_UNAVAILABLE$"):
+            module.run_sealer(
+                executable=Path(sys.executable),
+                arguments=(str(script), str(pidfile), str(ready)),
+                stdin=b"synthetic private",
+                output=tmp_path / "sealed",
+                timeout_seconds=0.4,
+                environment=dict(os.environ),
+            )
+    finally:
+        if pidfile.exists():
+            group, child = map(int, pidfile.read_text(encoding="utf-8").split())
+            try:
+                os.kill(child, 0)
+                alive = True
+            except ProcessLookupError:
+                pass
+        if alive and group is not None:
+            os.killpg(group, signal.SIGKILL)
+    assert not alive
+    assert not (tmp_path / "sealed").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="inode-bound swap and input-symlink witness is POSIX-only")
+def test_all_capsule_paths_remain_inode_bound_and_reject_input_parent_symlinks(
+    age_material, trust, public_identity, tmp_path, monkeypatch
+):
+    module = _api("B13_ALL_INODE_BOUND")
+    violations = []
+    swap_root = tmp_path / "swap"
+    capsule_parent, public_parent = swap_root / "capsule", swap_root / "public"
+    capsule_parent.mkdir(mode=0o700, parents=True)
+    public_parent.mkdir(mode=0o700)
+    real_require = module._require_trusted_parent
+
+    def swap_after_last_recheck(path, **kwargs):
+        token = real_require(path, **kwargs)
+        if path == public_parent and not capsule_parent.is_symlink():
+            moved, attacker = swap_root / "capsule-moved", swap_root / "attacker"
+            capsule_parent.rename(moved)
+            attacker.mkdir(mode=0o700)
+            stage = next(moved.glob(".capsule-run-*"))
+            (attacker / stage.name).mkdir(mode=0o700)
+            capsule_parent.symlink_to(attacker, target_is_directory=True)
+        return token
+
+    def redirected_seal(**kwargs):
+        violations.append(f"redirected:{kwargs['output'].resolve()}")
+        kwargs["output"].write_bytes(b"redirected private")
+        raise module.CapsuleError("synthetic stop")
+
+    monkeypatch.setattr(module, "_require_trusted_parent", swap_after_last_recheck)
+    monkeypatch.setattr(module, "snapshot_sealer", lambda source, *_args, **_kwargs: source)
+    monkeypatch.setattr(module, "encrypt_private_capsule", redirected_seal)
+    with pytest.raises(module.CapsuleError):
+        module.publish_recovery_pair(
+            public_dir=public_parent / "bundle",
+            capsule_path=capsule_parent / "capsule.age",
+            public_identity=public_identity,
+            recovery_trust=_canonical(trust),
+            private_plaintext=b"private",
+            sealer=tmp_path / "age",
+        )
+    moved = swap_root / "capsule-moved"
+    if moved.exists() and list(moved.glob(".capsule-run-*")):
+        violations.append("original-private-stage-survived-cleanup")
+
+    monkeypatch.undo()
+    for kind in ("capsule", "trust", "sealer"):
+        case = tmp_path / f"input-{kind}"
+        case.mkdir()
+        bundle = _fixture_recovery_pair(case, public_identity, trust)
+        bundle["public_dir"].chmod(0o700)
+        runtime = case / "runtime"
+        runtime.mkdir()
+        real_inputs, alias = case / "real-inputs", case / "input-alias"
+        real_inputs.mkdir(mode=0o700)
+        alias.symlink_to(real_inputs, target_is_directory=True)
+        (real_inputs / "capsule.age").write_bytes(bundle["capsule_bytes"])
+        (real_inputs / "trust.json").write_bytes(_canonical(trust))
+        shutil.copyfile(age_material["age"], real_inputs / "age")
+        (real_inputs / "age").chmod(0o500)
+        direct_capsule, direct_trust, direct_sealer = (
+            case / "capsule.age",
+            case / "trust.json",
+            case / "age",
+        )
+        direct_capsule.write_bytes(bundle["capsule_bytes"])
+        direct_trust.write_bytes(_canonical(trust))
+        shutil.copyfile(age_material["age"], direct_sealer)
+        direct_sealer.chmod(0o500)
+        selected = {
+            "capsule": alias / "capsule.age" if kind == "capsule" else direct_capsule,
+            "trust": alias / "trust.json" if kind == "trust" else direct_trust,
+            "sealer": alias / "age" if kind == "sealer" else direct_sealer,
+        }
+        staging = type(
+            "Staging",
+            (),
+            {
+                "state_dir": case / "state",
+                "runtime": runtime,
+                "hrh": None,
+                "project": PROJECT,
+            },
+        )()
+        try:
+            prepared = module.prepare_published_restore(
+                staging,
+                bundle["public_dir"],
+                selected["capsule"],
+                selected["trust"],
+                selected["sealer"],
+                bundle["external_manifest_sha256"],
+                now=NOW,
+            )
+        except module.CapsuleError:
+            continue
+        module.cleanup_prepared_restore(prepared)
+        violations.append(f"accepted-{kind}-intermediate-symlink")
+    assert violations == []
+
+
+def test_timeout_joins_feeder_after_group_termination_before_cleanup(tmp_path, monkeypatch):
+    module = _api("B29_JOIN_AFTER_KILL")
+
+    class FakePipe:
+        def write(self, _payload):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeProcess:
+        pid = 12345
+        returncode = None
+        stdin = FakePipe()
+
+        def __init__(self):
+            self.waits = 0
+            self.killed = False
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("synthetic", timeout)
+            self.returncode = -9
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+
+    class FakeThread:
+        def __init__(self, *, target):
+            self.target = target
+            self.started = False
+            self.joins = 0
+
+        def start(self):
+            self.started = True
+
+        def join(self, _timeout=None):
+            self.joins += 1
+            self.started = False
+
+        def is_alive(self):
+            return self.started
+
+    process = FakeProcess()
+    threads = []
+
+    def make_thread(*, target):
+        thread = FakeThread(target=target)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(module.threading, "Thread", make_thread)
+    with pytest.raises(module.CapsuleError, match="^RECOVERY_SEALER_UNAVAILABLE$"):
+        module.run_sealer(
+            executable=Path(sys.executable),
+            arguments=(),
+            stdin=b"private",
+            output=tmp_path / "sealed",
+            timeout_seconds=0.1,
+            environment={},
+        )
+    assert process.killed
+    assert len(threads) == 1 and threads[0].joins == 1
+    assert not threads[0].is_alive()
+    assert not list(tmp_path.glob("*.partial-*"))
