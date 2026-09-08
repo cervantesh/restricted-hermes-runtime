@@ -1955,3 +1955,118 @@ def test_timeout_joins_feeder_after_group_termination_before_cleanup(tmp_path, m
     assert len(threads) == 1 and threads[0].joins == 1
     assert not threads[0].is_alive()
     assert not list(tmp_path.glob("*.partial-*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="post-retention parent swap witness is POSIX-only")
+def test_private_output_is_inode_bound_after_final_parent_retention_check(
+    trust, public_identity, tmp_path, monkeypatch
+):
+    module = _api("B11_POST_RETENTION_SWAP")
+    capsule_parent, public_parent = tmp_path / "capsule", tmp_path / "public"
+    capsule_parent.mkdir(mode=0o700)
+    public_parent.mkdir(mode=0o700)
+    real_retained = module._retained_directory_is_current
+    swapped = {"value": False}
+    private_outputs = []
+
+    def swap_after_last_check(path, descriptor, token, **kwargs):
+        result = real_retained(path, descriptor, token, **kwargs)
+        if path == public_parent and not swapped["value"]:
+            moved, attacker = tmp_path / "capsule-moved", tmp_path / "attacker"
+            capsule_parent.rename(moved)
+            attacker.mkdir(mode=0o700)
+            stage = next(moved.glob(".capsule-run-*"))
+            (attacker / stage.name).mkdir(mode=0o700)
+            capsule_parent.symlink_to(attacker, target_is_directory=True)
+            swapped["value"] = True
+        return result
+
+    def record_output(**kwargs):
+        kwargs["output"].write_bytes(b"redirected private")
+        private_outputs.append(kwargs["output"].resolve())
+        raise module.CapsuleError("synthetic stop")
+
+    monkeypatch.setattr(module, "_retained_directory_is_current", swap_after_last_check)
+    monkeypatch.setattr(module, "snapshot_sealer", lambda source, *_args, **_kwargs: source)
+    monkeypatch.setattr(module, "encrypt_private_capsule", record_output)
+    with pytest.raises(module.CapsuleError):
+        module.publish_recovery_pair(
+            public_dir=public_parent / "bundle",
+            capsule_path=capsule_parent / "capsule.age",
+            public_identity=public_identity,
+            recovery_trust=_canonical(trust),
+            private_plaintext=b"private",
+            sealer=tmp_path / "age",
+        )
+    assert private_outputs == [], "private output followed a substituted pathname after retained-fd validation"
+    moved = tmp_path / "capsule-moved"
+    assert not moved.exists() or not list(moved.glob(".capsule-run-*"))
+
+
+def test_feeder_that_survives_pre_kill_join_is_joined_again_after_kill(
+    tmp_path, monkeypatch
+):
+    module = _api("B29_POST_KILL_REJOIN")
+
+    class FakePipe:
+        def write(self, _payload):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeProcess:
+        pid = 12345
+        stdin = FakePipe()
+
+        def __init__(self):
+            self.returncode = 0
+            self.killed = False
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    class FakeThread:
+        def __init__(self, *, target):
+            self.target = target
+            self.alive = False
+            self.joins = 0
+
+        def start(self):
+            self.alive = True
+
+        def join(self, _timeout=None):
+            self.joins += 1
+            if self.joins >= 2:
+                self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+    process = FakeProcess()
+    threads = []
+
+    def make_thread(*, target):
+        thread = FakeThread(target=target)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(module.threading, "Thread", make_thread)
+    with pytest.raises(module.CapsuleError, match="^RECOVERY_SEALER_UNAVAILABLE$"):
+        module.run_sealer(
+            executable=Path(sys.executable),
+            arguments=(),
+            stdin=b"private",
+            output=tmp_path / "sealed",
+            timeout_seconds=0.1,
+            environment={},
+        )
+    assert process.killed
+    assert len(threads) == 1 and threads[0].joins == 2
+    assert not threads[0].is_alive()
+    assert not list(tmp_path.glob("*.partial-*"))
