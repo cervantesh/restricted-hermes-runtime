@@ -738,10 +738,6 @@ def restore_published_backup(
     if identity_reader is None:
         raise CapsuleError("RECOVERY_IDENTITY_REQUIRED")
     identity_holder: list[bytes] = []
-    authorize_restore_trust(
-        archived_trust_bytes, fresh_trust_bytes, recipient_sha256=identity["recipient_sha256"], now=now,
-        identity_reader=lambda: identity_holder.append(validate_identity_input(identity_reader())),
-    )
     run = staging.state_dir.parent / f".capsule-run-{os.urandom(16).hex()}"
     run.mkdir(mode=0o700)
     plaintext_path, capsule_snapshot = run / "plaintext.tar", run / "capsule.age"
@@ -754,6 +750,11 @@ def restore_published_backup(
             declared_sha256=manifest["recovery_capsule"]["ciphertext_sha256"],
         )
         sealer = snapshot_sealer(recovery_sealer, run / "sealer", fresh_trust["sealer_sha256"])
+        authorize_restore_trust(
+            archived_trust_bytes, fresh_trust_bytes,
+            recipient_sha256=identity["recipient_sha256"], now=now,
+            identity_reader=lambda: identity_holder.append(validate_identity_input(identity_reader())),
+        )
         decrypt_private_capsule(
             sealer=sealer, capsule=capsule_snapshot, identity=identity_holder[0], output=plaintext_path,
             timeout_seconds=30, environment={},
