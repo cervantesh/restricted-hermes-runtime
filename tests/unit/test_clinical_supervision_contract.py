@@ -440,6 +440,55 @@ def test_supervision_generation_bytes_and_parent_are_verified(parser):
     asserted_only[0]["generation"]["before_sha256"] = "a" * 64
     assert_rejected(parser, asserted_only)
 
+    failed_changed = packet()
+    failed_changed[0]["generation"].update(
+        operation="restart",
+        parent_sha256=sha256(failed_changed[1][BEFORE]),
+    )
+    failed_changed[1][AFTER] = canonical(generation(container="8" * 64))
+    failed_changed[0]["generation"]["after_sha256"] = sha256(
+        failed_changed[1][AFTER]
+    )
+    failed_changed[2]["expected_after"] = failed_changed[1][AFTER]
+    assert_rejected(parser, failed_changed)
+
+
+def test_recovered_event_requires_linked_changed_workload_generation(parser):
+    valid = packet()
+    before_hash = sha256(valid[1][BEFORE])
+    valid[1][AFTER] = canonical(
+        generation(container="8" * 64, started="2026-09-07T12:02:00.123456789Z")
+    )
+    after_hash = sha256(valid[1][AFTER])
+    valid[0]["generation"].update(
+        operation="restart",
+        before_sha256=before_hash,
+        after_sha256=after_hash,
+        parent_sha256=before_hash,
+    )
+    valid[2]["expected_after"] = valid[1][AFTER]
+    recovered = make_event(
+        after_hash,
+        event_class="recovered",
+        outcome="SUCCEEDED",
+    )
+    replace_event(valid, recovered)
+    assert validate(parser, valid) is None
+
+    unchanged = packet()
+    unchanged_hash = sha256(unchanged[1][BEFORE])
+    unchanged[0]["generation"].update(
+        operation="restart",
+        parent_sha256=unchanged_hash,
+    )
+    recovered = make_event(
+        unchanged_hash,
+        event_class="recovered",
+        outcome="SUCCEEDED",
+    )
+    replace_event(unchanged, recovered)
+    assert_rejected(parser, unchanged, match="restart-unchanged-generation")
+
 
 def test_supervision_proofs_require_declared_bytes_and_status_cardinality(parser):
     validate(parser, packet())
