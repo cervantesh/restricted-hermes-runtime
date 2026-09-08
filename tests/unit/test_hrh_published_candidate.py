@@ -250,7 +250,12 @@ def signed_statement(receipt: dict, role: str, predicate_type: str) -> dict:
                     "material_evidence": subject["material_evidence"],
                     "retention_evidence": subject["retention_evidence"],
                 },
-                "resolvedDependencies": [{"digest": {"gitCommit": H}}],
+                "resolvedDependencies": [
+                    {
+                        "uri": "https://forgejo.aalinstitute.com/cervantes/Health-Record-Hub.git",
+                        "digest": {"gitCommit": H},
+                    }
+                ],
             },
             "runDetails": {
                 "metadata": {"invocationId": receipt["signing"]["workflow_run_url"]}
@@ -684,6 +689,92 @@ def test_forged_nested_matching_statement_cannot_replace_wrong_signed_outer_stat
         tool.CandidateVerificationError, match="signed candidate contract"
     ):
         tool.verify_attestations(candidate, key.read_bytes(), docker_config, runner=runner)
+
+
+def _attestation_docker_config(tmp_path: Path) -> Path:
+    directory = tmp_path / "attestation-docker"
+    directory.mkdir(mode=0o700)
+    config = directory / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "auths": {
+                    "us-east4-docker.pkg.dev": {
+                        "auth": base64.b64encode(b"user:placeholder").decode()
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        config.chmod(0o600)
+    return directory
+
+
+def test_one_matching_and_one_conflicting_signed_outer_statement_is_rejected(tmp_path):
+    tool = load_tool()
+    trust, receipt, key = fixture(tmp_path)
+    candidate = tool.validate_candidate(trust, receipt, key.read_bytes())
+    docker_config = _attestation_docker_config(tmp_path)
+
+    def runner(args, **kwargs):
+        role = "migrate" if MIGRATE in args else "web"
+        predicate = (
+            "https://spdx.dev/Document/v2.3"
+            if "spdxjson" in args
+            else "https://slsa.dev/provenance/v1"
+        )
+        matching = signed_statement(receipt, role, predicate)
+        statements = [matching]
+        if role == "web" and predicate.endswith("provenance/v1"):
+            conflicting = json.loads(json.dumps(matching))
+            conflicting["predicate"]["buildDefinition"]["externalParameters"][
+                "role"
+            ] = "migrate"
+            statements.append(conflicting)
+        envelopes = [
+            {
+                "payload": base64.b64encode(json.dumps(statement).encode()).decode()
+            }
+            for statement in statements
+        ]
+        return subprocess.CompletedProcess(args, 0, json.dumps(envelopes), "")
+
+    with pytest.raises(tool.CandidateVerificationError, match="signed candidate contract"):
+        tool.verify_attestations(
+            candidate, key.read_bytes(), docker_config, runner=runner
+        )
+
+
+def test_provenance_rejects_unrelated_decoy_dependency_carrying_trusted_h(tmp_path):
+    tool = load_tool()
+    trust, receipt, key = fixture(tmp_path)
+    candidate = tool.validate_candidate(trust, receipt, key.read_bytes())
+    docker_config = _attestation_docker_config(tmp_path)
+
+    def runner(args, **kwargs):
+        role = "migrate" if MIGRATE in args else "web"
+        predicate = (
+            "https://spdx.dev/Document/v2.3"
+            if "spdxjson" in args
+            else "https://slsa.dev/provenance/v1"
+        )
+        statement = signed_statement(receipt, role, predicate)
+        if role == "web" and predicate.endswith("provenance/v1"):
+            statement["predicate"]["buildDefinition"]["resolvedDependencies"] = [
+                {"uri": "git+https://attacker.invalid/wrong", "digest": {"gitCommit": "c" * 40}},
+                {"digest": {"gitCommit": H}},
+            ]
+        payload = base64.b64encode(json.dumps(statement).encode()).decode()
+        return subprocess.CompletedProcess(
+            args, 0, json.dumps([{"payload": payload}]), ""
+        )
+
+    with pytest.raises(tool.CandidateVerificationError, match="signed candidate contract"):
+        tool.verify_attestations(
+            candidate, key.read_bytes(), docker_config, runner=runner
+        )
 
 
 @pytest.mark.parametrize(

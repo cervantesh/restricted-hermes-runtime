@@ -287,6 +287,20 @@ def _statement_matches(statement: dict[str, Any], candidate: dict[str, Any], rol
     build = predicate.get("buildDefinition", {})
     external = build.get("externalParameters", {})
     run = predicate.get("runDetails", {}).get("metadata", {}).get("invocationId")
+    dependencies = build.get("resolvedDependencies")
+    expected_run = receipt["signing"]["workflow_run_url"]
+    run_root, separator, run_id = expected_run.rpartition("/actions/runs/")
+    if not separator or not run_root or not run_id:
+        return False
+    dependency_matches = (
+        isinstance(dependencies, list)
+        and len(dependencies) == 1
+        and isinstance(dependencies[0], dict)
+        and set(dependencies[0]) == {"uri", "digest"}
+        and dependencies[0].get("uri") == f"{run_root}.git"
+        and dependencies[0].get("digest")
+        == {"gitCommit": trust["build_source_revision"]}
+    )
     return (
         external.get("role") == role
         and external.get("platform") == "linux/amd64"
@@ -298,8 +312,8 @@ def _statement_matches(statement: dict[str, Any], candidate: dict[str, Any], rol
         and external.get("runtime_identity") == subject["runtime_identity"]
         and external.get("material_evidence") == subject["material_evidence"]
         and external.get("retention_evidence") == subject["retention_evidence"]
-        and run == receipt["signing"]["workflow_run_url"]
-        and any(item.get("digest", {}).get("gitCommit") == trust["build_source_revision"] for item in build.get("resolvedDependencies", []) if isinstance(item, dict))
+        and run == expected_run
+        and dependency_matches
     )
 
 
@@ -351,7 +365,13 @@ def verify_attestations(
                 result = runner(args, text=True, capture_output=True, check=False, timeout=300, env=sealed_docker_environment())
                 _require(result.returncode == 0, f"{role} {field} cryptographic verification failed")
                 statements = _parse_cosign_envelopes(result.stdout)
-                _require(any(_statement_matches(statement, candidate, role, field) for statement in statements), f"{role} {field} verified payload does not bind the exact signed candidate contract")
+                _require(
+                    all(
+                        _statement_matches(statement, candidate, role, field)
+                        for statement in statements
+                    ),
+                    f"{role} {field} verified payload does not bind the exact signed candidate contract",
+                )
                 verified += 1
     return {
         "verified_predicates": sorted(
