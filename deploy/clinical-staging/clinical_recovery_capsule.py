@@ -220,6 +220,31 @@ def _require_trusted_parent(
     return token
 
 
+def _retained_directory_is_current(
+    path: Path, descriptor: int | None, token: tuple[int, int, int, int], *,
+    allowed_modes: frozenset[int] | None,
+) -> bool:
+    if descriptor is None:
+        return _require_trusted_parent(path, allowed_modes=allowed_modes) == token
+    held = _trusted_directory_metadata(os.fstat(descriptor), allowed_modes=allowed_modes)
+    current_descriptor, current = _open_trusted_directory(path, allowed_modes=allowed_modes)
+    try:
+        return held == token == current
+    finally:
+        if current_descriptor is not None:
+            os.close(current_descriptor)
+
+
+def _remove_private_tree_from(descriptor: int | None, path: Path) -> None:
+    if descriptor is None:
+        _remove_private_tree(path)
+        return
+    try:
+        shutil.rmtree(path.name, dir_fd=descriptor)
+    except FileNotFoundError:
+        pass
+
+
 def _reject_inode_aliases(paths: list[Path]) -> None:
     identities: set[tuple[int, int]] = set()
     for path in paths:
@@ -738,6 +763,14 @@ def run_sealer(
     partial = output.parent / f".{output.name}.partial-{os.urandom(8).hex()}"
     output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     process: subprocess.Popen[bytes] | None = None
+    feeder: threading.Thread | None = None
+    feeder_joined = False
+
+    def join_feeder() -> None:
+        nonlocal feeder_joined
+        if feeder is not None and not feeder_joined:
+            feeder.join(max(0.0, deadline - time.monotonic()))
+            feeder_joined = True
 
     def terminate_group() -> None:
         if process is None:
@@ -750,9 +783,15 @@ def run_sealer(
         except (OSError, ProcessLookupError):
             pass
         try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except OSError:
+            pass
+        try:
             process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except (subprocess.SubprocessError, OSError):
             pass
+        join_feeder()
 
     deadline = time.monotonic() + timeout_seconds
     try:
@@ -802,13 +841,30 @@ def run_sealer(
                 except subprocess.TimeoutExpired:
                     terminate_group()
                     raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from None
-                feeder.join(max(0.0, deadline - time.monotonic()))
+                join_feeder()
                 if feeder.is_alive() or failures:
                     terminate_group()
                     raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
                 if process.returncode:
                     terminate_group()
                     raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except OSError as exc:
+                        raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from exc
+                    while True:
+                        try:
+                            os.killpg(process.pid, 0)
+                        except ProcessLookupError:
+                            break
+                        except OSError as exc:
+                            raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from exc
+                        if time.monotonic() >= deadline:
+                            raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
+                        time.sleep(min(0.005, max(0.0, deadline - time.monotonic())))
                 output_stream.flush()
                 os.fsync(output_stream.fileno())
                 output_stream.seek(0)
@@ -1002,6 +1058,8 @@ def prepare_published_restore(
         raise CapsuleError("published recovery paths overlap")
     _reject_inode_aliases(paths)
     _require_trusted_parent(public_dir, allowed_modes=frozenset({0o700, 0o750}))
+    for source in (capsule_path, recovery_trust_path, recovery_sealer):
+        _require_trusted_parent(source.parent)
     _require_trusted_parent(staging.state_dir.parent)
     for parent in {staging.state_dir.parent, public_dir.parent, capsule_path.parent}:
         reconcile_owned_staging(parent, project=staging.project)
@@ -1167,8 +1225,8 @@ def publish_recovery_pair(
         else:
             os.fsync(public_parent_fd)
     except Exception:
-        _remove_private_tree(stage)
-        _remove_private_tree(public_stage)
+        _remove_private_tree_from(capsule_parent_fd, stage)
+        _remove_private_tree_from(public_parent_fd, public_stage)
         if capsule_parent_fd is not None:
             os.close(capsule_parent_fd)
         if public_parent_fd is not None:
@@ -1183,6 +1241,14 @@ def publish_recovery_pair(
         if _require_trusted_parent(capsule_path.parent, allowed_modes=capsule_modes) != capsule_parent_token:
             raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
         if _require_trusted_parent(public_dir.parent, allowed_modes=public_modes) != public_parent_token:
+            raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
+        if not _retained_directory_is_current(
+            capsule_path.parent, capsule_parent_fd, capsule_parent_token,
+            allowed_modes=capsule_modes,
+        ) or not _retained_directory_is_current(
+            public_dir.parent, public_parent_fd, public_parent_token,
+            allowed_modes=public_modes,
+        ):
             raise CapsuleError("RECOVERY_OUTPUT_PARENT_UNTRUSTED")
         result = encrypt_private_capsule(sealer=sealer, recipient=recipient["recipient"], plaintext=private_plaintext, output=temp_capsule, timeout_seconds=30, environment={})
         observer("CAPSULE_CIPHERTEXT_FSYNCED")
@@ -1229,9 +1295,8 @@ def publish_recovery_pair(
             capsule_path.unlink(missing_ok=True)
         raise CapsuleError("RECOVERY_PUBLICATION_INCOMPLETE") from exc
     finally:
-        _remove_private_tree(stage)
-        if public_stage.exists():
-            _remove_private_tree(public_stage)
+        _remove_private_tree_from(capsule_parent_fd, stage)
+        _remove_private_tree_from(public_parent_fd, public_stage)
         if capsule_parent_fd is not None:
             os.close(capsule_parent_fd)
         if public_parent_fd is not None:
