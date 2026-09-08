@@ -610,6 +610,32 @@ The receipt rules are:
 - cross-mode, minimal, duplicate-member and substituted receipts fail before a
   `verified-restore-*` artifact is written.
 
+### Causal-finalization authority
+
+Published-v2 causal finalization does not trust the retained mechanical receipt
+by filename or content alone. In addition to the closed causal-check set, its
+CLI/method boundary requires exactly:
+
+```text
+--backup-dir PATH
+--expected-manifest-sha256 HASH
+--expected-mechanical-receipt-sha256 HASH
+```
+
+The restore result exposes the mechanical receipt SHA-256 as public output for
+independent operator custody. Finalization snapshots and revalidates the exact
+public bundle against the expected manifest hash, validates the current
+published marker, reads the exact retained mechanical bytes with duplicate
+rejection, and requires their recomputed hash to equal the independently
+supplied expected mechanical hash. It then enforces every bundle/marker/
+mechanical equality above before constructing the causal receipt. The causal
+`mechanical_receipt_sha256` is that recomputed and externally expected value.
+
+Missing, extra or duplicate finalizer inputs; a missing, substituted or
+cross-mode bundle; a mechanical hash mismatch; or any field mismatch fails
+before a causal artifact is created. The finalizer does not require the private
+capsule, recovery identity, Docker configuration or a KMS/IAM call.
+
 For every published receipt, `synthetic_only` is true; hash strings are
 lowercase 64-character SHA-256 values; epochs and ciphertext size are positive
 integers that do not accept booleans; timestamps are UTC
@@ -654,13 +680,13 @@ justification and tests remain separate from capsule confidentiality.
 | B22 | Real subprocess restores on a distinct state path without an HRH checkout or preexisting HRH web/migrate images; pinned third-party and locally built clinical images are explicit preconditions. |
 | B23 | `recovering` precedes the first volume; later failure remains visible and non-operational. |
 | B24 | Migration failure never starts HRH web or clinical witnesses. |
-| B25 | Backup emits the exact content-safe published backup receipt; restore success reaches `ready`, emits only a bound mechanical receipt and removes run-owned snapshots/plaintext; the separate causal finalizer remains required. |
+| B25 | Backup emits the exact content-safe published backup receipt; restore success reaches `ready`, emits only a bound mechanical receipt plus its public SHA-256 and removes run-owned snapshots/plaintext; the separate causal finalizer requires the revalidated public bundle and independently custodied expected mechanical hash. |
 | B26 | Exact trust comparison demonstrates allowed active/retired transitions, no validity-window extension, revoked/removal rejection and lost-identity fail-closed behavior; receipts bind archived backup trust and fresh restore authority separately. |
 | B27 | Published v1 returns `PUBLISHED_BACKUP_V1_UNSAFE` without opening `state.tar`. |
 | B28 | Source-v1 and published-v2 schema substitution fails before mutation. |
 | B29 | A sealer hang is terminated as a process group within the bounded timeout, produces only `RECOVERY_SEALER_UNAVAILABLE`, leaves no output/plaintext partial, and does not relay child diagnostics. |
 | R01 | Source receipt golden fixtures remain byte-identical under frozen clock/path inputs. |
-| R02 | Closed published receipts bind exact bundle/marker/mechanical bytes through `mechanical_receipt_sha256`, preserve distinct backup-trust and fresh-restore-authority hashes/epochs/status across rotation, and require independent finalization. |
+| R02 | Closed published receipts bind exact revalidated bundle/current marker/mechanical bytes through the independently supplied and recomputed `mechanical_receipt_sha256`, preserve distinct backup-trust and fresh-restore-authority hashes/epochs/status across rotation, and require independent finalization. |
 | R03 | Mutants that hard-code source `BACKUP_SCHEMA` or substitute the mechanical receipt are killed. |
 
 ## Planned implementation footprint
