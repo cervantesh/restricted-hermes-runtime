@@ -27,6 +27,7 @@ PUBLISHED_FLAGS = ("--hrh-trust", "--hrh-evidence", "--hrh-docker-config")
 _FLAGS = frozenset({"--hrh-root", "--hrh-mode", *PUBLISHED_FLAGS})
 _MODES = frozenset({"source-build", "published"})
 _RESUMABLE = frozenset({"initializing", "finalizing"})
+_LIFECYCLES = _RESUMABLE | {"recovering", "ready", "stopped", "renewing_tls", "tls_prepared"}
 
 
 class ModeError(ValueError):
@@ -111,8 +112,8 @@ def plan_hrh_mode(
 ) -> HRHModePlan:
     """Resolve a transient plan without consulting environment or filesystem.
 
-    ``environment`` is explicitly supplied only to reject a forbidden published
-    HRH source-root declaration. It supplies no defaults or acquisition values.
+    Published plans require an explicit ``environment`` mapping to reject a
+    forbidden HRH source-root declaration. It supplies no defaults or inputs.
     The integrator must pass its actual environment and validated marker header;
     this pure helper deliberately does not discover either itself.
     """
@@ -140,12 +141,17 @@ def plan_hrh_mode(
             raise ModeError("source-build requires --hrh-root")
         return HRHModePlan(command, mode, source_root=Path(root))
 
-    if root is not None or (environment is not None and "CLINICAL_HRH_ROOT" in environment):
+    if not isinstance(environment, Mapping):
+        raise ModeError("published planning requires an explicit environment mapping")
+    if root is not None or "CLINICAL_HRH_ROOT" in environment:
         raise ModeError("published mode rejects any HRH root argument or CLINICAL_HRH_ROOT")
     if command == "reset":
         raise ModeError("published reset is unsupported; destroy then use explicit published init/restore")
-    if command == "up" and marker_lifecycle in _RESUMABLE:
-        raise ModeError("published incomplete state requires explicit init-based resume with fresh inputs")
+    if command == "up":
+        if not isinstance(marker_lifecycle, str) or marker_lifecycle not in _LIFECYCLES:
+            raise ModeError("published up requires a supplied validated marker lifecycle")
+        if marker_lifecycle in _RESUMABLE:
+            raise ModeError("published incomplete state requires explicit init-based resume with fresh inputs")
     if command == "init" and persisted == "published" and marker_lifecycle not in _RESUMABLE:
         raise ModeError("published init can resume only initializing or finalizing state")
     if command in CREATION_COMMANDS:

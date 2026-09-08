@@ -468,7 +468,7 @@ def test_u2_every_source_command_requires_explicit_root(pure_mode, command):
 
 @pytest.mark.parametrize("command", ["init", "restore"])
 def test_u2_published_creation_requires_exact_inputs_and_overlay(pure_mode, tmp_path, command):
-    plan = pure_mode.plan_hrh_mode(command, ["--hrh-mode", "published", *_publication_arguments(tmp_path)])
+    plan = pure_mode.plan_hrh_mode(command, ["--hrh-mode", "published", *_publication_arguments(tmp_path)], environment={})
     assert plan.mode == "published" and plan.source_root is None
     assert plan.published_inputs.trust == tmp_path / "trust.json"
     assert plan.published_inputs.evidence == tmp_path / "evidence"
@@ -486,7 +486,7 @@ def test_u2_published_creation_rejects_each_missing_path(pure_mode, tmp_path, co
     index = options.index(flag)
     del options[index:index + 2]
     with pytest.raises(pure_mode.ModeError, match=flag):
-        pure_mode.plan_hrh_mode(command, ["--hrh-mode", "published", *options])
+        pure_mode.plan_hrh_mode(command, ["--hrh-mode", "published", *options], environment={})
 
 
 @pytest.mark.parametrize("mode", ["source", "Published", "SOURCE-BUILD", "", " published"])
@@ -571,12 +571,12 @@ def test_u2_environment_cannot_supply_published_acquisition(pure_mode):
 
 def test_u2_published_reset_is_denied_with_recovery_direction(pure_mode):
     with pytest.raises(pure_mode.ModeError, match="destroy.*init/restore"):
-        pure_mode.plan_hrh_mode("reset", (), marker_schema=pure_mode.PUBLISHED_MARKER_SCHEMA)
+        pure_mode.plan_hrh_mode("reset", (), marker_schema=pure_mode.PUBLISHED_MARKER_SCHEMA, environment={})
 
 
 @pytest.mark.parametrize("lifecycle", ["initializing", "finalizing"])
 def test_u2_published_resume_requires_explicit_fresh_inputs(pure_mode, tmp_path, lifecycle):
-    header = {"marker_schema": pure_mode.PUBLISHED_MARKER_SCHEMA, "marker_lifecycle": lifecycle}
+    header = {"marker_schema": pure_mode.PUBLISHED_MARKER_SCHEMA, "marker_lifecycle": lifecycle, "environment": {}}
     with pytest.raises(pure_mode.ModeError, match="explicit.*published"):
         pure_mode.plan_hrh_mode("init", (), **header)
     with pytest.raises(pure_mode.ModeError, match="--hrh-trust"):
@@ -591,7 +591,7 @@ def test_u2_published_resume_requires_explicit_fresh_inputs(pure_mode, tmp_path,
 def test_u2_published_init_cannot_resume_an_unapproved_lifecycle(pure_mode, tmp_path, lifecycle):
     with pytest.raises(pure_mode.ModeError, match="resume"):
         pure_mode.plan_hrh_mode("init", ["--hrh-mode", "published", *_publication_arguments(tmp_path)],
-            marker_schema=pure_mode.PUBLISHED_MARKER_SCHEMA, marker_lifecycle=lifecycle)
+            marker_schema=pure_mode.PUBLISHED_MARKER_SCHEMA, marker_lifecycle=lifecycle, environment={})
 
 
 def test_u2_existing_generation_cannot_switch_modes(pure_mode, tmp_path):
@@ -608,6 +608,29 @@ def test_u2_planning_never_resolves_paths_or_invokes_children(pure_mode, tmp_pat
     monkeypatch.setattr(Path, "stat", denied)
     monkeypatch.setattr(Path, "open", denied)
     monkeypatch.setattr(subprocess, "run", denied)
-    plan = pure_mode.plan_hrh_mode("restore", ["--hrh-mode", "published", *_publication_arguments(tmp_path)])
+    plan = pure_mode.plan_hrh_mode("restore", ["--hrh-mode", "published", *_publication_arguments(tmp_path)], environment={})
     assert plan.acquire_hrh is True
     assert "docker-reader" not in repr(plan)
+
+
+@pytest.mark.parametrize("lifecycle", [None, "", "unknown"])
+def test_u2_published_up_requires_supplied_lifecycle(pure_mode, lifecycle):
+    header = {} if lifecycle is None else {"marker_lifecycle": lifecycle}
+    with pytest.raises(pure_mode.ModeError, match="lifecycle"):
+        pure_mode.plan_hrh_mode("up", (), marker_schema=pure_mode.PUBLISHED_MARKER_SCHEMA,
+            environment={}, **header)
+
+
+@pytest.mark.parametrize("command", ["init", "restore", *ORDINARY])
+def test_u2_published_plan_requires_explicit_environment(pure_mode, tmp_path, command):
+    options = ["--hrh-mode", "published", *_publication_arguments(tmp_path)] if command in {"init", "restore"} else []
+    header = {"marker_schema": pure_mode.PUBLISHED_MARKER_SCHEMA, "marker_lifecycle": "ready"} if command in ORDINARY else {}
+    with pytest.raises(pure_mode.ModeError, match="environment mapping"):
+        pure_mode.plan_hrh_mode(command, options, **header)
+
+
+@pytest.mark.parametrize("environment", [None, "", [], True])
+def test_u2_published_environment_requires_mapping(pure_mode, tmp_path, environment):
+    with pytest.raises(pure_mode.ModeError, match="environment mapping"):
+        pure_mode.plan_hrh_mode("init", ["--hrh-mode", "published", *_publication_arguments(tmp_path)],
+            environment=environment)
