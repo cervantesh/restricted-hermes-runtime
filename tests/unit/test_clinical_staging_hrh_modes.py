@@ -7,10 +7,12 @@ Public input flags were adjudicated as --hrh-trust, --hrh-evidence and
 effective Compose merge, never because a proposed module cannot be imported.
 
 Acceptance map (all fixture values are synthetic):
- A01: source defaults, parser-optional root, semantic missing-root rejection.
+ A01: source defaults, parser-optional root, init/restore missing-root denial
+      before child processes or target-state mutation.
  A02: supported published syntax, root/input/environment rejection before I/O.
  A03: no second CLI mode/input authority on ordinary lifecycle commands;
-      root optional at parsing, then required for an existing source marker.
+      root optional at parsing, then required for an existing source marker
+      on every ordinary command, including refresh-policy and reset.
  A05/A06: real Compose CLI config, not a hand-written YAML merge.
  A14: exact existing source frame/marker/backup and built_images result shape.
  A18: reset cannot select a new mode; existing source reset choreography.
@@ -243,15 +245,34 @@ def _source_marker(module, tmp_path, *, lifecycle="ready"):
     return marker
 
 
-@pytest.mark.parametrize("command", ["status", "up", "stop", "backup", "destroy", "renew-tls"])
-def test_a03_existing_source_marker_requires_root_before_children(module, tmp_path, monkeypatch, command):
+@pytest.mark.parametrize("command", ["init", "restore", *ORDINARY])
+def test_a01_a03_source_mode_requires_root_before_children_or_state_mutation(module, tmp_path, monkeypatch, capsys, command):
     _parse_supported(module, _argv(tmp_path, command))
-    _source_marker(module, tmp_path)
-    before = (_paths(tmp_path)[0] / module.MARKER_NAME).read_bytes()
+    state, _ = _paths(tmp_path)
+    if command in ORDINARY:
+        _source_marker(module, tmp_path)
+        for name in ("seed", "evidence"):
+            (state / name).mkdir()
+            (state / name / "preserve.txt").write_bytes(b"synthetic-state-must-survive")
+
+    def snapshot():
+        return {
+            path.relative_to(tmp_path).as_posix(): None if path.is_dir() else path.read_bytes()
+            for path in tmp_path.rglob("*")
+        }
+
+    before = snapshot()
     calls = _deny_children(module, monkeypatch)
+    # Keep the assertion about missing source authority, not Windows support.
+    monkeypatch.setattr(module.ClinicalStaging, "_require_linux", lambda self: None)
     assert _main_exit(module, _argv(tmp_path, command)) != 0
     assert calls == []
-    assert (_paths(tmp_path)[0] / module.MARKER_NAME).read_bytes() == before
+    assert snapshot() == before
+    if command not in ORDINARY:
+        assert not state.exists()
+    output = capsys.readouterr()
+    assert "Traceback" not in output.err
+    assert re.search(r"hrh.root|hrh-root|clinical_hrh_root", output.err.lower())
 
 
 def _compose_environment(module, tmp_path, *, published):
