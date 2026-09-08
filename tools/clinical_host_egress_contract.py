@@ -23,6 +23,7 @@ from typing import Any, Iterable
 BEFORE = "platform/generation.before.json"
 AFTER = "platform/generation.after.json"
 WITNESS = "platform/egress-witness.v1.json"
+GENERATION_SCHEMA = "restricted-clinical-platform-generation.v1"
 ROWS = tuple(f"EL{index:02}" for index in range(1, 18))
 _MODES = {"source-build", "published"}
 _MISSING = {"witness-unavailable", "host-not-observed"}
@@ -122,7 +123,7 @@ def _timestamp(value: object) -> bool:
 def _generation(raw: bytes) -> dict[str, Any]:
     _require(isinstance(raw, bytes) and 1 <= len(raw) <= 1_048_576, "generation-size")
     value = _closed(_canonical_object(raw), _GENERATION_KEYS, "generation-fields")
-    _require(value["schema"] == "restricted-clinical-platform-generation.v1", "generation-schema")
+    _require(value["schema"] == GENERATION_SCHEMA, "generation-schema")
     _require(isinstance(value["mode"], str) and value["mode"] in _MODES, "generation-mode")
     _require(_digest(value["candidate_id"]), "candidate-id")
     policy = _closed(value["policy"], {"epoch", "digest"}, "policy-fields")
@@ -152,6 +153,49 @@ def _generation(raw: bytes) -> dict[str, Any]:
         _sorted_unique(network_ids, "network-order")
     _sorted_unique(services, "workload-order")
     return value
+
+
+def validate_generation_bytes(
+    raw: bytes,
+    *,
+    expected_mode: str,
+    expected_candidate_id: str,
+    expected_services: Iterable[str],
+) -> None:
+    """Validate one generation document against independent frame inputs.
+
+    This is the single public entry point for the private ``_generation``
+    grammar.  It proves only closed/canonical byte structure and equality to
+    the caller-supplied frame; it does not establish where either came from.
+    """
+    value = _generation(raw)
+    _require(
+        isinstance(expected_mode, str) and expected_mode in _MODES,
+        "expected-generation-mode",
+    )
+    _require(_digest(expected_candidate_id), "expected-candidate-id")
+    _require(
+        not isinstance(expected_services, (str, bytes)),
+        "expected-service-inventory",
+    )
+    try:
+        services = list(expected_services)
+    except TypeError:
+        raise ContractError("expected-service-inventory") from None
+    _require(
+        bool(services) and all(_text(service) for service in services),
+        "expected-service-inventory",
+    )
+    _sorted_unique(services, "expected-service-order")
+    _require(value["mode"] == expected_mode, "generation-mode-binding")
+    _require(
+        value["candidate_id"] == expected_candidate_id,
+        "generation-candidate-binding",
+    )
+    _require(
+        [row["service"] for row in value["workloads"]] == services,
+        "generation-service-binding",
+    )
 
 
 def _producer(value: object) -> dict[str, Any]:

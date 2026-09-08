@@ -107,6 +107,37 @@ def test_parser_acceptance_does_not_promote_unverified_effects(parser, packet):
     assert packet[2] == before[2]
 
 
+def test_public_generation_validator_binds_independent_frame(parser, packet):
+    raw = packet[1][BEFORE]
+    assert parser.validate_generation_bytes(
+        raw,
+        expected_mode="published",
+        expected_candidate_id="sha256:" + "1" * 64,
+        expected_services=("operator-proxy",),
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("expected_mode", "source-build"),
+        ("expected_candidate_id", "sha256:" + "0" * 64),
+        ("expected_services", ("other-service",)),
+    ],
+)
+def test_public_generation_validator_rejects_frame_substitution(
+    parser, packet, field, value
+):
+    expected = {
+        "expected_mode": "published",
+        "expected_candidate_id": "sha256:" + "1" * 64,
+        "expected_services": ("operator-proxy",),
+    }
+    expected[field] = value
+    with pytest.raises(parser.ContractError):
+        parser.validate_generation_bytes(packet[1][BEFORE], **expected)
+
+
 @pytest.mark.parametrize("field", ["candidate_id", "mode", "policy", "compose_sha256", "resolver_sha", "project", "state_id", "host_baseline_sha256", "enforcement_sha256", "workloads"])
 def test_identity_or_mode_substitution_rejected(parser, packet, field):
     replacements = {"candidate_id": "sha256:" + "0" * 64, "mode": "source-build",
