@@ -833,6 +833,7 @@ def test_b10_b11_publication_failpoints_never_report_or_retain_partial_success(
     age_material, trust, public_identity, tmp_path, stage
 ):
     module = _api("B10")
+    tmp_path.chmod(0o700)
     (tmp_path / "private").mkdir(mode=0o700)
     events = []
 
@@ -1290,8 +1291,8 @@ def test_b12_owner_markers_are_durable_before_private_sealing(
 ):
     module = _api("B12_DURABLE_OWNER")
     public_parent, capsule_parent = tmp_path / "public-parent", tmp_path / "capsule-parent"
-    public_parent.mkdir()
-    capsule_parent.mkdir()
+    public_parent.mkdir(mode=0o700)
+    capsule_parent.mkdir(mode=0o700)
     events = []
     real_fsync = os.fsync
 
@@ -1331,8 +1332,8 @@ def test_b11_manifest_failpoint_precedes_complete_visibility(
 ):
     module = _api("B11_EXACT_STAGE")
     public_parent, capsule_parent = tmp_path / "public-parent", tmp_path / "capsule-parent"
-    public_parent.mkdir()
-    capsule_parent.mkdir()
+    public_parent.mkdir(mode=0o700)
+    capsule_parent.mkdir(mode=0o700)
     monkeypatch.setattr(module, "snapshot_sealer", lambda source, *_args, **_kwargs: source)
 
     def seal(**kwargs):
