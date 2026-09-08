@@ -463,7 +463,7 @@ from clinical_backup_bundle import (
     build_backup_manifest as _codec_build_backup_manifest,
     build_backup_receipt as _codec_build_backup_receipt,
     build_causal_receipt as _codec_build_causal_receipt,
-    build_causal_receipt as _codec_validate_causal_receipt,
+    validate_causal_receipt as _codec_validate_causal_receipt,
     build_restore_receipt as _codec_build_restore_receipt,
     canonical_json_bytes as _codec_canonical_json_bytes,
     create_state_archive as _codec_create_state_archive,
@@ -1553,6 +1553,10 @@ class ClinicalStaging:
         if not backup_dir.parent.is_dir():
             raise SafetyError("backup parent directory must already exist")
         temporary = backup_dir.parent / f".{backup_dir.name}.partial-{secrets.token_hex(8)}"
+        if self.mode_plan.mode == "published" and recovery_trust is not None:
+            recovery_codec.reconcile_owned_staging(backup_dir.parent, project=self.project)
+            private_builder = lambda: recovery_codec.build_private_backup_inputs(self, temporary, marker, volume_directory=BACKUP_VOLUME_DIR, state_archive=BACKUP_STATE_ARCHIVE, volume_keys=BACKED_UP_VOLUME_KEYS, create_state=create_state_archive)
+            return recovery_codec.finish_published_backup(self, temporary, marker, backup_dir, recovery_trust_path=recovery_trust, recovery_sealer=recovery_sealer, capsule_path=recovery_capsule, contract=_backup_contract(), receipt_builder=_codec_build_backup_receipt, now=datetime.now(UTC), verifier_evidence_names=hrh_mode._verifier(self.runtime).EVIDENCE_FILES, private_builder=private_builder)
         try:
             temporary.mkdir(mode=0o700)
             (temporary / BACKUP_VOLUME_DIR).mkdir(mode=0o700)
@@ -1565,8 +1569,6 @@ class ClinicalStaging:
             for key in BACKED_UP_VOLUME_KEYS:
                 self._assert_unmounted_backup_volumes(marker["volumes"])
                 self._backup_volume(key, marker["volumes"][key], temporary)
-            if self.mode_plan.mode == "published" and recovery_trust is not None:
-                return recovery_codec.finish_published_backup(self, temporary, marker, backup_dir, recovery_trust_path=recovery_trust, recovery_sealer=recovery_sealer, capsule_path=recovery_capsule, contract=_backup_contract(), receipt_builder=_codec_build_backup_receipt, now=datetime.now(UTC), verifier_evidence_names=hrh_mode._verifier(self.runtime).EVIDENCE_FILES)
             fsync_directory(temporary / BACKUP_VOLUME_DIR)
             manifest = build_backup_manifest(marker, self.state_dir, temporary)
             write_backup_manifest(temporary, manifest)
@@ -1579,11 +1581,6 @@ class ClinicalStaging:
                 shutil.rmtree(temporary)
             raise
         manifest_sha256 = file_sha256(backup_dir / BACKUP_MANIFEST_NAME)
-        if self.mode_plan.mode == "published":
-            return _codec_build_backup_receipt(
-                _backup_contract(), manifest, backup_dir, identity=marker,
-                manifest_sha256=manifest_sha256, backed_up_at=datetime.now(UTC).isoformat(),
-            )
         return {
             "schema": BACKUP_SCHEMA,
             "synthetic_only": True,
@@ -1673,11 +1670,18 @@ class ClinicalStaging:
         self._require_linux()
         backup_dir = validate_backup_path(backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime,) if self.hrh is None else (self.runtime, self.hrh))
         if self.mode_plan.mode == "published" and recovery_trust is not None:
+            prepared = None
             try:
-                recovery_codec.validate_recovery_pair({"public_dir": backup_dir, "capsule_path": recovery_capsule}, expected_manifest_sha256=expected_manifest_sha256, fresh_trust=recovery_codec.read_bounded_regular(recovery_trust, limit=1024 * 1024, code="RECOVERY_TRUST_UNAVAILABLE"), acquired_generation=None)
-                acquisition = hrh_mode.acquire_published_candidate(self.runtime, self.mode_plan.published_inputs, operator_lock_path(self.state_dir, self.project).parent, runner=subprocess.run, snapshot_key=self.project)
-                return recovery_codec.restore_published_backup(self, backup_dir, expected_manifest_sha256, recovery_trust_path=recovery_trust, recovery_sealer=recovery_sealer, capsule_path=recovery_capsule, identity_reader=recovery_identity_reader, acquired_generation=acquisition.candidate, contract=_backup_contract(), receipt_builder=_codec_build_restore_receipt, renew_tls=renew_tls, now=datetime.now(UTC))
+                prepared = recovery_codec.prepare_published_restore(self, backup_dir, recovery_capsule, recovery_trust, recovery_sealer, expected_manifest_sha256, now=datetime.now(UTC))
+                try:
+                    acquisition = hrh_mode.acquire_published_candidate(self.runtime, self.mode_plan.published_inputs, operator_lock_path(self.state_dir, self.project).parent, runner=subprocess.run, snapshot_key=self.project)
+                except Exception:
+                    recovery_codec.cleanup_prepared_restore(prepared)
+                    raise
+                return recovery_codec.restore_published_backup(self, backup_dir, expected_manifest_sha256, recovery_trust_path=recovery_trust, recovery_sealer=recovery_sealer, capsule_path=recovery_capsule, identity_reader=recovery_identity_reader, acquired_generation=acquisition.candidate, contract=_backup_contract(), receipt_builder=_codec_build_restore_receipt, renew_tls=renew_tls, now=datetime.now(UTC), prepared=prepared)
             except (hrh_mode.ModeError, recovery_codec.CapsuleError) as exc:
+                if prepared is not None:
+                    recovery_codec.cleanup_prepared_restore(prepared)
                 raise SafetyError(str(exc)) from exc
         snapshot = materialize_backup_snapshot(
             backup_dir, self.state_dir.parent, snapshot_stem=self.state_dir.name,
@@ -1738,18 +1742,8 @@ class ClinicalStaging:
             }
             receipt_dir = self.state_dir / "evidence" / "recovery"
             receipt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if self.mode_plan.mode == "published":
-                receipt = _codec_build_restore_receipt(
-                    _backup_contract(), manifest, expected_manifest_sha256,
-                    identity=marker, restore_trust=manifest.get("restore_trust", {}),
-                    restore_trust_sha256=manifest.get("restore_trust_sha256", "0" * 64),
-                    status_observed_at=status["observed_at"], restored_at=datetime.now(UTC).isoformat(),
-                )
             receipt_path = receipt_dir / f"restore-{expected_manifest_sha256}.json"
-            if self.mode_plan.mode == "published":
-                receipt_path.write_bytes(canonical_json_bytes(receipt))
-            else:
-                write_json_atomic(receipt_path, receipt, mode=0o600)
+            write_json_atomic(receipt_path, receipt, mode=0o600)
             return receipt
         except Exception as exc:
             if published_state:
@@ -1781,12 +1775,17 @@ class ClinicalStaging:
         if self.mode_plan.mode == "published":
             if backup_dir is None or expected_mechanical_receipt_sha256 is None:
                 raise SafetyError("published causal finalization requires independent public anchors")
-            manifest_bytes = (backup_dir / BACKUP_MANIFEST_NAME).read_bytes()
-            if file_sha256(backup_dir / BACKUP_MANIFEST_NAME) != expected_manifest_sha256:
-                raise SafetyError("external manifest hash differs")
-            manifest = json.loads(manifest_bytes)
-            identity = json.loads((backup_dir / "backup-identity.json").read_bytes())
-            mechanical_bytes = mechanical_path.read_bytes()
+            try:
+                validated = recovery_codec.snapshot_and_validate_public_bundle(
+                    backup_dir, self.state_dir.parent, project=self.project, expected_manifest_sha256=expected_manifest_sha256,
+                    verifier_evidence_names=hrh_mode._verifier(Path(__file__).resolve().parents[2]).EVIDENCE_FILES,
+                )
+                manifest, identity = validated["manifest"], validated["identity"]
+                mechanical_bytes = recovery_codec.read_bounded_regular(
+                    mechanical_path, limit=1024 * 1024, code="RECOVERY_MECHANICAL_RECEIPT_UNAVAILABLE",
+                )
+            except recovery_codec.CapsuleError as exc:
+                raise SafetyError(str(exc)) from exc
             if hashlib.sha256(mechanical_bytes).hexdigest() != expected_mechanical_receipt_sha256:
                 raise SafetyError("external mechanical receipt hash differs")
             if marker["project"] != identity["project"] or marker["state_id"] != identity["state_id"] or {"runtime_head": marker["runtime_head"], "runtime_tree": marker["runtime_tree"]} != identity["runtime_source"] or marker["hrh_candidate"] != identity["hrh_candidate"] or marker["effective_images"] != identity["effective_images"]:

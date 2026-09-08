@@ -775,7 +775,7 @@ def _zulu(value: Any) -> bool:
     return True
 
 
-def build_causal_receipt(
+def validate_causal_receipt(
     contract: BackupContract, mechanical_receipt_bytes: bytes, manifest: Mapping[str, Any], identity: Mapping[str, Any],
     restore_trust: Mapping[str, Any] | None, restore_trust_sha256: str, causal_checks: Mapping[str, bool], *, verified_at: str,
     current_marker: Mapping[str, Any] | None = None, expected_manifest_sha256: str | None = None,
@@ -835,3 +835,8 @@ def build_causal_receipt(
         "verification": "causal_e2e_verified", "causal_checks": dict(causal_checks), "verified_at": verified_at,
         "nonclaims": list(PUBLISHED_CAUSAL_NONCLAIMS),
     }
+
+
+def build_causal_receipt(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Build only from the same closed inputs accepted by the pure validator."""
+    return validate_causal_receipt(*args, **kwargs)

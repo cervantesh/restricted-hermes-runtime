@@ -7,11 +7,14 @@ import hashlib
 import json
 import os
 import re
+import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
+import time
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -67,6 +70,8 @@ def validate_recovery_arguments(parser: argparse.ArgumentParser, parsed: argpars
         parser.error("the complete recovery boundary must be declared")
     if parsed.command == "restore" and parsed.recovery_identity_stdin and not all(declared):
         parser.error("recovery identity stdin requires the complete recovery boundary")
+    if parsed.command == "restore" and all(declared) and not parsed.recovery_identity_stdin:
+        parser.error("published recovery requires --recovery-identity-stdin")
 
 
 def add_finalizer_arguments(parser: argparse.ArgumentParser) -> None:
@@ -91,7 +96,7 @@ def dispatch_recovery_command(staging: Any, args: argparse.Namespace) -> Any:
             args.backup_dir, args.expected_manifest_sha256, renew_tls=args.renew_tls,
             recovery_trust=args.recovery_trust, recovery_sealer=args.recovery_sealer,
             recovery_capsule=args.recovery_capsule,
-            recovery_identity_reader=(lambda: sys.stdin.buffer.read(4097)) if args.recovery_identity_stdin else None,
+            recovery_identity_reader=(lambda: read_identity_stdin(sys.stdin.buffer, timeout_seconds=30)) if args.recovery_identity_stdin else None,
         )
     if len(args.causal_check) != len(set(args.causal_check)):
         raise CapsuleError("causal checks must not be duplicated")
@@ -102,12 +107,53 @@ def dispatch_recovery_command(staging: Any, args: argparse.Namespace) -> Any:
     )
 
 
+def read_identity_stdin(stream: Any, *, timeout_seconds: float) -> bytes:
+    try:
+        descriptor = stream.fileno()
+    except (AttributeError, OSError, ValueError) as exc:
+        raise CapsuleError("RECOVERY_IDENTITY_REQUIRED") from exc
+    deadline = time.monotonic() + timeout_seconds
+    payload = bytearray()
+    while b"\n" not in payload and len(payload) <= 4096:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([descriptor], [], [], remaining)[0]:
+            raise CapsuleError("RECOVERY_CAPSULE_UNAVAILABLE")
+        chunk = os.read(descriptor, min(512, 4097 - len(payload)))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    return validate_identity_input(bytes(payload))
+
+
 def _canonical(value: Mapping[str, Any]) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name != "posix":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _overlap(left: Path, right: Path) -> bool:
+    left, right = left.resolve(), right.resolve()
+    try:
+        left.relative_to(right)
+        return True
+    except ValueError:
+        try:
+            right.relative_to(left)
+            return True
+        except ValueError:
+            return False
 
 
 def _duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -237,7 +283,14 @@ def snapshot_sealer(source: Path, run_dir: Path, expected_sha256: str, *, opener
         effective_opener = os.open if os.name == "nt" else opener
         fd = effective_opener(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         with os.fdopen(fd, "rb") as handle:
-            data = handle.read()
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
+            if os.name == "posix" and (metadata.st_uid not in {0, os.geteuid()} or metadata.st_mode & 0o022 or not metadata.st_mode & 0o100):
+                raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
+            data = handle.read(32 * 1024 * 1024 + 1)
+        if len(data) > 32 * 1024 * 1024:
+            raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
         if _sha(data) != expected_sha256:
             raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
         with destination.open("xb") as handle:
@@ -245,6 +298,7 @@ def snapshot_sealer(source: Path, run_dir: Path, expected_sha256: str, *, opener
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(destination, 0o500)
+        _fsync_directory(destination.parent)
     except CapsuleError:
         raise
     except OSError as exc:
@@ -300,10 +354,19 @@ def build_public_bundle(
     }
     public_dir.mkdir(mode=0o700, parents=False)
     for name, data in files.items():
-        (public_dir / name).write_bytes(data)
-    (public_dir / "backup-manifest.json").write_bytes(_canonical(manifest))
-    (public_dir / "COMPLETE").write_bytes(b"complete\n")
+        _write_fsynced(public_dir / name, data)
+    _write_fsynced(public_dir / "backup-manifest.json", _canonical(manifest))
+    _write_fsynced(public_dir / "COMPLETE", b"complete\n")
+    _fsync_directory(public_dir)
     return manifest
+
+
+def _write_fsynced(path: Path, data: bytes) -> None:
+    with path.open("xb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(path, 0o600)
 
 
 def write_private_atomic(path: Path, data: bytes) -> None:
@@ -375,9 +438,10 @@ def load_public_evidence(state_dir: Path, verifier_evidence_names: tuple[str, ..
         raise CapsuleError("RECOVERY_EVIDENCE_UNAVAILABLE") from exc
 
 
-def _safe_tar(payload: bytes) -> tuple[dict[str, bytes], list[str]]:
+def _safe_tar(payload: bytes) -> tuple[dict[str, bytes], list[str], dict[str, str]]:
     files: dict[str, bytes] = {}
     order: list[str] = []
+    ownership: dict[str, str] = {}
     try:
         with tarfile.open(fileobj=BytesIO(payload), mode="r:") as archive:
             for member in archive.getmembers():
@@ -389,15 +453,33 @@ def _safe_tar(payload: bytes) -> tuple[dict[str, bytes], list[str]]:
                     raise CapsuleError("RECOVERY_CAPSULE_INVALID")
                 files[member.name] = handle.read()
                 order.append(member.name)
+                ownership[member.name] = _sha(_canonical({"uid": member.uid, "gid": member.gid, "mode": member.mode}))
     except CapsuleError:
         raise
     except (tarfile.TarError, OSError) as exc:
         raise CapsuleError("RECOVERY_CAPSULE_INVALID") from exc
-    return files, order
+    return files, order, ownership
+
+
+def _validate_nested_tar(payload: bytes) -> None:
+    names: set[str] = set()
+    try:
+        with tarfile.open(fileobj=BytesIO(payload), mode="r:") as archive:
+            for member in archive.getmembers():
+                path = PurePosixPath(member.name)
+                if path.is_absolute() or ".." in path.parts or member.name in names:
+                    raise CapsuleError("RECOVERY_CAPSULE_INVALID")
+                if not (member.isdir() or member.isreg()):
+                    raise CapsuleError("RECOVERY_CAPSULE_INVALID")
+                names.add(member.name)
+    except CapsuleError:
+        raise
+    except (tarfile.TarError, OSError) as exc:
+        raise CapsuleError("RECOVERY_CAPSULE_INVALID") from exc
 
 
 def validate_capsule_plaintext(plaintext: bytes, *, public_identity: Mapping[str, Any]) -> dict[str, Any]:
-    files, names = _safe_tar(plaintext)
+    files, names, ownership = _safe_tar(plaintext)
     if set(files) != set(PRIVATE_NAMES):
         raise CapsuleError("RECOVERY_CAPSULE_INVALID")
     manifest = parse_closed_json(files["capsule-manifest.json"], document="capsule manifest")
@@ -418,8 +500,9 @@ def validate_capsule_plaintext(plaintext: bytes, *, public_identity: Mapping[str
         declaration = manifest["members"][name]
         if not isinstance(declaration, dict) or set(declaration) != {"sha256", "size", "ownership_sha256"}:
             raise CapsuleError("RECOVERY_CAPSULE_INVALID")
-        if declaration["sha256"] != _sha(files[name]) or declaration["size"] != len(files[name]):
+        if declaration["sha256"] != _sha(files[name]) or declaration["size"] != len(files[name]) or declaration["ownership_sha256"] != ownership[name]:
             raise CapsuleError("RECOVERY_CAPSULE_INVALID")
+        _validate_nested_tar(files[name])
     return {"manifest": manifest, "members": files, "member_names": names}
 
 
@@ -470,28 +553,33 @@ def run_sealer(
             if completed.returncode != 0:
                 raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
             data = completed.stdout
+            with partial.open("xb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
         else:
-            kwargs: dict[str, Any] = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "env": dict(environment)}
-            if os.name == "posix":
-                kwargs["start_new_session"] = True
-            process = subprocess.Popen([str(executable), *arguments], **kwargs)
-            try:
-                data, _diagnostic = process.communicate(stdin, timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
+            with partial.open("xb") as output_stream:
+                kwargs: dict[str, Any] = {"stdin": subprocess.PIPE, "stdout": output_stream, "stderr": subprocess.DEVNULL, "env": dict(environment)}
                 if os.name == "posix":
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
-                process.communicate()
-                raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from None
-            if process.returncode:
-                raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
-        with partial.open("xb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+                    kwargs["start_new_session"] = True
+                process = subprocess.Popen([str(executable), *arguments], **kwargs)
+                try:
+                    process.communicate(stdin, timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                    process.communicate()
+                    raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE") from None
+                if process.returncode:
+                    raise CapsuleError("RECOVERY_SEALER_UNAVAILABLE")
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+            data = read_bounded_regular(partial, limit=64 * 1024 * 1024, code="RECOVERY_SEALER_UNAVAILABLE")
         os.chmod(partial, 0o600)
         os.replace(partial, output)
+        _fsync_directory(output.parent)
         return {"sha256": _sha(data), "size": len(data), "stderr": b""}
     except CapsuleError:
         partial.unlink(missing_ok=True)
@@ -503,14 +591,14 @@ def run_sealer(
 
 def encrypt_private_capsule(
     *, sealer: Path, recipient: str, plaintext: bytes, output: Path,
-    timeout_seconds: float, environment: Mapping[str, str], runner: Callable[..., Any] = subprocess.run,
+    timeout_seconds: float, environment: Mapping[str, str], runner: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     return run_sealer(executable=sealer, arguments=("--encrypt", "--recipient", recipient), stdin=plaintext, output=output, timeout_seconds=timeout_seconds, environment=environment, runner=runner)
 
 
 def decrypt_private_capsule(
     *, sealer: Path, capsule: Path, identity: bytes, output: Path,
-    timeout_seconds: float, environment: Mapping[str, str], runner: Callable[..., Any] = subprocess.run,
+    timeout_seconds: float, environment: Mapping[str, str], runner: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     if output.exists():
         raise CapsuleError("RECOVERY_OUTPUT_EXISTS")
@@ -520,10 +608,12 @@ def decrypt_private_capsule(
 
 def authorize_restore_trust(
     archived_raw: bytes, fresh_raw: bytes, *, recipient_sha256: str, now: datetime,
-    identity_reader: Callable[[], Any],
+    identity_reader: Callable[[], Any], read_identity: bool = True,
 ) -> dict[str, Any]:
     archived = _parse_recovery_trust(archived_raw, require_one_active=False)
     fresh = _parse_recovery_trust(fresh_raw, require_one_active=False)
+    if any(fresh[field] != archived[field] for field in ("schema", "scheme", "sealer_sha256")):
+        raise CapsuleError("RECOVERY_TRUST_MISMATCH")
     if fresh["policy_epoch"] < archived["policy_epoch"]:
         raise CapsuleError("RECOVERY_POLICY_ROLLBACK")
     old = next((item for item in archived["recipients"] if item["recipient_sha256"] == recipient_sha256), None)
@@ -538,7 +628,8 @@ def authorize_restore_trust(
         raise CapsuleError("RECOVERY_RECIPIENT_EXPIRED")
     if _time(current["not_before"]) != _time(old["not_before"]) or _time(current["not_after"]) > _time(old["not_after"]):
         raise CapsuleError("RECOVERY_RECIPIENT_REVOKED")
-    identity_reader()
+    if read_identity:
+        identity_reader()
     return {"archived": archived, "fresh": fresh, "recipient": current}
 
 
@@ -558,11 +649,10 @@ def require_restore_schema(selected: str, actual: str, *, mutate: Callable[[], A
     mutate()
 
 
-def validate_recovery_pair(
-    pair: Mapping[str, Any], *, expected_manifest_sha256: str,
-    fresh_trust: bytes, acquired_generation: Mapping[str, Any] | None,
+def validate_public_bundle(
+    public: Path, *, expected_manifest_sha256: str,
+    verifier_evidence_names: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    public = Path(pair["public_dir"])
     expected_files = {"COMPLETE", "backup-identity.json", "backup-manifest.json", "public-evidence.tar", "recovery-trust.json"}
     try:
         entries = list(public.iterdir())
@@ -570,7 +660,7 @@ def validate_recovery_pair(
         raise CapsuleError("RECOVERY_MANIFEST_MISMATCH") from exc
     if {item.name for item in entries} != expected_files or any(item.is_symlink() or not item.is_file() for item in entries):
         raise CapsuleError("RECOVERY_MANIFEST_MISMATCH")
-    if (public / "COMPLETE").read_bytes() != b"complete\n":
+    if read_bounded_regular(public / "COMPLETE", limit=9, code="RECOVERY_MANIFEST_MISMATCH") != b"complete\n":
         raise CapsuleError("RECOVERY_MANIFEST_MISMATCH")
     manifest_raw = read_bounded_regular(public / "backup-manifest.json", limit=1024 * 1024, code="RECOVERY_MANIFEST_MISMATCH")
     if _sha(manifest_raw) != expected_manifest_sha256:
@@ -597,7 +687,53 @@ def validate_recovery_pair(
         data = read_bounded_regular(public / name, limit=16 * 1024 * 1024, code="RECOVERY_MANIFEST_MISMATCH")
         if not isinstance(declaration, dict) or set(declaration) != {"sha256", "size", "ownership_sha256"} or declaration.get("sha256") != _sha(data) or declaration.get("size") != len(data) or not _SHA256.fullmatch(str(declaration.get("ownership_sha256", ""))):
             raise CapsuleError("RECOVERY_MANIFEST_MISMATCH")
+    if verifier_evidence_names is not None:
+        _evidence, evidence_order, _ownership = _safe_tar(
+            read_bounded_regular(public / "public-evidence.tar", limit=16 * 1024 * 1024, code="RECOVERY_MANIFEST_MISMATCH")
+        )
+        expected_order = [*verifier_evidence_names, "SHA256SUMS.json", "trust.json", "verification.json"]
+        if evidence_order != expected_order:
+            raise CapsuleError("RECOVERY_MANIFEST_MISMATCH")
     parse_recovery_trust(trust_raw, now=datetime.now(UTC))
+    return {"manifest": manifest, "identity": identity, "archived_trust": trust_raw}
+
+
+def snapshot_and_validate_public_bundle(
+    public: Path, staging_parent: Path, *, project: str, expected_manifest_sha256: str,
+    verifier_evidence_names: tuple[str, ...],
+) -> dict[str, Any]:
+    run_id = os.urandom(16).hex()
+    run = staging_parent / f".capsule-run-{run_id}"
+    run.mkdir(mode=0o700)
+    _write_fsynced(run / ".clinical-recovery-owner.json", _canonical(_owner(run, project=project, run_id=run_id, mode="restore")))
+    snapshot = run / "public"
+    snapshot.mkdir(mode=0o700)
+    try:
+        manifest_raw = read_bounded_regular(public / "backup-manifest.json", limit=1024 * 1024, code="RECOVERY_MANIFEST_MISMATCH")
+        if _sha(manifest_raw) != expected_manifest_sha256:
+            raise CapsuleError("RECOVERY_MANIFEST_MISMATCH")
+        manifest = parse_closed_json(manifest_raw, document="backup manifest")
+        members = manifest.get("members", {})
+        declarations = {
+            "COMPLETE": {"size": 9, "sha256": _sha(b"complete\n")},
+            "backup-manifest.json": {"size": len(manifest_raw), "sha256": expected_manifest_sha256},
+            **{name: members.get(name, {}) for name in ("backup-identity.json", "public-evidence.tar", "recovery-trust.json")},
+        }
+        for name, declaration in declarations.items():
+            snapshot_declared_member(public / name, snapshot / name, declared_size=declaration.get("size", -1), declared_sha256=declaration.get("sha256", ""))
+        return validate_public_bundle(snapshot, expected_manifest_sha256=expected_manifest_sha256, verifier_evidence_names=verifier_evidence_names)
+    finally:
+        _remove_private_tree(run)
+
+
+def validate_recovery_pair(
+    pair: Mapping[str, Any], *, expected_manifest_sha256: str,
+    fresh_trust: bytes, acquired_generation: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    validated = validate_public_bundle(
+        Path(pair["public_dir"]), expected_manifest_sha256=expected_manifest_sha256,
+    )
+    manifest, identity = validated["manifest"], validated["identity"]
     declared = manifest.get("recovery_capsule", {})
     if not isinstance(declared, dict) or set(declared) != {"capsule_id", "ciphertext_sha256", "ciphertext_size"} or declared.get("capsule_id") != identity.get("capsule_id") or not _HEX32.fullmatch(str(declared.get("capsule_id", ""))) or not _SHA256.fullmatch(str(declared.get("ciphertext_sha256", ""))) or isinstance(declared.get("ciphertext_size"), bool) or not isinstance(declared.get("ciphertext_size"), int) or declared["ciphertext_size"] < 1:
         raise CapsuleError("RECOVERY_MANIFEST_MISMATCH")
@@ -607,9 +743,60 @@ def validate_recovery_pair(
     if acquired_generation is not None and identity.get("hrh_candidate") != acquired_generation:
         raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
     fresh = parse_recovery_trust(fresh_trust, now=datetime.now(UTC))
-    if identity.get("recovery_trust_sha256") != _sha(trust_raw) or fresh.get("policy_epoch", 0) < identity.get("recovery_policy_epoch", 0):
+    if identity.get("recovery_trust_sha256") != _sha(validated["archived_trust"]) or fresh.get("policy_epoch", 0) < identity.get("recovery_policy_epoch", 0):
         raise CapsuleError("RECOVERY_TRUST_MISMATCH")
-    return {"manifest": manifest, "identity": identity, "capsule": capsule}
+    return {**validated, "capsule": capsule}
+
+
+def prepare_published_restore(
+    staging: Any, public_dir: Path, capsule_path: Path, recovery_trust_path: Path,
+    recovery_sealer: Path, expected_manifest_sha256: str, *, now: datetime,
+) -> dict[str, Any]:
+    for parent in {staging.state_dir.parent, public_dir.parent, capsule_path.parent}:
+        reconcile_owned_staging(parent, project=staging.project)
+    run_id = os.urandom(16).hex()
+    run = staging.state_dir.parent / f".capsule-run-{run_id}"
+    run.mkdir(mode=0o700)
+    (run / ".clinical-recovery-owner.json").write_bytes(
+        _canonical(_owner(run, project=staging.project, run_id=run_id, mode="restore"))
+    )
+    try:
+        manifest_raw = read_bounded_regular(public_dir / "backup-manifest.json", limit=1024 * 1024, code="RECOVERY_MANIFEST_MISMATCH")
+        if _sha(manifest_raw) != expected_manifest_sha256:
+            raise CapsuleError("RECOVERY_MANIFEST_MISMATCH")
+        manifest = parse_closed_json(manifest_raw, document="backup manifest")
+        members = manifest.get("members", {})
+        snapshot = run / "public"
+        snapshot.mkdir(mode=0o700)
+        snapshot_declared_member(public_dir / "COMPLETE", snapshot / "COMPLETE", declared_size=9, declared_sha256=_sha(b"complete\n"))
+        snapshot_declared_member(public_dir / "backup-manifest.json", snapshot / "backup-manifest.json", declared_size=len(manifest_raw), declared_sha256=expected_manifest_sha256)
+        for name in ("backup-identity.json", "public-evidence.tar", "recovery-trust.json"):
+            declaration = members.get(name, {})
+            snapshot_declared_member(public_dir / name, snapshot / name, declared_size=declaration.get("size", -1), declared_sha256=declaration.get("sha256", ""))
+        declared_capsule = manifest.get("recovery_capsule", {})
+        capsule_snapshot = snapshot_declared_member(
+            capsule_path, run / "capsule.age", declared_size=declared_capsule.get("ciphertext_size", -1),
+            declared_sha256=declared_capsule.get("ciphertext_sha256", ""),
+        )
+        fresh_trust = read_bounded_regular(recovery_trust_path, limit=1024 * 1024, code="RECOVERY_TRUST_UNAVAILABLE")
+        fresh = parse_recovery_trust(fresh_trust, now=now)
+        sealer = snapshot_sealer(recovery_sealer, run / "sealer", fresh["sealer_sha256"])
+        result = validate_recovery_pair(
+            {"public_dir": snapshot, "capsule_path": capsule_snapshot}, expected_manifest_sha256=expected_manifest_sha256,
+            fresh_trust=fresh_trust, acquired_generation=None,
+        )
+        authorize_restore_trust(
+            result["archived_trust"], fresh_trust, recipient_sha256=result["identity"]["recipient_sha256"],
+            now=now, identity_reader=lambda: None, read_identity=False,
+        )
+        return {"run": run, "public": snapshot, "capsule": capsule_snapshot, "sealer": sealer, "fresh_trust": fresh_trust, "result": result}
+    except Exception:
+        _remove_private_tree(run)
+        raise
+
+
+def cleanup_prepared_restore(prepared: Mapping[str, Any]) -> None:
+    _remove_private_tree(Path(prepared["run"]))
 
 
 def _owner(stage: Path, *, project: str, run_id: str, mode: str) -> dict[str, Any]:
@@ -642,6 +829,43 @@ def reconcile_capsule_outputs(
     return {"code": "CLEAN"}
 
 
+def reconcile_owned_staging(parent: Path, *, project: str) -> None:
+    try:
+        candidates = sorted(path for path in parent.iterdir() if path.name.startswith(".capsule-run-"))
+    except OSError as exc:
+        raise CapsuleError("RECOVERY_STAGING_UNAVAILABLE") from exc
+    if len(candidates) > 8:
+        raise CapsuleError("RECOVERY_STAGING_UNAVAILABLE")
+    for stage in candidates:
+        match = re.fullmatch(r"\.capsule-run-([0-9a-f]{32})", stage.name)
+        marker = stage / ".clinical-recovery-owner.json"
+        if match is None or stage.is_symlink() or not stage.is_dir() or marker.is_symlink() or not marker.is_file():
+            continue
+        try:
+            raw = read_bounded_regular(marker, limit=4096, code="RECOVERY_STAGING_UNAVAILABLE")
+            owner = parse_closed_json(raw, document="recovery owner")
+            if owner.get("mode") not in {"backup", "restore"}:
+                continue
+            expected = _owner(stage, project=project, run_id=match.group(1), mode=owner["mode"])
+            if owner == expected and _canonical(owner) == raw:
+                _remove_private_tree(stage)
+        except CapsuleError:
+            continue
+
+
+def build_private_backup_inputs(
+    staging: Any, target: Path, marker: Mapping[str, Any], *, volume_directory: str,
+    state_archive: str, volume_keys: tuple[str, ...], create_state: Callable[[Path, Path], Any],
+) -> None:
+    target.mkdir(mode=0o700)
+    (target / volume_directory).mkdir(mode=0o700)
+    create_state(staging.state_dir, target / state_archive)
+    staging.compose("down", timeout=600)
+    for key in volume_keys:
+        staging._assert_unmounted_backup_volumes(marker["volumes"])
+        staging._backup_volume(key, marker["volumes"][key], target)
+
+
 def publish_recovery_pair(
     *, public_dir: Path, capsule_path: Path, public_identity: Mapping[str, Any],
     recovery_trust: bytes, private_plaintext: bytes, sealer: Path,
@@ -651,11 +875,16 @@ def publish_recovery_pair(
     if public_dir.exists() or capsule_path.exists():
         raise CapsuleError("RECOVERY_OUTPUT_EXISTS")
     run_id = os.urandom(16).hex()
-    stage = public_dir.parent / f".capsule-run-{run_id}"
+    stage = capsule_path.parent / f".capsule-run-{run_id}"
+    public_run_id = os.urandom(16).hex()
+    public_stage = public_dir.parent / f".capsule-run-{public_run_id}"
+    capsule_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     stage.mkdir(mode=0o700)
     (stage / ".clinical-recovery-owner.json").write_bytes(_canonical(_owner(stage, project=public_identity["project"], run_id=run_id, mode="backup")))
+    public_stage.mkdir(mode=0o700)
+    (public_stage / ".clinical-recovery-owner.json").write_bytes(_canonical(_owner(public_stage, project=public_identity["project"], run_id=public_run_id, mode="backup")))
     temp_capsule = stage / "capsule.age"
-    temp_public = stage / "public"
+    temp_public = public_stage / "public"
     try:
         trust = parse_recovery_trust(recovery_trust, now=datetime.now(UTC))
         recipient = select_backup_recipient(trust, now=datetime.now(UTC))
@@ -665,14 +894,24 @@ def publish_recovery_pair(
         capsule_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.replace(temp_capsule, capsule_path)
         observer("CAPSULE_PUBLISHED")
+        _fsync_directory(capsule_path.parent)
         observer("CAPSULE_PARENT_FSYNCED")
         build_public_bundle(temp_public, public_identity=public_identity, recovery_trust=recovery_trust, evidence=evidence or {}, capsule_sha256=result["sha256"], capsule_size=result["size"])
         observer("PUBLIC_MANIFEST_FSYNCED")
         observer("PUBLIC_COMPLETE_FSYNCED")
         os.replace(temp_public, public_dir)
         observer("PUBLIC_PUBLISHED")
+        _fsync_directory(public_dir.parent)
         observer("PUBLIC_PARENT_FSYNCED")
-        return {"manifest_sha256": _sha((public_dir / "backup-manifest.json").read_bytes())}
+        final_manifest_raw = read_bounded_regular(public_dir / "backup-manifest.json", limit=1024 * 1024, code="RECOVERY_PUBLICATION_INCOMPLETE")
+        declared = parse_closed_json(
+            final_manifest_raw,
+            document="backup manifest",
+        )["recovery_capsule"]
+        snapshot_declared_member(capsule_path, stage / "final-capsule.check", declared_size=declared["ciphertext_size"], declared_sha256=declared["ciphertext_sha256"])
+        if read_bounded_regular(public_dir / "COMPLETE", limit=9, code="RECOVERY_PUBLICATION_INCOMPLETE") != b"complete\n":
+            raise CapsuleError("RECOVERY_PUBLICATION_INCOMPLETE")
+        return {"manifest_sha256": _sha(final_manifest_raw)}
     except Exception as exc:
         if public_dir.exists() and (public_dir / "COMPLETE").is_file():
             pass
@@ -683,29 +922,53 @@ def publish_recovery_pair(
         raise CapsuleError("RECOVERY_PUBLICATION_INCOMPLETE") from exc
     finally:
         _remove_private_tree(stage)
+        if public_stage.exists():
+            _remove_private_tree(public_stage)
 
 
 def finish_published_backup(
     staging: Any, private_root: Path, marker: Mapping[str, Any], public_dir: Path, *,
     recovery_trust_path: Path | None, recovery_sealer: Path | None, capsule_path: Path | None,
     contract: Any, receipt_builder: Callable[..., Mapping[str, Any]], now: datetime,
-    verifier_evidence_names: tuple[str, ...],
+    verifier_evidence_names: tuple[str, ...], private_builder: Callable[[], Any] | None = None,
 ) -> Mapping[str, Any]:
     if recovery_trust_path is None or recovery_sealer is None or capsule_path is None:
         raise CapsuleError("published backup requires the complete recovery boundary")
+    paths = [private_root, public_dir, recovery_trust_path, recovery_sealer, capsule_path, staging.state_dir, staging.runtime]
+    if getattr(staging, "hrh", None) is not None:
+        paths.append(staging.hrh)
+    if any(_overlap(left, right) for index, left in enumerate(paths) for right in paths[index + 1:]) or not public_dir.parent.is_dir() or not capsule_path.parent.is_dir():
+        raise CapsuleError("published recovery paths overlap or have unavailable parents")
+    reconcile_owned_staging(capsule_path.parent, project=staging.project)
+    if capsule_path.exists() and not (public_dir / "COMPLETE").is_file():
+        raise CapsuleError("RECOVERY_CAPSULE_ORPHANED")
     trust_bytes = read_bounded_regular(recovery_trust_path, limit=1024 * 1024, code="RECOVERY_TRUST_UNAVAILABLE")
     trust = parse_recovery_trust(trust_bytes, now=now)
-    select_backup_recipient(trust, now=now)
-    capsule_id = os.urandom(16).hex()
-    identity = build_public_identity(
-        marker, recovery_trust=trust_bytes, sealer_sha256=trust["sealer_sha256"], capsule_id=capsule_id,
+    recipient = select_backup_recipient(trust, now=now)
+    preflight = capsule_path.parent / f".capsule-run-{os.urandom(16).hex()}"
+    preflight.mkdir(mode=0o700)
+    preflight_run_id = preflight.name.removeprefix(".capsule-run-")
+    _write_fsynced(
+        preflight / ".clinical-recovery-owner.json",
+        _canonical(_owner(preflight, project=staging.project, run_id=preflight_run_id, mode="backup")),
     )
-    plaintext = build_capsule_plaintext(private_root, public_identity=identity)
-    evidence = load_public_evidence(staging.state_dir, verifier_evidence_names)
     try:
+        sealer_snapshot = snapshot_sealer(recovery_sealer, preflight / "sealer", trust["sealer_sha256"])
+        encrypt_private_capsule(
+            sealer=sealer_snapshot, recipient=recipient["recipient"], plaintext=b"synthetic recovery preflight\n",
+            output=preflight / "preflight.age", timeout_seconds=30, environment={},
+        )
+        if private_builder is not None:
+            private_builder()
+        capsule_id = os.urandom(16).hex()
+        identity = build_public_identity(
+            marker, recovery_trust=trust_bytes, sealer_sha256=trust["sealer_sha256"], capsule_id=capsule_id,
+        )
+        plaintext = build_capsule_plaintext(private_root, public_identity=identity)
+        evidence = load_public_evidence(staging.state_dir, verifier_evidence_names)
         result = publish_recovery_pair(
             public_dir=public_dir, capsule_path=capsule_path, public_identity=identity,
-            recovery_trust=trust_bytes, private_plaintext=plaintext, sealer=recovery_sealer,
+            recovery_trust=trust_bytes, private_plaintext=plaintext, sealer=sealer_snapshot,
             evidence=evidence,
         )
         manifest = parse_closed_json((public_dir / "backup-manifest.json").read_bytes(), document="backup manifest")
@@ -714,6 +977,7 @@ def finish_published_backup(
             manifest_sha256=result["manifest_sha256"], backed_up_at=now.isoformat().replace("+00:00", "Z"),
         )
     finally:
+        _remove_private_tree(preflight)
         _remove_private_tree(private_root)
 
 
@@ -723,40 +987,38 @@ def restore_published_backup(
     capsule_path: Path | None, identity_reader: Callable[[], bytes] | None,
     acquired_generation: Mapping[str, Any], contract: Any,
     receipt_builder: Callable[..., Mapping[str, Any]], renew_tls: bool, now: datetime,
+    prepared: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     if recovery_trust_path is None or recovery_sealer is None or capsule_path is None:
         raise CapsuleError("published restore requires the complete recovery boundary")
-    fresh_trust_bytes = read_bounded_regular(recovery_trust_path, limit=1024 * 1024, code="RECOVERY_TRUST_UNAVAILABLE")
-    pair_result = validate_recovery_pair(
-        {"public_dir": public_dir, "capsule_path": capsule_path},
-        expected_manifest_sha256=expected_manifest_sha256,
-        fresh_trust=fresh_trust_bytes, acquired_generation=acquired_generation,
+    prepared = prepared or prepare_published_restore(
+        staging, public_dir, capsule_path, recovery_trust_path, recovery_sealer,
+        expected_manifest_sha256, now=now,
     )
+    fresh_trust_bytes = prepared["fresh_trust"]
+    pair_result = prepared["result"]
     identity, manifest = pair_result["identity"], pair_result["manifest"]
-    archived_trust_bytes = (public_dir / "recovery-trust.json").read_bytes()
+    archived_trust_bytes = pair_result["archived_trust"]
     fresh_trust = parse_recovery_trust(fresh_trust_bytes, now=now)
+    if identity.get("hrh_candidate") != acquired_generation:
+        cleanup_prepared_restore(prepared)
+        raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
     if identity_reader is None:
+        cleanup_prepared_restore(prepared)
         raise CapsuleError("RECOVERY_IDENTITY_REQUIRED")
     identity_holder: list[bytes] = []
-    run = staging.state_dir.parent / f".capsule-run-{os.urandom(16).hex()}"
-    run.mkdir(mode=0o700)
-    plaintext_path, capsule_snapshot = run / "plaintext.tar", run / "capsule.age"
+    run = prepared["run"]
+    plaintext_path, capsule_snapshot = run / "plaintext.tar", prepared["capsule"]
     target: Path | None = None
     published_state = False
     try:
-        snapshot_declared_member(
-            capsule_path, capsule_snapshot,
-            declared_size=manifest["recovery_capsule"]["ciphertext_size"],
-            declared_sha256=manifest["recovery_capsule"]["ciphertext_sha256"],
-        )
-        sealer = snapshot_sealer(recovery_sealer, run / "sealer", fresh_trust["sealer_sha256"])
         authorize_restore_trust(
             archived_trust_bytes, fresh_trust_bytes,
             recipient_sha256=identity["recipient_sha256"], now=now,
             identity_reader=lambda: identity_holder.append(validate_identity_input(identity_reader())),
         )
         decrypt_private_capsule(
-            sealer=sealer, capsule=capsule_snapshot, identity=identity_holder[0], output=plaintext_path,
+            sealer=prepared["sealer"], capsule=capsule_snapshot, identity=identity_holder[0], output=plaintext_path,
             timeout_seconds=30, environment={},
         )
         decoded = validate_capsule_plaintext(plaintext_path.read_bytes(), public_identity=identity)
