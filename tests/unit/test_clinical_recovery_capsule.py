@@ -20,6 +20,7 @@ cross-path restore, receipts and service lifecycle effects.
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import importlib.util
@@ -1429,6 +1430,231 @@ def test_restore_zeroes_mutable_identity_after_sealer_failure(
         )
     assert len(captured) == 1 and isinstance(captured[0], bytearray)
     assert captured[0] and not any(captured[0]), "identity buffer was not zeroed on failure"
+
+
+def test_u5_restore_rebinds_effective_compose_paths_after_relocation(
+    age_material, public_identity, tmp_path, monkeypatch
+):
+    """A published capsule must not retain producer-host bind-mount paths."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    module = _api("U5_RELOCATABLE_COMPOSE_ENV")
+    old_runtime = tmp_path / "producer" / "runtime"
+    old_state = tmp_path / "producer" / "state"
+    new_runtime = tmp_path / "recovery-host" / "runtime"
+    new_state = tmp_path / "recovery-host" / "state"
+    new_harness = new_runtime / "tests" / "deployment" / "clinical-composed-e2e"
+    old_port, new_port = 18443, 28443
+    new_state.parent.mkdir(parents=True)
+    new_runtime.mkdir(parents=True)
+    private_key = Ed25519PrivateKey.generate()
+    policy_private = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    policy_public = base64.b64encode(private_key.public_key().public_bytes_raw()).decode(
+        "ascii"
+    )
+    identity = copy.deepcopy(public_identity)
+    secret_values = {
+        "CLINICAL_MM_DB_PASSWORD": "a" * 48,
+        "CLINICAL_HRH_DB_PASSWORD": "b" * 48,
+        "CLINICAL_HRH_SESSION_SECRET": "c" * 64,
+        "CLINICAL_HRH_ENCRYPTION_KEY": "d" * 64,
+    }
+    archived_values = {
+        **secret_values,
+        "CLINICAL_HARNESS": (
+            old_runtime / "tests" / "deployment" / "clinical-composed-e2e"
+        ).as_posix(),
+        "CLINICAL_SEED": (old_state / "seed").as_posix(),
+        "CLINICAL_INGRESS_IMAGE": f"restricted-clinical-ingress:{identity['project']}",
+        "CLINICAL_ADAPTER_IMAGE": f"restricted-clinical-adapter:{identity['project']}",
+        "CLINICAL_POLICY_PUBLIC_KEY": policy_public,
+        "CLINICAL_STAGING_PROJECT": identity["project"],
+        "CLINICAL_STAGING_STATE_ID": identity["state_id"],
+        "CLINICAL_STAGING_PORT": str(old_port),
+        "CLINICAL_HRH_WEB_IMAGE": identity["hrh_candidate"]["subjects"]["web"],
+        "CLINICAL_HRH_MIGRATE_IMAGE": identity["hrh_candidate"]["subjects"]["migrate"],
+        **{
+            f"CLINICAL_VOLUME_{key.upper()}": value
+            for key, value in identity["volumes"].items()
+        },
+    }
+    old_compose = "".join(
+        f"{key}={value}\n" for key, value in archived_values.items()
+    ).encode("utf-8")
+    archived_compose_sha256 = hashlib.sha256(old_compose).hexdigest()
+    identity["compose_env_sha256"] = archived_compose_sha256
+    marker = {
+        "schema": "restricted-synthetic-clinical-staging-published.v1",
+        "synthetic_only": True,
+        "project": identity["project"],
+        "state_dir": str(old_state),
+        "state_id": identity["state_id"],
+        "compose_env_sha256": identity["compose_env_sha256"],
+        "lifecycle": "stopped",
+        "runtime_head": identity["runtime_source"]["runtime_head"],
+        "runtime_tree": identity["runtime_source"]["runtime_tree"],
+        "volumes": identity["volumes"],
+        "hrh_candidate": identity["hrh_candidate"],
+        "effective_images": identity["effective_images"],
+    }
+    run = tmp_path / "prepared-restore"
+    run.mkdir()
+    prepared = {
+        "run": run,
+        "fresh_trust": b"fresh-trust",
+        "capsule": tmp_path / "capsule.age",
+        "sealer": tmp_path / "age",
+        "result": {
+            "identity": identity,
+            "manifest": {},
+            "archived_trust": b"archived-trust",
+        },
+    }
+
+    class Contract:
+        @staticmethod
+        def write_json_atomic(path, value, *, mode):
+            del mode
+            path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+
+    class Staging:
+        runtime = new_runtime
+        state_dir = new_state
+        harness = new_harness
+        port = new_port
+        project = identity["project"]
+        observed_start = False
+        ready_marker = None
+
+        @staticmethod
+        def _require_empty_restore_destination():
+            assert not new_state.exists()
+
+        @staticmethod
+        def _extract_safe_state_archive(_archive, target):
+            target.mkdir(exist_ok=True)
+            (target / "compose.env").write_bytes(old_compose)
+            (target / "seed").mkdir()
+            (target / "seed" / "policy-private.pem").write_bytes(policy_private)
+            (target / "staging-state.json").write_text(
+                json.dumps(marker, sort_keys=True), encoding="utf-8"
+            )
+
+        @staticmethod
+        def _create_volumes(_marker):
+            return None
+
+        @staticmethod
+        def _restore_volume(*_args):
+            return None
+
+        @staticmethod
+        def _start_restored_stack():
+            Staging.observed_start = True
+            raw = (new_state / "compose.env").read_bytes()
+            values = dict(
+                line.split("=", 1)
+                for line in raw.decode("utf-8").splitlines()
+            )
+            assert set(values) == set(archived_values)
+            # Keep the first predicate on relocation.  On the frozen base this
+            # is the intended RED, rather than an incidental schema rejection.
+            assert old_runtime.as_posix() not in raw.decode("utf-8")
+            assert old_state.as_posix() not in raw.decode("utf-8")
+            assert {
+                name: values[name] for name in ("CLINICAL_SEED", "CLINICAL_HARNESS")
+            } == {
+                "CLINICAL_SEED": (new_state / "seed").as_posix(),
+                "CLINICAL_HARNESS": new_harness.as_posix(),
+            }
+            assert {key: values[key] for key in secret_values} == secret_values
+            expected_nonsecret = {
+                key: value
+                for key, value in archived_values.items()
+                if key
+                not in {
+                    *secret_values,
+                    "CLINICAL_HARNESS",
+                    "CLINICAL_SEED",
+                    "CLINICAL_STAGING_PORT",
+                }
+            }
+            expected_nonsecret["CLINICAL_HARNESS"] = new_harness.as_posix()
+            expected_nonsecret["CLINICAL_SEED"] = (new_state / "seed").as_posix()
+            expected_nonsecret["CLINICAL_STAGING_PORT"] = str(new_port)
+            assert {key: values[key] for key in expected_nonsecret} == expected_nonsecret
+            effective_sha256 = hashlib.sha256(raw).hexdigest()
+            restored_marker = json.loads(
+                (new_state / "staging-state.json").read_text(encoding="utf-8")
+            )
+            assert restored_marker["compose_env_sha256"] == effective_sha256
+            assert effective_sha256 != archived_compose_sha256
+
+        @staticmethod
+        def status(*, _allow_recovering):
+            assert _allow_recovering is True
+            return {"observed_at": "2026-09-08T12:00:01Z"}
+
+        @staticmethod
+        def _write_marker(value):
+            Staging.ready_marker = copy.deepcopy(value)
+
+        @staticmethod
+        def _contain_failed_restore():
+            return None
+
+    monkeypatch.setattr(module, "parse_recovery_trust", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        module,
+        "authorize_restore_trust",
+        lambda *_args, identity_reader, **_kwargs: identity_reader(),
+    )
+    monkeypatch.setattr(
+        module,
+        "decrypt_private_capsule",
+        lambda **kwargs: kwargs["output"].write_bytes(b"synthetic plaintext"),
+    )
+
+    def extract_plaintext(_plaintext, destination, **_kwargs):
+        destination.mkdir()
+        (destination / "state.tar").write_bytes(b"synthetic state archive")
+
+    monkeypatch.setattr(module, "extract_capsule_plaintext", extract_plaintext)
+    receipt_inputs = {}
+
+    def build_receipt(*_args, **kwargs):
+        receipt_inputs.update(kwargs)
+        return {"schema": "synthetic-u5-restore-receipt.v1"}
+
+    result = module.restore_published_backup(
+        Staging(),
+        tmp_path / "public",
+        "b" * 64,
+        recovery_trust_path=tmp_path / "trust",
+        recovery_sealer=tmp_path / "age",
+        capsule_path=tmp_path / "capsule.age",
+        identity_reader=lambda: age_material["identity"].splitlines()[-1] + b"\n",
+        acquired_generation=identity["hrh_candidate"],
+        contract=Contract(),
+        receipt_builder=build_receipt,
+        renew_tls=False,
+        now=NOW,
+        prepared=prepared,
+    )
+    assert Staging.observed_start is True
+    assert Staging.ready_marker["lifecycle"] == "ready"
+    effective_sha256 = hashlib.sha256((new_state / "compose.env").read_bytes()).hexdigest()
+    assert Staging.ready_marker["compose_env_sha256"] == effective_sha256
+    assert receipt_inputs["archived_compose_env_sha256"] == archived_compose_sha256
+    assert receipt_inputs["effective_compose_env_sha256"] == effective_sha256
+    assert result["schema"] == "synthetic-u5-restore-receipt.v1"
+    assert not old_runtime.exists()
+    assert not old_state.exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="trusted-parent ownership and mode witness is POSIX-only")
