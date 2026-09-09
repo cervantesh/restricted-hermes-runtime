@@ -1797,6 +1797,8 @@ class ClinicalStaging:
                 restore_trust_sha256=json.loads(mechanical_bytes)["restore_recovery_trust_sha256"],
                 causal_checks=causal_checks, expected_manifest_sha256=expected_manifest_sha256,
                 expected_mechanical_receipt_sha256=expected_mechanical_receipt_sha256,
+                current_compose_env_sha256=file_sha256(self.env_file),
+                effective_mattermost_port=self.port,
                 verified_at=datetime.now(UTC).isoformat(),
             )
             _codec_validate_causal_receipt(_backup_contract(), **validation_kwargs)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -20,6 +21,8 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
+
+from cryptography.hazmat.primitives import serialization
 
 
 TRUST_SCHEMA = "restricted-synthetic-clinical-recovery-trust.v1"
@@ -42,6 +45,26 @@ RECIPIENT_FIELDS = {
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 _NATIVE_IDENTITY = re.compile(rb"^AGE-SECRET-KEY-1[0-9A-Z]+\n$")
+PUBLISHED_VOLUME_KEYS = (
+    "mattermost_db", "mattermost_data", "mattermost_tls", "hrh_db", "hrh_tls",
+    "hrh_secret", "clinical_config", "clinical_socket", "ingress_config",
+    "ingress_outbox", "controller_state",
+)
+PUBLISHED_SECRET_PATTERNS = {
+    "CLINICAL_MM_DB_PASSWORD": re.compile(r"^[0-9a-f]{48}$"),
+    "CLINICAL_HRH_DB_PASSWORD": re.compile(r"^[0-9a-f]{48}$"),
+    "CLINICAL_HRH_SESSION_SECRET": re.compile(r"^[0-9a-f]{64}$"),
+    "CLINICAL_HRH_ENCRYPTION_KEY": re.compile(r"^[0-9a-f]{64}$"),
+}
+PUBLISHED_ENV_KEYS = (
+    *PUBLISHED_SECRET_PATTERNS,
+    "CLINICAL_HARNESS", "CLINICAL_SEED", "CLINICAL_INGRESS_IMAGE",
+    "CLINICAL_ADAPTER_IMAGE", "CLINICAL_POLICY_PUBLIC_KEY",
+    "CLINICAL_STAGING_PROJECT", "CLINICAL_STAGING_STATE_ID",
+    "CLINICAL_STAGING_PORT", "CLINICAL_HRH_WEB_IMAGE",
+    "CLINICAL_HRH_MIGRATE_IMAGE",
+    *(f"CLINICAL_VOLUME_{key.upper()}" for key in PUBLISHED_VOLUME_KEYS),
+)
 
 
 class CapsuleError(RuntimeError):
@@ -132,6 +155,159 @@ def _canonical(value: Mapping[str, Any]) -> bytes:
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def parse_archived_published_environment(raw: bytes) -> dict[str, str]:
+    """Parse one duplicate-free, exact-keyset published environment."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CapsuleError("RECOVERY_GENERATION_MISMATCH") from exc
+    if not text.endswith("\n") or "\r" in text or "\x00" in text:
+        raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+    values: dict[str, str] = {}
+    for line in text[:-1].split("\n"):
+        if not line or "=" not in line:
+            raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+        key, value = line.split("=", 1)
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or key in values or not value:
+            raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+        values[key] = value
+    if set(values) != set(PUBLISHED_ENV_KEYS):
+        raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+    for key, pattern in PUBLISHED_SECRET_PATTERNS.items():
+        if not pattern.fullmatch(values[key]):
+            raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+    for key in ("CLINICAL_HARNESS", "CLINICAL_SEED"):
+        if not Path(values[key]).is_absolute():
+            raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+    try:
+        archived_port = int(values["CLINICAL_STAGING_PORT"])
+    except ValueError as exc:
+        raise CapsuleError("RECOVERY_GENERATION_MISMATCH") from exc
+    if str(archived_port) != values["CLINICAL_STAGING_PORT"] or not 1024 <= archived_port <= 65535:
+        raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+    return values
+
+
+def _restored_policy_public_key(seed_root: Path) -> str:
+    try:
+        private = serialization.load_pem_private_key(
+            (seed_root / "policy-private.pem").read_bytes(), password=None
+        )
+        return base64.b64encode(private.public_key().public_bytes_raw()).decode("ascii")
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise CapsuleError("RECOVERY_GENERATION_MISMATCH") from exc
+
+
+def render_effective_published_environment(
+    staging: Any, target: Path, marker: Mapping[str, Any],
+    identity: Mapping[str, Any], archived: Mapping[str, str],
+) -> bytes:
+    """Render the one target-local published environment accepted by restore."""
+    try:
+        subjects = identity["hrh_candidate"]["subjects"]
+        volumes = marker["volumes"]
+        project = marker["project"]
+        state_id = marker["state_id"]
+        if (
+            volumes != identity["volumes"]
+            or project != identity["project"]
+            or state_id != identity["state_id"]
+            or staging.project != project
+            or set(volumes) != set(PUBLISHED_VOLUME_KEYS)
+            or isinstance(staging.port, bool)
+            or not isinstance(staging.port, int)
+            or not 1024 <= staging.port <= 65535
+        ):
+            raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+        policy_public = _restored_policy_public_key(target / "seed")
+        authenticated_archived = {
+            "CLINICAL_INGRESS_IMAGE": f"restricted-clinical-ingress:{project}",
+            "CLINICAL_ADAPTER_IMAGE": f"restricted-clinical-adapter:{project}",
+            "CLINICAL_POLICY_PUBLIC_KEY": policy_public,
+            "CLINICAL_STAGING_PROJECT": project,
+            "CLINICAL_STAGING_STATE_ID": state_id,
+            "CLINICAL_HRH_WEB_IMAGE": subjects["web"],
+            "CLINICAL_HRH_MIGRATE_IMAGE": subjects["migrate"],
+            **{
+                f"CLINICAL_VOLUME_{key.upper()}": volumes[key]
+                for key in PUBLISHED_VOLUME_KEYS
+            },
+        }
+        if any(archived.get(key) != value for key, value in authenticated_archived.items()):
+            raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+        values = {
+            **{key: archived[key] for key in PUBLISHED_SECRET_PATTERNS},
+            "CLINICAL_HARNESS": staging.harness.as_posix(),
+            "CLINICAL_SEED": (staging.state_dir / "seed").as_posix(),
+            **{
+                key: authenticated_archived[key]
+                for key in (
+                    "CLINICAL_INGRESS_IMAGE", "CLINICAL_ADAPTER_IMAGE",
+                    "CLINICAL_POLICY_PUBLIC_KEY", "CLINICAL_STAGING_PROJECT",
+                    "CLINICAL_STAGING_STATE_ID",
+                )
+            },
+            "CLINICAL_STAGING_PORT": str(staging.port),
+            **{
+                key: authenticated_archived[key]
+                for key in (
+                    "CLINICAL_HRH_WEB_IMAGE", "CLINICAL_HRH_MIGRATE_IMAGE",
+                    *(f"CLINICAL_VOLUME_{name.upper()}" for name in PUBLISHED_VOLUME_KEYS),
+                )
+            },
+        }
+    except (KeyError, TypeError) as exc:
+        raise CapsuleError("RECOVERY_GENERATION_MISMATCH") from exc
+    if tuple(values) != PUBLISHED_ENV_KEYS:
+        raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+    if any(
+        not isinstance(value, str)
+        or not value
+        or any(character in value for character in "\r\n\x00")
+        for value in values.values()
+    ):
+        raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+    rendered = "".join(
+        f"{key}={values[key]}\n" for key in PUBLISHED_ENV_KEYS
+    ).encode()
+    if parse_archived_published_environment(rendered) != values:
+        raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+    return rendered
+
+
+def replace_private_fsynced(path: Path, data: bytes) -> str:
+    """Atomically replace one private file and return its re-read SHA-256."""
+    partial = path.parent / f".{path.name}.partial-{os.urandom(8).hex()}"
+    try:
+        fd = os.open(
+            partial,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), 0o600)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not hasattr(os, "fchmod"):
+            os.chmod(partial, 0o600)
+        os.replace(partial, path)
+        _fsync_directory(path.parent)
+        effective = read_bounded_regular(
+            path, limit=1024 * 1024, code="RECOVERY_GENERATION_MISMATCH"
+        )
+        if effective != data:
+            raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+        return _sha(effective)
+    except CapsuleError:
+        raise
+    except OSError as exc:
+        raise CapsuleError("RECOVERY_PUBLICATION_INCOMPLETE") from exc
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -1526,17 +1702,43 @@ def restore_published_backup(
         }
         if any(marker.get(key) != value for key, value in marker_bindings.items()):
             raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
-        marker["state_dir"], marker["lifecycle"] = str(staging.state_dir.resolve()), "recovering"
-        contract.write_json_atomic(marker_path, marker, mode=0o600)
-        if hashlib.sha256((target / "compose.env").read_bytes()).hexdigest() != identity["compose_env_sha256"]:
+        archived_env = read_bounded_regular(
+            target / "compose.env", limit=1024 * 1024,
+            code="RECOVERY_GENERATION_MISMATCH",
+        )
+        archived_compose_env_sha256 = _sha(archived_env)
+        if archived_compose_env_sha256 != identity["compose_env_sha256"]:
             raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
+        preserved_secrets = parse_archived_published_environment(archived_env)
+        effective_env = render_effective_published_environment(
+            staging, target, marker, identity, preserved_secrets
+        )
+        effective_compose_env_sha256 = replace_private_fsynced(
+            target / "compose.env", effective_env
+        )
+        marker.update(
+            state_dir=str(staging.state_dir.resolve()),
+            lifecycle="recovering",
+            compose_env_sha256=effective_compose_env_sha256,
+        )
+        contract.write_json_atomic(marker_path, marker, mode=0o600)
+        _fsync_directory(target)
+        if staging.state_dir.exists():
+            staging.state_dir.rmdir()
         os.replace(target, staging.state_dir)
+        _fsync_directory(staging.state_dir.parent)
         published_state = True
         staging._create_volumes(marker)
         for key in VOLUME_KEYS:
             staging._restore_volume(key, marker["volumes"][key], private)
         if renew_tls:
             staging._renew_tls_material(marker, restoring=True)
+        current_env = read_bounded_regular(
+            staging.state_dir / "compose.env", limit=1024 * 1024,
+            code="RECOVERY_GENERATION_MISMATCH",
+        )
+        if _sha(current_env) != marker["compose_env_sha256"]:
+            raise CapsuleError("RECOVERY_GENERATION_MISMATCH")
         staging._start_restored_stack()
         status = staging.status(_allow_recovering=True)
         marker["lifecycle"] = "ready"
@@ -1545,6 +1747,9 @@ def restore_published_backup(
             contract, manifest, expected_manifest_sha256, identity=identity,
             restore_trust=fresh_trust, restore_trust_sha256=_sha(fresh_trust_bytes),
             status_observed_at=status["observed_at"], restored_at=now.isoformat().replace("+00:00", "Z"),
+            archived_compose_env_sha256=archived_compose_env_sha256,
+            effective_compose_env_sha256=effective_compose_env_sha256,
+            effective_mattermost_port=staging.port,
         )
         receipt_dir = staging.state_dir / "evidence" / "recovery"
         receipt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)

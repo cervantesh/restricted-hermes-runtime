@@ -667,8 +667,8 @@ def extract_safe_state_archive(contract: BackupContract, archive_path: Path, des
 
 
 PUBLISHED_BACKUP_RECEIPT_SCHEMA = "restricted-synthetic-clinical-cold-backup-receipt-published.v1"
-PUBLISHED_RESTORE_RECEIPT_SCHEMA = "restricted-synthetic-clinical-cold-restore-published.v1"
-PUBLISHED_CAUSAL_RECEIPT_SCHEMA = "restricted-synthetic-clinical-cold-restore-verification-published.v1"
+PUBLISHED_RESTORE_RECEIPT_SCHEMA = "restricted-synthetic-clinical-cold-restore-published.v2"
+PUBLISHED_CAUSAL_RECEIPT_SCHEMA = "restricted-synthetic-clinical-cold-restore-verification-published.v2"
 PUBLISHED_BACKUP_NONCLAIMS = ["not a scheduled backup", "not PHI-authorized", "not production", "not a compliance certification"]
 PUBLISHED_RESTORE_NONCLAIMS = ["not a causal recovery verification", "not PHI-authorized", "not production", "not a compliance certification"]
 PUBLISHED_CAUSAL_NONCLAIMS = ["not PHI-authorized", "not production", "not a compliance certification"]
@@ -724,7 +724,20 @@ def _recipient_status(contract: BackupContract, trust: Mapping[str, Any], recipi
 def build_restore_receipt(
     contract: BackupContract, manifest: Mapping[str, Any], manifest_sha256: str, *, identity: Mapping[str, Any],
     restore_trust: Mapping[str, Any], restore_trust_sha256: str, status_observed_at: str, restored_at: str,
+    archived_compose_env_sha256: str, effective_compose_env_sha256: str,
+    effective_mattermost_port: int,
 ) -> dict[str, Any]:
+    if archived_compose_env_sha256 != identity["compose_env_sha256"]:
+        raise contract.error_type("restore receipt archived environment differs")
+    _require_sha256(
+        contract, effective_compose_env_sha256, name="effective compose environment hash"
+    )
+    if (
+        isinstance(effective_mattermost_port, bool)
+        or not isinstance(effective_mattermost_port, int)
+        or not 1024 <= effective_mattermost_port <= 65535
+    ):
+        raise contract.error_type("effective Mattermost port is invalid")
     return {
         "schema": PUBLISHED_RESTORE_RECEIPT_SCHEMA, "synthetic_only": True,
         **_published_common(contract, manifest, identity, manifest_sha256), "mode": "published_restore",
@@ -732,6 +745,9 @@ def build_restore_receipt(
         "restore_recovery_policy_epoch": restore_trust["policy_epoch"],
         "restore_recipient_status": _recipient_status(contract, restore_trust, identity["recipient_sha256"]),
         "excluded_volume": identity["excluded_volume"], "status_observed_at": status_observed_at,
+        "archived_compose_env_sha256": archived_compose_env_sha256,
+        "effective_compose_env_sha256": effective_compose_env_sha256,
+        "effective_mattermost_port": effective_mattermost_port,
         "verification": "mechanical_restore_only", "restored_at": restored_at,
         "nonclaims": list(PUBLISHED_RESTORE_NONCLAIMS),
     }
@@ -742,7 +758,8 @@ _MECHANICAL_FIELDS = {
     "capsule_id", "capsule_ciphertext_sha256", "backup_recovery_trust_sha256", "backup_recovery_policy_epoch",
     "restore_recovery_trust_sha256", "restore_recovery_policy_epoch", "restore_recipient_status", "recipient_sha256",
     "runtime_source", "hrh_candidate", "effective_images", "excluded_volume", "status_observed_at", "verification",
-    "restored_at", "nonclaims",
+    "restored_at", "nonclaims", "archived_compose_env_sha256",
+    "effective_compose_env_sha256", "effective_mattermost_port",
 }
 
 
@@ -780,6 +797,8 @@ def validate_causal_receipt(
     restore_trust: Mapping[str, Any] | None, restore_trust_sha256: str, causal_checks: Mapping[str, bool], *, verified_at: str,
     current_marker: Mapping[str, Any] | None = None, expected_manifest_sha256: str | None = None,
     expected_mechanical_receipt_sha256: str | None = None,
+    current_compose_env_sha256: str | None = None,
+    effective_mattermost_port: int | None = None,
 ) -> dict[str, Any]:
     mechanical = _closed_mechanical(contract, mechanical_receipt_bytes)
     mechanical_sha256 = hashlib.sha256(mechanical_receipt_bytes).hexdigest()
@@ -787,15 +806,30 @@ def validate_causal_receipt(
         raise contract.error_type("mechanical receipt does not bind external manifest")
     if expected_mechanical_receipt_sha256 is not None and mechanical_sha256 != expected_mechanical_receipt_sha256:
         raise contract.error_type("mechanical receipt does not bind external authority")
-    if current_marker is not None:
-        marker_bindings = {
-            "project": identity["project"], "state_id": identity["state_id"],
-            "runtime_head": identity["runtime_source"]["runtime_head"],
-            "runtime_tree": identity["runtime_source"]["runtime_tree"],
-            "hrh_candidate": identity["hrh_candidate"], "effective_images": identity["effective_images"],
-        }
-        if any(current_marker.get(key) != value for key, value in marker_bindings.items()):
-            raise contract.error_type("current marker does not bind published identity")
+    if current_marker is None:
+        raise contract.error_type("current marker is required for published verification")
+    marker_bindings = {
+        "project": identity["project"], "state_id": identity["state_id"],
+        "runtime_head": identity["runtime_source"]["runtime_head"],
+        "runtime_tree": identity["runtime_source"]["runtime_tree"],
+        "hrh_candidate": identity["hrh_candidate"], "effective_images": identity["effective_images"],
+    }
+    if any(current_marker.get(key) != value for key, value in marker_bindings.items()):
+        raise contract.error_type("current marker does not bind published identity")
+    if (
+        current_compose_env_sha256 is None
+        or mechanical.get("effective_compose_env_sha256")
+        != current_marker.get("compose_env_sha256")
+        or mechanical.get("effective_compose_env_sha256")
+        != current_compose_env_sha256
+    ):
+        raise contract.error_type("current compose environment is not bound")
+    if (
+        isinstance(effective_mattermost_port, bool)
+        or not isinstance(effective_mattermost_port, int)
+        or not 1024 <= effective_mattermost_port <= 65535
+    ):
+        raise contract.error_type("effective Mattermost port is invalid")
     common = _published_common(contract, manifest, identity, mechanical["manifest_sha256"])
     if restore_trust is None:
         restore_epoch = mechanical.get("restore_recovery_policy_epoch")
@@ -816,6 +850,9 @@ def validate_causal_receipt(
         "restore_recovery_policy_epoch": restore_epoch,
         "restore_recipient_status": restore_status,
         "excluded_volume": identity["excluded_volume"], "verification": "mechanical_restore_only",
+        "archived_compose_env_sha256": identity["compose_env_sha256"],
+        "effective_compose_env_sha256": current_marker.get("compose_env_sha256"),
+        "effective_mattermost_port": effective_mattermost_port,
         "nonclaims": PUBLISHED_RESTORE_NONCLAIMS,
     }
     for key, value in expected.items():

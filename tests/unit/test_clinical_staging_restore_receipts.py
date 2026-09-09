@@ -28,8 +28,8 @@ CODEC_PATH = ROOT / "deploy" / "clinical-staging" / "clinical_backup_bundle.py"
 VERIFIER_PATH = ROOT / "tools" / "verify_hrh_published_candidate.py"
 
 BACKUP_SCHEMA = "restricted-synthetic-clinical-cold-backup-receipt-published.v1"
-MECHANICAL_SCHEMA = "restricted-synthetic-clinical-cold-restore-published.v1"
-CAUSAL_SCHEMA = "restricted-synthetic-clinical-cold-restore-verification-published.v1"
+MECHANICAL_SCHEMA = "restricted-synthetic-clinical-cold-restore-published.v2"
+CAUSAL_SCHEMA = "restricted-synthetic-clinical-cold-restore-verification-published.v2"
 
 BACKUP_FIELDS = {
     "schema", "synthetic_only", "project", "state_id", "mode",
@@ -47,7 +47,8 @@ MECHANICAL_FIELDS = {
     "restore_recovery_policy_epoch", "restore_recipient_status",
     "recipient_sha256", "runtime_source", "hrh_candidate", "effective_images",
     "excluded_volume", "status_observed_at", "verification", "restored_at",
-    "nonclaims",
+    "nonclaims", "archived_compose_env_sha256", "effective_compose_env_sha256",
+    "effective_mattermost_port",
 }
 CAUSAL_FIELDS = {
     "schema", "synthetic_only", "project", "state_id", "mode",
@@ -211,11 +212,13 @@ def _published_fixture() -> dict[str, Any]:
         "not_after": "2027-01-01T00:00:00Z", "status": "active",
     })
     restore_trust["recipients"].sort(key=lambda item: item["recipient_sha256"])
+    effective_compose_bytes = b"CLINICAL_SYNTHETIC_EFFECTIVE=true\n"
     current_marker = {
         "schema": "restricted-synthetic-clinical-staging-published.v1",
         "synthetic_only": True, "project": identity["project"],
         "state_dir": "<STATE>", "state_id": identity["state_id"],
-        "compose_env_sha256": identity["compose_env_sha256"], "lifecycle": "ready",
+        "compose_env_sha256": hashlib.sha256(effective_compose_bytes).hexdigest(),
+        "lifecycle": "ready",
         "runtime_head": runtime_source["runtime_head"], "runtime_tree": runtime_source["runtime_tree"],
         "volumes": volumes, "hrh_candidate": hrh_candidate, "effective_images": effective_images,
     }
@@ -228,6 +231,8 @@ def _published_fixture() -> dict[str, Any]:
         "restore_trust_sha256": _sha(restore_trust),
         "capsule_bytes": capsule_bytes, "current_marker": current_marker,
         "public_evidence_bytes": public_evidence_bytes,
+        "effective_compose_bytes": effective_compose_bytes,
+        "effective_mattermost_port": 18443,
     }
 
 
@@ -297,6 +302,9 @@ def _published_mechanical(fixture: Mapping[str, Any]) -> dict[str, Any]:
         "runtime_source": identity["runtime_source"], "hrh_candidate": identity["hrh_candidate"],
         "effective_images": identity["effective_images"], "excluded_volume": "clinical_socket",
         "status_observed_at": "2026-08-01T12:29:00Z",
+        "archived_compose_env_sha256": identity["compose_env_sha256"],
+        "effective_compose_env_sha256": fixture["current_marker"]["compose_env_sha256"],
+        "effective_mattermost_port": fixture["effective_mattermost_port"],
         "verification": "mechanical_restore_only", "restored_at": "2026-08-01T12:30:00Z",
         "nonclaims": MECHANICAL_NONCLAIMS,
     }
@@ -794,6 +802,9 @@ def test_published_mechanical_receipt_preserves_archived_and_fresh_authority() -
         restore_trust_sha256=fixture["restore_trust_sha256"],
         status_observed_at="2026-08-01T12:29:00Z",
         restored_at="2026-08-01T12:30:00Z",
+        archived_compose_env_sha256=fixture["identity"]["compose_env_sha256"],
+        effective_compose_env_sha256=fixture["current_marker"]["compose_env_sha256"],
+        effective_mattermost_port=fixture["effective_mattermost_port"],
     )
     _assert_closed(receipt, MECHANICAL_FIELDS)
     _assert_bound_common(receipt, fixture)
@@ -804,6 +815,8 @@ def test_published_mechanical_receipt_preserves_archived_and_fresh_authority() -
     assert receipt["restore_recovery_trust_sha256"] == fixture["restore_trust_sha256"]
     assert receipt["restore_recovery_policy_epoch"] == 8
     assert receipt["restore_recipient_status"] == "retired"
+    assert receipt["effective_mattermost_port"] == 18443
+    assert isinstance(receipt["effective_mattermost_port"], int)
     assert receipt["verification"] == "mechanical_restore_only"
     assert receipt["nonclaims"] == MECHANICAL_NONCLAIMS
 
@@ -817,6 +830,9 @@ def test_published_causal_receipt_hashes_exact_mechanical_bytes() -> None:
     receipt = _require_builder(codec, "build_causal_receipt")(
         _codec_contract(codec), mechanical_bytes, fixture["manifest"], fixture["identity"],
         fixture["restore_trust"], fixture["restore_trust_sha256"], checks,
+        current_marker=fixture["current_marker"],
+        current_compose_env_sha256=fixture["current_marker"]["compose_env_sha256"],
+        effective_mattermost_port=fixture["effective_mattermost_port"],
         verified_at="2026-08-01T12:31:00Z",
     )
     _assert_closed(receipt, CAUSAL_FIELDS)
@@ -843,6 +859,7 @@ def _exercise_published_finalizer(
     state = tmp_path / f"{project}.synthetic-clinical-staging"
     runtime.mkdir()
     (state / "evidence" / "recovery").mkdir(parents=True)
+    (state / "compose.env").write_bytes(fixture["effective_compose_bytes"])
     marker = dict(fixture["current_marker"], state_dir=str(state.resolve()))
     marker.update(marker_overrides or {})
     staging_module.write_json_atomic(state / staging_module.MARKER_NAME, marker, mode=0o600)
@@ -911,6 +928,9 @@ def test_published_finalizer_consumes_bound_builder_and_persists_exact_receipt(
     assert kwargs["mechanical_receipt_bytes"] == mechanical_bytes
     assert kwargs["expected_manifest_sha256"] == fixture["manifest_sha256"]
     assert kwargs["expected_mechanical_receipt_sha256"] == hashlib.sha256(mechanical_bytes).hexdigest()
+    assert kwargs["current_compose_env_sha256"] == fixture["current_marker"]["compose_env_sha256"]
+    assert kwargs["effective_mattermost_port"] == 18443
+    assert isinstance(kwargs["effective_mattermost_port"], int)
     expected_bytes = _canonical(_expected_published_causal(fixture, mechanical_bytes))
     assert receipt == json.loads(expected_bytes)
     assert artifact.read_bytes() == _persisted(json.loads(expected_bytes))
@@ -946,6 +966,10 @@ def test_published_finalizer_rejects_invalid_complete_before_causal_artifact(
         ("mechanical", "restore_recovery_policy_epoch", True),
         ("mechanical", "restore_recipient_status", "revoked"),
         ("mechanical", "recipient_sha256", "0" * 64),
+        ("mechanical", "archived_compose_env_sha256", "0" * 64),
+        ("mechanical", "effective_compose_env_sha256", "0" * 64),
+        ("mechanical", "effective_mattermost_port", 28443),
+        ("mechanical", "effective_mattermost_port", True),
         ("mechanical", "excluded_volume", "other"),
         ("mechanical", "synthetic_only", False),
         ("mechanical", "verification", "causal_e2e_verified"),
@@ -955,6 +979,7 @@ def test_published_finalizer_rejects_invalid_complete_before_causal_artifact(
         ("marker", "project", "clinicalstagingother"),
         ("marker", "state_id", "0" * 32),
         ("marker", "runtime_head", "0" * 40),
+        ("marker", "compose_env_sha256", "0" * 64),
         ("marker", "hrh_candidate", {}), ("marker", "effective_images", {}),
     ),
 )
@@ -1086,6 +1111,7 @@ def test_published_restore_rejects_conflicting_target_before_capsule_or_hrh(
 @pytest.mark.parametrize(
     ("mutant", "reason"),
     (
+        ({"schema": "restricted-synthetic-clinical-cold-restore-published.v1"}, "superseded schema"),
         ({"schema": "restricted-synthetic-clinical-cold-backup.v1"}, "cross-mode schema"),
         ({"mode": "published_backup"}, "cross-mode operation"),
         ({"restore_recipient_status": "active"}, "fresh authority substitution"),
@@ -1100,11 +1126,16 @@ def test_published_causal_builder_kills_cross_mode_and_substitution_mutants(
     mechanical = _published_mechanical(fixture)
     mechanical.update(mutant)
     builder = _require_builder(codec, "build_causal_receipt")
-    with pytest.raises(ReceiptSafetyError, match="bind|schema|mode|authority|image"):
+    with pytest.raises(
+        ReceiptSafetyError, match="bind|schema|mode|authority|image|environment|port"
+    ):
         builder(
             _codec_contract(codec), _canonical(mechanical), fixture["manifest"], fixture["identity"],
             fixture["restore_trust"], fixture["restore_trust_sha256"],
             {"backup_data_observed": True, "gateway_observed": True, "restart_observed": True},
+            current_marker=fixture["current_marker"],
+            current_compose_env_sha256=fixture["current_marker"]["compose_env_sha256"],
+            effective_mattermost_port=fixture["effective_mattermost_port"],
             verified_at="2026-08-01T12:31:00Z",
         )
 
@@ -1123,5 +1154,8 @@ def test_published_causal_builder_rejects_duplicate_and_minimal_mechanical_recei
                 _codec_contract(codec), mechanical_bytes, fixture["manifest"], fixture["identity"],
                 fixture["restore_trust"], fixture["restore_trust_sha256"],
                 {"backup_data_observed": True, "gateway_observed": True, "restart_observed": True},
+                current_marker=fixture["current_marker"],
+                current_compose_env_sha256=fixture["current_marker"]["compose_env_sha256"],
+                effective_mattermost_port=fixture["effective_mattermost_port"],
                 verified_at="2026-08-01T12:31:00Z",
             )
