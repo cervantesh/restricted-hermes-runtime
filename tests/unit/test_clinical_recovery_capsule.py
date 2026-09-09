@@ -1652,6 +1652,8 @@ def test_u5_restore_rebinds_effective_compose_paths_after_relocation(
     assert Staging.ready_marker["compose_env_sha256"] == effective_sha256
     assert receipt_inputs["archived_compose_env_sha256"] == archived_compose_sha256
     assert receipt_inputs["effective_compose_env_sha256"] == effective_sha256
+    assert receipt_inputs["effective_mattermost_port"] == new_port
+    assert isinstance(receipt_inputs["effective_mattermost_port"], int)
     assert result["schema"] == "synthetic-u5-restore-receipt.v1"
     assert not old_runtime.exists()
     assert not old_state.exists()

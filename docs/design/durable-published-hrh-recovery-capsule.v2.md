@@ -69,9 +69,9 @@ Exact schemas:
 - published backup receipt:
   `restricted-synthetic-clinical-cold-backup-receipt-published.v1`;
 - published mechanical receipt:
-  `restricted-synthetic-clinical-cold-restore-published.v1`;
+  `restricted-synthetic-clinical-cold-restore-published.v2`;
 - published causal receipt:
-  `restricted-synthetic-clinical-cold-restore-verification-published.v1`.
+  `restricted-synthetic-clinical-cold-restore-verification-published.v2`.
 
 Published v1 plaintext bundles are recognized only to return
 `PUBLISHED_BACKUP_V1_UNSAFE`. They are never extracted, restored or silently
@@ -433,10 +433,14 @@ Under the same persistent lock:
 9. validate the private tar, capsule manifest, member hashes, ownership and all
    public/private bindings;
 10. validate the restored marker duplicate-free and equal to the public
-   identity; validate `compose.env` and every volume archive before target
-   mutation;
+   identity; authenticate the archived `compose.env`, strictly parse its exact
+   25-key published-mode shape, preserve only its four format-valid application
+   secrets, and validate every volume archive before target mutation;
 11. close the identity pipe and retain no identity bytes;
-12. atomically publish `recovering` before the first target volume;
+12. rederive a fixed-order target-local `compose.env` from the accepted runtime,
+   target state, invocation port, restored policy private key and authenticated
+   identity; fsync it and atomically publish `recovering` bound to its effective
+   hash before the first target volume;
 13. create and restore volumes, start databases, run migration, then start web
     and clinical witnesses;
 14. verify effective state, publish `ready` and write only the bound mechanical
@@ -467,6 +471,7 @@ state directory, volume, network or service exists before `recovering`.
 | Empty, malformed, additional or wrong identity; age authentication failure against exact authorized ciphertext | one `RECOVERY_CAPSULE_UNAVAILABLE` |
 | Invalid inner tar/manifest/member | `RECOVERY_CAPSULE_INVALID` |
 | Public/private generation mismatch | `RECOVERY_GENERATION_MISMATCH` |
+| Missing, duplicate, extra, blank, malformed or source-build-only published environment field; malformed preserved secret | `RECOVERY_GENERATION_MISMATCH`, before destination publication or Docker mutation |
 
 The runtime never relays age diagnostics. Child stdout is consumed only by the
 named private wrapper output. Operator output exposes stable stage/error codes;
@@ -553,6 +558,9 @@ hrh_candidate
 effective_images
 excluded_volume
 status_observed_at
+archived_compose_env_sha256
+effective_compose_env_sha256
+effective_mattermost_port
 verification
 restored_at
 nonclaims
@@ -589,7 +597,8 @@ nonclaims
 The receipt rules are:
 
 - source mechanical and causal receipts remain byte-compatible;
-- a published causal receipt requires a closed published mechanical receipt;
+- published mechanical and causal receipts use their operation-specific v2
+  schemas; a published causal receipt requires a closed v2 mechanical receipt;
 - `mechanical_receipt_sha256` is recomputed from the exact retained canonical
   mechanical bytes;
 - backup recovery trust hash/epoch equal the public backup identity and
@@ -601,6 +610,12 @@ The receipt rules are:
   recipient, runtime, candidate and effective-image field equals the public
   bundle, current marker and mechanical receipt before writing the causal
   receipt;
+- the mechanical receipt's `archived_compose_env_sha256` remains the immutable public identity binding;
+  `effective_compose_env_sha256` equals both the current marker and actual
+  target `compose.env`; `effective_mattermost_port` is an integer equal to the
+  current operator configuration; the causal receipt validates these fields
+  from the mechanical bytes but binds them only through
+  `mechanical_receipt_sha256` rather than duplicating them;
 - each receipt's `mode` equals its own operation-specific constant below and
   is not copied from the bundle, marker or preceding receipt;
 - mechanical `verification` is exactly `mechanical_restore_only`; causal
