@@ -201,7 +201,10 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
         created_sink = False
         command("docker", "network", "rm", network)
         created_network = False
-        if not exact_absent("container", sink) or not exact_absent("network", network):
+        command("docker", "network", "rm", open_network)
+        created_open_network = False
+        if (not exact_absent("container", sink) or not exact_absent("network", network)
+                or not exact_absent("network", open_network)):
             raise RuntimeError("clinical egress witness failed: cleanup")
         phase = "receipt"
         inputs = {"status": status, "observations": observations, "environment": environment, "networks": networks, "red": red, "external": external, "cleanup": {"network_absent": True, "sink_absent": True}}
