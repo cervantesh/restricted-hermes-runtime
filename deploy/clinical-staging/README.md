@@ -82,7 +82,10 @@ synthetic environment; `destroy` removes the bounded state directory.
 `status` writes `evidence/status.json`, binding the runtime and HRH heads and
 trees, built image IDs, current policy digest, requested and effective loopback
 publisher tuples, the CA-verified TLS probe, the narrow network exception,
-lifecycle state and nonclaims. `evidence/last-transition.json` records a normal stop.
+the effective non-root identity, non-privileged container state, read-only root
+filesystem, dropped capabilities, `no-new-privileges`, bounded tmpfs and exact
+mount modes of the restricted ingress and clinical-adapter containers, lifecycle
+state and nonclaims. `evidence/last-transition.json` records a normal stop.
 These are technical staging receipts, not compliance artifacts.
 
 If initialization stops before `status` succeeds, do not hand-edit the marker,
