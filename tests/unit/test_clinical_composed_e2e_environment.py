@@ -59,3 +59,33 @@ def test_compose_ignores_inherited_clinical_variables_and_uses_generated_e30_fra
     compose = runner.COMPOSE_FILE.read_text(encoding="utf-8")
     assert "Dockerfile.web.clinical-candidate" in compose
     assert "Dockerfile.migrate.clinical-candidate" in compose
+
+
+def test_windows_compose_discovery_allows_only_installation_roots():
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+    environment = runner.compose_process_environment(
+        {
+            "PATH": "C:/safe/bin",
+            "ProgramFiles": "C:/Program Files",
+            "CLINICAL_HRH_ROOT": "C:/attacker/override",
+        },
+        platform_name="nt",
+    )
+
+    assert environment == {
+        "PATH": "C:/safe/bin",
+        "ProgramFiles": "C:/Program Files",
+    }
+
+
+def test_windows_compose_discovery_rejects_a_host_without_installation_root():
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+
+    try:
+        runner.compose_process_environment({"PATH": "C:/safe/bin"}, platform_name="nt")
+    except RuntimeError as exc:
+        assert str(exc) == "clinical composed E2E Docker Compose discovery is unavailable"
+    else:
+        raise AssertionError("missing Windows Docker Compose discovery was accepted")

@@ -1,11 +1,13 @@
-# A0 candidate evaluation — execution closure card
+# Historical A0 candidate evaluation — execution closure card
 
 ## Exact subject and purpose
 
-This card defines the smallest reproducible A0 execution that advances the
-reconciled runtime candidate from source-only evidence to a digest-pinned,
-hosted synthetic evaluation. It is not an authorization record and does not
-permit PHI, a controlled pilot, or deployment on a representative host.
+This card records the former `49dca06` source-only candidate evaluation frame.
+It is historical evidence, not a current execution authorization: that source
+cannot be relabeled as the integrated candidate because it diverged from the
+current P2 host-admission line.  The current integration boundary is defined
+by `a0-integrated-candidate-closure.md` and requires fresh exact-SHA receipts
+before any future candidate-tag consideration.
 
 The only admissible source subject is revision
 `49dca06b7a2e2b8134e2c4e426112e55fa73d0c3`, tree

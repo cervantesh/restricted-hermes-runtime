@@ -40,6 +40,7 @@ SAFE_COMPOSE_PROCESS_ENV = (
     "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG",
     "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR",
 )
+WINDOWS_COMPOSE_DISCOVERY_ENV = ("ProgramFiles", "ProgramW6432")
 PROJECT = f"clinicale2e{os.getpid()}_{int(time.time())}"
 STATE = Path(tempfile.mkdtemp(prefix="clinical-composed-e2e-"))
 SEED = STATE / "seed"
@@ -87,6 +88,27 @@ def run(
     return result
 
 
+def compose_process_environment(
+    environ: dict[str, str] | None = None,
+    platform_name: str | None = None,
+) -> dict[str, str]:
+    """Return the non-clinical process variables Docker needs to start.
+
+    Windows Docker CLI plugin discovery uses the installation-root variables.
+    They describe the local Docker installation; they are not caller-provided
+    compose configuration and therefore cannot override the sealed contract.
+    """
+    source = os.environ if environ is None else environ
+    name = os.name if platform_name is None else platform_name
+    process = {key: source[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in source}
+    if name == "nt":
+        discovery = {key: source[key] for key in WINDOWS_COMPOSE_DISCOVERY_ENV if key in source}
+        if not discovery:
+            raise RuntimeError("clinical composed E2E Docker Compose discovery is unavailable")
+        process.update(discovery)
+    return process
+
+
 def sealed_compose_environment() -> dict[str, str]:
     """Return only Docker transport variables plus the generated E2E contract.
 
@@ -106,7 +128,7 @@ def sealed_compose_environment() -> dict[str, str]:
         sealed[key] = value
     if not sealed:
         raise RuntimeError("clinical composed E2E environment is empty")
-    process = {key: os.environ[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in os.environ}
+    process = compose_process_environment()
     process.update(sealed)
     return process
 
