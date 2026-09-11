@@ -232,6 +232,109 @@ def test_compose_interpolation_uses_sealed_environment_not_ambient_hrh_root(tmp_
     assert "CLINICAL_UNDECLARED" not in captured["env"]
 
 
+def _write_compose_config_environment(module, staging) -> None:
+    values = {
+        "CLINICAL_MM_DB_PASSWORD": "synthetic-mm-password",
+        "CLINICAL_HRH_DB_PASSWORD": "synthetic-hrh-password",
+        "CLINICAL_HRH_SESSION_SECRET": "0" * 64,
+        "CLINICAL_HRH_ENCRYPTION_KEY": "1" * 64,
+        "CLINICAL_HRH_ROOT": staging.hrh.as_posix(),
+        "CLINICAL_HARNESS": staging.harness.as_posix(),
+        "CLINICAL_SEED": (staging.state_dir / "seed").as_posix(),
+        "CLINICAL_INGRESS_IMAGE": "restricted-clinical-ingress:test",
+        "CLINICAL_ADAPTER_IMAGE": "restricted-clinical-adapter:test",
+        "CLINICAL_POLICY_PUBLIC_KEY": "c3ludGhldGlj",
+        "CLINICAL_HRH_BUILD_SHA": module.REQUIRED_HRH_SHA,
+        "CLINICAL_STAGING_PROJECT": staging.project,
+        "CLINICAL_STAGING_STATE_ID": "2" * 32,
+        "CLINICAL_STAGING_PORT": str(staging.port),
+    }
+    values.update(
+        {
+            f"CLINICAL_VOLUME_{key.upper()}": name
+            for key, name in module.volume_names(staging.project).items()
+        }
+    )
+    staging.env_file.write_bytes(staging._env_bytes(values))
+
+
+def test_default_operator_compose_uses_exactly_one_source_build_overlay_and_is_valid(
+    tmp_path: Path,
+):
+    module = load_module()
+    hrh = tmp_path / "hrh"
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    hrh.mkdir()
+    state.mkdir()
+    staging = module.ClinicalStaging(ROOT, hrh, state, "clinicalstagingdemo", 18443)
+    _write_compose_config_environment(module, staging)
+
+    compose_files = [
+        Path(staging._compose_args()[index + 1])
+        for index, value in enumerate(staging._compose_args())
+        if value == "--file"
+    ]
+    hrh_overlays = {
+        staging.harness / "compose.source-build.yaml",
+        staging.harness / "compose.published-hrh.yaml",
+    }
+
+    assert compose_files == [
+        staging.base_compose,
+        staging.harness / "compose.source-build.yaml",
+        staging.overlay,
+    ]
+    assert len(hrh_overlays.intersection(compose_files)) == 1
+    if shutil.which("docker") is None:
+        pytest.skip("Docker CLI is required for the real Compose configuration witness")
+    result = subprocess.run(
+        (*staging._compose_args(), "config", "--quiet"),
+        cwd=staging.runtime,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_lifecycle_compose_operations_reuse_the_same_hrh_overlay_chain(tmp_path: Path):
+    module = load_module()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / "compose.env").write_text("SEALED=true\n", encoding="utf-8")
+    calls: list[tuple[str, ...]] = []
+
+    class CapturingShell:
+        def run(self, *args, **_kwargs):
+            calls.append(args)
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    staging = module.ClinicalStaging(
+        runtime, hrh, state, "clinicalstagingdemo", 18443, shell=CapturingShell()
+    )
+    lifecycle_operations = (
+        ("config", "--quiet"),  # init preflight
+        ("ps", "--all", "--format", "json"),  # status
+        ("down",),  # backup/destroy teardown
+        ("up", "--detach", *module.LONG_RUNNING_SERVICES),  # normal up
+        ("up", "--detach", "mattermost-postgres", "hrh-postgres", "hrh-migrate"),  # restore
+    )
+
+    for operation in lifecycle_operations:
+        staging.compose(*operation)
+
+    prefix = staging._compose_args()
+    assert calls == [(*prefix, *operation) for operation in lifecycle_operations]
+    assert prefix.count("--file") == 3
+    assert str(staging.hrh_overlay) in prefix
+    assert "compose.published-hrh.yaml" not in " ".join(prefix)
+
+
 def test_destructive_volume_guard_rejects_missing_labels_and_unexpected_project_volume():
     module = load_module()
     project = "clinicalstagingdemo"

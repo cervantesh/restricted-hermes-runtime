@@ -61,6 +61,14 @@ directory. Its Mattermost certificate covers both the internal DNS name and the
 advertised loopback IPv4 address; `status` verifies the advertised IP endpoint
 from the host before it writes evidence.
 
+The operator lifecycle intentionally remains source-build only. Every lifecycle
+command uses the common composition, exactly one HRH service overlay
+(`compose.source-build.yaml`), and the staging overlay. The separate
+source-free published-candidate witness described in
+`docs/design/source-free-hrh-candidate-consumption.md` is not an operator
+staging mode: adopting it here also requires a persisted candidate trust and
+verification contract, rather than only selecting another Compose file.
+
 `init` builds from the exact clean sources, initializes the external volumes,
 runs the root controller only through `docker compose run --rm`, and then
 verifies that no privileged provisioner remains. `stop` preserves every
