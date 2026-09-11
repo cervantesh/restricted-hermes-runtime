@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -727,6 +731,37 @@ def test_operational_commands_reject_initializing_marker_before_compose(
 
     with pytest.raises(module.SafetyError, match="lifecycle"):
         getattr(staging, command)("clinical-e2") if command == "refresh_policy" else getattr(staging, command)()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the production lifecycle lock is Linux/POSIX-only")
+def test_lifecycle_lock_blocks_a_second_operator_process(tmp_path: Path):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    released = tmp_path / "second-entered"
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingdemo", 18443)
+    child = """
+import importlib.util
+import pathlib
+import sys
+spec = importlib.util.spec_from_file_location('clinical_staging_child', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+staging = module.ClinicalStaging(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4]), 'clinicalstagingdemo', 18443)
+with staging._lifecycle_lock():
+    pathlib.Path(sys.argv[5]).write_text('entered', encoding='ascii')
+"""
+
+    with staging._lifecycle_lock():
+        process = subprocess.Popen(
+            [sys.executable, "-c", child, str(MODULE_PATH), str(runtime), str(hrh), str(state), str(released)],
+        )
+        time.sleep(0.15)
+        assert not released.exists(), "second lifecycle process entered while the first held the state lock"
+    assert process.wait(timeout=5) == 0
+    assert released.read_text(encoding="ascii") == "entered"
 
 
 def test_stop_failure_preserves_ready_marker_and_transition_evidence(

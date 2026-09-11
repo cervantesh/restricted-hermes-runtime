@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import functools
 import hashlib
 import http.client
 import ipaddress
@@ -17,6 +19,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -26,6 +29,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the supported operator path is Linux.
+    fcntl = None
 
 
 RUNTIME_BASE_SHA = "c6c41a0980ed21de95d324c828ee9c5bb50cb8dd"
@@ -68,6 +76,16 @@ class SafetyError(RuntimeError):
 
 class CommandError(RuntimeError):
     pass
+
+
+def serialized_lifecycle(method):
+    """Serialize every mutating/observing lifecycle command for one state target."""
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        self._require_linux()
+        with self._lifecycle_lock():
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 class Shell:
@@ -472,6 +490,43 @@ class ClinicalStaging:
         self.overlay = self.runtime / "deploy" / "clinical-staging" / "compose.yaml"
         self.harness = self.runtime / "tests" / "deployment" / "clinical-composed-e2e"
         self.env_file = self.state_dir / "compose.env"
+        self._lifecycle_lock_depth = 0
+        self._lifecycle_thread_lock = threading.RLock()
+
+    @contextlib.contextmanager
+    def _lifecycle_lock(self):
+        """Take a per-state advisory lock, reentrant for nested command calls."""
+        if self._lifecycle_lock_depth:
+            self._lifecycle_lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lifecycle_lock_depth -= 1
+            return
+
+        # init may create a fresh state directory, so the lock lives beside it.
+        self.state_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_path = self.state_dir.parent / f".{self.state_dir.name}.lifecycle.lock"
+        if fcntl is None:  # pragma: no cover - test portability only; Linux is required in production.
+            with self._lifecycle_thread_lock:
+                self._lifecycle_lock_depth = 1
+                try:
+                    yield
+                finally:
+                    self._lifecycle_lock_depth = 0
+            return
+
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self._lifecycle_lock_depth = 1
+            try:
+                yield
+            finally:
+                self._lifecycle_lock_depth = 0
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def _require_linux(self) -> None:
         if os.name != "posix" or not sys.platform.startswith("linux"):
@@ -604,6 +659,7 @@ class ClinicalStaging:
         self.compose("build", "ingress", "clinical-adapter", timeout=2400)
         self.compose("build", "controller", "hrh-migrate", "hrh", timeout=2400)
 
+    @serialized_lifecycle
     def init(self) -> dict[str, Any]:
         self._require_linux()
         frame = verify_source_frame(self.runtime, self.hrh, self.shell)
@@ -660,6 +716,7 @@ class ClinicalStaging:
         self.up()
         return self.status()
 
+    @serialized_lifecycle
     def up(self) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
@@ -769,6 +826,7 @@ class ClinicalStaging:
         if any(labels.get("com.docker.compose.service") == "controller" for labels in containers.values()):
             raise SafetyError("privileged provisioner must not remain after initialization")
 
+    @serialized_lifecycle
     def status(self) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
@@ -838,6 +896,7 @@ class ClinicalStaging:
         write_json_atomic(self.state_dir / "evidence" / "status.json", evidence, mode=0o600)
         return evidence
 
+    @serialized_lifecycle
     def refresh_policy(self, epoch: str) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
@@ -852,6 +911,7 @@ class ClinicalStaging:
         self.compose("up", "--detach", "ingress")
         return self.status()
 
+    @serialized_lifecycle
     def stop(self) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
@@ -914,6 +974,7 @@ class ClinicalStaging:
         for name in volume_names_to_remove:
             self.shell.run("docker", "volume", "rm", name, cwd=self.runtime)
 
+    @serialized_lifecycle
     def reset(self) -> dict[str, Any]:
         self._require_linux()
         self._destroy_resources()
@@ -923,6 +984,7 @@ class ClinicalStaging:
             (self.state_dir / name).unlink()
         return self.init()
 
+    @serialized_lifecycle
     def destroy(self) -> dict[str, Any]:
         self._require_linux()
         marker = read_marker(self.state_dir, self.project)
