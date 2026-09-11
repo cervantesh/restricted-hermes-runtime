@@ -52,13 +52,15 @@ def test_retained_candidate_ledgers_verify_from_the_evidence_frame(name: str) ->
 
 
 def test_p2_collector_ledger_names_the_immediately_preceding_candidate_subject() -> None:
+    path = "docs/evidence/p2-collector-candidate-ledger-2026-09-11.json"
     raw = subprocess.run(
-        ["git", "-C", str(ROOT), "show", "HEAD:docs/evidence/p2-collector-candidate-ledger-2026-09-11.json"],
+        ["git", "-C", str(ROOT), "show", f"HEAD:{path}"],
         capture_output=True,
         check=True,
     ).stdout
     value = json.loads(raw)
-    candidate = git(ROOT, "rev-parse", "HEAD~1")
+    ledger_commit = git(ROOT, "log", "-1", "--format=%H", "--", path)
+    candidate = git(ROOT, "rev-parse", f"{ledger_commit}~1")
 
     assert value["candidate"] == {
         "revision": candidate,
