@@ -569,19 +569,29 @@ def main() -> None:
     # Reauthorization is an external effect, so the executor claims the row
     # before it begins.  The harness delay holds that call after the durable
     # claim and before delivery; the payload must still be retained.
-    claimed_records = [row for row in paused_outbox_snapshot() if row.get("state") == "IN_FLIGHT"]
-    if len(claimed_records) != 1:
-        raise RuntimeError(
-            "source-deletion barrier did not isolate exactly one IN_FLIGHT outbox record "
-            f"(observed={len(claimed_records)})"
-        )
-    source_before = claimed_records[0]
-    if source_before.get("reason") != "" or source_before.get("nonce_erased") or source_before.get("ciphertext_erased"):
-        raise RuntimeError("source-deletion claimed record did not retain its encrypted payload")
-    source_record_tag = source_before.get("record_tag")
-    if not isinstance(source_record_tag, str) or len(source_record_tag) != 64:
-        raise RuntimeError("source-deletion claimed record tag was invalid")
-    source_deletion = json.loads(control("delete-source", "source-deleted").stdout)
+    # Hold the executor after its durable claim until the external source has
+    # been definitively deleted.  A probe snapshot that unpauses first leaves
+    # a race between the Mattermost DELETE and the final source revalidation.
+    compose("pause", "ingress")
+    try:
+        snapshot = json.loads(control("snapshot-outbox-records").stdout)
+        if not isinstance(snapshot, list):
+            raise RuntimeError("source-deletion outbox snapshot was not a list")
+        claimed_records = [row for row in snapshot if row.get("state") == "IN_FLIGHT"]
+        if len(claimed_records) != 1:
+            raise RuntimeError(
+                "source-deletion barrier did not isolate exactly one IN_FLIGHT outbox record "
+                f"(observed={len(claimed_records)})"
+            )
+        source_before = claimed_records[0]
+        if source_before.get("reason") != "" or source_before.get("nonce_erased") or source_before.get("ciphertext_erased"):
+            raise RuntimeError("source-deletion claimed record did not retain its encrypted payload")
+        source_record_tag = source_before.get("record_tag")
+        if not isinstance(source_record_tag, str) or len(source_record_tag) != 64:
+            raise RuntimeError("source-deletion claimed record tag was invalid")
+        source_deletion = json.loads(control("delete-source", "source-deleted").stdout)
+    finally:
+        compose("unpause", "ingress", check=False)
     control("mutate", "drop-source-delete-delay", timeout=60)
     wait_delivery_reauthorized("source-deleted")
     control("expect", "source-deleted", "no-reply", timeout=45)
