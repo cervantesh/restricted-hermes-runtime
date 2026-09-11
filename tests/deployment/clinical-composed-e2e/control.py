@@ -227,8 +227,8 @@ def policy_private() -> Ed25519PrivateKey:
     return private
 
 
-def verify_policy_pair(directory: Path, public_key: Any) -> str:
-    raw = (directory / "policy.json").read_bytes()
+def verify_policy_pair(directory: Path, public_key: Any, *, raw: bytes | None = None) -> str:
+    raw = (directory / "policy.json").read_bytes() if raw is None else raw
     try:
         signature = base64.b64decode((directory / "policy.sig").read_bytes(), validate=True)
         public_key.verify(signature, raw)
@@ -324,8 +324,9 @@ def policy_digest() -> str:
 
 def policy_live() -> str:
     """Verify the signed policy and its current validity window."""
-    digest = verify_policy_pair(INGRESS, policy_private().public_key())
-    values = load_closed_json((INGRESS / "policy.json").read_bytes())
+    raw = (INGRESS / "policy.json").read_bytes()
+    digest = verify_policy_pair(INGRESS, policy_private().public_key(), raw=raw)
+    values = load_closed_json(raw)
     if not isinstance(values, dict):
         raise RuntimeError("policy is not an object")
     MattermostPolicy(values, digest).validate()

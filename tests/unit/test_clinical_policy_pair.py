@@ -58,11 +58,13 @@ def test_policy_live_requires_the_policy_validity_check(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(module, "INGRESS", tmp_path)
     monkeypatch.setattr(module, "policy_private", lambda: Ed25519PrivateKey.generate())
-    monkeypatch.setattr(module, "verify_policy_pair", lambda *_args: "a" * 64)
-    monkeypatch.setattr(module, "load_closed_json", lambda _raw: {"closed": "policy"})
+    observed: list[bytes] = []
+    monkeypatch.setattr(module, "verify_policy_pair", lambda *_args, raw=None: observed.append(raw) or "a" * 64)
+    monkeypatch.setattr(module, "load_closed_json", lambda raw: observed.append(raw) or {"closed": "policy"})
     monkeypatch.setattr(module, "MattermostPolicy", lambda values, digest: calls.append((values, digest)) or ExpiredPolicy())
     (tmp_path / "policy.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="expired"):
         module.policy_live()
     assert calls == [({"closed": "policy"}, "a" * 64), "validate"]
+    assert observed == [b"{}", b"{}"]
