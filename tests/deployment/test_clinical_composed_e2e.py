@@ -562,7 +562,7 @@ def main() -> None:
     phase("source-deletion-before-delivery")
     control("mutate", "reset")
     before = int(control("grant-count").stdout.strip())
-    control("mutate", "crash-delay")
+    control("mutate", "source-delete-delay")
     control("send", "actor", "actor_dm", "018f22bb-414d-7cc4-b5a4-83cc8ec92cb1", "source-deleted")
     wait_grants(before)
     wait_delivery_delay()
@@ -582,7 +582,7 @@ def main() -> None:
     if not isinstance(source_record_tag, str) or len(source_record_tag) != 64:
         raise RuntimeError("source-deletion claimed record tag was invalid")
     source_deletion = json.loads(control("delete-source", "source-deleted").stdout)
-    control("mutate", "drop-crash-delay", timeout=60)
+    control("mutate", "drop-source-delete-delay", timeout=60)
     wait_delivery_reauthorized("source-deleted")
     control("expect", "source-deleted", "no-reply", timeout=45)
     terminal_records = paused_outbox_snapshot(source_record_tag)
