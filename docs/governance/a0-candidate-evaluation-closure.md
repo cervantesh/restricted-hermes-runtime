@@ -55,9 +55,15 @@ attempt; do not synthesize a success receipt.
 ## Sequence and nonclaims
 
 1. From this retained-evidence checkout, verify the A0 source ledger.
-2. Create the unique tag on the exact source revision.
-3. Run the immutable workflow and retain its artifact.
-4. Verify the artifact manifest from a clean checkout and record the result.
+2. Run `tools/a0_tag_preflight.py` against the declared source revision/tree
+   and the proposed unique tag. Retain its canonical, content-safe receipt in
+   the later evidence frame. A denial, including an existing remote tag, stops
+   before any tag is created.
+3. Create the unique tag on the exact source revision only after that receipt
+   passes. Push only the new tag ref; a remote rejection or any mismatch stops
+   the attempt rather than retrying with a moved/reforced tag.
+4. Run the immutable workflow and retain its artifact.
+5. Verify the artifact manifest from a clean checkout and record the result.
 
 This is hosted, synthetic, non-PHI evidence only. It does not replace the
 representative-host gate, external service qualification, operational review,

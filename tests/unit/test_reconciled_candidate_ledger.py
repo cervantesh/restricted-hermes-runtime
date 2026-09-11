@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("reconciled_candidate_ledger", ROOT / "tools" / "reconciled_candidate_ledger.py")
 assert SPEC and SPEC.loader
@@ -93,6 +92,8 @@ def test_a0_card_is_bound_to_the_p2_admission_candidate_and_its_real_guard() -> 
     assert candidate["revision"] in card
     assert candidate["tree"] in card
     assert "immutable-candidate-<date>-" + candidate["revision"][:7] in card
+    assert "tools/a0_tag_preflight.py" in card
+    assert "before any tag is created" in card
 
     admission = subprocess.run(
         ["git", "-C", str(ROOT), "show", f"{candidate['revision']}:tools/p2_host_platform_admission.py"],
