@@ -130,12 +130,12 @@ def build_receipt(
         "controlled_external": valid_external,
         "cleanup": valid_cleanup,
     }
-    if verify_receipt(canonical_bytes(receipt), expected_source=status.get("source")):
+    if verify_receipt(canonical_bytes(receipt), expected_status=status):
         raise ValueError("candidate witness is not admissible")
     return receipt
 
 
-def verify_receipt(raw: bytes, *, expected_source: object) -> list[str]:
+def verify_receipt(raw: bytes, *, expected_status: Mapping[str, Any]) -> list[str]:
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError):
@@ -147,7 +147,7 @@ def verify_receipt(raw: bytes, *, expected_source: object) -> list[str]:
     if value["schema"] != SCHEMA or value["synthetic_non_phi_only"] is not True:
         return ["schema"]
     candidate = _candidate()
-    if candidate.verify_receipt(candidate.canonical_bytes(value["candidate_receipt"]), expected_source=expected_source):
+    if candidate.verify_receipt(candidate.canonical_bytes(value["candidate_receipt"]), expected_status=expected_status):
         return ["candidate-receipt"]
     if _images({"built_images": value["effective_images"]}) is None:
         return ["images"]
@@ -187,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
             receipt = build_receipt(*(_read(getattr(args, name)) for name in ("status", "observations", "environment", "networks", "red", "external", "cleanup")))
             write_new(args.output, receipt)
         else:
-            errors = verify_receipt(args.receipt.read_bytes(), expected_source=_read(args.status).get("source"))
+            errors = verify_receipt(args.receipt.read_bytes(), expected_status=_read(args.status))
             if errors:
                 raise ValueError(errors[0])
     except (OSError, ValueError) as exc:
