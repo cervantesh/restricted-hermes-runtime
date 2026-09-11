@@ -574,9 +574,10 @@ def mutate(name: str) -> None:
             cursor.execute("""CREATE OR REPLACE FUNCTION clinical_e2e_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='restricted_hermes_delivery_reauthorized' THEN PERFORM pg_sleep(20); END IF; RETURN NEW; END $$""")
             cursor.execute("CREATE TRIGGER clinical_e2e_delay BEFORE INSERT ON audit_logs FOR EACH ROW EXECUTE FUNCTION clinical_e2e_delay()")
         elif name == "source-delete-delay":
-            # Keep the known-success authorization response below the UDS
-            # timeout while holding a deterministic pre-revalidation window.
-            cursor.execute("""CREATE OR REPLACE FUNCTION clinical_e2e_source_delete_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='restricted_hermes_delivery_reauthorized' THEN PERFORM pg_sleep(10); END IF; RETURN NEW; END $$""")
+            # Keep the known-success authorization response below the adapter's
+            # 10-second upstream deadline while holding a deterministic
+            # pre-revalidation window.
+            cursor.execute("""CREATE OR REPLACE FUNCTION clinical_e2e_source_delete_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='restricted_hermes_delivery_reauthorized' THEN PERFORM pg_sleep(4); END IF; RETURN NEW; END $$""")
             cursor.execute("CREATE TRIGGER clinical_e2e_source_delete_delay BEFORE INSERT ON audit_logs FOR EACH ROW EXECUTE FUNCTION clinical_e2e_source_delete_delay()")
         elif name == "drop-crash-delay":
             cursor.execute("DROP TRIGGER IF EXISTS clinical_e2e_delay ON audit_logs")
