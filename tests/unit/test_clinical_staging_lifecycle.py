@@ -54,6 +54,52 @@ def test_clinical_staging_rejects_state_inside_either_build_context(tmp_path: Pa
             module.ClinicalStaging(runtime, hrh, state, project, 18443)
 
 
+def test_compose_strips_host_clinical_environment_before_interpolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    observed: dict[str, object] = {}
+
+    class CapturingShell:
+        def run(self, *args, **kwargs):
+            observed["args"] = args
+            observed["kwargs"] = kwargs
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("CLINICAL_HRH_ROOT", "host-override-must-not-reach-compose")
+    monkeypatch.setenv("CLINICAL_POLICY_PUBLIC_KEY", "host-override-must-not-reach-compose")
+    monkeypatch.setenv("UNRELATED_OPERATOR_SETTING", "preserved")
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingdemo", 18443, shell=CapturingShell())
+
+    staging.compose("config", "--quiet")
+
+    env = observed["kwargs"]["env"]
+    assert "CLINICAL_HRH_ROOT" not in env
+    assert "CLINICAL_POLICY_PUBLIC_KEY" not in env
+    assert env["UNRELATED_OPERATOR_SETTING"] == "preserved"
+    assert "--env-file" in observed["args"]
+    assert str(state / "compose.env") in observed["args"]
+
+
+def test_sealed_compose_environment_reaches_a_real_child_process(monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    monkeypatch.setenv("CLINICAL_HRH_ROOT", "host-override-must-not-reach-child")
+    monkeypatch.setenv("UNRELATED_OPERATOR_SETTING", "preserved")
+
+    result = module.Shell().run(
+        sys.executable,
+        "-c",
+        "import os; print(os.getenv('CLINICAL_HRH_ROOT')); print(os.getenv('UNRELATED_OPERATOR_SETTING'))",
+        env=module.ClinicalStaging._sealed_compose_environment(),
+    )
+
+    assert result.stdout.splitlines() == ["None", "preserved"]
+
+
 def test_marker_is_closed_and_binds_project_path_and_synthetic_purpose(tmp_path: Path):
     module = load_module()
     state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"

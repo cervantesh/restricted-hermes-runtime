@@ -98,12 +98,14 @@ class Shell:
         self,
         *args: str,
         cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
         check: bool = True,
         timeout: int = 600,
     ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
             args,
             cwd=cwd,
+            env=dict(env) if env is not None else None,
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -614,8 +616,29 @@ class ClinicalStaging:
             "--file", str(self.overlay),
         )
 
+    @staticmethod
+    def _sealed_compose_environment() -> dict[str, str]:
+        """Keep host `CLINICAL_*` values out of Compose interpolation.
+
+        The closed `compose.env` file is the only authority for this namespace.
+        Passing the host environment through would let its values take
+        precedence during Compose interpolation despite `--env-file`.
+        """
+        return {
+            name: value
+            for name, value in os.environ.items()
+            if not name.upper().startswith("CLINICAL_")
+        }
+
     def compose(self, *args: str, check: bool = True, timeout: int = 1200) -> subprocess.CompletedProcess[str]:
-        return self.shell.run(*self._compose_args(), *args, cwd=self.runtime, check=check, timeout=timeout)
+        return self.shell.run(
+            *self._compose_args(),
+            *args,
+            cwd=self.runtime,
+            env=self._sealed_compose_environment(),
+            check=check,
+            timeout=timeout,
+        )
 
     def control(self, *args: str, timeout: int = 600) -> str:
         result = self.compose(
