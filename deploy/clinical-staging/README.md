@@ -59,6 +59,11 @@ from the host before it writes evidence.
 runs the root controller only through `docker compose run --rm`, and then
 verifies that no privileged provisioner remains. `stop` preserves every
 credential, database and outbox volume. `up` does not reseed or rotate them.
+If `init` is killed before its private state directory is atomically renamed,
+a later `init` removes only a bounded, operator-owned pre-rename remnant under
+the same lifecycle lock; links, foreign entries, malformed roots, or excessive
+remnants fail closed rather than being removed. It never reuses that partial
+seed material.
 `refresh-policy` stops ingress, installs and verifies a newly signed matched
 policy/signature pair through the existing
 controller helper, and restarts only ingress after the pair verifies. An
