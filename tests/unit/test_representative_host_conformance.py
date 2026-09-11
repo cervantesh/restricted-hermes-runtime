@@ -14,6 +14,7 @@ HEAD = "a" * 40
 TREE = "b" * 40
 MANIFEST = "c" * 64
 EGRESS = "d" * 64
+SUBJECT_SET = "e" * 64
 
 
 def load_module():
@@ -47,7 +48,7 @@ def receipt(module, *, outcome="PASS"):
             "runtime_head": HEAD,
             "runtime_tree": TREE,
             "candidate_manifest_sha256": MANIFEST,
-            "subject_set_sha256": "e" * 64,
+            "subject_set_sha256": SUBJECT_SET,
         },
         "inputs": {"container_egress_receipt_sha256": EGRESS},
         "host": {"class": "ubuntu-24.04-lts-x86_64", "toolchain_sha256": "f" * 64},
@@ -66,6 +67,7 @@ def test_valid_green_receipt_is_canonical_and_candidate_bound():
         expected_runtime_head=HEAD,
         expected_runtime_tree=TREE,
         expected_candidate_manifest_sha256=MANIFEST,
+        expected_subject_set_sha256=SUBJECT_SET,
         expected_egress_receipt_sha256=EGRESS,
         expected_outcome="PASS",
     ) == []
@@ -81,6 +83,7 @@ def test_valid_red_receipt_is_structurally_valid_but_cannot_satisfy_green_gate()
         expected_runtime_head=HEAD,
         expected_runtime_tree=TREE,
         expected_candidate_manifest_sha256=MANIFEST,
+        expected_subject_set_sha256=SUBJECT_SET,
         expected_egress_receipt_sha256=EGRESS,
         expected_outcome="FAIL",
     ) == []
@@ -89,6 +92,7 @@ def test_valid_red_receipt_is_structurally_valid_but_cannot_satisfy_green_gate()
         expected_runtime_head=HEAD,
         expected_runtime_tree=TREE,
         expected_candidate_manifest_sha256=MANIFEST,
+        expected_subject_set_sha256=SUBJECT_SET,
         expected_egress_receipt_sha256=EGRESS,
         expected_outcome="PASS",
     )
@@ -99,6 +103,7 @@ def test_valid_red_receipt_is_structurally_valid_but_cannot_satisfy_green_gate()
     [
         (lambda value: value["candidate"].update(runtime_head="0" * 40), "runtime-head"),
         (lambda value: value["candidate"].update(subject_set_sha256="not-a-digest"), "candidate"),
+        (lambda value: value["candidate"].update(subject_set_sha256="1" * 64), "subject-set"),
         (lambda value: value["inputs"].update(container_egress_receipt_sha256="0" * 64), "egress"),
         (lambda value: value["claims"].pop(), "claims"),
         (lambda value: value["claims"][0].update(proof_sha256="raw-secret-value"), "claims"),
@@ -116,6 +121,7 @@ def test_substitution_missing_claim_or_content_bearing_field_is_rejected(mutate,
         expected_runtime_head=HEAD,
         expected_runtime_tree=TREE,
         expected_candidate_manifest_sha256=MANIFEST,
+        expected_subject_set_sha256=SUBJECT_SET,
         expected_egress_receipt_sha256=EGRESS,
         expected_outcome="PASS",
     )
@@ -133,6 +139,7 @@ def test_noncanonical_or_duplicate_json_cannot_be_a_receipt():
             expected_runtime_head=HEAD,
             expected_runtime_tree=TREE,
             expected_candidate_manifest_sha256=MANIFEST,
+            expected_subject_set_sha256=SUBJECT_SET,
             expected_egress_receipt_sha256=EGRESS,
             expected_outcome="PASS",
         )
