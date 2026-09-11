@@ -424,8 +424,29 @@ def verify_live_attestations(manifest: object, *, repo_root: Path = ROOT) -> lis
             run = json.loads(result.stdout) if result.returncode == 0 else {}
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
             run = {}
-        if run.get("conclusion") != "success" or run.get("head_sha") != source_revision:
-            errors.append("authenticated workflow run is not a successful source-matched run")
+        if run.get("head_sha") != source_revision:
+            errors.append("authenticated workflow run is not source-matched")
+            return errors
+        # The verifier runs inside the same workflow that created the
+        # attestations.  Requiring the *whole* run to be successful here is
+        # circular: this check necessarily observes the run before its own job
+        # can conclude.  Instead, require the exact authenticated run to show
+        # successful build-and-publish jobs for both declared subjects.  The
+        # workflow's final status remains a separate GitHub check.
+        try:
+            result = subprocess.run(
+                ["gh", "api", f"repos/{REPOSITORY}/actions/runs/{run_id}/jobs"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            jobs = json.loads(result.stdout).get("jobs", []) if result.returncode == 0 else []
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            jobs = []
+        build_jobs = [
+            job for job in jobs
+            if isinstance(job, dict) and str(job.get("name", "")).startswith("build-publish")
+        ]
+        if len(build_jobs) != len(EXPECTED_IMAGES) or any(job.get("conclusion") != "success" for job in build_jobs):
+            errors.append("authenticated workflow run lacks successful source-subject build jobs")
     return errors
 
 
