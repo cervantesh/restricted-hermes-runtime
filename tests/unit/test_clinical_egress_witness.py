@@ -87,14 +87,23 @@ def test_builder_rejects_incomplete_red_or_cleanup():
         module.build_receipt(*values)
 
 
+def test_receipt_writer_does_not_replace_an_existing_caller_path(tmp_path):
+    module = load_module()
+    output = tmp_path / "receipt.json"
+    output.write_bytes(b"sentinel")
+    with pytest.raises(FileExistsError):
+        module.write_new(output, module.build_receipt(*inputs(module)))
+    assert output.read_bytes() == b"sentinel"
+
+
 def test_versioned_wsl_receipt_is_canonical_and_bound_to_its_recorded_subject():
     module = load_module()
     raw = (ROOT / "docs" / "evidence" / "clinical-egress-wsl-receipt-2026-09-11.json").read_bytes()
     expected = {
-        "runtime_head": "e06e0a81964544123b507c31cf9190d36593a345",
-        "runtime_tree": "e699bbacfa02d77c3ec601810be628ee1cb4720b",
+        "runtime_head": "350afec376c7133a7caa5068f18e8c011bfe2f4a",
+        "runtime_tree": "9411109faad5f3baa22d0badba92c502bb75d788",
         "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
         "hrh_tree": "f217b0b1cf7f438422528dfe178d81b78212c68b",
     }
     assert module.verify_receipt(raw, expected_source=expected) == []
-    assert hashlib.sha256(raw).hexdigest() == "101ddd90cde61107dd6ad27a1ba52a0c6dd0794bb7baf53d2306821404ef247a"
+    assert hashlib.sha256(raw).hexdigest() == "833e63b36df9e2474991fdc1b79b281cd0ab21d4943124d38c347d965f990a28"
