@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Build and verify the current synthetic clinical egress witness.
+
+This is deliberately a receipt boundary, not a network-policy mechanism.  The
+Linux runner obtains the observations through real containers; this program
+retains only their fixed, content-safe outcomes, never raw endpoints, logs,
+environment values, DNS answers, response bodies, or credentials.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any, Mapping
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CANDIDATE = ROOT / "tools" / "candidate_clinical_egress.py"
+SCHEMA = "restricted-runtime-clinical-egress-witness.v2"
+SERVICES = ("clinical-adapter", "ingress")
+EXPECTED_NETWORKS = {
+    "clinical-adapter": ["clinical_upstream"],
+    "ingress": ["mattermost_edge"],
+}
+EXPECTED_RED = {service: {"ipv4": True, "ipv6": True} for service in SERVICES}
+EXPECTED_EXTERNAL = {"open_control": True, **{service: False for service in SERVICES}}
+_VERSION = re.compile(r"[A-Za-z0-9._+:/~:-]{1,160}")
+_IMAGE = re.compile(r"sha256:[a-f0-9]{64}")
+
+
+def _candidate():
+    spec = importlib.util.spec_from_file_location("candidate_clinical_egress", CANDIDATE)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("candidate egress contract is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def canonical_bytes(value: Mapping[str, Any]) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+
+
+def write_new(path: Path, value: Mapping[str, Any]) -> None:
+    """Create a receipt once without following a caller-provided symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(canonical_bytes(value))
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _closed_mapping(value: object, keys: set[str]) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != keys:
+        return None
+    return dict(value)
+
+
+def _strict_bool_mapping(value: object, expected: Mapping[str, bool]) -> dict[str, bool] | None:
+    fields = _closed_mapping(value, set(expected))
+    if fields is None or not all(isinstance(item, bool) for item in fields.values()):
+        return None
+    output = {key: fields[key] for key in expected}
+    return output if output == expected else None
+
+
+def _controlled_red(value: object) -> dict[str, dict[str, bool]] | None:
+    fields = _closed_mapping(value, set(SERVICES))
+    if fields is None:
+        return None
+    output: dict[str, dict[str, bool]] = {}
+    for service in SERVICES:
+        outcome = _strict_bool_mapping(fields[service], {"ipv4": True, "ipv6": True})
+        if outcome is None:
+            return None
+        output[service] = outcome
+    return output if output == EXPECTED_RED else None
+
+
+def _environment(value: object) -> dict[str, str] | None:
+    fields = _closed_mapping(value, {"system", "kernel", "architecture", "docker", "compose"})
+    if fields is None or not all(isinstance(item, str) and _VERSION.fullmatch(item) for item in fields.values()):
+        return None
+    return fields  # type: ignore[return-value]
+
+
+def _networks(value: object) -> dict[str, list[str]] | None:
+    fields = _closed_mapping(value, set(SERVICES))
+    if fields is None:
+        return None
+    output: dict[str, list[str]] = {}
+    for service in SERVICES:
+        networks = fields[service]
+        if not isinstance(networks, list) or not networks or not all(isinstance(item, str) and _VERSION.fullmatch(item) for item in networks):
+            return None
+        if networks != sorted(set(networks)):
+            return None
+        output[service] = networks
+    if output != EXPECTED_NETWORKS:
+        return None
+    return output
+
+
+def _images(status: Mapping[str, Any]) -> dict[str, str] | None:
+    images = status.get("built_images")
+    # Staging status binds the full Compose set.  This witness retains only
+    # its two edge subjects while refusing to synthesize either one.
+    if not isinstance(images, dict) or not set(SERVICES).issubset(images):
+        return None
+    selected = {service: images[service] for service in SERVICES}
+    if not all(isinstance(item, str) and _IMAGE.fullmatch(item) for item in selected.values()):
+        return None
+    return selected
+
+
+def build_receipt(
+    status: Mapping[str, Any], observations: Mapping[str, Any], environment: Mapping[str, Any],
+    networks: Mapping[str, Any], red: Mapping[str, Any], external: Mapping[str, Any], cleanup: Mapping[str, Any],
+) -> dict[str, Any]:
+    candidate = _candidate()
+    candidate_receipt = candidate.build_receipt(status, observations)
+    images = _images(status)
+    valid_environment = _environment(environment)
+    valid_networks = _networks(networks)
+    valid_red = _controlled_red(red)
+    valid_external = _strict_bool_mapping(external, EXPECTED_EXTERNAL)
+    valid_cleanup = _strict_bool_mapping(cleanup, {"network_absent": True, "sink_absent": True})
+    if images is None:
+        raise ValueError("image-binding")
+    if valid_environment is None:
+        raise ValueError("environment-binding")
+    if valid_networks is None:
+        raise ValueError("network-binding")
+    if valid_red != EXPECTED_RED:
+        raise ValueError("controlled RED observations are incomplete")
+    if valid_external != EXPECTED_EXTERNAL:
+        raise ValueError("controlled external observations are incomplete")
+    if valid_cleanup != {"network_absent": True, "sink_absent": True}:
+        raise ValueError("controlled resource cleanup is incomplete")
+    receipt = {
+        "schema": SCHEMA,
+        "synthetic_non_phi_only": True,
+        "candidate_receipt": candidate_receipt,
+        "effective_images": images,
+        "environment": valid_environment,
+        "network_membership": valid_networks,
+        "controlled_red": valid_red,
+        "controlled_external": valid_external,
+        "cleanup": valid_cleanup,
+    }
+    if verify_receipt(canonical_bytes(receipt), expected_status=status):
+        raise ValueError("candidate witness is not admissible")
+    return receipt
+
+
+def verify_receipt(raw: bytes, *, expected_status: Mapping[str, Any]) -> list[str]:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return ["canonical"]
+    if not isinstance(value, dict) or canonical_bytes(value) != raw:
+        return ["canonical"]
+    if set(value) != {"schema", "synthetic_non_phi_only", "candidate_receipt", "effective_images", "environment", "network_membership", "controlled_red", "controlled_external", "cleanup"}:
+        return ["fields"]
+    if value["schema"] != SCHEMA or value["synthetic_non_phi_only"] is not True:
+        return ["schema"]
+    candidate = _candidate()
+    if candidate.verify_receipt(candidate.canonical_bytes(value["candidate_receipt"]), expected_status=expected_status):
+        return ["candidate-receipt"]
+    images = _images({"built_images": value["effective_images"]})
+    expected_images = _images(expected_status)
+    if images is None or expected_images is None or images != expected_images:
+        return ["images"]
+    if _environment(value["environment"]) is None:
+        return ["environment"]
+    if _networks(value["network_membership"]) is None:
+        return ["networks"]
+    if _controlled_red(value["controlled_red"]) != EXPECTED_RED:
+        return ["red"]
+    if _strict_bool_mapping(value["controlled_external"], EXPECTED_EXTERNAL) != EXPECTED_EXTERNAL:
+        return ["external"]
+    if _strict_bool_mapping(value["cleanup"], {"network_absent": True, "sink_absent": True}) != {"network_absent": True, "sink_absent": True}:
+        return ["cleanup"]
+    return []
+
+
+def _read(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("input must be a JSON object")
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    build = sub.add_parser("build")
+    for name in ("status", "observations", "environment", "networks", "red", "external", "cleanup"):
+        build.add_argument(f"--{name}", required=True, type=Path)
+    build.add_argument("--output", required=True, type=Path)
+    verify = sub.add_parser("verify")
+    verify.add_argument("--receipt", required=True, type=Path)
+    verify.add_argument("--status", required=True, type=Path)
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "build":
+            receipt = build_receipt(*(_read(getattr(args, name)) for name in ("status", "observations", "environment", "networks", "red", "external", "cleanup")))
+            write_new(args.output, receipt)
+        else:
+            errors = verify_receipt(args.receipt.read_bytes(), expected_status=_read(args.status))
+            if errors:
+                raise ValueError(errors[0])
+    except (OSError, ValueError) as exc:
+        # Keep the command's public outcome enumerable and content-safe.  The
+        # caller must never receive a path, endpoint, environment value, or
+        # child output merely because receipt assembly was rejected.
+        reason = str(exc)
+        allowed = {
+            "image-binding", "environment-binding", "network-binding",
+            "controlled RED observations are incomplete", "controlled resource cleanup is incomplete",
+            "status is not an admissible candidate binding", "observations are not an admissible content-safe egress receipt",
+            "candidate witness is not admissible", "canonical", "fields", "schema", "candidate-receipt",
+            "images", "environment", "networks", "red", "external", "cleanup",
+        }
+        if reason not in allowed:
+            reason = "input"
+        print(f"clinical-egress-witness outcome=denied reason={reason}")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
