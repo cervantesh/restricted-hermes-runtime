@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -45,6 +46,17 @@ def test_ledger_can_be_retained_in_a_later_evidence_frame() -> None:
 def test_retained_candidate_ledgers_verify_from_the_evidence_frame(name: str) -> None:
     raw = (ROOT / "docs" / "evidence" / name).read_bytes()
     assert ledger.verify_ledger(raw, repo_root=ROOT) == []
+
+
+def test_receipt_hashes_bind_committed_git_bytes_not_worktree_line_endings() -> None:
+    value = ledger.build_ledger(repo_root=ROOT, candidate_revision=RETAINED_A0_CANDIDATE)
+    for receipt in value["retained_receipts"]:
+        tracked = subprocess.run(
+            ["git", "-C", str(ROOT), "show", f"HEAD:{receipt['path']}"],
+            capture_output=True,
+            check=True,
+        ).stdout
+        assert receipt["sha256"] == hashlib.sha256(tracked).hexdigest()
 
 
 def test_candidate_ledger_rejects_source_line_not_in_candidate() -> None:

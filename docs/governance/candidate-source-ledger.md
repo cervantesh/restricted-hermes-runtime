@@ -34,6 +34,11 @@ evidence-frame checkout is therefore required for verification. This prevents
 a self-referential tree claim while still making the candidate relation
 reproducible.
 
+Receipt hashes are SHA-256 values over the committed Git blob bytes, not the
+platform-specific working-tree bytes. This keeps the evidence invariant under
+Windows CRLF checkout conversion while still rejecting a changed committed
+receipt.
+
 The ledger is a bounded source-reconciliation artifact for issue #35. It is
 not an immutable OCI-candidate manifest and does not close A0 or the
 representative-host gate.
