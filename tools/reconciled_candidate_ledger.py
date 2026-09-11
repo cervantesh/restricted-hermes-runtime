@@ -36,9 +36,13 @@ REQUIRED_LINES = (
     ("composed_compose_seal", "efcc2e0b04a5b59c9a9c51c95d4505636363e1bb"),
 )
 RECEIPTS = (
-    ("clinical_egress", "docs/evidence/clinical-egress-wsl-receipt-2026-09-11.json", "29c321cb06076e935833e01e7b7d4f70d6bf7c10", "restricted-runtime-clinical-egress-witness.v1"),
-    ("clinical_composed", "docs/evidence/clinical-composed-receipt-2026-09-11.json", "14793b98d310fab44ef4bc22086c55039e279d46", "restricted-runtime-composed-e2e-receipt.v1"),
+    ("clinical_egress", "docs/evidence/clinical-egress-wsl-receipt-2026-09-11.json", "29c321cb06076e935833e01e7b7d4f70d6bf7c10", "565e2198d09f5a046a91b77ebe4c2a95f3351b2f", "restricted-runtime-clinical-egress-witness.v1"),
+    ("clinical_composed", "docs/evidence/clinical-composed-receipt-2026-09-11.json", "14793b98d310fab44ef4bc22086c55039e279d46", "cc83f7c4cad7e6f4da063c4ce9fcc90ad90bce19", "restricted-runtime-composed-e2e-receipt.v1"),
 )
+FROZEN_HRH_SOURCE = {
+    "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
+    "hrh_tree": "f217b0b1cf7f438422528dfe178d81b78212c68b",
+}
 
 
 def canonical_bytes(value: Mapping[str, Any]) -> bytes:
@@ -99,11 +103,11 @@ def build_ledger(*, repo_root: Path, candidate_revision: str) -> dict[str, Any]:
         for name, revision in REQUIRED_LINES
     ]
     receipts: list[dict[str, Any]] = []
-    for name, relative, runtime_head, _schema in RECEIPTS:
+    for name, relative, runtime_head, runtime_tree, _schema in RECEIPTS:
         path = repo_root / relative
         value = _read_json(path)
         source = _receipt_source(value) if value else None
-        if source is None or source["runtime_head"] != runtime_head:
+        if source is None or source["runtime_head"] != runtime_head or source["runtime_tree"] != runtime_tree or any(source[key] != expected for key, expected in FROZEN_HRH_SOURCE.items()):
             raise ValueError(f"{name}: retained receipt has unexpected source")
         receipts.append({
             "name": name, "path": relative, "sha256": _sha(path),
@@ -172,7 +176,7 @@ def verify_ledger(raw: bytes, *, repo_root: Path) -> list[str]:
     receipts = value.get("retained_receipts")
     if not isinstance(receipts, list) or len(receipts) != len(RECEIPTS):
         return ["receipts"]
-    expected_receipts = {name: (path, head, schema) for name, path, head, schema in RECEIPTS}
+    expected_receipts = {name: (path, head, tree, schema) for name, path, head, tree, schema in RECEIPTS}
     seen_receipts: set[str] = set()
     for item in receipts:
         if not isinstance(item, dict) or set(item) != {"name", "path", "sha256", "source"} or not isinstance(item.get("name"), str):
@@ -180,16 +184,16 @@ def verify_ledger(raw: bytes, *, repo_root: Path) -> list[str]:
         name = item["name"]
         expected = expected_receipts.get(name)
         source = _source(item.get("source"))
-        if name in seen_receipts or expected is None or item.get("path") != expected[0] or not isinstance(item.get("sha256"), str) or not RAW_SHA.fullmatch(item["sha256"]) or source is None or source["runtime_head"] != expected[1]:
+        if name in seen_receipts or expected is None or item.get("path") != expected[0] or not isinstance(item.get("sha256"), str) or not RAW_SHA.fullmatch(item["sha256"]) or source is None or source["runtime_head"] != expected[1] or source["runtime_tree"] != expected[2] or any(source[key] != expected_value for key, expected_value in FROZEN_HRH_SOURCE.items()):
             return ["receipts"]
         path = (repo_root / item["path"]).resolve()
         if not path.is_relative_to(repo_root.resolve()) or not path.is_file() or _sha(path) != item["sha256"]:
             return ["receipts"]
         retained = _read_json(path)
-        if retained is None or retained.get("schema") != expected[2] or _receipt_source(retained) != source:
+        if retained is None or retained.get("schema") != expected[3] or _receipt_source(retained) != source:
             return ["receipts"]
         try:
-            if not _ancestor(repo_root, PRODUCT_SHA, source["runtime_head"]) or not _ancestor(repo_root, source["runtime_head"], candidate["revision"]):
+            if _tree(repo_root, source["runtime_head"]) != source["runtime_tree"] or not _ancestor(repo_root, PRODUCT_SHA, source["runtime_head"]) or not _ancestor(repo_root, source["runtime_head"], candidate["revision"]):
                 return ["receipts"]
         except ValueError:
             return ["receipts"]
@@ -221,9 +225,10 @@ def write_new(path: Path, content: bytes) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        if path.exists():
-            raise FileExistsError(path)
-        os.replace(temporary, path)
+        # link() is an atomic create-if-absent operation: unlike exists()+replace(),
+        # it cannot replace a file created by another writer after our check.
+        os.link(temporary, path)
+        temporary.unlink()
         temporary = None
     finally:
         if descriptor is not None:
