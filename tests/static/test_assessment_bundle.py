@@ -52,6 +52,42 @@ def test_windows_junction_is_detected_when_available(tmp_path: Path):
     assert builder._is_reparse_point(junction.lstat())
 
 
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions are Windows-only")
+def test_verifier_rejects_a_junctioned_evidence_directory(tmp_path: Path):
+    verifier = _load(VERIFY, "assessment_bundle_verifier_junction")
+    bundle = _build(tmp_path)
+    expected = _expected(bundle)
+    source = tmp_path / "external-evidence"
+    shutil.move(str(bundle / "evidence"), str(source))
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(bundle / "evidence"), str(source)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip("junction creation unavailable")
+    assert any("reparse point" in error for error in verifier.verify(bundle, expected_manifest_sha256=expected).errors)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions are Windows-only")
+def test_verifier_rejects_a_junctioned_bundle_root(tmp_path: Path):
+    verifier = _load(VERIFY, "assessment_bundle_verifier_root_junction")
+    bundle = _build(tmp_path)
+    expected = _expected(bundle)
+    source = tmp_path / "external-bundle"
+    shutil.move(str(bundle), str(source))
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(bundle), str(source)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip("junction creation unavailable")
+    assert any("real directory" in error for error in verifier.verify(bundle, expected_manifest_sha256=expected).errors)
+
+
 def _declaration() -> dict[str, object]:
     return {
         "profile": "restricted-clinical-candidate.v1",

@@ -25,6 +25,7 @@ MEDIA_TYPES = {".json": "application/json", ".md": "text/markdown", ".py": "text
 MAX_FILE_BYTES = 1_048_576
 MAX_TOTAL_BYTES = 5_242_880
 MAX_FILES = 64
+FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 SECRET_PATTERNS = (
     re.compile(rb"(?i)(?:password|api[_-]?key|token|secret)[_-]?secret[_-]?canary"),
     re.compile(rb"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"),
@@ -98,14 +99,20 @@ def _error(errors: list[str], message: str) -> None:
     errors.append(message)
 
 
+def _is_reparse_point(stat_result: object) -> bool:
+    """Treat Windows junctions as links even though ``S_ISLNK`` is false."""
+    return bool(getattr(stat_result, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 def _regular(path: Path, errors: list[str], context: str) -> bool:
     try:
-        mode = path.lstat().st_mode
+        stat_result = path.lstat()
     except OSError as exc:
         _error(errors, f"{context}: unavailable: {exc}")
         return False
-    if stat.S_ISLNK(mode):
-        _error(errors, f"{context}: symlink is forbidden")
+    mode = stat_result.st_mode
+    if stat.S_ISLNK(mode) or _is_reparse_point(stat_result):
+        _error(errors, f"{context}: symlink or reparse point is forbidden")
         return False
     if not stat.S_ISREG(mode):
         _error(errors, f"{context}: regular file required")
@@ -459,10 +466,10 @@ def verify(bundle_dir: Path, *, expected_manifest_sha256: str) -> VerificationRe
         return VerificationResult(["expected manifest sha256 is required"], statuses, False)
     expected = expected_manifest_sha256.removeprefix("sha256:")
     try:
-        root_mode = bundle_dir.lstat().st_mode
+        root_stat = bundle_dir.lstat()
     except OSError as exc:
         return VerificationResult([f"bundle: unavailable: {exc}"], statuses, False)
-    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+    if stat.S_ISLNK(root_stat.st_mode) or _is_reparse_point(root_stat) or not stat.S_ISDIR(root_stat.st_mode):
         return VerificationResult(["bundle: real directory required"], statuses, False)
     manifest_path = bundle_dir / "assessment.manifest.json"
     if not _regular(manifest_path, errors, "manifest"):
@@ -528,12 +535,13 @@ def verify(bundle_dir: Path, *, expected_manifest_sha256: str) -> VerificationRe
                 path = Path(entry.path)
                 relative = path.relative_to(bundle_dir).as_posix()
                 try:
-                    mode = path.lstat().st_mode
+                    stat_result = path.lstat()
                 except OSError as exc:
                     _error(errors, f"bundle member {relative}: unavailable: {exc}")
                     continue
-                if stat.S_ISLNK(mode):
-                    _error(errors, f"bundle member {relative}: symlink is forbidden")
+                mode = stat_result.st_mode
+                if stat.S_ISLNK(mode) or _is_reparse_point(stat_result):
+                    _error(errors, f"bundle member {relative}: symlink or reparse point is forbidden")
                 elif stat.S_ISDIR(mode):
                     actual_dirs.add(relative)
                     pending.append(path)
