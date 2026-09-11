@@ -107,8 +107,13 @@ class Shell:
             errors="replace",
         )
         if check and result.returncode:
-            detail = (result.stdout + result.stderr)[-1600:]
-            raise CommandError(f"{args[0]} exited {result.returncode}: {detail}")
+            # Child output can contain credentials (or values derived from them).
+            # Do not turn it into operator/CI output by copying it into the
+            # exception.  This wrapper deliberately keeps no secondary
+            # diagnostic receipt: its only public contract is a fixed command
+            # class and exit code.
+            command = Path(args[0]).name if args and Path(args[0]).name in {"docker", "git"} else "child"
+            raise CommandError(f"command failed: {command} exit={result.returncode}")
         return result
 
     def git(self, cwd: Path, *args: str) -> str:
@@ -231,7 +236,7 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         or value["volumes"] != volume_names(project)
         or not re.fullmatch(r"[a-f0-9]{32}", value["state_id"])
         or not re.fullmatch(r"[a-f0-9]{64}", value["compose_env_sha256"])
-        or value["lifecycle"] not in {"initializing", "ready", "stopped"}
+        or value["lifecycle"] not in {"initializing", "finalizing", "ready", "stopped"}
         or not isinstance(value["expected_images"], dict)
     ):
         raise SafetyError("staging marker does not match the requested synthetic target")
@@ -291,9 +296,9 @@ def verify_destructive_volumes(
     for name in discovered:
         if any(discovered[name].get(key) != value for key, value in required.items()):
             raise SafetyError(f"volume label mismatch: {name}")
-    if lifecycle in {"ready", "stopped"} and set(discovered) != expected:
-        raise SafetyError("ready/stopped staging requires the exact volume set")
-    if lifecycle not in {"initializing", "ready", "stopped"}:
+    if lifecycle in {"finalizing", "ready", "stopped"} and set(discovered) != expected:
+        raise SafetyError("finalizing/ready/stopped staging requires the exact volume set")
+    if lifecycle not in {"initializing", "finalizing", "ready", "stopped"}:
         raise SafetyError("unknown lifecycle for destructive volume verification")
     return sorted(discovered)
 
@@ -324,14 +329,14 @@ def verify_destructive_resources(
     duplicates = sorted({service for service in services if services.count(service) > 1})
     if duplicates:
         raise SafetyError("duplicate project service containers: " + ", ".join(duplicates))
-    if lifecycle in {"ready", "stopped"}:
+    if lifecycle in {"finalizing", "ready", "stopped"}:
         if "controller" in services:
-            raise SafetyError("controller must be absent from ready/stopped staging")
+            raise SafetyError("controller must be absent from finalizing/ready/stopped staging")
         expected_services = set(LONG_RUNNING_SERVICES) | set(ONE_SHOT_SERVICES)
         if set(services) != expected_services:
-            raise SafetyError("ready/stopped staging requires the exact service set")
+            raise SafetyError("finalizing/ready/stopped staging requires the exact service set")
         if set(networks) != allowed_networks:
-            raise SafetyError("ready/stopped staging requires the exact network set")
+            raise SafetyError("finalizing/ready/stopped staging requires the exact network set")
     elif lifecycle != "initializing":
         raise SafetyError("unknown lifecycle for destructive resource verification")
     return sorted(containers), sorted(networks)
@@ -665,13 +670,51 @@ class ClinicalStaging:
         self.compose("build", "ingress", "clinical-adapter", timeout=2400)
         self.compose("build", "controller", "hrh-migrate", "hrh", timeout=2400)
 
+    def _provision_initial_mattermost_admin(self) -> None:
+        """Create the initial admin inside the provisioner boundary.
+
+        The controller reads the mode-0600 seed file from its private,
+        read-only mount and sends the password only as the HTTPS request body.
+        The host never reads it for a child command, so neither host argv nor
+        Docker's container command metadata receives the value.
+        """
+        self.control("create-initial-admin", timeout=180)
+
+    def _erase_initial_admin_password(self) -> None:
+        """Discard the bootstrap-only secret while the marker is finalizing."""
+        password = self.state_dir / "seed" / "admin_password"
+        try:
+            metadata = password.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise SafetyError("bootstrap password artifact is not an operator-owned mode-0600 regular file")
+        password.unlink()
+        fsync_directory(password.parent)
+
+    def _finalize_initialization(self, marker: dict[str, Any]) -> None:
+        """Durably complete the one-way bootstrap-secret cleanup protocol.
+
+        ``finalizing`` is deliberately not an operational lifecycle.  It is a
+        recoverable checkpoint after every service has started, but before the
+        marker can advertise ``ready``.  An interrupt before unlink leaves the
+        protected seed and a finalizing marker; an interrupt after unlink but
+        before the atomic ready marker leaves only that finalizing marker.  A
+        subsequent ``init`` repeats this idempotent finalizer and cannot leave
+        a ready staging target with a reusable bootstrap secret.
+        """
+        self._require_lifecycle(marker, "initialization finalization", {"finalizing"})
+        self._erase_initial_admin_password()
+        marker["lifecycle"] = "ready"
+        self._write_marker(marker)
+
     @serialized_lifecycle
     def init(self) -> dict[str, Any]:
         self._require_linux()
         frame = verify_source_frame(self.runtime, self.hrh, self.shell)
         if self.state_dir.exists() and (self.state_dir / MARKER_NAME).exists():
             marker = read_marker(self.state_dir, self.project)
-            if marker["lifecycle"] != "initializing":
+            if marker["lifecycle"] not in {"initializing", "finalizing"}:
                 raise SafetyError("staging target is already initialized")
             verify_effective_env(self.state_dir, marker)
             if any(marker[key] != value for key, value in frame.items()):
@@ -682,6 +725,9 @@ class ClinicalStaging:
         state_stat = self.state_dir.stat()
         if state_stat.st_uid != os.getuid() or stat.S_IMODE(state_stat.st_mode) != 0o700:
             raise SafetyError("state directory must be owned by the operator with mode 0700")
+        if marker["lifecycle"] == "finalizing":
+            self._finalize_initialization(marker)
+            return self.up()
         self._create_volumes(marker)
         self.compose("config", "--quiet")
         self._build_images()
@@ -692,14 +738,7 @@ class ClinicalStaging:
             raise CommandError("HRH migration did not complete successfully")
         self.compose("up", "--detach", "mattermost", timeout=600)
         self.control("wait-mm")
-        password = (self.state_dir / "seed" / "admin_password").read_text(encoding="ascii")
-        created = self.compose(
-            "exec", "--no-TTY", "mattermost", "/mattermost/bin/mmctl", "--local", "user", "create",
-            "--email", "admin@clinical.invalid", "--username", "clinicaladmin", "--password", password,
-            "--system-admin", "--email-verified", "--disable-welcome-email", "--quiet", check=False,
-        )
-        if created.returncode and "already exists" not in (created.stdout + created.stderr).lower():
-            raise CommandError("synthetic Mattermost administrator bootstrap failed")
+        self._provision_initial_mattermost_admin()
         self.control("bootstrap-mm")
         self.control("seed-hrh")
         self.control("policy", "clinical-e1", "3600")
@@ -717,10 +756,10 @@ class ClinicalStaging:
         self.control("wait-mm")
         self.control("wait-hrh")
         marker["expected_images"] = self._built_images()
-        marker["lifecycle"] = "ready"
+        marker["lifecycle"] = "finalizing"
         self._write_marker(marker)
-        self.up()
-        return self.status()
+        self._finalize_initialization(marker)
+        return self.up()
 
     @serialized_lifecycle
     def up(self) -> dict[str, Any]:
@@ -1023,7 +1062,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             result = staging.refresh_policy(args.epoch)
         else:
             result = getattr(staging, args.command)()
-    except (SafetyError, CommandError) as exc:
+    except CommandError:
+        # CommandError is a boundary type: never let a future child-output
+        # regression become public just because this CLI renders its message.
+        print("clinical_staging outcome=denied reason=command_failed", file=sys.stderr)
+        return 2
+    except SafetyError as exc:
         print(f"clinical_staging outcome=denied reason={exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, sort_keys=True))
