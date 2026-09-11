@@ -37,8 +37,11 @@ except ImportError:  # pragma: no cover - the supported operator path is Linux.
 
 
 RUNTIME_BASE_SHA = "c6c41a0980ed21de95d324c828ee9c5bb50cb8dd"
-REQUIRED_HRH_SHA = "89fea476ef95a0dfd3cd60a587ec6cb9e1d3aa1f"
-REQUIRED_HRH_TREE = "363cfe56bd6757ff0c98c098f468cb0e86dc2e4f"
+# This must match the composed E2E build subject.  Keeping a second staging
+# subject here would make the two executable entry points disagree about what
+# source the candidate is allowed to use.
+REQUIRED_HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"
+REQUIRED_HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"
 SCHEMA = "restricted-synthetic-clinical-staging.v1"
 MARKER_NAME = "staging-state.json"
 PROJECT_LABEL = "io.cervantesh.restricted-runtime.project"
