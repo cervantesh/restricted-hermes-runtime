@@ -84,7 +84,7 @@ def build_ledger(*, repo_root: Path, candidate_revision: str, required_source_li
     retained = []
     for name, path, schema in receipts:
         descriptor = _descriptor(name, path, schema)
-        raw = _git_bytes(repo_root, "show", f"HEAD:{path}")
+        raw = _git_bytes(repo_root, "show", f"{candidate_revision}:{path}")
         try:
             value = json.loads(raw.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
@@ -158,7 +158,7 @@ def verify_ledger(raw: bytes, *, repo_root: Path) -> list[str]:
         if source is None:
             return ["receipts"]
         try:
-            tracked = _git_bytes(repo_root, "show", f"HEAD:{descriptor['path']}")
+            tracked = _git_bytes(repo_root, "show", f"{candidate['revision']}:{descriptor['path']}")
             receipt_value = json.loads(tracked.decode("utf-8"))
         except (ValueError, UnicodeError, json.JSONDecodeError):
             return ["receipts"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 
@@ -75,3 +76,34 @@ def test_integrated_ledger_writer_never_replaces_concurrent_output(tmp_path: Pat
     with pytest.raises(FileExistsError):
         ledger.write_new(output, b"new")
     assert output.read_bytes() == b"concurrent"
+
+
+def test_ledger_binds_retained_receipt_to_the_named_candidate_not_head(tmp_path: Path) -> None:
+    """A later checkout must not silently replace a candidate's retained blob."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    def run(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    run("init", "--quiet")
+    run("config", "user.email", "test@example.invalid")
+    run("config", "user.name", "Ledger test")
+    receipt = repo / "receipt.json"
+    receipt.write_text(json.dumps({"schema": "receipt.v1", "runtime_head": "a" * 40, "runtime_tree": "b" * 40, "hrh_head": "c" * 40, "hrh_tree": "d" * 40}) + "\n", encoding="utf-8")
+    run("add", "receipt.json")
+    run("commit", "--quiet", "-m", "candidate receipt")
+    candidate = run("rev-parse", "HEAD")
+    receipt.write_text(json.dumps({"schema": "receipt.v1", "runtime_head": "e" * 40, "runtime_tree": "f" * 40, "hrh_head": "0" * 40, "hrh_tree": "1" * 40}) + "\n", encoding="utf-8")
+    run("add", "receipt.json")
+    run("commit", "--quiet", "-m", "later receipt")
+
+    value = ledger.build_ledger(
+        repo_root=repo,
+        candidate_revision=candidate,
+        required_source_lines=[],
+        receipts=[("retained", "receipt.json", "receipt.v1")],
+    )
+
+    candidate_bytes = subprocess.run(["git", "-C", str(repo), "show", f"{candidate}:receipt.json"], capture_output=True, check=True).stdout
+    assert value["retained_receipts"][0]["sha256"] == hashlib.sha256(candidate_bytes).hexdigest()
+    assert ledger.verify_ledger(ledger.canonical_bytes(value), repo_root=repo) == []

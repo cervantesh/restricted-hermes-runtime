@@ -30,9 +30,9 @@ independent hardening.
    editable sibling installation. A new ledger verifier accepts no implicit
    historical candidate or receipt.
 3. A new source ledger is generated from the integrated revision in a later
-   retained-evidence commit. Its receipts are read and hashed from committed
-   Git blobs, remain historical provenance, and cannot be used as proof that
-   the integrated candidate itself executed.
+   retained-evidence commit. Its receipts are read and hashed from that named
+   candidate's committed Git blobs, remain historical provenance, and cannot
+   be used as proof that the integrated candidate itself executed.
 4. The historical `49dca06` candidate is not relabeled as the integrated
    candidate; its incompatible ledger artifacts are absent from this tree.
 5. Targeted ledger, P2 admission, recovery, and E2E controls are green on the
