@@ -385,7 +385,7 @@ def test_live_attestation_verifier_binds_exact_subject_workflow_source_and_predi
                 {"name": "build-publish (restricted-mattermost-ingress)", "conclusion": "success"},
                 {"name": "build-publish (restricted-clinical-adapter)", "conclusion": "success"},
             ]}))
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"head_sha": "d" * 40}))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"head_sha": "d" * 40, "conclusion": "success"}))
 
     monkeypatch.setattr(verifier.subprocess, "run", run)
     assert verifier.verify_live_attestations(manifest) == []
@@ -423,11 +423,33 @@ def test_live_attestation_verifier_rejects_missing_authenticated_subject_build(t
             return SimpleNamespace(returncode=0, stdout=json.dumps({"jobs": [
                 {"name": "build-publish (restricted-mattermost-ingress)", "conclusion": "success"},
             ]}))
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"head_sha": "d" * 40}))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"head_sha": "d" * 40, "conclusion": "success"}))
 
     monkeypatch.setattr(verifier.subprocess, "run", run)
     errors = verifier.verify_live_attestations(manifest)
     assert errors == ["authenticated workflow run lacks successful source-subject build jobs"]
+
+
+def test_live_attestation_verifier_rejects_a_failed_completed_run(tmp_path: Path, monkeypatch):
+    verifier = _load_verifier()
+    manifest = valid_manifest(tmp_path)
+    for subject in manifest["subjects"]:
+        subject["base_materials"] = verifier._expected_base_material((ROOT / verifier.EXPECTED_DOCKERFILES[subject["name"]]).read_bytes())
+    monkeypatch.setattr(verifier.shutil, "which", lambda _command: "gh")
+    monkeypatch.setattr(verifier, "_git_show", lambda _root, _revision, path: (ROOT / path).read_bytes())
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+
+    def run(command, **_kwargs):
+        if command[:3] == ["gh", "attestation", "verify"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                "verificationResult": {"signature": {"certificate": {
+                    "runInvocationURI": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/1/attempts/1",
+                }}},
+            }]))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"head_sha": "d" * 40, "conclusion": "failure"}))
+
+    monkeypatch.setattr(verifier.subprocess, "run", run)
+    assert verifier.verify_live_attestations(manifest) == ["authenticated workflow run did not complete successfully"]
 
 
 def test_live_attestation_verifier_does_not_expose_provider_output(tmp_path: Path, monkeypatch):
