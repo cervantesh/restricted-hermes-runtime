@@ -364,17 +364,28 @@ def test_cli_reverifies_attestations_by_default_and_structure_only_is_non_succes
 def test_live_attestation_verifier_binds_exact_subject_workflow_source_and_predicate(tmp_path: Path, monkeypatch):
     verifier = _load_verifier()
     manifest = valid_manifest(tmp_path)
+    for subject in manifest["subjects"]:
+        subject["base_materials"] = verifier._expected_base_material((ROOT / verifier.EXPECTED_DOCKERFILES[subject["name"]]).read_bytes())
     commands: list[list[str]] = []
     monkeypatch.setattr(verifier.shutil, "which", lambda _command: "gh")
+    monkeypatch.setattr(verifier, "_git_show", lambda _root, _revision, path: (ROOT / path).read_bytes())
 
     def run(command, **_kwargs):
         commands.append(command)
-        return SimpleNamespace(returncode=0)
+        if command[:3] == ["gh", "attestation", "verify"]:
+            predicate = command[command.index("--predicate-type") + 1]
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                "verificationResult": {"signature": {"certificate": {
+                    "runInvocationURI": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/1/attempts/1",
+                }}},
+                "statement": {"predicateType": predicate},
+            }]))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"conclusion": "success", "head_sha": "d" * 40}))
 
     monkeypatch.setattr(verifier.subprocess, "run", run)
     assert verifier.verify_live_attestations(manifest) == []
-    assert len(commands) == 4
-    for command in commands:
+    assert len(commands) == 5
+    for command in commands[:4]:
         assert command[:3] == ["gh", "attestation", "verify"]
         assert command[3].startswith("oci://ghcr.io/cervantesh/restricted-")
         assert ["--repo", verifier.REPOSITORY] == command[4:6]
@@ -384,19 +395,23 @@ def test_live_attestation_verifier_binds_exact_subject_workflow_source_and_predi
         assert command[source_index + 1] == "d" * 40
         predicate_index = command.index("--predicate-type")
         assert command[predicate_index + 1] in {"https://slsa.dev/provenance/v1", "https://spdx.dev/Document/v2.3"}
+    assert commands[-1] == ["gh", "api", "repos/cervantesh/restricted-hermes-runtime/actions/runs/1"]
 
 
 def test_live_attestation_verifier_does_not_expose_provider_output(tmp_path: Path, monkeypatch):
     verifier = _load_verifier()
     manifest = valid_manifest(tmp_path)
+    for subject in manifest["subjects"]:
+        subject["base_materials"] = verifier._expected_base_material((ROOT / verifier.EXPECTED_DOCKERFILES[subject["name"]]).read_bytes())
     monkeypatch.setattr(verifier.shutil, "which", lambda _command: "gh")
+    monkeypatch.setattr(verifier, "_git_show", lambda _root, _revision, path: (ROOT / path).read_bytes())
     monkeypatch.setattr(
         verifier.subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout="private output", stderr="private failure"),
     )
     errors = verifier.verify_live_attestations(manifest)
-    assert len(errors) == 4
+    assert len(errors) == 5
     assert all("private" not in error for error in errors)
 
 

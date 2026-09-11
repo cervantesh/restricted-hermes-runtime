@@ -30,7 +30,12 @@ EXPECTED_LOCKS = {
     "restricted-mattermost-ingress": "requirements/immutable/mattermost-ingress.txt",
     "restricted-clinical-adapter": "requirements/immutable/clinical-adapter.txt",
 }
+EXPECTED_DOCKERFILES = {
+    "restricted-mattermost-ingress": "Dockerfile.mattermost-ingress",
+    "restricted-clinical-adapter": "Dockerfile.clinical-adapter",
+}
 LOCK_LINE = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s]+)\s+--hash=sha256:([0-9a-f]{64})$")
+BASE_IMAGE = re.compile(r"^FROM\s+([^@\s]+)@(sha256:[0-9a-f]{64})(?:\s|$)", re.MULTILINE)
 
 
 def _mapping(value: object) -> dict[str, Any] | None:
@@ -339,18 +344,39 @@ def verify(manifest: object, *, require_external: bool = True, repo_root: Path =
     return errors
 
 
-def verify_live_attestations(manifest: object) -> list[str]:
+def _git_show(repo_root: Path, revision: str, path: str) -> bytes | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{revision}:{path}"],
+            capture_output=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _expected_base_material(source: bytes) -> list[dict[str, str]]:
+    found: list[dict[str, str]] = []
+    for image, digest in BASE_IMAGE.findall(source.decode("utf-8")):
+        found.append({"image": "docker.io/library/" + image if "/" not in image else image, "digest": digest, "platform": PLATFORM})
+    return found[:1]
+
+
+def verify_live_attestations(manifest: object, *, repo_root: Path = ROOT) -> list[str]:
     """Re-run GitHub's verifier; retained JSON is audit material, not trust."""
     root = _mapping(manifest)
     if root is None:
         return ["attestation authentication requires a manifest object"]
     source_revision = root.get("source_revision")
     subjects = root.get("subjects")
-    if not isinstance(source_revision, str) or not isinstance(subjects, list):
+    workflow = _mapping(root.get("workflow"))
+    run_url = workflow.get("run_url") if workflow else None
+    if not isinstance(source_revision, str) or not isinstance(subjects, list) or not isinstance(run_url, str):
         return ["attestation authentication requires a valid candidate frame"]
     if shutil.which("gh") is None:
         return ["attestation verifier unavailable"]
     errors: list[str] = []
+    authenticated_runs: set[str] = set()
     for subject in subjects:
         item = _mapping(subject)
         name = item.get("name") if item else "unknown-subject"
@@ -358,6 +384,13 @@ def verify_live_attestations(manifest: object) -> list[str]:
         if not isinstance(name, str) or not isinstance(image, str):
             errors.append("attestation authentication has an invalid subject")
             continue
+        lock = _mapping(item.get("dependency_lock"))
+        lock_bytes = _git_show(repo_root, source_revision, EXPECTED_LOCKS.get(name, ""))
+        if lock_bytes is None or lock is None or lock.get("sha256") != hashlib.sha256(lock_bytes or b"").hexdigest() or lock.get("artifacts") != _lock_artifacts(lock_bytes or b""):
+            errors.append(f"{name}: authenticated source lock binding failed")
+        dockerfile = _git_show(repo_root, source_revision, EXPECTED_DOCKERFILES.get(name, ""))
+        if dockerfile is None or item.get("base_materials") != _expected_base_material(dockerfile):
+            errors.append(f"{name}: authenticated source base material binding failed")
         for kind, predicate in (("provenance", "https://slsa.dev/provenance/v1"), ("SBOM", "https://spdx.dev/Document/v2.3")):
             command = [
                 "gh", "attestation", "verify", f"oci://{image}", "--repo", REPOSITORY,
@@ -371,6 +404,28 @@ def verify_live_attestations(manifest: object) -> list[str]:
                 continue
             if result.returncode != 0:
                 errors.append(f"{name}: {kind} attestation authentication failed")
+                continue
+            try:
+                entries = _attestation_entries(json.loads(result.stdout))
+                invocation = _mapping(_mapping(entries[0].get("verificationResult")).get("signature")).get("certificate").get("runInvocationURI")
+            except (AttributeError, IndexError, json.JSONDecodeError):
+                errors.append(f"{name}: {kind} attestation lacks an authenticated run identity")
+                continue
+            if not isinstance(invocation, str) or not invocation.startswith(run_url + "/attempts/"):
+                errors.append(f"{name}: {kind} attestation run identity does not match evidence")
+            else:
+                authenticated_runs.add(invocation)
+    if len(authenticated_runs) != 1:
+        errors.append("attestation authentication does not bind one workflow run")
+    elif authenticated_runs:
+        run_id = authenticated_runs.pop().removeprefix(f"https://github.com/{REPOSITORY}/actions/runs/").split("/", 1)[0]
+        try:
+            result = subprocess.run(["gh", "api", f"repos/{REPOSITORY}/actions/runs/{run_id}"], capture_output=True, text=True, timeout=30, check=False)
+            run = json.loads(result.stdout) if result.returncode == 0 else {}
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            run = {}
+        if run.get("conclusion") != "success" or run.get("head_sha") != source_revision:
+            errors.append("authenticated workflow run is not a successful source-matched run")
     return errors
 
 
@@ -388,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     errors = verify(manifest, require_external=not args.closed_subjects_only, repo_root=args.repo_root)
     if not errors and not args.offline_structure_only:
-        errors.extend(verify_live_attestations(manifest))
+        errors.extend(verify_live_attestations(manifest, repo_root=args.repo_root))
     if errors:
         print(*["immutable candidate: FAIL: " + error for error in errors], sep="\n", file=sys.stderr)
         return 1
