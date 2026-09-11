@@ -149,7 +149,9 @@ def verify_receipt(raw: bytes, *, expected_status: Mapping[str, Any]) -> list[st
     candidate = _candidate()
     if candidate.verify_receipt(candidate.canonical_bytes(value["candidate_receipt"]), expected_status=expected_status):
         return ["candidate-receipt"]
-    if _images({"built_images": value["effective_images"]}) is None:
+    images = _images({"built_images": value["effective_images"]})
+    expected_images = _images(expected_status)
+    if images is None or expected_images is None or images != expected_images:
         return ["images"]
     if _environment(value["environment"]) is None:
         return ["environment"]

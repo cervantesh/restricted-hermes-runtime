@@ -69,6 +69,7 @@ def test_accepts_a_normal_distribution_qualified_compose_version_without_accepti
     (lambda receipt: receipt["cleanup"].update(sink_absent=False), "cleanup"),
     (lambda receipt: receipt["network_membership"].update(ingress=["mattermost_edge", "red"]), "networks"),
     (lambda receipt: receipt["effective_images"].update(ingress="latest"), "images"),
+    (lambda receipt: receipt["effective_images"].update(ingress="sha256:" + "0" * 64), "images"),
     (lambda receipt: receipt.update(raw_log="forbidden"), "fields"),
 ])
 def test_rejects_incomplete_or_unsafe_witness(mutate, expected):
