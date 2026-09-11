@@ -25,6 +25,13 @@ def _load(path: Path) -> dict[str, Any]:
     return value
 
 
+def _load_list(path: Path) -> list[Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, list):
+        raise SystemExit(f"{path}: expected list")
+    return value
+
+
 def lock_record(name: str, repo_root: Path) -> dict[str, Any]:
     relative = LOCKS[name]
     content = (repo_root / relative).read_bytes()
@@ -99,7 +106,7 @@ def main() -> int:
         })
     manifest: dict[str, Any] = {"schema_version": "restricted-runtime-immutable-candidate.v1", "source_revision": args.source_revision, "platform": "linux/amd64", "workflow": {"repository": "cervantesh/restricted-hermes-runtime", "path": ".github/workflows/immutable-candidate.yml", "run_url": args.run_url}, "subjects": subjects, "evidence": evidence}
     if args.external_subjects:
-        manifest["external_subjects"] = _load(_at_root(repo_root, args.external_subjects))
+        manifest["external_subjects"] = _load_list(_at_root(repo_root, args.external_subjects))
     _at_root(repo_root, args.output).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0
 

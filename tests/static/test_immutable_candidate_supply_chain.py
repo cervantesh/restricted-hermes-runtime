@@ -38,10 +38,21 @@ def _subject(name: str, image: str, lock: str, marker: str, repo_root: Path) -> 
     lock_bytes = (ROOT / lock).read_bytes()
     provenance_path = f"candidate-verification/{name}.provenance.json"
     sbom_path = f"candidate-verification/{name}.sbom.json"
-    for relative in (provenance_path, sbom_path):
+    raw_by_path = {
+        provenance_path: [{"verificationResult": {"statement": {
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "subject": [{"digest": {"sha256": digest.removeprefix("sha256:")}}],
+            "predicate": {"buildDefinition": {"resolvedDependencies": [{"digest": {"gitCommit": "d" * 40}}]}},
+        }}}],
+        sbom_path: [{"verificationResult": {"statement": {
+            "predicateType": "https://spdx.dev/Document/v2.3",
+            "subject": [{"digest": {"sha256": digest.removeprefix("sha256:")}}],
+        }}}],
+    }
+    for relative, raw_value in raw_by_path.items():
         path = repo_root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}", encoding="utf-8")
+        path.write_text(json.dumps(raw_value), encoding="utf-8")
     verification = {
         "schema_version": "restricted-runtime-attestation-receipt.v1",
         "image": f"{image}@{digest}",
@@ -196,7 +207,8 @@ def test_candidate_workflow_is_same_repository_build_once_and_attests_each_final
     assert source.index("name: Prepare retained SBOM evidence directory") < source.index("name: Generate an SPDX SBOM from the final immutable OCI subject")
     assert "verify_immutable_candidate.py" in source
     assert "test_mattermost_esr_staging.py" in source
-    assert "test_clinical_adapter_process.py" in source
+    assert 'name: Prove the bounded clinical adapter protocol in its published image' in source
+    assert 'run: bash tests/deployment/test_clinical_adapter_image.sh' in source
 
 
 def test_candidate_workflow_exports_published_digests_before_consuming_them_and_scopes_permissions():
@@ -304,6 +316,16 @@ def test_candidate_verifier_accepts_matching_subjects_and_rejects_relational_fai
     platform_path.write_text(json.dumps(receipt), encoding="utf-8")
     assert any("receipt hash does not match" in error for error in verifier.verify(wrong_receipt, repo_root=tmp_path))
 
+    empty_raw = copy.deepcopy(manifest)
+    raw_path = tmp_path / empty_raw["subjects"][0]["provenance"]["verification"]["receipt"]
+    raw_receipt = json.loads(raw_path.read_text())
+    raw_artifact = tmp_path / raw_receipt["provenance"]["raw_artifact"]
+    raw_artifact.write_text("{}", encoding="utf-8")
+    raw_receipt["provenance"]["raw_sha256"] = hashlib.sha256(raw_artifact.read_bytes()).hexdigest()
+    raw_path.write_text(json.dumps(raw_receipt), encoding="utf-8")
+    empty_raw["subjects"][0]["provenance"]["verification"]["receipt_sha256"] = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+    assert any("raw verification does not name the exact subject" in error for error in verifier.verify(empty_raw, repo_root=tmp_path))
+
 
 def test_actual_candidate_layout_receipts_build_and_verify_from_repo_root(tmp_path: Path):
     repo = tmp_path / "repo"
@@ -340,8 +362,11 @@ def test_actual_candidate_layout_receipts_build_and_verify_from_repo_root(tmp_pa
     command_ids = ["mattermost-role-closure", "clinical-role-closure", "subject-platform-source-inspection", "provenance-predicate-verification", "spdx-sbom-predicate-verification", "clinical-protocol", "mattermost-esr"]
     evidence = {"source_revision": revision, "workflow_run_url": run_url, "phi_authorized": False, "deployment_conformant": False, "commands": [{"id": identifier, "command": identifier, "outcome": "passed", "exit_code": 0} for identifier in command_ids], "results": {identifier: "passed" for identifier in command_ids}, "summary": {"passed": len(command_ids), "skipped": 0, "failed": 0}, "subject_digests": {name: item["digest"] for name, item in subjects.items()}}
     (candidate / "candidate-evidence.json").write_text(json.dumps(evidence), encoding="utf-8")
-    built = subprocess.run([sys.executable, str(ROOT / "tools" / "build_immutable_candidate_manifest.py"), "--repo-root", str(repo), "--source-revision", revision, "--run-url", run_url, "--subject-dir", str(candidate), "--test-receipts", str(candidate / "test-receipts.json"), "--verification-dir", str(verification), "--evidence", str(candidate / "candidate-evidence.json"), "--output", str(candidate / "candidate.manifest.json")], capture_output=True, text=True)
+    external_subjects = [{"name": "health-record-hub", "reference": "registry.invalid/hrh@" + _digest("1"), "digest": _digest("1"), "verified": True, "build_or_attestation_claimed": False}]
+    (candidate / "external-subjects.json").write_text(json.dumps(external_subjects), encoding="utf-8")
+    built = subprocess.run([sys.executable, str(ROOT / "tools" / "build_immutable_candidate_manifest.py"), "--repo-root", str(repo), "--source-revision", revision, "--run-url", run_url, "--subject-dir", str(candidate), "--test-receipts", str(candidate / "test-receipts.json"), "--verification-dir", str(verification), "--evidence", str(candidate / "candidate-evidence.json"), "--external-subjects", str(candidate / "external-subjects.json"), "--output", str(candidate / "candidate.manifest.json")], capture_output=True, text=True)
     assert built.returncode == 0, built.stderr
+    assert json.loads((candidate / "candidate.manifest.json").read_text())["external_subjects"] == external_subjects
     verified = subprocess.run([sys.executable, str(ROOT / "tools" / "verify_immutable_candidate.py"), str(candidate / "candidate.manifest.json"), "--repo-root", str(repo), "--closed-subjects-only"], capture_output=True, text=True)
     assert verified.returncode == 0, verified.stderr
 

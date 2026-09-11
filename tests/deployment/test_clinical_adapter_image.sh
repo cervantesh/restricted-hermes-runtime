@@ -46,4 +46,32 @@ assert files == {
     "services/production_clinical_adapter.py",
 }, files
 '
+docker run --rm --network none --entrypoint python "$image" -c '
+import os
+import socket
+from restricted_runtime.clinical_adapter import ClinicalAdapter, peer_uid, receive_one
+from restricted_runtime.contracts import jcs_bytes
+
+class Upstream:
+    def request(self, path, body):
+        assert path == "/api/restricted-hermes/clinical/next-appointment"
+        return {"clinicTimezone": "America/New_York", "appointment": None, "responseDigest": "b" * 64}
+
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind("/tmp/adapter-protocol.sock")
+listener.listen(1)
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.connect("/tmp/adapter-protocol.sock")
+connection, _ = listener.accept()
+body = jcs_bytes({"mattermostActorId": "actor000000000000000000000", "patientId": "123e4567-e89b-42d3-a456-426614174000", "requestId": "request_123", "integrationId": "hrh-mattermost-01", "clinicalPolicyId": "clinical-read-v1", "policyEpoch": "mattermost-e1", "policyDigest": "a" * 64})
+client.sendall(b"POST /v1/clinical/query HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
+client.shutdown(socket.SHUT_WR)
+raw = receive_one(connection, timeout_seconds=2)
+response = ClinicalAdapter(expected_ingress_uid=os.geteuid(), expected_clinical_timezone="America/New_York", upstream=Upstream()).handle(peer_uid(connection), raw)
+assert response.startswith(b"HTTP/1.1 200 OK\r\n"), response
+connection.close()
+client.close()
+listener.close()
+os.unlink("/tmp/adapter-protocol.sock")
+'
 printf '%s\n' 'clinical adapter image closure: PASS'
