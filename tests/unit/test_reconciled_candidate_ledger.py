@@ -111,6 +111,26 @@ def test_a0_card_is_bound_to_the_p2_admission_candidate_and_its_real_guard() -> 
     assert harness.index("p2_host_platform_admission.py") < harness.index("docker info")
     assert harness.index("DOCKER_HOST") < harness.index("docker info")
 
+    workflow = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"{candidate['revision']}:.github/workflows/immutable-candidate.yml"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    assert 'tags: ["immutable-candidate-*"]' in workflow
+    assert "restricted-mattermost-ingress" in workflow
+    assert "restricted-clinical-adapter" in workflow
+    assert "--closed-subjects-only" in workflow
+    for path in (
+        "Dockerfile.mattermost-ingress",
+        "Dockerfile.clinical-adapter",
+        "tools/verify_immutable_candidate.py",
+    ):
+        subprocess.run(
+            ["git", "-C", str(ROOT), "cat-file", "-e", f"{candidate['revision']}:{path}"],
+            check=True,
+        )
+
 
 def test_receipt_hashes_bind_committed_git_bytes_not_worktree_line_endings() -> None:
     value = ledger.build_ledger(repo_root=ROOT, candidate_revision=git(ROOT, "rev-parse", "HEAD"))
