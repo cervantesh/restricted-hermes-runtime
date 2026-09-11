@@ -38,7 +38,6 @@ def test_ledger_can_be_retained_in_a_later_evidence_frame() -> None:
 @pytest.mark.parametrize(
     "name",
     (
-        "reconciled-candidate-ledger-2026-09-11.json",
         "reconciled-a0-candidate-ledger-2026-09-11.json",
     ),
 )

@@ -8,8 +8,8 @@ hosted synthetic evaluation. It is not an authorization record and does not
 permit PHI, a controlled pilot, or deployment on a representative host.
 
 The only admissible source subject is revision
-`49dca06b7a2e2b8134e2c4e426112e55fa73d0c3`, tree
-`5e0708c609621b8930aac03a57ac47f9f453ce0f`, as named by
+`6e1b36edbc8d78b7824dc9174170aef2d5a0da3e`, tree
+`dccbe9e407308823cd56b4c0b71c1dba646351ac`, as named by
 `docs/evidence/reconciled-a0-candidate-ledger-2026-09-11.json`. The ledger is
 retained in a later evidence frame; it verifies the source subject's Git
 objects and ancestry but does not claim to be part of that source tree.
@@ -18,7 +18,7 @@ objects and ancestry but does not claim to be part of that source tree.
 
 The execution is complete only if all conditions below hold:
 
-1. A new, unique `immutable-candidate-<date>-49dca06` tag resolves exactly to
+1. A new, unique `immutable-candidate-<date>-6e1b36e` tag resolves exactly to
    the subject revision. A previous tag or a moved tag is inadmissible.
 2. `Immutable clinical-edge candidate` completes successfully for that tag and
    produces digest-pinned `restricted-mattermost-ingress` and
@@ -34,6 +34,8 @@ The execution is complete only if all conditions below hold:
 
 The retained A0 record must name the tag, source revision/tree, workflow URL,
 artifact hashes, both immutable image references, and every command outcome.
+Historical synthetic receipts listed by the source ledger remain bounded
+provenance only; they are not execution evidence for this rebased subject.
 
 ## Negative controls and stop conditions
 
