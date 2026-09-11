@@ -20,11 +20,19 @@ Generate only after all receipt files are present:
 python tools/reconciled_candidate_ledger.py --candidate-revision <exact-head> --output docs/evidence/reconciled-candidate-ledger-YYYY-MM-DD.json
 ```
 
-Verify from a clean checkout of that candidate:
+Verify from a clean retained-evidence checkout that contains the ledger and
+the candidate's Git objects:
 
 ```text
 python tools/reconciled_candidate_ledger.py --verify docs/evidence/reconciled-candidate-ledger-YYYY-MM-DD.json
 ```
+
+The ledger is retained *after* the code subject it describes. It proves that
+the named candidate's Git objects and ancestors are exact; it does not imply
+that the evidence file existed in that candidate's source tree. A later
+evidence-frame checkout is therefore required for verification. This prevents
+a self-referential tree claim while still making the candidate relation
+reproducible.
 
 The ledger is a bounded source-reconciliation artifact for issue #35. It is
 not an immutable OCI-candidate manifest and does not close A0 or the
