@@ -47,6 +47,14 @@ def test_builds_closed_content_safe_witness():
     assert b"http" not in raw.lower() and b"raw_log" not in raw
 
 
+def test_selects_only_the_two_edge_image_subjects_from_full_staging_status():
+    module = load_module()
+    values = list(inputs(module))
+    values[0]["built_images"]["mattermost"] = "sha256:" + "a" * 64
+    receipt = module.build_receipt(*values)
+    assert set(receipt["effective_images"]) == set(module.SERVICES)
+
+
 @pytest.mark.parametrize("mutate, expected", [
     (lambda receipt: receipt["controlled_red"].update(ingress=False), "red"),
     (lambda receipt: receipt["cleanup"].update(sink_absent=False), "cleanup"),

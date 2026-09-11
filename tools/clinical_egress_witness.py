@@ -72,10 +72,15 @@ def _networks(value: object) -> dict[str, list[str]] | None:
 
 
 def _images(status: Mapping[str, Any]) -> dict[str, str] | None:
-    images = _closed_mapping(status.get("built_images"), set(SERVICES))
-    if images is None or not all(isinstance(item, str) and _IMAGE.fullmatch(item) for item in images.values()):
+    images = status.get("built_images")
+    # Staging status binds the full Compose set.  This witness retains only
+    # its two edge subjects while refusing to synthesize either one.
+    if not isinstance(images, dict) or not set(SERVICES).issubset(images):
         return None
-    return images  # type: ignore[return-value]
+    selected = {service: images[service] for service in SERVICES}
+    if not all(isinstance(item, str) and _IMAGE.fullmatch(item) for item in selected.values()):
+        return None
+    return selected
 
 
 def build_receipt(
