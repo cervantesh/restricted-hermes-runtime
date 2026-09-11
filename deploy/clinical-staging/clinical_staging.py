@@ -73,6 +73,27 @@ EXPECTED_NETWORK_KEYS_BY_SERVICE = {
     "ingress": {"mattermost_edge"},
     "operator-proxy": {"operator_access", "mattermost_edge"},
 }
+RESTRICTED_CONTAINER_CONTROLS = {
+    "clinical-adapter": {
+        "user": "restricted-clinical-adapter",
+        "uid": 10008,
+        "gid": 20007,
+        "groups": [20006, 20007],
+        "read_only_mounts": {"/run/clinical-config", "/run/hrh-secret", "/run/hrh-tls"},
+        "writable_mounts": {"/run/restricted-clinical"},
+    },
+    "ingress": {
+        "user": "restricted-mattermost-ingress",
+        "uid": 10007,
+        "gid": 20005,
+        "groups": [20000, 20001, 20005, 20006],
+        "read_only_mounts": {"/run/ingress"},
+        "writable_mounts": {
+            "/run/restricted-clinical",
+            "/var/lib/restricted-mattermost-outbox",
+        },
+    },
+}
 
 
 class SafetyError(RuntimeError):
@@ -489,6 +510,107 @@ def verify_network_topology(
         expected_memberships = {f"{project}_{key}" for key in expected_keys}
         if memberships != expected_memberships:
             raise SafetyError(f"{service} has unexpected network membership")
+
+
+def _tmpfs_is_confined(value: Any, *, uid: int, gid: int) -> bool:
+    """Accept only the exact restrictive /tmp option grammar we rely on."""
+    if not isinstance(value, str):
+        return False
+    tokens = [item.strip() for item in value.split(",")]
+    if not tokens or any(not item for item in tokens):
+        return False
+    flags: set[str] = set()
+    values: dict[str, str] = {}
+    allowed_flags = {"rw", "ro", "noexec", "exec", "nosuid", "suid"}
+    allowed_values = {"size", "mode", "uid", "gid"}
+    for token in tokens:
+        if "=" in token:
+            key, item = token.split("=", 1)
+            if key not in allowed_values or not item or key in values:
+                return False
+            values[key] = item
+        else:
+            if token not in allowed_flags or token in flags:
+                return False
+            flags.add(token)
+    if {"ro", "rw"} <= flags or {"exec", "noexec"} <= flags or {"suid", "nosuid"} <= flags:
+        return False
+    return (
+        {"rw", "noexec", "nosuid"} <= flags
+        and values.get("size") in {"16m", "16384k", "16777216"}
+        and values.get("mode") in {"0700", "700"}
+        and values.get("uid") == str(uid)
+        and values.get("gid") == str(gid)
+    )
+
+
+def verify_restricted_container_controls(
+    inspected: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Fail closed unless Docker reports the exact restricted service boundaries."""
+    evidence: dict[str, dict[str, Any]] = {}
+    for service, expected in RESTRICTED_CONTAINER_CONTROLS.items():
+        info = inspected.get(service)
+        if not isinstance(info, Mapping):
+            raise SafetyError(f"{service} container inspection is unavailable")
+        config = info.get("Config") or {}
+        host = info.get("HostConfig") or {}
+        security = {str(value).replace(":", "=") for value in (host.get("SecurityOpt") or [])}
+        tmpfs = host.get("Tmpfs") or {}
+        mounts = info.get("Mounts") or []
+        mount_modes: dict[str, bool] = {}
+        for mount in mounts:
+            if not isinstance(mount, Mapping) or not isinstance(mount.get("Destination"), str):
+                raise SafetyError(f"{service} mount inspection is malformed")
+            destination = str(mount["Destination"])
+            if destination in mount_modes or not isinstance(mount.get("RW"), bool):
+                raise SafetyError(f"{service} mount inspection is ambiguous")
+            mount_modes[destination] = bool(mount["RW"])
+        expected_modes = {
+            **{path: False for path in expected["read_only_mounts"]},
+            **{path: True for path in expected["writable_mounts"]},
+        }
+        if (
+            config.get("User") != expected["user"]
+            or host.get("Privileged") is not False
+            or host.get("ReadonlyRootfs") is not True
+            or {str(value).upper() for value in (host.get("CapDrop") or [])} != {"ALL"}
+            or host.get("CapAdd") not in (None, [])
+            or security != {"no-new-privileges=true"}
+            or set(tmpfs) != {"/tmp"}
+            or not _tmpfs_is_confined(tmpfs.get("/tmp"), uid=expected["uid"], gid=expected["gid"])
+            or mount_modes != expected_modes
+        ):
+            raise SafetyError(f"{service} effective container confinement rejected")
+        evidence[service] = {
+            "user": expected["user"],
+            "privileged": False,
+            "read_only_rootfs": True,
+            "cap_drop": ["ALL"],
+            "no_new_privileges": True,
+            "tmpfs": ["/tmp"],
+            "read_only_mounts": sorted(expected["read_only_mounts"]),
+            "writable_mounts": sorted(expected["writable_mounts"]),
+        }
+    return evidence
+
+
+def verify_restricted_process_identities(
+    observed: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Require the process actually running in each container to retain its identity."""
+    evidence: dict[str, dict[str, Any]] = {}
+    for service, expected in RESTRICTED_CONTAINER_CONTROLS.items():
+        identity = observed.get(service)
+        expected_identity = {
+            "uid": expected["uid"],
+            "gid": expected["gid"],
+            "groups": expected["groups"],
+        }
+        if identity != expected_identity:
+            raise SafetyError(f"{service} effective process identity rejected")
+        evidence[service] = expected_identity
+    return evidence
 
 
 def _certificate_material(seed: Path) -> None:
@@ -1008,6 +1130,19 @@ class ClinicalStaging:
         if any(labels.get("com.docker.compose.service") == "controller" for labels in containers.values()):
             raise SafetyError("privileged provisioner must not remain after initialization")
 
+    def _restricted_process_identities(self) -> dict[str, dict[str, Any]]:
+        observed: dict[str, Mapping[str, Any]] = {}
+        probe = "import json,os; print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'groups':sorted(os.getgroups())}))"
+        for service in RESTRICTED_CONTAINER_CONTROLS:
+            try:
+                value = json.loads(
+                    self.compose("exec", "--no-TTY", service, "python", "-c", probe).stdout
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise SafetyError(f"{service} effective process identity is unreadable") from exc
+            observed[service] = value
+        return verify_restricted_process_identities(observed)
+
     @serialized_lifecycle
     def status(self) -> dict[str, Any]:
         self._require_linux()
@@ -1023,6 +1158,8 @@ class ClinicalStaging:
         inspected = {service: all_inspected[service] for service in LONG_RUNNING_SERVICES}
         publisher = verify_publishers(inspected, self.port)
         verify_network_topology(self.project, inspected, self._network_inspections())
+        restricted_controls = verify_restricted_container_controls(inspected)
+        restricted_identities = self._restricted_process_identities()
         self.control("wait-mm")
         self.control("wait-hrh")
         tls_probe = self._probe_mattermost_tls()
@@ -1070,6 +1207,8 @@ class ClinicalStaging:
             "ingress_started_at": ingress_started_at,
             "tls_probe": tls_probe,
             "network_exception": "operator-proxy only: operator_access is non-internal",
+            "restricted_container_controls": restricted_controls,
+            "restricted_process_identities": restricted_identities,
             "privileged_provisioner_running": False,
             "nonclaims": ["not HIPAA", "not PHI-authorized", "not production"],
             "observed_at": datetime.now(UTC).isoformat(),

@@ -114,7 +114,9 @@ services:
     environment:
       RESTRICTED_CLINICAL_ADAPTER_CONFIG_PATH: /run/clinical-config/adapter.json
     read_only: true
-    tmpfs: [/tmp]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=0700,uid=10008,gid=20007"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     volumes:
       - clinical_socket:/run/restricted-clinical
       - clinical_config:/run/clinical-config:ro
@@ -138,7 +140,9 @@ services:
       RESTRICTED_MATTERMOST_CA_PATH: /run/ingress/ca.crt
       RESTRICTED_MATTERMOST_OUTBOX_KEY_PATH: /run/ingress/outbox.key
     read_only: true
-    tmpfs: [/tmp]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=0700,uid=10007,gid=20005"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     dns: [192.0.2.1]
     dns_opt: [timeout:1, attempts:1]
     volumes:

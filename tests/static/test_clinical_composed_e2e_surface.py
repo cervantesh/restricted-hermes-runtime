@@ -1,6 +1,7 @@
 from pathlib import Path
 import re
 
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = ROOT / "tests" / "deployment" / "clinical-composed-e2e"
@@ -31,6 +32,24 @@ def test_clinical_e2e_keeps_hrh_credentials_out_of_the_edge():
 
     assert "hrh_api_key" not in ingress
     assert "hrh_secret" in adapter
+
+
+def test_restricted_clinical_services_have_explicit_runtime_confinement():
+    compose = yaml.safe_load((HARNESS / "compose.yaml").read_text(encoding="utf-8"))
+    runner = (ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py").read_text(encoding="utf-8")
+    expected = {
+        "clinical-adapter": "/tmp:rw,noexec,nosuid,size=16m,mode=0700,uid=10008,gid=20007",
+        "ingress": "/tmp:rw,noexec,nosuid,size=16m,mode=0700,uid=10007,gid=20005",
+    }
+    for service, tmpfs in expected.items():
+        config = compose["services"][service]
+        assert config["read_only"] is True
+        assert config["cap_drop"] == ["ALL"]
+        assert config["security_opt"] == ["no-new-privileges:true"]
+        assert config["tmpfs"] == [tmpfs]
+    assert "restricted_container_control_evidence" in runner
+    assert "verify_restricted_container_controls" in runner
+    assert "os.getuid()" in runner and "os.getgroups()" in runner
 
 
 def test_clinical_e2e_proves_clean_descendant_sources_and_exact_post_cardinality():

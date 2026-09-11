@@ -65,3 +65,5 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert "not HIPAA" in runbook
     assert "not production" in runbook
     assert "privileged provisioner" in runbook
+    assert "dropped capabilities" in runbook
+    assert "no-new-privileges" in runbook
