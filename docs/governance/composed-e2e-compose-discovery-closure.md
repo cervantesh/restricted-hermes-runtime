@@ -17,8 +17,9 @@ host-conformance change.
    environment file.
 3. On Windows, absence of both discovery variables fails before a Compose
    command is attempted, with a content-free diagnostic.
-4. Docker's mutable client state is written below the harness temporary state,
-   never below the source checkout or an operator's Docker configuration.
+4. Docker's mutable client state and Windows temporary metadata are written
+   below the harness temporary state, never below the source checkout, a
+   system directory, or an operator's Docker configuration.
 5. The actual `docker compose --env-file ... version` probe succeeds in the
    sealed environment before the expensive build is used as evidence.
 
@@ -30,6 +31,8 @@ host-conformance change.
 - The probe must still include `--env-file`; falling back to an ambient process
   environment is inadmissible.
 - A probe that writes `.docker/` under the source checkout is inadmissible.
+- A Windows probe that defaults its temporary metadata under a system directory
+  is inadmissible.
 
 ## Nonclaims
 

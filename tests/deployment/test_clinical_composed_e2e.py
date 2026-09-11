@@ -47,6 +47,7 @@ SEED = STATE / "seed"
 EVIDENCE = STATE / "evidence"
 ENV_FILE = STATE / "compose.env"
 DOCKER_CONFIG_DIR = STATE / "docker-config"
+DOCKER_CLIENT_TMP_DIR = STATE / "docker-tmp"
 CANDIDATE_MANIFEST = os.environ.get("RESTRICTED_IMMUTABLE_CANDIDATE_MANIFEST")
 
 
@@ -130,10 +131,15 @@ def sealed_compose_environment() -> dict[str, str]:
     if not sealed:
         raise RuntimeError("clinical composed E2E environment is empty")
     DOCKER_CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    DOCKER_CLIENT_TMP_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     process = compose_process_environment()
     # Compose may create buildx/client state.  Keep it below the disposable
     # harness directory rather than consulting or mutating operator config.
     process["DOCKER_CONFIG"] = str(DOCKER_CONFIG_DIR)
+    # Docker/Buildx uses TEMP/TMP on Windows for metadata files.  With neither
+    # variable present it can default to a protected system directory.
+    process["TEMP"] = str(DOCKER_CLIENT_TMP_DIR)
+    process["TMP"] = str(DOCKER_CLIENT_TMP_DIR)
     process.update(sealed)
     return process
 
