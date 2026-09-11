@@ -602,7 +602,7 @@ def main() -> None:
     expected_after = {
         "record_tag": source_record_tag,
         "state": "BLOCKED",
-        "reason": "current_authorization_rejected",
+        "reason": "post_authorization_source_rejected",
         "generation": int(source_before["generation"]) + 1,
         "nonce_erased": True,
         "ciphertext_erased": True,
