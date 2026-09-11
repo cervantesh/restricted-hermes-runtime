@@ -1,0 +1,70 @@
+from __future__ import annotations
+
+import importlib.util
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[2]
+TOOL = ROOT / "tools" / "clinical_egress_witness.py"
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location("clinical_egress_witness", TOOL)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def status(module):
+    candidate = module._candidate()
+    return {
+        "source": {"runtime_head": "a" * 40, "runtime_tree": "b" * 40, "hrh_head": "c" * 40, "hrh_tree": "d" * 40},
+        "restricted_container_controls": deepcopy(candidate.EXPECTED_RESTRICTED_CONTROLS),
+        "restricted_process_identities": deepcopy(candidate.EXPECTED_RESTRICTED_IDENTITIES),
+        "built_images": {service: "sha256:" + char * 64 for service, char in zip(module.SERVICES, "ef")},
+    }
+
+
+def observations(module):
+    candidate = module._candidate()
+    return {service: {"denied": {item: True for item in candidate.DENIED_CLASSES}, "allowed": {item: True for item in candidate.ALLOWED_CLASSES[service]}} for service in module.SERVICES}
+
+
+def inputs(module):
+    return (status(module), observations(module), {"system": "Linux", "kernel": "6.8.0", "architecture": "x86_64", "docker": "29.4.3", "compose": "2.40.3"}, {"clinical-adapter": ["clinical_upstream"], "ingress": ["mattermost_edge"]}, {service: True for service in module.SERVICES}, {"network_absent": True, "sink_absent": True})
+
+
+def test_builds_closed_content_safe_witness():
+    module = load_module()
+    values = inputs(module)
+    receipt = module.build_receipt(*values)
+    raw = module.canonical_bytes(receipt)
+    assert module.verify_receipt(raw, expected_source=values[0]["source"]) == []
+    assert b"http" not in raw.lower() and b"raw_log" not in raw
+
+
+@pytest.mark.parametrize("mutate, expected", [
+    (lambda receipt: receipt["controlled_red"].update(ingress=False), "red"),
+    (lambda receipt: receipt["cleanup"].update(sink_absent=False), "cleanup"),
+    (lambda receipt: receipt["network_membership"].update(ingress=["mattermost_edge", "red"]), "networks"),
+    (lambda receipt: receipt["effective_images"].update(ingress="latest"), "images"),
+    (lambda receipt: receipt.update(raw_log="forbidden"), "fields"),
+])
+def test_rejects_incomplete_or_unsafe_witness(mutate, expected):
+    module = load_module()
+    values = inputs(module)
+    receipt = module.build_receipt(*values)
+    mutate(receipt)
+    assert module.verify_receipt(module.canonical_bytes(receipt), expected_source=values[0]["source"]) == [expected]
+
+
+def test_builder_rejects_incomplete_red_or_cleanup():
+    module = load_module()
+    values = list(inputs(module))
+    values[4]["ingress"] = False
+    with pytest.raises(ValueError, match="RED"):
+        module.build_receipt(*values)
