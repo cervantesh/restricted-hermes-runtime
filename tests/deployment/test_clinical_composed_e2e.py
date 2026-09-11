@@ -452,7 +452,8 @@ def restricted_container_control_evidence() -> dict[str, object]:
             raise RuntimeError(f"{service} effective runtime identity rejected")
         identities[service] = identity
     controls = module.verify_restricted_container_controls(inspected)
-    return {"effective_identity": identities, "confinement": controls}
+    verified_identities = module.verify_restricted_process_identities(identities)
+    return {"effective_identity": verified_identities, "confinement": controls}
 
 
 def network_and_surface_controls() -> dict[str, bool]:

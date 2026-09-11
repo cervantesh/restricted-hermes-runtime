@@ -630,6 +630,24 @@ def test_restricted_container_guard_requires_exact_effective_confinement():
             module.verify_restricted_container_controls(changed)
 
 
+def test_restricted_process_identity_guard_rejects_live_privilege_or_group_drift():
+    module = load_module()
+    identities = {
+        service: {
+            "uid": expected["uid"],
+            "gid": expected["gid"],
+            "groups": expected["groups"],
+        }
+        for service, expected in module.RESTRICTED_CONTAINER_CONTROLS.items()
+    }
+    assert module.verify_restricted_process_identities(identities) == identities
+    for field, value in (("uid", 0), ("gid", 0), ("groups", [0])):
+        changed = json.loads(json.dumps(identities))
+        changed["ingress"][field] = value
+        with pytest.raises(module.SafetyError, match="ingress"):
+            module.verify_restricted_process_identities(changed)
+
+
 def test_generated_mattermost_certificate_covers_dns_and_advertised_loopback_ip(tmp_path: Path):
     module = load_module()
     seed = tmp_path / "seed"
@@ -829,6 +847,10 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
         if args[:2] == ("logs", "--no-color"):
             ingress_log_calls.append(args)
             return SimpleNamespace(stdout="mattermost_ingress_outcome=authenticated_ready\n", returncode=0)
+        if args[:3] == ("exec", "--no-TTY", "clinical-adapter") and "os.getuid()" in args[-1]:
+            return SimpleNamespace(stdout=json.dumps({"uid": 10008, "gid": 20007, "groups": [20006, 20007]}), returncode=0)
+        if args[:3] == ("exec", "--no-TTY", "ingress") and "os.getuid()" in args[-1]:
+            return SimpleNamespace(stdout=json.dumps({"uid": 10007, "gid": 20005, "groups": [20000, 20001, 20005, 20006]}), returncode=0)
         return SimpleNamespace(
             stdout=json.dumps({"uid": 10008, "gid": 20006, "mode": 0o660, "socket": True}),
             returncode=0,
@@ -874,6 +896,7 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
     }
     assert result["tls_probe"] == tls_probe
     assert result["network_exception"] == "operator-proxy only: operator_access is non-internal"
+    assert result["restricted_process_identities"]["ingress"]["uid"] == 10007
     assert result["ingress_started_at"] == "2026-09-06T15:00:00.000000000Z"
     assert "policy-live" in policy_controls
     assert ingress_log_calls == [

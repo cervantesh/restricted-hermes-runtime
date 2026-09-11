@@ -78,6 +78,7 @@ RESTRICTED_CONTAINER_CONTROLS = {
         "user": "restricted-clinical-adapter",
         "uid": 10008,
         "gid": 20007,
+        "groups": [20006, 20007],
         "read_only_mounts": {"/run/clinical-config", "/run/hrh-secret", "/run/hrh-tls"},
         "writable_mounts": {"/run/restricted-clinical"},
     },
@@ -85,6 +86,7 @@ RESTRICTED_CONTAINER_CONTROLS = {
         "user": "restricted-mattermost-ingress",
         "uid": 10007,
         "gid": 20005,
+        "groups": [20000, 20001, 20005, 20006],
         "read_only_mounts": {"/run/ingress"},
         "writable_mounts": {
             "/run/restricted-clinical",
@@ -590,6 +592,24 @@ def verify_restricted_container_controls(
             "read_only_mounts": sorted(expected["read_only_mounts"]),
             "writable_mounts": sorted(expected["writable_mounts"]),
         }
+    return evidence
+
+
+def verify_restricted_process_identities(
+    observed: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Require the process actually running in each container to retain its identity."""
+    evidence: dict[str, dict[str, Any]] = {}
+    for service, expected in RESTRICTED_CONTAINER_CONTROLS.items():
+        identity = observed.get(service)
+        expected_identity = {
+            "uid": expected["uid"],
+            "gid": expected["gid"],
+            "groups": expected["groups"],
+        }
+        if identity != expected_identity:
+            raise SafetyError(f"{service} effective process identity rejected")
+        evidence[service] = expected_identity
     return evidence
 
 
@@ -1110,6 +1130,19 @@ class ClinicalStaging:
         if any(labels.get("com.docker.compose.service") == "controller" for labels in containers.values()):
             raise SafetyError("privileged provisioner must not remain after initialization")
 
+    def _restricted_process_identities(self) -> dict[str, dict[str, Any]]:
+        observed: dict[str, Mapping[str, Any]] = {}
+        probe = "import json,os; print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'groups':sorted(os.getgroups())}))"
+        for service in RESTRICTED_CONTAINER_CONTROLS:
+            try:
+                value = json.loads(
+                    self.compose("exec", "--no-TTY", service, "python", "-c", probe).stdout
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise SafetyError(f"{service} effective process identity is unreadable") from exc
+            observed[service] = value
+        return verify_restricted_process_identities(observed)
+
     @serialized_lifecycle
     def status(self) -> dict[str, Any]:
         self._require_linux()
@@ -1126,6 +1159,7 @@ class ClinicalStaging:
         publisher = verify_publishers(inspected, self.port)
         verify_network_topology(self.project, inspected, self._network_inspections())
         restricted_controls = verify_restricted_container_controls(inspected)
+        restricted_identities = self._restricted_process_identities()
         self.control("wait-mm")
         self.control("wait-hrh")
         tls_probe = self._probe_mattermost_tls()
@@ -1174,6 +1208,7 @@ class ClinicalStaging:
             "tls_probe": tls_probe,
             "network_exception": "operator-proxy only: operator_access is non-internal",
             "restricted_container_controls": restricted_controls,
+            "restricted_process_identities": restricted_identities,
             "privileged_provisioner_running": False,
             "nonclaims": ["not HIPAA", "not PHI-authorized", "not production"],
             "observed_at": datetime.now(UTC).isoformat(),
