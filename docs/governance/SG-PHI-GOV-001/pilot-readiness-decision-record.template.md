@@ -216,14 +216,31 @@ untested rollback is not evidence of recovery.
 
 ### 8.1 Canonical decision payload
 
-The **Decision Payload** is the canonical serialization of the completed content
-of sections 1 through 9, including the exact candidate bindings, evidence
-manifest digest, external decision references, conditions, and effective
-decision. It excludes section 10, all signature rows, and any signature
-envelope. The `Decision payload digest` field in section 1 is computed over
-sections 1 through 9 with that field itself represented as a fixed empty value
-before hashing; it is not computed over the signature envelope. This removes
-the circularity between the payload and its signatures.
+The Markdown record is a human-readable view and is **not** hashed or signed.
+The Decision Payload is the completed JSON document named
+`SG-PHI-GOV-001-decision-payload.v1.json`, initialized from the adjacent
+template. It represents sections 1 through 9, including exact candidate
+bindings, the evidence-manifest digest, external decision references,
+conditions, and the effective decision. It excludes section 10, all signature
+rows, and any signature envelope.
+
+The payload has one reproducible byte encoding:
+
+1. Its top-level fields are exactly `schema`, `record_id`, and `sections`.
+   `schema` is exactly `sg-phi-gov-001-decision-payload.v1`; `sections` has
+   exactly the string keys `1` through `9`.
+2. Its JSON input rejects duplicate keys, non-finite numbers, and values not
+   representable by [RFC 8785 JSON Canonicalization Scheme (JCS)](https://www.rfc-editor.org/rfc/rfc8785).
+3. Serialize that object with RFC 8785 JCS: recursively sorted object keys,
+   JCS number/string escaping, UTF-8, no byte-order mark, and **no trailing
+   newline or whitespace**.
+4. The Decision Payload digest is lowercase `sha256` over those exact JCS
+   bytes. It is not a member of the JSON payload. Copy its value into section
+   1 of this Markdown record only after hashing.
+
+This removes both Markdown formatting ambiguity and digest circularity. Any
+edit to either the payload's section data or its exact candidate/evidence
+bindings changes the digest and requires a new decision/review cycle.
 
 Each signatory signs the tuple:
 
