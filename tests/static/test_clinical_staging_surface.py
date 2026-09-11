@@ -67,3 +67,16 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert "privileged provisioner" in runbook
     assert "dropped capabilities" in runbook
     assert "no-new-privileges" in runbook
+
+
+def test_representative_egress_admits_host_and_local_docker_before_collection():
+    harness = (ROOT / "tests" / "deployment" / "test_representative_clinical_egress.sh").read_text(encoding="utf-8")
+
+    admission = '"$python_bin" "$runtime/tools/p2_host_platform_admission.py"'
+    assert admission in harness
+    assert harness.index(admission) < harness.index("docker info >/dev/null 2>&1")
+    assert 'representative-clinical-egress: DENIED class=unsupported-host' in harness
+    assert '[[ -z "${DOCKER_HOST:-}" && -z "${DOCKER_CONTEXT:-}" ]]' in harness
+    assert "docker context inspect default --format" in harness
+    assert '"$docker_endpoint" == "unix:///var/run/docker.sock"' in harness
+    assert 'representative-clinical-egress: DENIED class=unsupported-docker-endpoint' in harness

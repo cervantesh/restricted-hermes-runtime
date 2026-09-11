@@ -30,7 +30,10 @@ values, logs, credentials, or payloads.
    match.
 3. The existing RED/GREEN network, container-control, image-binding and cleanup
    receipt checks remain covered by focused tests.
-4. A real representative Linux host run is explicitly *not* claimed by this
+4. Before Docker discovery or collection, the harness admits only the declared
+   Ubuntu 24.04 x86_64 non-WSL host class and rejects an overridden or non-local
+   Docker endpoint.
+5. A real representative Linux host run is explicitly *not* claimed by this
    slice. The runbook may remain draft until the candidate and host are both
    admissible under #31.
 
