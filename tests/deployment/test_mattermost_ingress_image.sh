@@ -2,10 +2,21 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
-tag="${RESTRICTED_MATTERMOST_IMAGE_TAG:-restricted-mattermost-ingress-closure:sg-mattermost-004}"
-
-docker build -f Dockerfile.mattermost-ingress -t "$tag" .
-docker run --rm --network none --entrypoint python "$tag" -c '
+if [[ "${RESTRICTED_PUBLISHED_CANDIDATE:-}" == "1" && -z "${RESTRICTED_MATTERMOST_IMAGE_DIGEST:-}" ]]; then
+  printf '%s\n' 'published candidate requires an immutable digest' >&2
+  exit 64
+fi
+image="${RESTRICTED_MATTERMOST_IMAGE_DIGEST:-${RESTRICTED_MATTERMOST_IMAGE_TAG:-restricted-mattermost-ingress-closure:sg-mattermost-004}}"
+if [[ -n "${RESTRICTED_MATTERMOST_IMAGE_DIGEST:-}" ]]; then
+  if [[ "$image" != *@sha256:* ]]; then
+    printf '%s\n' 'published Mattermost ingress subject must be immutable' >&2
+    exit 64
+  fi
+  docker pull "$image"
+else
+  docker build -f Dockerfile.mattermost-ingress -t "$image" .
+fi
+docker run --rm --network none --entrypoint python "$image" -c '
 import importlib
 import importlib.util
 from pathlib import Path

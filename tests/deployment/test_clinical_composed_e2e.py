@@ -37,8 +37,28 @@ STATE = Path(tempfile.mkdtemp(prefix="clinical-composed-e2e-"))
 SEED = STATE / "seed"
 EVIDENCE = STATE / "evidence"
 ENV_FILE = STATE / "compose.env"
-INGRESS_IMAGE = f"restricted-clinical-ingress:{PROJECT}"
-ADAPTER_IMAGE = f"restricted-clinical-adapter:{PROJECT}"
+CANDIDATE_MANIFEST = os.environ.get("RESTRICTED_IMMUTABLE_CANDIDATE_MANIFEST")
+
+
+def candidate_subject_image(name: str) -> str | None:
+    if not CANDIDATE_MANIFEST:
+        return None
+    try:
+        manifest = json.loads(Path(CANDIDATE_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("immutable candidate manifest is unreadable") from exc
+    for subject in manifest.get("subjects", []):
+        if isinstance(subject, dict) and subject.get("name") == name:
+            image = subject.get("image")
+            if not isinstance(image, str) or "@sha256:" not in image:
+                raise RuntimeError("published subject requires an immutable digest")
+            return image
+    raise RuntimeError(f"immutable candidate subject is missing: {name}")
+
+
+INGRESS_IMAGE = candidate_subject_image("restricted-mattermost-ingress") or f"restricted-clinical-ingress:{PROJECT}"
+ADAPTER_IMAGE = candidate_subject_image("restricted-clinical-adapter") or f"restricted-clinical-adapter:{PROJECT}"
+PUBLISHED_SUBJECTS = CANDIDATE_MANIFEST is not None
 CREATED = False
 SOURCE_FRAME: dict[str, str] = {}
 
@@ -239,8 +259,13 @@ def main() -> None:
     global CREATED
     phase("prepare")
     prepare()
-    phase("build")
-    compose("build", "ingress", "clinical-adapter", timeout=600)
+    if PUBLISHED_SUBJECTS:
+        phase("pull-published-no-rebuild")
+        run("docker", "pull", INGRESS_IMAGE, timeout=600)
+        run("docker", "pull", ADAPTER_IMAGE, timeout=600)
+    else:
+        phase("build")
+        compose("build", "ingress", "clinical-adapter", timeout=600)
     compose("build", "controller", "hrh-migrate", "hrh", timeout=1800)
     phase("initialize-volumes")
     compose("up", "--detach", "controller")

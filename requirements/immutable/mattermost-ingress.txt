@@ -1,0 +1,7 @@
+# linux/amd64 closure for Dockerfile.mattermost-ingress.
+# Generated from a clean python@sha256:d1053354624536b044162aaab1e418bd000ea35184fb1ae098ab3166b1072e72
+# resolver on 2026-09-06.  Every downloaded artifact is intentionally pinned.
+cffi==2.1.1 --hash=sha256:34e261f78cb6ceaaa36f42f2613f4380d94d9c759a9c73c769ee6e0247364632
+cryptography==50.0.1 --hash=sha256:51afcfceb15597cf2635068e4ac9a56b2abde622edde17f37d85fd7b5306497a
+pycparser==3.0 --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+websockets==15.0.1 --hash=sha256:8dd8327c795b3e3f219760fa603dcae1dcc148172290a8ab15158cf85a953413

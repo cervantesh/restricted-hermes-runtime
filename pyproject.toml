@@ -7,7 +7,7 @@ name = "restricted-hermes-runtime"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-  "cryptography>=42,<45",
+  "cryptography>=50,<51",
   "fastapi>=0.115,<1",
   "psycopg[binary,pool]>=3.2,<4",
   "PyYAML>=6,<7",
