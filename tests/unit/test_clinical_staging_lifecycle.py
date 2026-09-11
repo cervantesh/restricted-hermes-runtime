@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -762,6 +763,42 @@ with staging._lifecycle_lock():
         assert not released.exists(), "second lifecycle process entered while the first held the state lock"
     assert process.wait(timeout=5) == 0
     assert released.read_text(encoding="ascii") == "entered"
+
+
+def test_lifecycle_lock_does_not_treat_another_thread_as_nested(tmp_path: Path):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingdemo", 18443)
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def first() -> None:
+        with staging._lifecycle_lock():
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+
+    def second() -> None:
+        assert first_entered.wait(timeout=5)
+        with staging._lifecycle_lock():
+            second_entered.set()
+
+    first_thread = threading.Thread(target=first)
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    assert first_entered.wait(timeout=5)
+    second_thread.start()
+    time.sleep(0.1)
+    assert not second_entered.is_set(), "another thread bypassed the lifecycle lock as a nested call"
+    release_first.set()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert second_entered.is_set()
 
 
 def test_stop_failure_preserves_ready_marker_and_transition_evidence(

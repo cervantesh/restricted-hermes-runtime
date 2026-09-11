@@ -490,43 +490,49 @@ class ClinicalStaging:
         self.overlay = self.runtime / "deploy" / "clinical-staging" / "compose.yaml"
         self.harness = self.runtime / "tests" / "deployment" / "clinical-composed-e2e"
         self.env_file = self.state_dir / "compose.env"
-        self._lifecycle_lock_depth = 0
         self._lifecycle_thread_lock = threading.RLock()
+        self._lifecycle_thread_state = threading.local()
 
     @contextlib.contextmanager
     def _lifecycle_lock(self):
         """Take a per-state advisory lock, reentrant for nested command calls."""
-        if self._lifecycle_lock_depth:
-            self._lifecycle_lock_depth += 1
-            try:
-                yield
-            finally:
-                self._lifecycle_lock_depth -= 1
-            return
-
-        # init may create a fresh state directory, so the lock lives beside it.
-        self.state_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        lock_path = self.state_dir.parent / f".{self.state_dir.name}.lifecycle.lock"
-        if fcntl is None:  # pragma: no cover - test portability only; Linux is required in production.
-            with self._lifecycle_thread_lock:
-                self._lifecycle_lock_depth = 1
+        # The process-local RLock remains held across the whole lifecycle
+        # operation.  flock covers independent operators; RLock covers two
+        # threads using this same ClinicalStaging instance.  Depth is local to
+        # the owning thread, so a concurrent thread can never impersonate a
+        # nested call and bypass either lock.
+        with self._lifecycle_thread_lock:
+            depth = getattr(self._lifecycle_thread_state, "depth", 0)
+            if depth:
+                self._lifecycle_thread_state.depth = depth + 1
                 try:
                     yield
                 finally:
-                    self._lifecycle_lock_depth = 0
-            return
+                    self._lifecycle_thread_state.depth = depth
+                return
 
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            self._lifecycle_lock_depth = 1
+            # init may create a fresh state directory, so the lock lives beside it.
+            self.state_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lock_path = self.state_dir.parent / f".{self.state_dir.name}.lifecycle.lock"
+            if fcntl is None:  # pragma: no cover - test portability only; Linux is required in production.
+                self._lifecycle_thread_state.depth = 1
+                try:
+                    yield
+                finally:
+                    self._lifecycle_thread_state.depth = 0
+                return
+
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
             try:
-                yield
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                self._lifecycle_thread_state.depth = 1
+                try:
+                    yield
+                finally:
+                    self._lifecycle_thread_state.depth = 0
+                    fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
-                self._lifecycle_lock_depth = 0
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+                os.close(fd)
 
     def _require_linux(self) -> None:
         if os.name != "posix" or not sys.platform.startswith("linux"):
