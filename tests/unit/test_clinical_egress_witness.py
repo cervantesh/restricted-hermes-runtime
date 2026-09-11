@@ -96,25 +96,23 @@ def test_receipt_writer_does_not_replace_an_existing_caller_path(tmp_path):
     assert output.read_bytes() == b"sentinel"
 
 
-def test_legacy_versioned_wsl_receipt_hash_is_preserved_until_replacement():
+def test_versioned_wsl_receipt_is_canonical_and_bound_to_its_recorded_subject():
     module = load_module()
     # The evidence was generated on Linux with LF.  Keep its source digest
     # stable when this test runs from a Windows checkout that expands text to
     # CRLF.
     raw = (ROOT / "docs" / "evidence" / "clinical-egress-wsl-receipt-2026-09-11.json").read_bytes().replace(b"\r\n", b"\n")
     expected_source = {
-        "runtime_head": "793feea781f2c9b70d0aa3f846c537826db889eb",
-        "runtime_tree": "83539372e8c46cc3ebccecf148a17304805fcf70",
+        "runtime_head": "146bf39c9a3ac8fa2155c7f52e53b51af5646fff",
+        "runtime_tree": "dc3560ba46df8d8157a1f79ed9c4c82ac274052c",
         "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
         "hrh_tree": "f217b0b1cf7f438422528dfe178d81b78212c68b",
     }
     expected_status = status(module)
     expected_status["source"] = expected_source
     expected_status["built_images"] = {
-        "clinical-adapter": "sha256:612a53906df02298b92a33d663adf510d92572c18557dd8d0d207d28045b5f2a",
-        "ingress": "sha256:944a5e7946e6338bbcb5456b9b20ed946340f0c6a4c1a61f38ed822d4181870b",
+        "clinical-adapter": "sha256:1a802089e130e6dc9c9e85c99863dc3a564b811ed2036cb76c49fd9754557af1",
+        "ingress": "sha256:739569b5c1c9219fc3b3aca4359ffc3cf743f0b82db980c031a8f2203d7b8015",
     }
-    # This historical receipt predates the current receipt contract.  Preserve
-    # its digest until the real-path collector replaces it with fresh evidence.
-    assert module.verify_receipt(raw, expected_status=expected_status) == ["candidate-receipt"]
-    assert hashlib.sha256(raw).hexdigest() == "920284a6a411396f5befb5433a95e89fc6a0cb1d896aa85faf00e87a498ac914"
+    assert module.verify_receipt(raw, expected_status=expected_status) == []
+    assert hashlib.sha256(raw).hexdigest() == "54ec7f0e257dfd6461c5697218f61cc32f3a0c9f12f77cd73afa0315dbcab1b7"
