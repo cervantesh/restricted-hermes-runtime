@@ -568,7 +568,10 @@ def main() -> None:
     wait_delivery_delay()
     ready_records = [row for row in paused_outbox_snapshot() if row.get("state") == "READY"]
     if len(ready_records) != 1:
-        raise RuntimeError("source-deletion barrier did not isolate exactly one READY outbox record")
+        raise RuntimeError(
+            "source-deletion barrier did not isolate exactly one READY outbox record "
+            f"(observed={len(ready_records)})"
+        )
     source_before = ready_records[0]
     if source_before.get("reason") != "" or source_before.get("nonce_erased") or source_before.get("ciphertext_erased"):
         raise RuntimeError("source-deletion READY record did not retain its encrypted payload")
