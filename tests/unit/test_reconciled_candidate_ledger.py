@@ -84,7 +84,12 @@ def test_a0_card_is_bound_to_the_p2_admission_candidate_and_its_real_guard() -> 
         check=True,
     ).stdout
     candidate = json.loads(raw)["candidate"]
-    card = (ROOT / "docs" / "governance" / "a0-candidate-evaluation-closure.md").read_text(encoding="utf-8")
+    card = subprocess.run(
+        ["git", "-C", str(ROOT), "show", "HEAD:docs/governance/a0-candidate-evaluation-closure.md"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
     assert candidate["revision"] in card
     assert candidate["tree"] in card
     assert "immutable-candidate-<date>-" + candidate["revision"][:7] in card
