@@ -691,9 +691,15 @@ def main() -> None:
         raise RuntimeError("known/unknown delivery post-count contract failed: " + json.dumps(post_counts, sort_keys=True))
     phase("evidence")
     logs = scan_logs(_known_secret_canaries())
+    policy_binding = json.loads(control("active-policy-binding").stdout)
+    if (not isinstance(policy_binding, dict) or set(policy_binding) != {"epoch", "digest"}
+            or not isinstance(policy_binding.get("epoch"), str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", policy_binding["epoch"])
+            or not isinstance(policy_binding.get("digest"), str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", policy_binding["digest"])):
+        raise RuntimeError("active policy binding is malformed")
     evidence = {
         **SOURCE_FRAME,
         "runtime_product_sha": RUNTIME_PRODUCT_SHA,
+        "policy": policy_binding,
         "images": image_evidence()["images"], "boundaries": boundaries,
         "secret_boundary": secret_boundary,
         "built_images": built_image_evidence(),

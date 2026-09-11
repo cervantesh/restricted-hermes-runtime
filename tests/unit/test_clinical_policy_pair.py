@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -45,3 +46,17 @@ def test_policy_pair_interruption_is_fail_closed_and_retryable(tmp_path: Path, f
 
     module.install_policy_pair(tmp_path, new_raw, new_sig, private.public_key())
     assert module.verify_policy_pair(tmp_path, private.public_key()) == module.hashlib.sha256(new_raw).hexdigest()
+
+
+def test_active_policy_binding_uses_the_same_verified_bytes_for_epoch_and_digest(tmp_path: Path, monkeypatch):
+    module = load_control()
+    verified_raw = b'{"policy_epoch":"verified"}'
+    replacement = b'{"policy_epoch":"replaced"}'
+    monkeypatch.setattr(module, "INGRESS", tmp_path)
+    monkeypatch.setattr(module, "policy_private", lambda: type("Key", (), {"public_key": lambda self: None})())
+    (tmp_path / "policy.json").write_bytes(verified_raw)
+    def replace_after_verification(*_args):
+        (tmp_path / "policy.json").write_bytes(replacement)
+        return verified_raw, hashlib.sha256(verified_raw).hexdigest()
+    monkeypatch.setattr(module, "verified_policy_bytes", replace_after_verification)
+    assert module.active_policy_binding() == {"epoch": "verified", "digest": "sha256:" + hashlib.sha256(verified_raw).hexdigest()}
