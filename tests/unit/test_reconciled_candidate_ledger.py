@@ -10,6 +10,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RETAINED_A0_CANDIDATE = "49dca06b7a2e2b8134e2c4e426112e55fa73d0c3"
 SPEC = importlib.util.spec_from_file_location("reconciled_candidate_ledger", ROOT / "tools" / "reconciled_candidate_ledger.py")
 assert SPEC and SPEC.loader
 ledger = importlib.util.module_from_spec(SPEC)
@@ -28,7 +29,7 @@ def test_current_candidate_ledger_verifies() -> None:
 
 def test_ledger_can_be_retained_in_a_later_evidence_frame() -> None:
     """The evidence file need not exist in the tree of the code subject it binds."""
-    candidate = git(ROOT, "rev-parse", "HEAD~1")
+    candidate = git(ROOT, "rev-parse", RETAINED_A0_CANDIDATE)
     value = ledger.build_ledger(repo_root=ROOT, candidate_revision=candidate)
     assert value["candidate"]["revision"] == candidate
     assert ledger.verify_ledger(ledger.canonical_bytes(value), repo_root=ROOT) == []
