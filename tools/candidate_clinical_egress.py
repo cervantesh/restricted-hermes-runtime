@@ -44,6 +44,7 @@ EXPECTED_RESTRICTED_IDENTITIES = {
     "ingress": {"uid": 10007, "gid": 20005, "groups": [20000, 20001, 20005, 20006]},
 }
 _SHA = re.compile(r"[a-f0-9]{40}")
+_IMAGE = re.compile(r"sha256:[a-f0-9]{64}")
 
 
 def canonical_bytes(value: Mapping[str, Any]) -> bytes:
@@ -70,6 +71,29 @@ def _source(value: object) -> dict[str, str] | None:
     return dict(value)
 
 
+def _strict_equal(observed: object, expected: object) -> bool:
+    """Compare JSON-shaped evidence without accepting bool/int aliases."""
+    if type(observed) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(observed) == set(expected) and all(_strict_equal(observed[key], value) for key, value in expected.items())
+    if isinstance(expected, list):
+        return len(observed) == len(expected) and all(_strict_equal(item, value) for item, value in zip(observed, expected))
+    return observed == expected
+
+
+def _images(status: object) -> dict[str, str] | None:
+    if not isinstance(status, dict):
+        return None
+    images = status.get("built_images")
+    if not isinstance(images, dict) or not set(SERVICES).issubset(images):
+        return None
+    selected = {service: images[service] for service in SERVICES}
+    if not all(isinstance(image, str) and _IMAGE.fullmatch(image) for image in selected.values()):
+        return None
+    return selected
+
+
 def _restricted_evidence(status: object) -> tuple[dict[str, Any], dict[str, Any]] | None:
     if not isinstance(status, dict):
         return None
@@ -82,7 +106,7 @@ def _restricted_evidence(status: object) -> tuple[dict[str, Any], dict[str, Any]
     for service in SERVICES:
         control = controls[service]
         identity = identities[service]
-        if control != EXPECTED_RESTRICTED_CONTROLS[service] or identity != EXPECTED_RESTRICTED_IDENTITIES[service]:
+        if not _strict_equal(control, EXPECTED_RESTRICTED_CONTROLS[service]) or not _strict_equal(identity, EXPECTED_RESTRICTED_IDENTITIES[service]):
             return None
     return controls, identities
 
@@ -90,7 +114,8 @@ def _restricted_evidence(status: object) -> tuple[dict[str, Any], dict[str, Any]
 def build_receipt(status: Mapping[str, Any], observations: Mapping[str, Any]) -> dict[str, Any]:
     source = _source(status.get("source"))
     restricted = _restricted_evidence(status)
-    if source is None or restricted is None:
+    images = _images(status)
+    if source is None or restricted is None or images is None:
         raise ValueError("status is not an admissible candidate binding")
     controls, identities = restricted
     receipt = {
@@ -99,29 +124,35 @@ def build_receipt(status: Mapping[str, Any], observations: Mapping[str, Any]) ->
         "source": source,
         "restricted_container_controls": controls,
         "restricted_process_identities": identities,
+        "effective_images": images,
         "services": dict(observations),
     }
-    if verify_receipt(canonical_bytes(receipt), expected_source=source):
+    if verify_receipt(canonical_bytes(receipt), expected_status=status):
         raise ValueError("observations are not an admissible content-safe egress receipt")
     return receipt
 
 
-def verify_receipt(raw: bytes, *, expected_source: Mapping[str, str]) -> list[str]:
+def verify_receipt(raw: bytes, *, expected_status: Mapping[str, Any]) -> list[str]:
     value = _parse_canonical(raw)
     if value is None:
         return ["canonical"]
     if set(value) != {
         "schema", "synthetic_non_phi_only", "source", "restricted_container_controls",
-        "restricted_process_identities", "services",
+        "restricted_process_identities", "effective_images", "services",
     }:
         return ["fields"]
     if value["schema"] != SCHEMA or value["synthetic_non_phi_only"] is not True:
         return ["schema"]
     source = _source(value["source"])
-    if source is None or source != dict(expected_source):
+    expected_source = _source(expected_status.get("source"))
+    if source is None or expected_source is None or source != expected_source:
         return ["source"]
     if _restricted_evidence(value) is None:
         return ["restricted-evidence"]
+    images = _images({"built_images": value["effective_images"]})
+    expected_images = _images(expected_status)
+    if images is None or expected_images is None or images != expected_images:
+        return ["images"]
     services = value["services"]
     if not isinstance(services, dict) or set(services) != set(SERVICES):
         return ["services"]
@@ -129,8 +160,8 @@ def verify_receipt(raw: bytes, *, expected_source: Mapping[str, str]) -> list[st
         observed = services[service]
         if not isinstance(observed, dict) or set(observed) != {"denied", "allowed"}:
             return ["services"]
-        if observed["denied"] != {name: True for name in DENIED_CLASSES}:
+        if not _strict_equal(observed["denied"], {name: True for name in DENIED_CLASSES}):
             return ["denied"]
-        if observed["allowed"] != {name: True for name in ALLOWED_CLASSES[service]}:
+        if not _strict_equal(observed["allowed"], {name: True for name in ALLOWED_CLASSES[service]}):
             return ["allowed"]
     return []
