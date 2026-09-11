@@ -380,11 +380,16 @@ def test_live_attestation_verifier_binds_exact_subject_workflow_source_and_predi
                 }}},
                 "statement": {"predicateType": predicate},
             }]))
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"conclusion": "success", "head_sha": "d" * 40}))
+        if command[-1].endswith("/jobs"):
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"jobs": [
+                {"name": "build-publish (restricted-mattermost-ingress)", "conclusion": "success"},
+                {"name": "build-publish (restricted-clinical-adapter)", "conclusion": "success"},
+            ]}))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"head_sha": "d" * 40}))
 
     monkeypatch.setattr(verifier.subprocess, "run", run)
     assert verifier.verify_live_attestations(manifest) == []
-    assert len(commands) == 5
+    assert len(commands) == 6
     for command in commands[:4]:
         assert command[:3] == ["gh", "attestation", "verify"]
         assert command[3].startswith("oci://ghcr.io/cervantesh/restricted-")
@@ -395,7 +400,34 @@ def test_live_attestation_verifier_binds_exact_subject_workflow_source_and_predi
         assert command[source_index + 1] == "d" * 40
         predicate_index = command.index("--predicate-type")
         assert command[predicate_index + 1] in {"https://slsa.dev/provenance/v1", "https://spdx.dev/Document/v2.3"}
-    assert commands[-1] == ["gh", "api", "repos/cervantesh/restricted-hermes-runtime/actions/runs/1"]
+    assert commands[-2] == ["gh", "api", "repos/cervantesh/restricted-hermes-runtime/actions/runs/1"]
+    assert commands[-1] == ["gh", "api", "repos/cervantesh/restricted-hermes-runtime/actions/runs/1/jobs"]
+
+
+def test_live_attestation_verifier_rejects_missing_authenticated_subject_build(tmp_path: Path, monkeypatch):
+    verifier = _load_verifier()
+    manifest = valid_manifest(tmp_path)
+    for subject in manifest["subjects"]:
+        subject["base_materials"] = verifier._expected_base_material((ROOT / verifier.EXPECTED_DOCKERFILES[subject["name"]]).read_bytes())
+    monkeypatch.setattr(verifier.shutil, "which", lambda _command: "gh")
+    monkeypatch.setattr(verifier, "_git_show", lambda _root, _revision, path: (ROOT / path).read_bytes())
+
+    def run(command, **_kwargs):
+        if command[:3] == ["gh", "attestation", "verify"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                "verificationResult": {"signature": {"certificate": {
+                    "runInvocationURI": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/1/attempts/1",
+                }}},
+            }]))
+        if command[-1].endswith("/jobs"):
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"jobs": [
+                {"name": "build-publish (restricted-mattermost-ingress)", "conclusion": "success"},
+            ]}))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"head_sha": "d" * 40}))
+
+    monkeypatch.setattr(verifier.subprocess, "run", run)
+    errors = verifier.verify_live_attestations(manifest)
+    assert errors == ["authenticated workflow run lacks successful source-subject build jobs"]
 
 
 def test_live_attestation_verifier_does_not_expose_provider_output(tmp_path: Path, monkeypatch):
