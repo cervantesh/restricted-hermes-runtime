@@ -72,7 +72,10 @@ def test_builds_a_closed_content_safe_receipt():
     (lambda receipt: receipt["edge_image_subjects"].update(ingress="sha256:" + "2" * 64), "images"),
     (lambda receipt: receipt.update(runtime_product_sha="2" * 40), "product"),
     (lambda receipt: receipt["boundaries"].update(edge_cannot_resolve_hrh=1), "boundaries"),
+    (lambda receipt: receipt["source"].update(unreviewed_identifier="forbidden"), "source"),
     (lambda receipt: receipt["source_deletion"]["after"].update(ciphertext_erased=1), "source-deletion"),
+    (lambda receipt: receipt["source_deletion"]["before"].update(nonce_erased=0), "source-deletion"),
+    (lambda receipt: receipt["source_deletion"].update(delivery_count=False), "source-deletion"),
     (lambda receipt: receipt.update(raw_log="forbidden"), "fields"),
 ])
 def test_rejects_substitution_and_non_boolean_claims(mutate, expected):
@@ -92,6 +95,34 @@ def test_builder_requires_completed_cleanup_and_exact_e2e_outcomes():
     values["post_counts"]["valid"] = 0
     with pytest.raises(ValueError, match="scenario"):
         module.build_receipt(values, cleanup_complete=True)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda value: value["source_deletion"]["after"].update(ciphertext_erased=1),
+    lambda value: value["source_deletion"]["before"].update(nonce_erased=0),
+    lambda value: value["source_deletion"].update(delivery_count=False),
+])
+def test_builder_refuses_boolean_integer_aliases_in_source_deletion_evidence(mutate):
+    module = load_module()
+    values = evidence()
+    mutate(values)
+    with pytest.raises(ValueError, match="deletion"):
+        module.build_receipt(values, cleanup_complete=True)
+
+
+def test_returned_receipt_does_not_share_mutable_expectations():
+    module = load_module()
+    receipt = module.build_receipt(evidence(), cleanup_complete=True)
+    receipt["scenarios"]["valid"] = "tampered"
+    receipt["post_counts"]["valid"] = 0
+    receipt["crash_invariants"]["read_authorized"] = 0
+    assert module._SCENARIOS["valid"] == "pass"
+    assert module._POST_COUNTS["valid"] == 1
+    assert module._CRASH["read_authorized"] == 1
+    next_receipt = module.build_receipt(evidence(), cleanup_complete=True)
+    assert next_receipt["scenarios"]["valid"] == "pass"
+    assert next_receipt["post_counts"]["valid"] == 1
+    assert next_receipt["crash_invariants"]["read_authorized"] == 1
 
 
 def test_writer_does_not_replace_existing_path(tmp_path):

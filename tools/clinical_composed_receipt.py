@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -74,11 +75,13 @@ def _strict_equal(observed: object, expected: object) -> bool:
     return observed == expected
 
 
-def _source(evidence: object) -> dict[str, str] | None:
+def _source(evidence: object, *, exact: bool = False) -> dict[str, str] | None:
     if not isinstance(evidence, dict):
         return None
+    if exact and set(evidence) != _SOURCE_KEYS:
+        return None
     source = {key: evidence.get(key) for key in _SOURCE_KEYS}
-    if set(source) != _SOURCE_KEYS or not all(isinstance(value, str) and _SHA.fullmatch(value) for value in source.values()):
+    if not all(isinstance(value, str) and _SHA.fullmatch(value) for value in source.values()):
         return None
     return source
 
@@ -108,11 +111,13 @@ def _source_deletion(evidence: object) -> dict[str, Any] | None:
         return None
     expected_before = {"state": "IN_FLIGHT", "reason": "", "nonce_erased": False, "ciphertext_erased": False}
     expected_after = {"state": "BLOCKED", "reason": "post_authorization_source_rejected", "nonce_erased": True, "ciphertext_erased": True}
-    if not all(before.get(key) == item for key, item in expected_before.items()):
+    observed_before = {key: before.get(key) for key in expected_before}
+    observed_after = {key: after.get(key) for key in expected_after}
+    if not _strict_equal(observed_before, expected_before):
         return None
-    if not all(after.get(key) == item for key, item in expected_after.items()):
+    if not _strict_equal(observed_after, expected_after):
         return None
-    if value.get("delivery_count") != 0 or value.get("delete_accepted") is not True:
+    if type(value.get("delivery_count")) is not int or value.get("delivery_count") != 0 or value.get("delete_accepted") is not True:
         return None
     return {"before": expected_before, "after": expected_after, "delivery_count": 0}
 
@@ -139,11 +144,11 @@ def build_receipt(evidence: Mapping[str, Any], *, cleanup_complete: bool) -> dic
         "source": source,
         "runtime_product_sha": product,
         "edge_image_subjects": images,
-        "boundaries": boundaries,
-        "scenarios": _SCENARIOS,
-        "post_counts": _POST_COUNTS,
-        "crash_invariants": _CRASH,
-        "source_deletion": deletion,
+        "boundaries": dict(boundaries),
+        "scenarios": deepcopy(_SCENARIOS),
+        "post_counts": deepcopy(_POST_COUNTS),
+        "crash_invariants": deepcopy(_CRASH),
+        "source_deletion": deepcopy(deletion),
         "cleanup": {"completed": True},
     }
     if verify_receipt(canonical_bytes(receipt), expected_source=source, expected_images=images, expected_product=product):
@@ -163,7 +168,7 @@ def verify_receipt(raw: bytes, *, expected_source: Mapping[str, str], expected_i
         return ["fields"]
     if value["schema"] != SCHEMA or value["synthetic_non_phi_only"] is not True:
         return ["schema"]
-    source = _source(value["source"])
+    source = _source(value["source"], exact=True)
     if source is None or not _strict_equal(source, expected_source):
         return ["source"]
     if not isinstance(value["runtime_product_sha"], str) or not _SHA.fullmatch(value["runtime_product_sha"]) or value["runtime_product_sha"] != expected_product:
