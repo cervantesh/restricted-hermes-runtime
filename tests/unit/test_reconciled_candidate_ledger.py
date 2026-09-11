@@ -26,6 +26,14 @@ def test_current_candidate_ledger_verifies() -> None:
     assert ledger.verify_ledger(ledger.canonical_bytes(value), repo_root=ROOT) == []
 
 
+def test_ledger_can_be_retained_in_a_later_evidence_frame() -> None:
+    """The evidence file need not exist in the tree of the code subject it binds."""
+    candidate = git(ROOT, "rev-parse", "HEAD~1")
+    value = ledger.build_ledger(repo_root=ROOT, candidate_revision=candidate)
+    assert value["candidate"]["revision"] == candidate
+    assert ledger.verify_ledger(ledger.canonical_bytes(value), repo_root=ROOT) == []
+
+
 def test_candidate_ledger_rejects_source_line_not_in_candidate() -> None:
     head = git(ROOT, "rev-parse", "HEAD")
     value = ledger.build_ledger(repo_root=ROOT, candidate_revision=head)

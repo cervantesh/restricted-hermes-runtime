@@ -22,3 +22,8 @@ The ledger intentionally says `false` for published immutable-subject
 re-verification, representative-host verification, PHI authorization, and
 deployment conformance. It is a source/evidence boundary for issue #35, not an
 A0 aggregate, host receipt, or approval artifact.
+
+This is the historical ledger for source subject `f6682ec`. The later A0
+source subject is named separately in
+`reconciled-a0-candidate-ledger-2026-09-11.json`; the two artifacts must not
+be conflated.
