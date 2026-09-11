@@ -73,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     sink = project + "-sink"
     created_network = created_sink = initialized = False
     phase = "preflight"
+    failure = "unknown"
 
     def staging(command_name: str) -> dict[str, Any]:
         result = command(sys.executable, str(STAGING), "--runtime-root", str(ROOT), "--hrh-root", str(args.hrh_root), "--state-dir", str(state), "--project", project, command_name, timeout=2400)
@@ -173,8 +174,17 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
         inputs = {"status": status, "observations": observations, "environment": environment, "networks": networks, "red": red, "cleanup": {"network_absent": True, "sink_absent": True}}
         for name, value in inputs.items():
             write_json(scratch / f"{name}.json", value)
-        command(sys.executable, str(WITNESS), "build", *(item for name in inputs for item in (f"--{name}", str(scratch / f"{name}.json"))), "--output", str(args.output))
-        command(sys.executable, str(WITNESS), "verify", "--receipt", str(args.output), "--status", str(scratch / "status.json"))
+        built = command(sys.executable, str(WITNESS), "build", *(item for name in inputs for item in (f"--{name}", str(scratch / f"{name}.json"))), "--output", str(args.output), check=False)
+        if built.returncode:
+            prefix = "clinical-egress-witness outcome=denied reason="
+            failure = built.stdout.strip().removeprefix(prefix)
+            if not failure or failure == built.stdout.strip() or not failure.isascii() or len(failure) > 80:
+                failure = "collector"
+            raise RuntimeError("clinical egress witness failed: receipt build")
+        verified = command(sys.executable, str(WITNESS), "verify", "--receipt", str(args.output), "--status", str(scratch / "status.json"), check=False)
+        if verified.returncode:
+            failure = "verify"
+            raise RuntimeError("clinical egress witness failed: receipt verify")
         print("clinical-egress-witness: PASS receipt_sha256=" + hashlib.sha256(args.output.read_bytes()).hexdigest())
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, KeyError, json.JSONDecodeError):
@@ -182,7 +192,7 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
         if args.diagnostic is not None:
             # This is intentionally the only retained failure diagnostic: it
             # contains a fixed phase name and no child output or local detail.
-            args.diagnostic.write_bytes(json.dumps({"schema": "restricted-runtime-clinical-egress-diagnostic.v1", "phase": phase}, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+            args.diagnostic.write_bytes(json.dumps({"schema": "restricted-runtime-clinical-egress-diagnostic.v1", "phase": phase, "reason": failure}, sort_keys=True, separators=(",", ":")).encode() + b"\n")
             args.diagnostic.chmod(0o600)
         print(f"clinical-egress-witness: DENIED phase={phase}", file=sys.stderr)
         return 2

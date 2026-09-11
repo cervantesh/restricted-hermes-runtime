@@ -94,8 +94,12 @@ def build_receipt(
     valid_networks = _networks(networks)
     valid_red = _closed_mapping(red, set(SERVICES))
     valid_cleanup = _closed_mapping(cleanup, {"network_absent", "sink_absent"})
-    if images is None or valid_environment is None or valid_networks is None:
-        raise ValueError("candidate witness binding is incomplete")
+    if images is None:
+        raise ValueError("image-binding")
+    if valid_environment is None:
+        raise ValueError("environment-binding")
+    if valid_networks is None:
+        raise ValueError("network-binding")
     if valid_red != {service: True for service in SERVICES}:
         raise ValueError("controlled RED observations are incomplete")
     if valid_cleanup != {"network_absent": True, "sink_absent": True}:
@@ -168,7 +172,21 @@ def main(argv: list[str] | None = None) -> int:
             errors = verify_receipt(args.receipt.read_bytes(), expected_source=_read(args.status).get("source"))
             if errors:
                 raise ValueError(errors[0])
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        # Keep the command's public outcome enumerable and content-safe.  The
+        # caller must never receive a path, endpoint, environment value, or
+        # child output merely because receipt assembly was rejected.
+        reason = str(exc)
+        allowed = {
+            "image-binding", "environment-binding", "network-binding",
+            "controlled RED observations are incomplete", "controlled resource cleanup is incomplete",
+            "status is not an admissible candidate binding", "observations are not an admissible content-safe egress receipt",
+            "candidate witness is not admissible", "canonical", "fields", "schema", "candidate-receipt",
+            "images", "environment", "networks", "red", "cleanup",
+        }
+        if reason not in allowed:
+            reason = "input"
+        print(f"clinical-egress-witness outcome=denied reason={reason}")
         return 2
     return 0
 
