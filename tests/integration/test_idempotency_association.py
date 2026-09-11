@@ -19,7 +19,7 @@ from restricted_runtime.policy import PolicyBundle, SYSTEM_INSTRUCTION
 from restricted_runtime.storage import PostgresContentStore, PostgresLedger
 from restricted_runtime.contracts import ProviderResult
 
-URL = os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+URL = os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not URL, reason="requires isolated PostgreSQL")
 
 

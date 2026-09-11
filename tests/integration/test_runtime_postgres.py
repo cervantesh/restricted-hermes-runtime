@@ -12,7 +12,7 @@ from restricted_runtime.storage import PostgresContentStore,PostgresLedger
 from restricted_runtime.reconciliation import Reconciler
 from restricted_runtime.reconciliation_driver import ReconciliationDriver
 
-DATABASE_URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+DATABASE_URL=os.environ.get("RESTRICTED_RUNTIME_TEST_DATABASE_URL")
 pytestmark=pytest.mark.skipif(not DATABASE_URL,reason="isolated PostgreSQL database unavailable: set RESTRICTED_RUNTIME_TEST_DATABASE_URL; SQLite/mocks are prohibited")
 @pytest.fixture(autouse=True)
 def isolated_database():
