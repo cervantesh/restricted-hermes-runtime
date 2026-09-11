@@ -53,11 +53,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hrh-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--diagnostic", type=Path)
     args = parser.parse_args(argv)
     if sys.platform != "linux":
         print("clinical-egress-witness: SKIP linux-required")
         return 77
     if args.output.exists() or not args.output.parent.is_dir() or not args.output.is_absolute():
+        return 2
+    if args.diagnostic is not None and (args.diagnostic.exists() or not args.diagnostic.parent.is_dir() or not args.diagnostic.is_absolute()):
         return 2
     if command("docker", "info", check=False).returncode:
         print("clinical-egress-witness: SKIP docker-unavailable")
@@ -176,6 +179,11 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, KeyError, json.JSONDecodeError):
         args.output.unlink(missing_ok=True)
+        if args.diagnostic is not None:
+            # This is intentionally the only retained failure diagnostic: it
+            # contains a fixed phase name and no child output or local detail.
+            args.diagnostic.write_bytes(json.dumps({"schema": "restricted-runtime-clinical-egress-diagnostic.v1", "phase": phase}, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+            args.diagnostic.chmod(0o600)
         print(f"clinical-egress-witness: DENIED phase={phase}", file=sys.stderr)
         return 2
     finally:
