@@ -119,3 +119,21 @@ def test_versioned_wsl_v1_receipt_is_historical_only_after_ipv6_control_repair()
     }
     assert module.verify_receipt(raw, expected_status=expected_status) == ["schema"]
     assert hashlib.sha256(raw).hexdigest() == "b1b1dc16bb9ca0670ad78b782372136edc5db363a37b80582bc2146813790093"
+
+
+def test_versioned_wsl_v2_receipt_is_canonical_and_bound_to_the_repaired_subject():
+    module = load_module()
+    raw = (ROOT / "docs" / "evidence" / "clinical-egress-wsl-v2-receipt-2026-09-11.json").read_bytes().replace(b"\r\n", b"\n")
+    expected_status = status(module)
+    expected_status["source"] = {
+        "runtime_head": "4ff9699d7839c4d00be6aa6ef3fbcac95bc4c3b7",
+        "runtime_tree": "9446b5559fc115be40109cd00b6c57779bba7c34",
+        "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
+        "hrh_tree": "f217b0b1cf7f438422528dfe178d81b78212c68b",
+    }
+    expected_status["built_images"] = {
+        "clinical-adapter": "sha256:2939d3ccb2a030c66348c1423f8ebd0ac5acf72425d603c0a7e7bf4d01988764",
+        "ingress": "sha256:059c959fe1070a6b9e5468fadd5199303bf4ead9ece7a8450c9ddff28a5b606f",
+    }
+    assert module.verify_receipt(raw, expected_status=expected_status) == []
+    assert hashlib.sha256(raw).hexdigest() == "5f3d744f614e86625b1a8c8c5d22c545078493b21df565ddc72aa95d2445ce5d"
