@@ -776,6 +776,75 @@ def test_operational_commands_reject_initializing_marker_before_compose(
         getattr(staging, command)("clinical-e2") if command == "refresh_policy" else getattr(staging, command)()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="owned initialization recovery is Linux/POSIX-only")
+def test_initialization_recovery_removes_only_owned_pre_rename_state(tmp_path: Path):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    orphan = tmp_path / ".clinicalstagingdemo.synthetic-clinical-staging.init-0123456789abcdef"
+    orphan.mkdir(mode=0o700)
+    (orphan / "seed").mkdir(mode=0o700)
+    (orphan / "seed" / "admin_password").write_text("synthetic", encoding="ascii")
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingdemo", 18443)
+
+    staging._reconcile_owned_initialization_orphans()
+
+    assert not orphan.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="owned initialization recovery is Linux/POSIX-only")
+def test_new_state_preparation_recovers_owned_remnant_before_creating_new_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    orphan = tmp_path / ".clinicalstagingdemo.synthetic-clinical-staging.init-0123456789abcdef"
+    orphan.mkdir(mode=0o700)
+    (orphan / "seed").mkdir(mode=0o700)
+    (orphan / "seed" / "admin_password").write_text("synthetic", encoding="ascii")
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingdemo", 18443)
+    monkeypatch.setattr(staging, "_seed_material", lambda root: (root / "seed").mkdir(mode=0o700))
+    monkeypatch.setattr(staging, "_env_values", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(staging, "_env_bytes", lambda _values: b"")
+
+    marker = staging._prepare_new_state({
+        "runtime_head": "a" * 40,
+        "runtime_tree": "b" * 40,
+        "hrh_head": module.REQUIRED_HRH_SHA,
+        "hrh_tree": module.REQUIRED_HRH_TREE,
+    })
+
+    assert marker["state_dir"] == str(state)
+    assert state.is_dir()
+    assert not orphan.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="owned initialization recovery is Linux/POSIX-only")
+def test_initialization_recovery_fails_closed_on_symlinked_remnant(tmp_path: Path):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    orphan = tmp_path / ".clinicalstagingdemo.synthetic-clinical-staging.init-0123456789abcdef"
+    target = tmp_path / "must-not-remove"
+    orphan.mkdir(mode=0o700)
+    target.write_text("retain", encoding="ascii")
+    (orphan / "unexpected-link").symlink_to(target)
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingdemo", 18443)
+
+    with pytest.raises(module.SafetyError, match="symlink"):
+        staging._reconcile_owned_initialization_orphans()
+
+    assert orphan.exists()
+    assert target.read_text(encoding="ascii") == "retain"
+
+
 @pytest.mark.skipif(os.name != "posix", reason="the production lifecycle lock is Linux/POSIX-only")
 def test_lifecycle_lock_blocks_a_second_operator_process(tmp_path: Path):
     module = load_module()

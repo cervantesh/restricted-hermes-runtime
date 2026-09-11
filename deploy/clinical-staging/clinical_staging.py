@@ -44,6 +44,8 @@ REQUIRED_HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"
 REQUIRED_HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"
 SCHEMA = "restricted-synthetic-clinical-staging.v1"
 MARKER_NAME = "staging-state.json"
+INIT_ORPHAN_RE_TEMPLATE = r"^\.{state}\.init-[a-f0-9]{{16}}$"
+MAX_INITIALIZATION_ORPHANS = 8
 PROJECT_LABEL = "io.cervantesh.restricted-runtime.project"
 STATE_LABEL = "io.cervantesh.restricted-runtime.state-id"
 SYNTHETIC_LABEL = "io.cervantesh.restricted-runtime.synthetic-clinical"
@@ -632,7 +634,57 @@ class ClinicalStaging:
         )
         policy_path.chmod(0o600)
 
+    def _owned_initialization_orphans(self) -> list[Path]:
+        """Return only this target's bounded pre-rename initialization roots.
+
+        ``init`` already holds the per-target lifecycle lock before it calls
+        this helper.  The random suffix prevents an unrelated directory from
+        becoming a cleanup target through a predictable name.
+        """
+        expression = re.compile(
+            INIT_ORPHAN_RE_TEMPLATE.format(state=re.escape(self.state_dir.name))
+        )
+        candidates = [
+            entry for entry in self.state_dir.parent.iterdir()
+            if expression.fullmatch(entry.name)
+        ]
+        if len(candidates) > MAX_INITIALIZATION_ORPHANS:
+            raise SafetyError("too many initialization remnants; refusing cleanup")
+        return candidates
+
+    @staticmethod
+    def _assert_owned_unlinked_tree(root: Path) -> None:
+        """Reject links, special files, or foreign entries before deletion."""
+        with os.scandir(root) as entries:
+            for entry in entries:
+                metadata = entry.stat(follow_symlinks=False)
+                if metadata.st_uid != os.getuid():
+                    raise SafetyError("initialization remnant contains a foreign entry")
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise SafetyError("initialization remnant contains a symlink")
+                if stat.S_ISDIR(metadata.st_mode):
+                    ClinicalStaging._assert_owned_unlinked_tree(Path(entry.path))
+                elif not stat.S_ISREG(metadata.st_mode):
+                    raise SafetyError("initialization remnant contains an unsafe filesystem entry")
+
+    def _reconcile_owned_initialization_orphans(self) -> None:
+        """Erase only safely attributable pre-rename state left by a dead init."""
+        for orphan in self._owned_initialization_orphans():
+            metadata = orphan.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise SafetyError("initialization remnant is not an operator-owned mode-0700 directory")
+            if not shutil.rmtree.avoids_symlink_attacks:
+                raise SafetyError("platform cannot safely remove an initialization remnant")
+            self._assert_owned_unlinked_tree(orphan)
+            shutil.rmtree(orphan)
+            fsync_directory(orphan.parent)
+
     def _prepare_new_state(self, frame: Mapping[str, str]) -> dict[str, Any]:
+        self._reconcile_owned_initialization_orphans()
         if self.state_dir.exists():
             if any(self.state_dir.iterdir()):
                 raise SafetyError("init requires a fresh target or a valid initializing marker")
