@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 
@@ -92,3 +93,30 @@ def test_windows_compose_discovery_rejects_a_host_without_installation_root():
         assert str(exc) == "clinical composed E2E Docker Compose discovery is unavailable"
     else:
         raise AssertionError("missing Windows Docker Compose discovery was accepted")
+
+
+def test_retained_receipt_is_canonical_and_confined_to_the_evidence_root(tmp_path, monkeypatch):
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+    root = tmp_path / "runtime"
+    evidence_root = root / "docs" / "evidence"
+    evidence_root.mkdir(parents=True)
+    monkeypatch.setattr(runner, "ROOT", root)
+    output = evidence_root / "receipt.json"
+    runner.write_retained_receipt(output, {"schema": "synthetic", "source": {"head": "a"}})
+
+    raw = output.read_bytes()
+    assert raw == b'{"schema":"synthetic","source":{"head":"a"}}\n'
+    assert json.loads(raw) == {"schema": "synthetic", "source": {"head": "a"}}
+    try:
+        runner.write_retained_receipt(root / "outside.json", {"schema": "synthetic"})
+    except RuntimeError as exc:
+        assert str(exc) == "clinical composed E2E receipt output is unsafe"
+    else:
+        raise AssertionError("outside receipt output was accepted")
+    try:
+        runner.write_retained_receipt(output, {"schema": "synthetic"})
+    except RuntimeError as exc:
+        assert str(exc) == "clinical composed E2E receipt output is unsafe"
+    else:
+        raise AssertionError("existing receipt output was overwritten")

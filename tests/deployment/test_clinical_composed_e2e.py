@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import argparse
 import base64
 import importlib.util
 import json
@@ -17,6 +18,7 @@ import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -181,6 +183,31 @@ def emit_public_debug(label: str, *_discarded: subprocess.CompletedProcess[str])
     material for a public test stream.
     """
     print(f"clinical_composed_e2e debug={label} details=omitted", file=sys.stderr)
+
+
+def write_retained_receipt(output: Path, evidence: dict[str, Any]) -> None:
+    """Atomically retain content-safe E2E evidence in the public evidence root."""
+    evidence_root = (ROOT / "docs" / "evidence").resolve()
+    try:
+        target = output.resolve(strict=False)
+    except OSError as exc:
+        raise RuntimeError("clinical composed E2E receipt output is unsafe") from exc
+    if target.parent != evidence_root or target.exists() or not evidence_root.is_dir():
+        raise RuntimeError("clinical composed E2E receipt output is unsafe")
+    raw = (json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+    temporary = target.with_name(target.name + f".{os.getpid()}.tmp")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except OSError as exc:
+        raise RuntimeError("clinical composed E2E receipt output is unavailable") from exc
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def make_certificates() -> None:
@@ -534,7 +561,7 @@ def scan_logs(canaries: dict[str, str]) -> str:
     return logs
 
 
-def main() -> None:
+def main(receipt_output: Path | None = None) -> None:
     global CREATED
     phase("prepare")
     prepare()
@@ -725,6 +752,7 @@ def main() -> None:
     phase("evidence")
     logs = scan_logs(_known_secret_canaries())
     evidence = {
+        "schema": "restricted-runtime-composed-e2e-receipt.v1",
         **SOURCE_FRAME,
         "runtime_product_sha": RUNTIME_PRODUCT_SHA,
         "images": image_evidence()["images"], "boundaries": boundaries,
@@ -755,6 +783,8 @@ def main() -> None:
     }
     _assert_no_secret_canaries([logs, json.dumps(evidence, sort_keys=True)], _known_secret_canaries())
     (EVIDENCE / "report.json").write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+    if receipt_output is not None:
+        write_retained_receipt(receipt_output, evidence)
     print(json.dumps(evidence, sort_keys=True))
     phase("cleanup")
     compose("down", "--volumes", "--remove-orphans", timeout=300)
@@ -766,4 +796,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--receipt-output", type=Path)
+    options = parser.parse_args()
+    main(options.receipt_output)
