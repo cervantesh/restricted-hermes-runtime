@@ -34,6 +34,18 @@ def test_ledger_can_be_retained_in_a_later_evidence_frame() -> None:
     assert ledger.verify_ledger(ledger.canonical_bytes(value), repo_root=ROOT) == []
 
 
+@pytest.mark.parametrize(
+    "name",
+    (
+        "reconciled-candidate-ledger-2026-09-11.json",
+        "reconciled-a0-candidate-ledger-2026-09-11.json",
+    ),
+)
+def test_retained_candidate_ledgers_verify_from_the_evidence_frame(name: str) -> None:
+    raw = (ROOT / "docs" / "evidence" / name).read_bytes()
+    assert ledger.verify_ledger(raw, repo_root=ROOT) == []
+
+
 def test_candidate_ledger_rejects_source_line_not_in_candidate() -> None:
     head = git(ROOT, "rev-parse", "HEAD")
     value = ledger.build_ledger(repo_root=ROOT, candidate_revision=head)
