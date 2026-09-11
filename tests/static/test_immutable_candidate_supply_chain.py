@@ -371,8 +371,10 @@ def test_live_attestation_verifier_binds_exact_subject_workflow_source_and_predi
     monkeypatch.setattr(verifier.shutil, "which", lambda _command: "gh")
     monkeypatch.setattr(verifier, "_git_show", lambda _root, _revision, path: (ROOT / path).read_bytes())
 
-    def run(command, **_kwargs):
+    def run(command, **kwargs):
         commands.append(command)
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "strict"
         if command[:3] == ["gh", "attestation", "verify"]:
             predicate = command[command.index("--predicate-type") + 1]
             return SimpleNamespace(returncode=0, stdout=json.dumps([{
@@ -403,6 +405,23 @@ def test_live_attestation_verifier_binds_exact_subject_workflow_source_and_predi
         assert command[predicate_index + 1] in {"https://slsa.dev/provenance/v1", "https://spdx.dev/Document/v2.3"}
     assert commands[-2] == ["gh", "api", "repos/cervantesh/restricted-hermes-runtime/actions/runs/1"]
     assert commands[-1] == ["gh", "api", "repos/cervantesh/restricted-hermes-runtime/actions/runs/1/jobs"]
+
+
+def test_live_attestation_verifier_fails_closed_when_cli_utf8_decode_fails(tmp_path: Path, monkeypatch):
+    verifier = _load_verifier()
+    manifest = valid_manifest(tmp_path)
+    for subject in manifest["subjects"]:
+        subject["base_materials"] = verifier._expected_base_material((ROOT / verifier.EXPECTED_DOCKERFILES[subject["name"]]).read_bytes())
+    monkeypatch.setattr(verifier.shutil, "which", lambda _command: "gh")
+    monkeypatch.setattr(verifier, "_git_show", lambda _root, _revision, path: (ROOT / path).read_bytes())
+
+    def run(*_args, **_kwargs):
+        raise UnicodeDecodeError("utf-8", b"\\x81", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(verifier.subprocess, "run", run)
+    errors = verifier.verify_live_attestations(manifest)
+    assert len(errors) == 5
+    assert all("unavailable" in error or "does not bind one workflow run" in error for error in errors)
 
 
 def test_live_attestation_verifier_rejects_missing_authenticated_subject_build(tmp_path: Path, monkeypatch):

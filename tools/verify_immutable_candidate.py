@@ -393,8 +393,19 @@ def verify_live_attestations(manifest: object, *, repo_root: Path = ROOT) -> lis
                 "--source-digest", source_revision, "--predicate-type", predicate, "--format=json",
             ]
             try:
-                result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
-            except (OSError, subprocess.TimeoutExpired):
+                # GitHub CLI emits UTF-8 JSON irrespective of the Windows console
+                # code page.  Decoding it through the process default can crash the
+                # verifier before it reaches its fail-closed error path.
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="strict",
+                    timeout=60,
+                    check=False,
+                )
+            except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired):
                 errors.append(f"{name}: {kind} attestation authentication unavailable")
                 continue
             if result.returncode != 0:
@@ -415,9 +426,17 @@ def verify_live_attestations(manifest: object, *, repo_root: Path = ROOT) -> lis
     elif authenticated_runs:
         run_id = authenticated_runs.pop().removeprefix(f"https://github.com/{REPOSITORY}/actions/runs/").split("/", 1)[0]
         try:
-            result = subprocess.run(["gh", "api", f"repos/{REPOSITORY}/actions/runs/{run_id}"], capture_output=True, text=True, timeout=30, check=False)
+            result = subprocess.run(
+                ["gh", "api", f"repos/{REPOSITORY}/actions/runs/{run_id}"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                timeout=30,
+                check=False,
+            )
             run = json.loads(result.stdout) if result.returncode == 0 else {}
-        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired, json.JSONDecodeError):
             run = {}
         if run.get("head_sha") != source_revision:
             errors.append("authenticated workflow run is not source-matched")
@@ -440,10 +459,15 @@ def verify_live_attestations(manifest: object, *, repo_root: Path = ROOT) -> lis
         try:
             result = subprocess.run(
                 ["gh", "api", f"repos/{REPOSITORY}/actions/runs/{run_id}/jobs"],
-                capture_output=True, text=True, timeout=30, check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                timeout=30,
+                check=False,
             )
             jobs = json.loads(result.stdout).get("jobs", []) if result.returncode == 0 else []
-        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired, json.JSONDecodeError):
             jobs = []
         build_jobs = [
             job for job in jobs
