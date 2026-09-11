@@ -93,7 +93,7 @@ def build_receipt(status: Mapping[str, Any], observations: Mapping[str, Any]) ->
     if source is None or restricted is None:
         raise ValueError("status is not an admissible candidate binding")
     controls, identities = restricted
-    return {
+    receipt = {
         "schema": SCHEMA,
         "synthetic_non_phi_only": True,
         "source": source,
@@ -101,6 +101,9 @@ def build_receipt(status: Mapping[str, Any], observations: Mapping[str, Any]) ->
         "restricted_process_identities": identities,
         "services": dict(observations),
     }
+    if verify_receipt(canonical_bytes(receipt), expected_source=source):
+        raise ValueError("observations are not an admissible content-safe egress receipt")
+    return receipt
 
 
 def verify_receipt(raw: bytes, *, expected_source: Mapping[str, str]) -> list[str]:

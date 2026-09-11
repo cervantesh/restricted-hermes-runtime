@@ -72,3 +72,11 @@ def test_noncanonical_json_is_not_a_receipt():
     receipt = module.build_receipt(current, observations(module))
     pretty = json.dumps(receipt, indent=2).encode() + b"\n"
     assert module.verify_receipt(pretty, expected_source=current["source"]) == ["canonical"]
+
+
+def test_builder_refuses_raw_or_incomplete_observations():
+    module = load_module()
+    incomplete = observations(module)
+    incomplete["ingress"]["raw_log"] = "must not be serializable"
+    with pytest.raises(ValueError, match="content-safe"):
+        module.build_receipt(status(module), incomplete)
