@@ -1,8 +1,8 @@
 # Bounded candidate source ledger — 2026-09-11
 
 The canonical JSON ledger beside this note binds the bounded source-reconciliation
-claim to candidate `ae72b3a73cf8059a9fe30e6c5749ad8ca0a5ccf9` and tree
-`2c8e37e59c58d960fd9219fe8f2d4459d7f977c1`.
+claim to candidate `f6682ec32967b8f09bdc326d4240c23a8734cd82` and tree
+`6c51ebdf3961b874b0756204704907201c484b43`.
 
 It verifies that the candidate descends from the declared immutable-base,
 lifecycle, delivery-reauthorization, source-frame, recovery, and sealed-Compose
