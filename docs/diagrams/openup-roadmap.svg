@@ -1,0 +1,38 @@
+<svg class="openup-graph" width="1120" height="760" viewBox="0 0 1120 760" role="img" aria-labelledby="openup-svg-title openup-svg-desc"><style>text{fill:#24292f;font-family:Arial,sans-serif;font-size:13px}.phase rect{fill:#f6f8fa;stroke:#d0d7de;stroke-width:1}.phase text,.labels text{fill:#57606a;font-size:12px}.flow{color:#57606a;stroke:#57606a;stroke-width:2}.node rect,.node circle,.node path{fill:#fff;stroke:#d0d7de;stroke-width:2}.node.gate path,.node.critical rect,.node.finish circle{stroke:#cf222e;stroke-width:3}.node.critical rect{fill:#fff5f5}.node.finish circle{fill:#dafbe1}</style>
+    <title id="openup-svg-title">OpenUP lifecycle customized for the restricted runtime program</title>
+    <desc id="openup-svg-desc">The OpenUP phases are Inception, Elaboration, Construction and Transition. Each contains iterations with delivery outcomes. Gate diamonds indicate phase milestones. A no decision loops to another focused iteration. The final transition connects to sustained operation cycles.</desc>
+    <defs><marker id="openup-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="currentColor"/></marker></defs>
+    <g class="phase" aria-hidden="true">
+      <rect x="35" y="80" width="245" height="590"/><rect x="280" y="80" width="270" height="590"/><rect x="550" y="80" width="300" height="590"/><rect x="850" y="80" width="235" height="590"/>
+      <text x="157" y="112" text-anchor="middle">INCEPTION</text><text x="415" y="112" text-anchor="middle">ELABORATION</text><text x="700" y="112" text-anchor="middle">CONSTRUCTION</text><text x="967" y="112" text-anchor="middle">TRANSITION</text>
+      <text x="157" y="140" text-anchor="middle">scope + ownership</text><text x="415" y="140" text-anchor="middle">retire architecture risk</text><text x="700" y="140" text-anchor="middle">build verified increments</text><text x="967" y="140" text-anchor="middle">assess + adopt safely</text>
+    </g>
+    <g class="flow" fill="none" marker-end="url(#openup-arrow)">
+      <path d="M157 245 V285"/><path d="M157 365 V400"/><path d="M235 440 H300 V205 H319"/>
+      <path d="M415 245 V285"/><path d="M415 365 V400"/><path d="M493 440 H570 V205 H597"/>
+      <path d="M700 245 V285"/><path d="M700 365 V400"/><path d="M778 440 H850 V205 H874"/>
+      <path d="M967 245 V285"/><path d="M967 365 V400"/><path d="M967 480 V535"/>
+      <path d="M79 440 C45 500, 55 555, 140 365"/>
+      <path d="M337 440 C300 510, 320 555, 395 365"/>
+      <path d="M622 440 C570 510, 590 555, 680 365"/>
+      <path d="M889 325 C850 370, 850 400, 920 245"/>
+    </g>
+    <g class="labels" aria-hidden="true"><text x="245" y="430">yes</text><text x="505" y="430">yes</text><text x="790" y="430">yes</text><text x="985" y="390">yes</text><text x="52" y="500">no: another iteration</text><text x="292" y="545">no: another iteration</text><text x="570" y="545">no: another iteration</text><text x="855" y="375">no: re-assess</text></g>
+
+    <g class="node task" transform="translate(157,205)"><rect x="-93" y="-40" width="186" height="80" rx="8"/><text text-anchor="middle" y="-10">I1 — #29.1 / #29.2</text><text text-anchor="middle" y="12">ownership + evidence</text><text text-anchor="middle" y="30">matrix, synthetic-only</text></g>
+    <g class="node task" transform="translate(157,325)"><rect x="-93" y="-40" width="186" height="80" rx="8"/><text text-anchor="middle" y="-10">I2 — #29.3 / #29.4</text><text text-anchor="middle" y="12">host/operator frame +</text><text text-anchor="middle" y="30">finite P2 closure card</text></g>
+    <g class="node gate" transform="translate(157,440)"><path d="M0,-40 L78,0 L0,40 L-78,0 Z"/><text text-anchor="middle" y="-6">LCO milestone</text><text text-anchor="middle" y="14">scope / owner agree?</text></g>
+
+    <g class="node task" transform="translate(415,205)"><rect x="-96" y="-40" width="192" height="80" rx="8"/><text text-anchor="middle" y="-10">E1 — executable boundary</text><text text-anchor="middle" y="12">P0 risk integration +</text><text text-anchor="middle" y="30">P2 harness / negatives</text></g>
+    <g class="node task" transform="translate(415,325)"><rect x="-96" y="-40" width="192" height="80" rx="8"/><text text-anchor="middle" y="-10">E2 — deployable proof</text><text text-anchor="middle" y="12">P1 subject intake +</text><text text-anchor="middle" y="30">real-path architecture test</text></g>
+    <g class="node gate" transform="translate(415,440)"><path d="M0,-40 L78,0 L0,40 L-78,0 Z"/><text text-anchor="middle" y="-6">LCA milestone</text><text text-anchor="middle" y="14">risk acceptable?</text></g>
+
+    <g class="node task" transform="translate(700,205)"><rect x="-103" y="-40" width="206" height="80" rx="8"/><text text-anchor="middle" y="-10">C1 — P2 host increment</text><text text-anchor="middle" y="12">real RED / GREEN receipt</text><text text-anchor="middle" y="30">with bounded remediation</text></g>
+    <g class="node task" transform="translate(700,325)"><rect x="-103" y="-40" width="206" height="80" rx="8"/><text text-anchor="middle" y="-10">C2 — P3 + integration</text><text text-anchor="middle" y="12">service frame and exact</text><text text-anchor="middle" y="30">candidate evidence</text></g>
+    <g class="node gate" transform="translate(700,440)"><path d="M0,-40 L78,0 L0,40 L-78,0 Z"/><text text-anchor="middle" y="-6">IOC milestone</text><text text-anchor="middle" y="14">candidate operable?</text></g>
+
+    <g class="node task" transform="translate(967,205)"><rect x="-93" y="-40" width="186" height="80" rx="8"/><text text-anchor="middle" y="-10">T1 — A0 assessment</text><text text-anchor="middle" y="12">freeze, replay,</text><text text-anchor="middle" y="30">independent findings</text></g>
+    <g class="node gate" transform="translate(967,325)"><path d="M0,-40 L78,0 L0,40 L-78,0 Z"/><text text-anchor="middle" y="-6">PR milestone</text><text text-anchor="middle" y="14">pilot authorized?</text></g>
+    <g class="node task critical" transform="translate(967,440)"><rect x="-93" y="-40" width="186" height="80" rx="8"/><text text-anchor="middle" y="-10">T2 — controlled pilot</text><text text-anchor="middle" y="12">observe, repair,</text><text text-anchor="middle" y="30">repeat evidence</text></g>
+    <g class="node finish critical" transform="translate(967,575)"><circle r="32"/><circle r="23"/><text text-anchor="middle" y="5">sustained operation</text></g>
+  </svg>
