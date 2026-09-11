@@ -81,7 +81,8 @@ def main(argv: list[str] | None = None) -> int:
     network = project + "-red"
     open_network = project + "-open-control"
     sink = project + "-sink"
-    created_network = created_open_network = created_sink = initialized = False
+    created_network = created_open_network = created_sink = False
+    initialization_attempted = output_owned = False
     target_ids: dict[str, str] = {}
     phase = "preflight"
     failure = "unknown"
@@ -98,8 +99,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         phase = "initialize"
+        # If initialization gets far enough to materialize its marker, this
+        # invocation owns teardown even when the subprocess returns failure.
+        initialization_attempted = True
         staging("init")
-        initialized = True
         phase = "create-controlled-network"
         if command("docker", "network", "create", "--ipv6", network, check=False).returncode:
             print("clinical-egress-witness: SKIP controlled-ipv6-network-unavailable")
@@ -142,14 +145,19 @@ def dns(host):
 print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db8::1',443),'public_dns':dns('example.com'),'metadata_ipv4':v4('169.254.169.254',80),'metadata_ipv6':v6('fd00:ec2::254',80),'metadata_dns':dns('metadata.google.internal'),'proxy_environment':any(os.getenv(k) is not None for k in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'))}))"""
 
         def service_probe(service: str, *, red: bool = False) -> dict[str, bool]:
-            code = probe if not red else "import json,socket\ns=socket.create_connection(('" + controlled_v4 + "',80),timeout=2);s.close();print(json.dumps({'reachable':True}))"
+            code = probe if not red else """import json,socket
+def reach(family, address):
+ try:
+  s=socket.socket(family,socket.SOCK_STREAM);s.settimeout(2);s.connect(address);s.close();return True
+ except OSError:return False
+print(json.dumps({'ipv4':reach(socket.AF_INET,('""" + controlled_v4 + """',80)),'ipv6':reach(socket.AF_INET6,('""" + controlled_v6 + """',80,0,0))}))"""
             result = compose("exec", "--no-TTY", service, "python", "-c", code, check=False)
             if result.returncode:
                 return {"reachable": False} if red else {}
             value = json.loads(result.stdout)
             return value if isinstance(value, dict) and all(isinstance(item, bool) for item in value.values()) else {}
 
-        red: dict[str, bool] = {}
+        red: dict[str, dict[str, bool]] = {}
         for service in SERVICES:
             phase = "red-" + service
             target = compose("ps", "--quiet", service).stdout.strip()
@@ -158,11 +166,11 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
             target_ids[service] = target
             command("docker", "network", "connect", network, target)
             try:
-                red[service] = service_probe(service, red=True) == {"reachable": True}
+                red[service] = service_probe(service, red=True)
             finally:
                 command("docker", "network", "disconnect", network, target)
-            if not red[service]:
-                raise RuntimeError("clinical egress witness failed: controlled RED was not reachable")
+            if red[service] != {"ipv4": True, "ipv6": True}:
+                raise RuntimeError("clinical egress witness failed: controlled RED was not reachable on both families")
         external: dict[str, bool] = {"open_control": True}
         for service in SERVICES:
             phase = "external-" + service
@@ -217,6 +225,7 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
             if not failure or failure == built.stdout.strip() or not failure.isascii() or len(failure) > 80:
                 failure = "collector"
             raise RuntimeError("clinical egress witness failed: receipt build")
+        output_owned = True
         verified = command(sys.executable, str(WITNESS), "verify", "--receipt", str(args.output), "--status", str(scratch / "status.json"), check=False)
         if verified.returncode:
             failure = "verify"
@@ -224,7 +233,8 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
         print("clinical-egress-witness: PASS receipt_sha256=" + hashlib.sha256(args.output.read_bytes()).hexdigest())
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, KeyError, json.JSONDecodeError):
-        args.output.unlink(missing_ok=True)
+        if output_owned:
+            args.output.unlink(missing_ok=True)
         if args.diagnostic is not None:
             # This is intentionally the only retained failure diagnostic: it
             # contains a fixed phase name and no child output or local detail.
@@ -246,19 +256,21 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
             or (created_open_network and not exact_absent("network", open_network))
         )
         if controlled_cleanup_failed:
-            args.output.unlink(missing_ok=True)
+            if output_owned:
+                args.output.unlink(missing_ok=True)
             if args.diagnostic is not None and not args.diagnostic.exists():
                 write_new(args.diagnostic, {"schema": "restricted-runtime-clinical-egress-diagnostic.v1", "phase": "controlled-cleanup", "reason": "cleanup"})
             print("clinical-egress-witness: DENIED phase=controlled-cleanup", file=sys.stderr)
             shutil.rmtree(scratch, ignore_errors=True)
             raise SystemExit(2)
-        if initialized and (state / "staging-state.json").exists():
+        if initialization_attempted and (state / "staging-state.json").exists():
             destroyed = command(sys.executable, str(STAGING), "--runtime-root", str(ROOT), "--hrh-root", str(args.hrh_root), "--state-dir", str(state), "--project", project, "destroy", check=False, timeout=900)
             if destroyed.returncode:
                 # A receipt cannot survive a failed teardown of the synthetic
                 # project that produced it.  Preserve only a fixed failure
                 # class; raw lifecycle output remains private and transient.
-                args.output.unlink(missing_ok=True)
+                if output_owned:
+                    args.output.unlink(missing_ok=True)
                 if args.diagnostic is not None:
                     if not args.diagnostic.exists():
                         write_new(args.diagnostic, {"schema": "restricted-runtime-clinical-egress-diagnostic.v1", "phase": "staging-cleanup", "reason": "destroy"})

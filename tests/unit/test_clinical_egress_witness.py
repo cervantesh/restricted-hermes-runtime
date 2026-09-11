@@ -36,7 +36,7 @@ def observations(module):
 
 
 def inputs(module):
-    return (status(module), observations(module), {"system": "Linux", "kernel": "6.8.0", "architecture": "x86_64", "docker": "29.4.3", "compose": "2.40.3"}, {"clinical-adapter": ["clinical_upstream"], "ingress": ["mattermost_edge"]}, {service: True for service in module.SERVICES}, {"open_control": True, **{service: False for service in module.SERVICES}}, {"network_absent": True, "sink_absent": True})
+    return (status(module), observations(module), {"system": "Linux", "kernel": "6.8.0", "architecture": "x86_64", "docker": "29.4.3", "compose": "2.40.3"}, {"clinical-adapter": ["clinical_upstream"], "ingress": ["mattermost_edge"]}, {service: {"ipv4": True, "ipv6": True} for service in module.SERVICES}, {"open_control": True, **{service: False for service in module.SERVICES}}, {"network_absent": True, "sink_absent": True})
 
 
 def test_builds_closed_content_safe_witness():
@@ -64,8 +64,10 @@ def test_accepts_a_normal_distribution_qualified_compose_version_without_accepti
 
 
 @pytest.mark.parametrize("mutate, expected", [
-    (lambda receipt: receipt["controlled_red"].update(ingress=False), "red"),
+    (lambda receipt: receipt["controlled_red"]["ingress"].update(ipv6=False), "red"),
+    (lambda receipt: receipt["controlled_red"]["ingress"].update(ipv4=1), "red"),
     (lambda receipt: receipt["controlled_external"].update(ingress=True), "external"),
+    (lambda receipt: receipt["controlled_external"].update(ingress=0), "external"),
     (lambda receipt: receipt["cleanup"].update(sink_absent=False), "cleanup"),
     (lambda receipt: receipt["network_membership"].update(ingress=["mattermost_edge", "red"]), "networks"),
     (lambda receipt: receipt["effective_images"].update(ingress="latest"), "images"),
@@ -83,7 +85,7 @@ def test_rejects_incomplete_or_unsafe_witness(mutate, expected):
 def test_builder_rejects_incomplete_red_or_cleanup():
     module = load_module()
     values = list(inputs(module))
-    values[4]["ingress"] = False
+    values[4]["ingress"]["ipv6"] = False
     with pytest.raises(ValueError, match="RED"):
         module.build_receipt(*values)
 
@@ -97,7 +99,7 @@ def test_receipt_writer_does_not_replace_an_existing_caller_path(tmp_path):
     assert output.read_bytes() == b"sentinel"
 
 
-def test_versioned_wsl_receipt_is_canonical_and_bound_to_its_recorded_subject():
+def test_versioned_wsl_v1_receipt_is_historical_only_after_ipv6_control_repair():
     module = load_module()
     # The evidence was generated on Linux with LF.  Keep its source digest
     # stable when this test runs from a Windows checkout that expands text to
@@ -115,5 +117,5 @@ def test_versioned_wsl_receipt_is_canonical_and_bound_to_its_recorded_subject():
         "clinical-adapter": "sha256:3004b951822a7589e46d1ef61fca0752c65441eb96880960a594837a0d0be063",
         "ingress": "sha256:19bed384dd06a8d90f745919c9796313a5726e9333d194bf32bcfe80177a5976",
     }
-    assert module.verify_receipt(raw, expected_status=expected_status) == []
+    assert module.verify_receipt(raw, expected_status=expected_status) == ["schema"]
     assert hashlib.sha256(raw).hexdigest() == "b1b1dc16bb9ca0670ad78b782372136edc5db363a37b80582bc2146813790093"

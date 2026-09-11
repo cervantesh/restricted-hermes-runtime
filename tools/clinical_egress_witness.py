@@ -19,12 +19,14 @@ from typing import Any, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 CANDIDATE = ROOT / "tools" / "candidate_clinical_egress.py"
-SCHEMA = "restricted-runtime-clinical-egress-witness.v1"
+SCHEMA = "restricted-runtime-clinical-egress-witness.v2"
 SERVICES = ("clinical-adapter", "ingress")
 EXPECTED_NETWORKS = {
     "clinical-adapter": ["clinical_upstream"],
     "ingress": ["mattermost_edge"],
 }
+EXPECTED_RED = {service: {"ipv4": True, "ipv6": True} for service in SERVICES}
+EXPECTED_EXTERNAL = {"open_control": True, **{service: False for service in SERVICES}}
 _VERSION = re.compile(r"[A-Za-z0-9._+:/~:-]{1,160}")
 _IMAGE = re.compile(r"sha256:[a-f0-9]{64}")
 
@@ -57,6 +59,27 @@ def _closed_mapping(value: object, keys: set[str]) -> dict[str, Any] | None:
     if not isinstance(value, dict) or set(value) != keys:
         return None
     return dict(value)
+
+
+def _strict_bool_mapping(value: object, expected: Mapping[str, bool]) -> dict[str, bool] | None:
+    fields = _closed_mapping(value, set(expected))
+    if fields is None or not all(isinstance(item, bool) for item in fields.values()):
+        return None
+    output = {key: fields[key] for key in expected}
+    return output if output == expected else None
+
+
+def _controlled_red(value: object) -> dict[str, dict[str, bool]] | None:
+    fields = _closed_mapping(value, set(SERVICES))
+    if fields is None:
+        return None
+    output: dict[str, dict[str, bool]] = {}
+    for service in SERVICES:
+        outcome = _strict_bool_mapping(fields[service], {"ipv4": True, "ipv6": True})
+        if outcome is None:
+            return None
+        output[service] = outcome
+    return output if output == EXPECTED_RED else None
 
 
 def _environment(value: object) -> dict[str, str] | None:
@@ -104,18 +127,18 @@ def build_receipt(
     images = _images(status)
     valid_environment = _environment(environment)
     valid_networks = _networks(networks)
-    valid_red = _closed_mapping(red, set(SERVICES))
-    valid_external = _closed_mapping(external, {"open_control", *SERVICES})
-    valid_cleanup = _closed_mapping(cleanup, {"network_absent", "sink_absent"})
+    valid_red = _controlled_red(red)
+    valid_external = _strict_bool_mapping(external, EXPECTED_EXTERNAL)
+    valid_cleanup = _strict_bool_mapping(cleanup, {"network_absent": True, "sink_absent": True})
     if images is None:
         raise ValueError("image-binding")
     if valid_environment is None:
         raise ValueError("environment-binding")
     if valid_networks is None:
         raise ValueError("network-binding")
-    if valid_red != {service: True for service in SERVICES}:
+    if valid_red != EXPECTED_RED:
         raise ValueError("controlled RED observations are incomplete")
-    if valid_external != {"open_control": True, **{service: False for service in SERVICES}}:
+    if valid_external != EXPECTED_EXTERNAL:
         raise ValueError("controlled external observations are incomplete")
     if valid_cleanup != {"network_absent": True, "sink_absent": True}:
         raise ValueError("controlled resource cleanup is incomplete")
@@ -157,11 +180,11 @@ def verify_receipt(raw: bytes, *, expected_status: Mapping[str, Any]) -> list[st
         return ["environment"]
     if _networks(value["network_membership"]) is None:
         return ["networks"]
-    if value["controlled_red"] != {service: True for service in SERVICES}:
+    if _controlled_red(value["controlled_red"]) != EXPECTED_RED:
         return ["red"]
-    if value["controlled_external"] != {"open_control": True, **{service: False for service in SERVICES}}:
+    if _strict_bool_mapping(value["controlled_external"], EXPECTED_EXTERNAL) != EXPECTED_EXTERNAL:
         return ["external"]
-    if value["cleanup"] != {"network_absent": True, "sink_absent": True}:
+    if _strict_bool_mapping(value["cleanup"], {"network_absent": True, "sink_absent": True}) != {"network_absent": True, "sink_absent": True}:
         return ["cleanup"]
     return []
 
