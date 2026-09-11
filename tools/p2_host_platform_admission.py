@@ -11,7 +11,6 @@ from __future__ import annotations
 import platform
 import sys
 
-
 HOST_CLASS = "ubuntu-24.04-lts-x86_64"
 
 
@@ -31,14 +30,20 @@ def _os_release_fields(raw: str) -> dict[str, str]:
     return fields
 
 
-def admit(system: str, machine: str, os_release: str) -> str:
+def admit(system: str, machine: str, os_release: str, kernel_release: str) -> str:
     """Return the sole admitted class or fail without echoing host inputs."""
     fields = _os_release_fields(os_release)
+    kernel = kernel_release.lower() if isinstance(kernel_release, str) else ""
     if (
         system != "Linux"
         or machine not in {"x86_64", "amd64"}
         or fields.get("ID") != "ubuntu"
         or fields.get("VERSION_ID") != "24.04"
+        # WSL can report this Ubuntu release while Docker is served by a
+        # different Desktop-managed VM. It is not the dedicated/equivalent
+        # Linux host required by #31, so deny it before any collection.
+        or "microsoft" in kernel
+        or "wsl" in kernel
     ):
         raise HostAdmissionError("unsupported-host")
     return HOST_CLASS
@@ -53,7 +58,9 @@ def _read_os_release() -> str:
 
 def main() -> int:
     try:
-        admitted = admit(platform.system(), platform.machine().lower(), _read_os_release())
+        admitted = admit(
+            platform.system(), platform.machine().lower(), _read_os_release(), platform.release()
+        )
     except HostAdmissionError:
         print("p2-host-admission: DENIED class=unsupported-host", file=sys.stderr)
         return 2

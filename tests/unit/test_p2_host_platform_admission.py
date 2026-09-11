@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools" / "p2_host_platform_admission.py"
 
@@ -22,24 +21,27 @@ def load_module():
 def test_accepts_only_the_declared_representative_host_class():
     module = load_module()
 
-    assert module.admit("Linux", "x86_64", "ID=ubuntu\nVERSION_ID=\"24.04\"\n") == module.HOST_CLASS
+    assert module.admit(
+        "Linux", "x86_64", "ID=ubuntu\nVERSION_ID=\"24.04\"\n", "6.8.0-generic"
+    ) == module.HOST_CLASS
 
 
 @pytest.mark.parametrize(
-    "system,machine,os_release",
+    "system,machine,os_release,kernel_release",
     [
-        ("Windows", "AMD64", ""),
-        ("Linux", "aarch64", "ID=ubuntu\nVERSION_ID=\"24.04\"\n"),
-        ("Linux", "x86_64", "ID=debian\nVERSION_ID=\"12\"\n"),
-        ("Linux", "x86_64", "ID=ubuntu\nVERSION_ID=\"22.04\"\n"),
-        ("Linux", "x86_64", "not=parseable"),
+        ("Windows", "AMD64", "", ""),
+        ("Linux", "aarch64", "ID=ubuntu\nVERSION_ID=\"24.04\"\n", "6.8.0-generic"),
+        ("Linux", "x86_64", "ID=debian\nVERSION_ID=\"12\"\n", "6.8.0-generic"),
+        ("Linux", "x86_64", "ID=ubuntu\nVERSION_ID=\"22.04\"\n", "6.8.0-generic"),
+        ("Linux", "x86_64", "not=parseable", "6.8.0-generic"),
+        ("Linux", "x86_64", "ID=ubuntu\nVERSION_ID=\"24.04\"\n", "6.6.87-microsoft-standard-WSL2"),
     ],
 )
-def test_rejects_every_other_platform_without_echoing_host_details(system, machine, os_release):
+def test_rejects_every_other_platform_without_echoing_host_details(system, machine, os_release, kernel_release):
     module = load_module()
 
     with pytest.raises(module.HostAdmissionError, match="unsupported-host"):
-        module.admit(system, machine, os_release)
+        module.admit(system, machine, os_release, kernel_release)
 
 
 def test_cli_reduces_a_real_platform_rejection_to_a_content_safe_error(monkeypatch, capsys):
