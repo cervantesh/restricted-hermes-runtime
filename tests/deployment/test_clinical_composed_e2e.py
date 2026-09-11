@@ -634,10 +634,10 @@ def main() -> None:
     after_recovery = json.loads(control("grant-evidence", "crash-retry").stdout)
     crash_records = [
         row for row in paused_outbox_snapshot()
-        if row.get("state") == "AMBIGUOUS" and row.get("reason") == "stale_in_flight"
+        if row.get("state") == "AMBIGUOUS" and row.get("reason") == "restart_in_flight"
     ]
     if len(crash_records) != 1 or not crash_records[0].get("nonce_erased") or not crash_records[0].get("ciphertext_erased"):
-        raise RuntimeError("crash recovery did not retain exactly one erased stale-IN_FLIGHT tombstone")
+        raise RuntimeError("crash recovery did not retain exactly one erased restart-IN_FLIGHT tombstone")
     crash_invariants = {
         "response_digest_equal": after_recovery["response_digest"] == before_crash["response_digest"],
         "read_authorized": after_recovery["audits"].get("restricted_hermes_next_appointment_read_authorized", 0),
