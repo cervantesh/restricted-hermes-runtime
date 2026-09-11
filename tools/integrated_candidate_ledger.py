@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -19,6 +20,7 @@ RAW_SHA = re.compile(r"[0-9a-f]{64}")
 SOURCE_KEYS = {"runtime_head", "runtime_tree", "hrh_head", "hrh_tree"}
 CLAIMS = {
     "bounded_source_reconciliation": True,
+    "historical_receipts_are_candidate_evidence": False,
     "published_immutable_subjects_reverified": False,
     "representative_host_verified": False,
     "phi_authorized": False,
@@ -97,6 +99,7 @@ def build_ledger(*, repo_root: Path, candidate_revision: str, required_source_li
         "candidate": {"revision": candidate_revision, "tree": candidate_tree},
         "required_source_lines": source_lines,
         "retained_receipts": retained,
+        "historical_receipts_only": True,
         "claims": CLAIMS,
     }
     errors = verify_ledger(canonical_bytes(ledger), repo_root=repo_root)
@@ -112,8 +115,8 @@ def verify_ledger(raw: bytes, *, repo_root: Path) -> list[str]:
         return ["json"]
     if not isinstance(value, dict) or raw != canonical_bytes(value):
         return ["canonical"]
-    required = {"schema", "synthetic_non_phi_only", "candidate", "required_source_lines", "retained_receipts", "claims"}
-    if set(value) != required or value.get("schema") != SCHEMA or value.get("synthetic_non_phi_only") is not True:
+    required = {"schema", "synthetic_non_phi_only", "candidate", "required_source_lines", "retained_receipts", "historical_receipts_only", "claims"}
+    if set(value) != required or value.get("schema") != SCHEMA or value.get("synthetic_non_phi_only") is not True or value.get("historical_receipts_only") is not True:
         return ["schema"]
     if value.get("claims") != CLAIMS:
         return ["claims"]
@@ -161,25 +164,31 @@ def verify_ledger(raw: bytes, *, repo_root: Path) -> list[str]:
             return ["receipts"]
         if hashlib.sha256(tracked).hexdigest() != item["sha256"] or _receipt(receipt_value, expected_schema=descriptor["schema"]) != source:
             return ["receipts"]
-        try:
-            if not _ancestor(repo_root, source["runtime_head"], candidate["revision"]):
-                return ["receipts"]
-        except ValueError:
-            return ["receipts"]
+        # Receipt source is historical provenance. Only declared control lines
+        # establish candidate ancestry; receipt ancestry cannot prove that this
+        # exact candidate was executed.
     return []
 
 
 def write_new(path: Path, raw: bytes) -> None:
-    if path.exists():
-        raise FileExistsError(path)
-    temporary = path.with_name(path.name + ".tmp")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = None
+    temporary: Path | None = None
     try:
-        with os.fdopen(fd, "wb") as stream:
+        descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        temporary = Path(name)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
             stream.write(raw); stream.flush(); os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        # Atomic create-if-absent. Unlike exists()+replace(), a concurrent
+        # writer cannot be replaced between a check and publication.
+        os.link(temporary, path)
+        temporary.unlink()
+        temporary = None
     finally:
-        if temporary.exists():
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
             temporary.unlink()
 
 

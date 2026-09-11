@@ -50,6 +50,9 @@ def test_integrated_ledger_rejects_source_or_receipt_tampering() -> None:
     changed_claim = copy.deepcopy(value)
     changed_claim["claims"]["phi_authorized"] = True
     assert ledger.verify_ledger(ledger.canonical_bytes(changed_claim), repo_root=ROOT) == ["claims"]
+    changed_scope = copy.deepcopy(value)
+    changed_scope["claims"]["historical_receipts_are_candidate_evidence"] = True
+    assert ledger.verify_ledger(ledger.canonical_bytes(changed_scope), repo_root=ROOT) == ["claims"]
 
 
 def test_integrated_ledger_writer_never_replaces_existing_output(tmp_path: Path) -> None:
@@ -58,3 +61,17 @@ def test_integrated_ledger_writer_never_replaces_existing_output(tmp_path: Path)
     with pytest.raises(FileExistsError):
         ledger.write_new(output, b"new")
     assert output.read_bytes() == b"existing"
+
+
+def test_integrated_ledger_writer_never_replaces_concurrent_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = tmp_path / "ledger.json"
+    original_link = ledger.os.link
+
+    def competing_link(source: Path, destination: Path) -> None:
+        output.write_bytes(b"concurrent")
+        original_link(source, destination)
+
+    monkeypatch.setattr(ledger.os, "link", competing_link)
+    with pytest.raises(FileExistsError):
+        ledger.write_new(output, b"new")
+    assert output.read_bytes() == b"concurrent"
