@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import subprocess
 import sys
@@ -444,6 +445,47 @@ def test_generated_mattermost_certificate_covers_dns_and_advertised_loopback_ip(
     assert [str(value) for value in san.get_values_for_type(module.x509.IPAddress)] == ["127.0.0.1"]
 
 
+def test_marker_tls_lease_is_closed_and_timezone_aware(tmp_path: Path):
+    module = load_module()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    state.mkdir()
+    marker = module.new_marker(
+        project="clinicalstagingdemo", state_dir=state, state_id="1" * 32,
+        env_sha256="2" * 64, runtime_head="a" * 40, runtime_tree="b" * 40,
+        hrh_head=module.REQUIRED_HRH_SHA, hrh_tree="c" * 40,
+    )
+    for value in (None, "not-a-date", "2026-09-11T12:00:00"):
+        changed = dict(marker)
+        if value is None:
+            changed.pop("certificate_not_after")
+        else:
+            changed["certificate_not_after"] = value
+        (state / module.MARKER_NAME).write_text(json.dumps(changed), encoding="utf-8")
+        with pytest.raises(module.SafetyError, match="TLS lease|unknown or missing"):
+            module.read_marker(state, "clinicalstagingdemo")
+
+
+def test_tls_lease_is_bound_to_seed_and_denies_expiry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    state.mkdir()
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingdemo", 18443)
+    expiry = datetime.now(UTC) + timedelta(hours=1)
+    marker = {"certificate_not_after": expiry.isoformat()}
+    monkeypatch.setattr(module, "certificate_not_after", lambda _seed: expiry)
+    staging._require_tls_lease(marker, now=expiry - timedelta(seconds=1))
+    with pytest.raises(module.SafetyError, match="expired"):
+        staging._require_tls_lease(marker, now=expiry)
+    with pytest.raises(module.SafetyError, match="differs"):
+        staging._require_tls_lease(
+            {"certificate_not_after": (expiry + timedelta(seconds=1)).isoformat()},
+            now=expiry - timedelta(seconds=1),
+        )
+
+
 def test_host_tls_probe_fails_closed_on_connection_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     module = load_module()
     runtime = tmp_path / "runtime"
@@ -590,10 +632,12 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
         "hrh_head": module.REQUIRED_HRH_SHA,
         "hrh_tree": module.REQUIRED_HRH_TREE,
         "expected_images": expected_images,
+        "certificate_not_after": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
     }
     staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
     monkeypatch.setattr(staging, "_require_linux", lambda: None)
     monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
+    monkeypatch.setattr(staging, "_require_tls_lease", lambda _marker: None)
     rows = _compose_rows(module)
     monkeypatch.setattr(staging, "_containers", lambda **_kwargs: rows)
     controller_checks: list[str] = []

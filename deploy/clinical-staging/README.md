@@ -59,6 +59,11 @@ from the host before it writes evidence.
 runs the root controller only through `docker compose run --rm`, and then
 verifies that no privileged provisioner remains. `stop` preserves every
 credential, database and outbox volume. `up` does not reseed or rotate them.
+Each generated TLS set has a fixed 30-day lease. The sealed marker records the
+earliest certificate expiry and `up`, `status`, and `refresh-policy` compare it
+with the private seed and fail closed once it expires. This synthetic staging
+wrapper intentionally has no in-place CA renewal: create a fresh synthetic
+target rather than extending a stale generation.
 `refresh-policy` stops ingress, installs and verifies a newly signed matched
 policy/signature pair through the existing
 controller helper, and restarts only ingress after the pair verifies. An
@@ -77,7 +82,7 @@ synthetic environment; `destroy` removes the bounded state directory.
 `status` writes `evidence/status.json`, binding the runtime and HRH heads and
 trees, built image IDs, current policy digest, requested and effective loopback
 publisher tuples, the CA-verified TLS probe, the narrow network exception,
-lifecycle state and nonclaims. `evidence/last-transition.json` records a normal stop.
+lifecycle state, TLS lease expiry and nonclaims. `evidence/last-transition.json` records a normal stop.
 These are technical staging receipts, not compliance artifacts.
 
 If initialization stops before `status` succeeds, do not hand-edit the marker,

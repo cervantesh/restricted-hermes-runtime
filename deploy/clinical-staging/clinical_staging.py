@@ -163,6 +163,7 @@ def new_marker(
     hrh_tree: str,
     lifecycle: str = "initializing",
     expected_images: Mapping[str, str] | None = None,
+    certificate_not_after: str | None = None,
 ) -> dict[str, Any]:
     validate_state_path(state_dir, project)
     return {
@@ -179,6 +180,12 @@ def new_marker(
         "hrh_tree": hrh_tree,
         "volumes": volume_names(project),
         "expected_images": dict(expected_images or {}),
+        # A staging generation is deliberately short-lived.  The value is
+        # bound to the actual seed certificates below before the marker is
+        # published; this default only keeps pure marker fixtures explicit.
+        "certificate_not_after": certificate_not_after or (
+            datetime.now(UTC) + timedelta(days=30)
+        ).isoformat(),
     }
 
 
@@ -218,7 +225,7 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
     expected_keys = {
         "schema", "synthetic_only", "project", "state_dir", "state_id",
         "compose_env_sha256", "lifecycle", "runtime_head", "runtime_tree",
-        "hrh_head", "hrh_tree", "volumes", "expected_images",
+        "hrh_head", "hrh_tree", "volumes", "expected_images", "certificate_not_after",
     }
     if set(value) != expected_keys:
         raise SafetyError("staging marker has unknown or missing fields")
@@ -233,8 +240,15 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         or not re.fullmatch(r"[a-f0-9]{64}", value["compose_env_sha256"])
         or value["lifecycle"] not in {"initializing", "ready", "stopped"}
         or not isinstance(value["expected_images"], dict)
+        or not isinstance(value["certificate_not_after"], str)
     ):
         raise SafetyError("staging marker does not match the requested synthetic target")
+    try:
+        expiry = datetime.fromisoformat(value["certificate_not_after"])
+    except ValueError as exc:
+        raise SafetyError("staging marker TLS lease is invalid") from exc
+    if expiry.tzinfo is None or expiry.utcoffset() is None:
+        raise SafetyError("staging marker TLS lease must be timezone-aware")
     return value
 
 
@@ -472,6 +486,21 @@ def _certificate_material(seed: Path) -> None:
         path.chmod(0o600)
 
 
+def certificate_not_after(seed: Path) -> datetime:
+    """Return the earliest expiry in the sealed synthetic TLS generation."""
+    expiries: list[datetime] = []
+    try:
+        for name in ("ca.crt", "mattermost.crt", "hrh-tls.crt"):
+            certificate = x509.load_pem_x509_certificate((seed / name).read_bytes())
+            expiry = getattr(certificate, "not_valid_after_utc", None)
+            if expiry is None:
+                expiry = certificate.not_valid_after.replace(tzinfo=UTC)
+            expiries.append(expiry.astimezone(UTC))
+    except (OSError, ValueError) as exc:
+        raise SafetyError("synthetic TLS generation is missing or invalid") from exc
+    return min(expiries)
+
+
 class ClinicalStaging:
     def __init__(self, runtime: Path, hrh: Path, state_dir: Path, project: str, port: int, shell: Shell | None = None):
         self.runtime = runtime.resolve()
@@ -634,11 +663,13 @@ class ClinicalStaging:
         try:
             (temporary / "evidence").mkdir(mode=0o700)
             self._seed_material(temporary)
+            tls_expiry = certificate_not_after(temporary / "seed").isoformat()
             marker = new_marker(
                 project=self.project,
                 state_dir=self.state_dir,
                 state_id=secrets.token_hex(16),
                 env_sha256="0" * 64,
+                certificate_not_after=tls_expiry,
                 **frame,
             )
             values = self._env_values(marker, seed_root=temporary)
@@ -727,6 +758,7 @@ class ClinicalStaging:
         self._require_linux()
         marker = self._verify_marker_and_source()
         self._require_lifecycle(marker, "up", {"ready", "stopped"})
+        self._require_tls_lease(marker)
         self.compose("up", "--detach", *ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
         self.control("wait-mm")
         self.control("wait-hrh")
@@ -743,6 +775,18 @@ class ClinicalStaging:
             if marker[key] != value:
                 raise SafetyError(f"current source frame differs from initialized {key}")
         return marker
+
+    def _require_tls_lease(self, marker: Mapping[str, Any], *, now: datetime | None = None) -> None:
+        """Fail closed instead of treating an expired staging CA as renewable in place."""
+        try:
+            expected = datetime.fromisoformat(str(marker["certificate_not_after"])).astimezone(UTC)
+        except (KeyError, ValueError) as exc:
+            raise SafetyError("staging marker TLS lease is invalid") from exc
+        observed = certificate_not_after(self.state_dir / "seed")
+        if observed != expected:
+            raise SafetyError("staging marker TLS lease differs from sealed certificate material")
+        if (now or datetime.now(UTC)) >= observed:
+            raise SafetyError("synthetic TLS lease expired; initialize a fresh synthetic staging target")
 
     @staticmethod
     def _require_lifecycle(marker: Mapping[str, Any], command: str, allowed: set[str]) -> None:
@@ -837,6 +881,7 @@ class ClinicalStaging:
         self._require_linux()
         marker = self._verify_marker_and_source()
         self._require_lifecycle(marker, "status", {"ready"})
+        self._require_tls_lease(marker)
         rows = self._containers(all_containers=True)
         verify_compose_rows(rows)
         self._assert_no_controller()
@@ -893,6 +938,7 @@ class ClinicalStaging:
             "mattermost_publisher": publisher,
             "ingress_started_at": ingress_started_at,
             "tls_probe": tls_probe,
+            "certificate_not_after": marker["certificate_not_after"],
             "network_exception": "operator-proxy only: operator_access is non-internal",
             "privileged_provisioner_running": False,
             "nonclaims": ["not HIPAA", "not PHI-authorized", "not production"],
@@ -907,6 +953,7 @@ class ClinicalStaging:
         self._require_linux()
         marker = self._verify_marker_and_source()
         self._require_lifecycle(marker, "refresh-policy", {"ready"})
+        self._require_tls_lease(marker)
         if not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", epoch):
             raise SafetyError("policy epoch has an invalid shape")
         self.compose("stop", "ingress")
