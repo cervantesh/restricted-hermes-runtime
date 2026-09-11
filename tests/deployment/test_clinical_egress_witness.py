@@ -69,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     network = project + "-red"
     sink = project + "-sink"
     created_network = created_sink = initialized = False
+    phase = "preflight"
 
     def staging(command_name: str) -> dict[str, Any]:
         result = command(sys.executable, str(STAGING), "--runtime-root", str(ROOT), "--hrh-root", str(args.hrh_root), "--state-dir", str(state), "--project", project, command_name, timeout=2400)
@@ -81,12 +82,15 @@ def main(argv: list[str] | None = None) -> int:
         return command("docker", "compose", "--env-file", str(state / "compose.env"), "--project-name", project, "--file", str(ROOT / "tests" / "deployment" / "clinical-composed-e2e" / "compose.yaml"), "--file", str(ROOT / "deploy" / "clinical-staging" / "compose.yaml"), *parts, check=check, timeout=300)
 
     try:
+        phase = "initialize"
         staging("init")
         initialized = True
+        phase = "create-controlled-network"
         if command("docker", "network", "create", "--ipv6", network, check=False).returncode:
             print("clinical-egress-witness: SKIP controlled-ipv6-network-unavailable")
             return 77
         created_network = True
+        phase = "create-controlled-sink"
         command("docker", "run", "--detach", "--name", sink, "--network", network, "--network-alias", "controlled-probe", "--network-alias", "synthetic-metadata-probe", SINK_IMAGE)
         created_sink = True
         inspect = json.loads(command("docker", "inspect", sink).stdout)[0]["NetworkSettings"]["Networks"][network]
@@ -118,6 +122,7 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
 
         red: dict[str, bool] = {}
         for service in SERVICES:
+            phase = "red-" + service
             target = compose("ps", "--quiet", service).stdout.strip()
             if not target:
                 raise RuntimeError("clinical egress witness failed: service lookup")
@@ -128,10 +133,12 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
                 command("docker", "network", "disconnect", network, target)
             if not red[service]:
                 raise RuntimeError("clinical egress witness failed: controlled RED was not reachable")
+        phase = "green-status"
         status = staging("status")
         observations: dict[str, dict[str, dict[str, bool]]] = {}
         allowed = {"ingress": ("mattermost", 8065, "mattermost"), "clinical-adapter": ("hrh-tls", 8443, "hrh_tls")}
         for service in SERVICES:
+            phase = "green-" + service
             result = service_probe(service)
             if set(result) != {"public_ipv4", "public_ipv6", "public_dns", "metadata_ipv4", "metadata_ipv6", "metadata_dns", "proxy_environment"}:
                 raise RuntimeError("clinical egress witness failed: denied probe output")
@@ -152,12 +159,14 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
         if networks != expected_networks:
             raise RuntimeError("clinical egress witness failed: topology was not restored")
         environment = {"system": platform.system(), "kernel": platform.release(), "architecture": platform.machine(), "docker": command("docker", "version", "--format", "{{.Server.Version}}").stdout.strip(), "compose": command("docker", "compose", "version", "--short").stdout.strip()}
+        phase = "cleanup-controlled-resources"
         command("docker", "container", "rm", "--force", sink)
         created_sink = False
         command("docker", "network", "rm", network)
         created_network = False
         if not exact_absent("container", sink) or not exact_absent("network", network):
             raise RuntimeError("clinical egress witness failed: cleanup")
+        phase = "receipt"
         inputs = {"status": status, "observations": observations, "environment": environment, "networks": networks, "red": red, "cleanup": {"network_absent": True, "sink_absent": True}}
         for name, value in inputs.items():
             write_json(scratch / f"{name}.json", value)
@@ -167,7 +176,7 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, KeyError, json.JSONDecodeError):
         args.output.unlink(missing_ok=True)
-        print("clinical-egress-witness: DENIED", file=sys.stderr)
+        print(f"clinical-egress-witness: DENIED phase={phase}", file=sys.stderr)
         return 2
     finally:
         if created_sink:
