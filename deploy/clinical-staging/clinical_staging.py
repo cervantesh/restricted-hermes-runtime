@@ -163,7 +163,7 @@ def new_marker(
     hrh_tree: str,
     lifecycle: str = "initializing",
     expected_images: Mapping[str, str] | None = None,
-    certificate_not_after: str | None = None,
+    certificate_not_after: str,
 ) -> dict[str, Any]:
     validate_state_path(state_dir, project)
     return {
@@ -180,12 +180,7 @@ def new_marker(
         "hrh_tree": hrh_tree,
         "volumes": volume_names(project),
         "expected_images": dict(expected_images or {}),
-        # A staging generation is deliberately short-lived.  The value is
-        # bound to the actual seed certificates below before the marker is
-        # published; this default only keeps pure marker fixtures explicit.
-        "certificate_not_after": certificate_not_after or (
-            datetime.now(UTC) + timedelta(days=30)
-        ).isoformat(),
+        "certificate_not_after": certificate_not_after,
     }
 
 

@@ -68,6 +68,7 @@ def test_marker_is_closed_and_binds_project_path_and_synthetic_purpose(tmp_path:
         runtime_tree="b" * 40,
         hrh_head=module.REQUIRED_HRH_SHA,
         hrh_tree="c" * 40,
+        certificate_not_after="2030-01-01T00:00:00+00:00",
     )
     module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
     assert module.read_marker(state, "clinicalstagingdemo") == marker
@@ -196,6 +197,7 @@ def test_marker_rejects_any_compose_environment_byte_change(tmp_path: Path):
         runtime_tree="b" * 40,
         hrh_head=module.REQUIRED_HRH_SHA,
         hrh_tree=module.REQUIRED_HRH_TREE,
+        certificate_not_after="2030-01-01T00:00:00+00:00",
     )
     module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
     module.verify_effective_env(state, marker)
@@ -453,6 +455,7 @@ def test_marker_tls_lease_is_closed_and_timezone_aware(tmp_path: Path):
         project="clinicalstagingdemo", state_dir=state, state_id="1" * 32,
         env_sha256="2" * 64, runtime_head="a" * 40, runtime_tree="b" * 40,
         hrh_head=module.REQUIRED_HRH_SHA, hrh_tree="c" * 40,
+        certificate_not_after="2030-01-01T00:00:00+00:00",
     )
     for value in (None, "not-a-date", "2026-09-11T12:00:00"):
         changed = dict(marker)
@@ -584,6 +587,7 @@ def test_nonzero_compose_down_preserves_marker_state_and_volumes(tmp_path: Path,
         runtime_tree="b" * 40,
         hrh_head=module.REQUIRED_HRH_SHA,
         hrh_tree=module.REQUIRED_HRH_TREE,
+        certificate_not_after="2030-01-01T00:00:00+00:00",
     )
     module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
 
