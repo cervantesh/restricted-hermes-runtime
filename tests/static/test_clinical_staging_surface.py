@@ -112,3 +112,7 @@ def test_representative_egress_admits_the_host_before_any_docker_collection():
     assert admission in harness
     assert harness.index(admission) < harness.index("docker info >/dev/null 2>&1")
     assert 'representative-clinical-egress: DENIED class=unsupported-host' in harness
+    assert '[[ -z "${DOCKER_HOST:-}" && -z "${DOCKER_CONTEXT:-}" ]]' in harness
+    assert 'docker context inspect default --format' in harness
+    assert '"$docker_endpoint" == "unix:///var/run/docker.sock"' in harness
+    assert 'representative-clinical-egress: DENIED class=unsupported-docker-endpoint' in harness

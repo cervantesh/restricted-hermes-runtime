@@ -21,6 +21,15 @@ fi
   echo "representative-clinical-egress: DENIED class=unsupported-host" >&2
   exit 2
 }
+[[ -z "${DOCKER_HOST:-}" && -z "${DOCKER_CONTEXT:-}" ]] || {
+  echo "representative-clinical-egress: DENIED class=unsupported-docker-endpoint" >&2
+  exit 2
+}
+docker_endpoint="$(docker context inspect default --format '{{(index .Endpoints "docker").Host}}' 2>/dev/null || true)"
+[[ "$docker_endpoint" == "unix:///var/run/docker.sock" ]] || {
+  echo "representative-clinical-egress: DENIED class=unsupported-docker-endpoint" >&2
+  exit 2
+}
 docker info >/dev/null 2>&1 || { echo "representative-clinical-egress: SKIP docker-unavailable"; exit 77; }
 
 head="$(git -C "$runtime" rev-parse HEAD)"
