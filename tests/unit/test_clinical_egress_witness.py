@@ -104,16 +104,16 @@ def test_versioned_wsl_receipt_is_canonical_and_bound_to_its_recorded_subject():
     # CRLF.
     raw = (ROOT / "docs" / "evidence" / "clinical-egress-wsl-receipt-2026-09-11.json").read_bytes().replace(b"\r\n", b"\n")
     expected_source = {
-        "runtime_head": "146bf39c9a3ac8fa2155c7f52e53b51af5646fff",
-        "runtime_tree": "dc3560ba46df8d8157a1f79ed9c4c82ac274052c",
+        "runtime_head": "29c321cb06076e935833e01e7b7d4f70d6bf7c10",
+        "runtime_tree": "565e2198d09f5a046a91b77ebe4c2a95f3351b2f",
         "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
         "hrh_tree": "f217b0b1cf7f438422528dfe178d81b78212c68b",
     }
     expected_status = status(module)
     expected_status["source"] = expected_source
     expected_status["built_images"] = {
-        "clinical-adapter": "sha256:1a802089e130e6dc9c9e85c99863dc3a564b811ed2036cb76c49fd9754557af1",
-        "ingress": "sha256:739569b5c1c9219fc3b3aca4359ffc3cf743f0b82db980c031a8f2203d7b8015",
+        "clinical-adapter": "sha256:3004b951822a7589e46d1ef61fca0752c65441eb96880960a594837a0d0be063",
+        "ingress": "sha256:19bed384dd06a8d90f745919c9796313a5726e9333d194bf32bcfe80177a5976",
     }
     assert module.verify_receipt(raw, expected_status=expected_status) == []
-    assert hashlib.sha256(raw).hexdigest() == "54ec7f0e257dfd6461c5697218f61cc32f3a0c9f12f77cd73afa0315dbcab1b7"
+    assert hashlib.sha256(raw).hexdigest() == "b1b1dc16bb9ca0670ad78b782372136edc5db363a37b80582bc2146813790093"

@@ -2,7 +2,7 @@
 
 This is a content-safe receipt from a real Docker Linux-container run on
 2026-09-11. Its receipt SHA-256 is
-`54ec7f0e257dfd6461c5697218f61cc32f3a0c9f12f77cd73afa0315dbcab1b7`.
+`b1b1dc16bb9ca0670ad78b782372136edc5db363a37b80582bc2146813790093`.
 
 The executable test created a disposable IPv6-capable Docker network and a
 local controlled sink, and verified that a separate non-internal control
@@ -17,8 +17,8 @@ is independently canonical-verifiable against its source frame and the exact
 two edge-service image digests emitted by staging.
 
 The observed source subject is runtime
-`146bf39c9a3ac8fa2155c7f52e53b51af5646fff` / tree
-`dc3560ba46df8d8157a1f79ed9c4c82ac274052c` and Health-Record-Hub
+`29c321cb06076e935833e01e7b7d4f70d6bf7c10` / tree
+`565e2198d09f5a046a91b77ebe4c2a95f3351b2f` and Health-Record-Hub
 `ad13735e9881a48580a9e138daac137f8c865dea` / tree
 `f217b0b1cf7f438422528dfe178d81b78212c68b`.
 
