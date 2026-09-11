@@ -181,6 +181,8 @@ jobs:
           PY
           RESTRICTED_IMMUTABLE_CANDIDATE_MANIFEST="$PWD/candidate-subjects/published-subjects.json" python tests/deployment/test_mattermost_esr_staging.py
       - name: Emit candidate test receipts, nonclaims, and manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           python - <<'PY'
           import json

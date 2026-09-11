@@ -6,6 +6,8 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,11 @@ EXPECTED_IMAGES = {
     "restricted-mattermost-ingress": "ghcr.io/cervantesh/restricted-mattermost-ingress",
     "restricted-clinical-adapter": "ghcr.io/cervantesh/restricted-clinical-adapter",
 }
+EXPECTED_LOCKS = {
+    "restricted-mattermost-ingress": "requirements/immutable/mattermost-ingress.txt",
+    "restricted-clinical-adapter": "requirements/immutable/clinical-adapter.txt",
+}
+LOCK_LINE = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s]+)\s+--hash=sha256:([0-9a-f]{64})$")
 
 
 def _mapping(value: object) -> dict[str, Any] | None:
@@ -36,6 +43,15 @@ def _digest(value: object) -> bool:
 
 def _raw_hash(value: object) -> bool:
     return isinstance(value, str) and bool(SHA256_RAW.fullmatch(value))
+
+
+def _lock_artifacts(content: bytes) -> list[dict[str, str]]:
+    artifacts: list[dict[str, str]] = []
+    for raw in content.decode("utf-8").splitlines():
+        match = LOCK_LINE.fullmatch(raw.strip())
+        if match:
+            artifacts.append({"name": match.group(1), "version": match.group(2), "sha256": match.group(3)})
+    return artifacts
 
 
 def _error(errors: list[str], message: str) -> None:
@@ -193,8 +209,11 @@ def _verify_subject(errors: list[str], subject: object, source_revision: str, ru
     if not isinstance(materials, list) or not materials or any(_mapping(x) is None or not _digest(_mapping(x).get("digest")) or _mapping(x).get("platform") != PLATFORM for x in materials):
         _error(errors, f"{name}: base material must be an immutable {PLATFORM} subject")
     lock = _mapping(item.get("dependency_lock"))
-    if lock is None or not isinstance(lock.get("path"), str) or not lock["path"].startswith("requirements/immutable/") or not _raw_hash(lock.get("sha256")):
+    expected_lock = EXPECTED_LOCKS.get(name)
+    if lock is None or not isinstance(lock.get("path"), str) or not _raw_hash(lock.get("sha256")):
         _error(errors, f"{name}: dependency lock is invalid")
+    elif lock["path"] != expected_lock:
+        _error(errors, f"{name}: designated dependency lock does not match subject")
     else:
         lock_path = (repo_root / lock["path"]).resolve()
         if not lock_path.is_relative_to(repo_root.resolve()):
@@ -207,6 +226,8 @@ def _verify_subject(errors: list[str], subject: object, source_revision: str, ru
             else:
                 if actual_hash != lock["sha256"]:
                     _error(errors, f"{name}: dependency lock hash does not match repo content")
+                elif lock.get("artifacts") != _lock_artifacts(lock_path.read_bytes()):
+                    _error(errors, f"{name}: dependency lock artifacts do not match repo content")
     _verify_attestation(errors, name, "SBOM", item.get("sbom"), str(image), str(digest), source_revision, run_url, repo_root)
     _verify_attestation(errors, name, "provenance", item.get("provenance"), str(image), str(digest), source_revision, run_url, repo_root)
     _verify_distinct_attestation_artifacts(errors, name, item, repo_root)
@@ -318,21 +339,62 @@ def verify(manifest: object, *, require_external: bool = True, repo_root: Path =
     return errors
 
 
-def main() -> int:
+def verify_live_attestations(manifest: object) -> list[str]:
+    """Re-run GitHub's verifier; retained JSON is audit material, not trust."""
+    root = _mapping(manifest)
+    if root is None:
+        return ["attestation authentication requires a manifest object"]
+    source_revision = root.get("source_revision")
+    subjects = root.get("subjects")
+    if not isinstance(source_revision, str) or not isinstance(subjects, list):
+        return ["attestation authentication requires a valid candidate frame"]
+    if shutil.which("gh") is None:
+        return ["attestation verifier unavailable"]
+    errors: list[str] = []
+    for subject in subjects:
+        item = _mapping(subject)
+        name = item.get("name") if item else "unknown-subject"
+        image = item.get("image") if item else None
+        if not isinstance(name, str) or not isinstance(image, str):
+            errors.append("attestation authentication has an invalid subject")
+            continue
+        for kind, predicate in (("provenance", "https://slsa.dev/provenance/v1"), ("SBOM", "https://spdx.dev/Document/v2.3")):
+            command = [
+                "gh", "attestation", "verify", f"oci://{image}", "--repo", REPOSITORY,
+                "--signer-workflow", f"{REPOSITORY}/{WORKFLOW}", "--bundle-from-oci",
+                "--source-digest", source_revision, "--predicate-type", predicate, "--format=json",
+            ]
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                errors.append(f"{name}: {kind} attestation authentication unavailable")
+                continue
+            if result.returncode != 0:
+                errors.append(f"{name}: {kind} attestation authentication failed")
+    return errors
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--repo-root", type=Path, default=ROOT)
     parser.add_argument("--closed-subjects-only", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--offline-structure-only", action="store_true")
+    args = parser.parse_args(argv)
     try:
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         print(f"immutable candidate: unreadable manifest: {exc}", file=sys.stderr)
         return 2
     errors = verify(manifest, require_external=not args.closed_subjects_only, repo_root=args.repo_root)
+    if not errors and not args.offline_structure_only:
+        errors.extend(verify_live_attestations(manifest))
     if errors:
         print(*["immutable candidate: FAIL: " + error for error in errors], sep="\n", file=sys.stderr)
         return 1
+    if args.offline_structure_only:
+        print("immutable candidate: STRUCTURE ONLY; attestation authenticity not reverified")
+        return 3
     print("immutable candidate: PASS")
     return 0
 
