@@ -53,7 +53,7 @@ def test_staging_volumes_are_external_exactly_named_and_label_verified_by_wrappe
 def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     script = (STAGING / "clinical_staging.py").read_text(encoding="utf-8")
     runbook = (STAGING / "README.md").read_text(encoding="utf-8")
-    for command in ("init", "up", "status", "refresh-policy", "stop", "reset", "destroy"):
+    for command in ("init", "up", "status", "refresh-policy", "stop", "backup", "restore", "reset", "destroy"):
         assert command in script
     assert "docker system prune" not in script
     assert '"--remove-orphans"' not in script
@@ -61,6 +61,10 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert "verify_destructive_resources" in script
     assert "expected_images" in script
     assert "fsync_directory" in script
+    assert "validate_backup_bundle" in script
+    assert "expected_manifest_sha256" in script
+    assert "EXCLUDED_RECOVERY_VOLUME" in script
+    assert "ownership_sha256" in script
     assert "synthetic-only" in runbook
     assert "not HIPAA" in runbook
     assert "not production" in runbook
@@ -68,5 +72,34 @@ def test_operator_surface_is_bounded_and_runbook_preserves_nonclaims():
     assert "dropped capabilities" in runbook
     assert "no-new-privileges" in runbook
     assert 'RUNTIME_BASE_SHA = "41464aee8748f857153ba2b47377515d4847d210"' in script
-    assert 'REQUIRED_HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"' in script
-    assert 'REQUIRED_HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"' in script
+    assert 'REQUIRED_HRH_SHA = "e30a4f968de6727519f49c08369f561fdf269ec5"' in script
+    assert 'REQUIRED_HRH_TREE = "7fb2543a2ceb1649f05c467b38708d1404106659"' in script
+    assert "Dockerfile.web.clinical-candidate" in script
+    assert "Dockerfile.migrate.clinical-candidate" in script
+    assert "verify_hrh_candidate_build_inputs(self.hrh)" in script
+    assert "Cold backup and restore" in runbook
+    assert "not a scheduled backup" in runbook
+
+
+def test_egress_failure_packet_is_content_safe_and_outside_disposable_state():
+    harness = (ROOT / "tests" / "deployment" / "test_representative_clinical_egress.sh").read_text(encoding="utf-8")
+
+    assert 'diagnostic_dir="$receipt.diagnostic"' in harness
+    assert 'mkdir -m 0700 "$diagnostic_dir"' in harness
+    assert 'chmod 0600 "$temporary"' in harness
+    assert 'rm -f "$receipt"; rm -rf "$evidence_dir"' in harness
+    assert "write_diagnostic" in harness
+    assert "collector_class_from" in harness
+    assert "receipt-policy/service-observation" in harness
+    assert "collector-generic" in harness
+    assert "receipt-policy/verification-ingress-networks" in harness
+    assert "receipt-policy/verification-clinical-adapter-proxy" in harness
+    assert "receipt-policy/verification-unknown" in harness
+    assert "exact_name_absent" in harness
+    assert "docker network ls --format '{{.Name}}'" in harness
+    assert "docker container ls --all --format '{{.Names}}'" in harness
+    assert "docker network inspect" not in harness
+    assert "docker container inspect" not in harness
+    packet = next(line for line in harness.splitlines() if '"schema":"restricted-runtime-representative-clinical-egress-diagnostic.v1"' in line)
+    for forbidden in ("$network", "$sink", "$state", "$project", "$controlled_"):
+        assert forbidden not in packet

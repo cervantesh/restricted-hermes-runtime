@@ -8,6 +8,19 @@ ROOT = Path(__file__).resolve().parents[2]
 HARNESS = ROOT / "tests" / "deployment" / "clinical-composed-e2e"
 
 
+def test_clinical_composed_e2e_wrapper_selects_a_portable_python_interpreter():
+    wrapper = (
+        ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "command -v python3" in wrapper
+    assert "elif command -v python" in wrapper
+    assert wrapper.index("command -v python3") < wrapper.index("elif command -v python")
+    assert 'exec "$python_bin"' in wrapper
+    assert 'exec python "$root/tests/deployment/test_clinical_composed_e2e.py"' not in wrapper
+    assert "clinical-composed-e2e: DENIED python-unavailable" in wrapper
+
+
 def test_clinical_composed_e2e_is_a_pinned_real_boundary_harness():
     compose = (HARNESS / "compose.yaml").read_text(encoding="utf-8")
     runner = (ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py").read_text(encoding="utf-8")
@@ -17,8 +30,8 @@ def test_clinical_composed_e2e_is_a_pinned_real_boundary_harness():
     assert compose.count("postgres:17.10-bookworm@sha256:") == 2
     assert "Dockerfile.clinical-adapter" in compose
     assert "Dockerfile.mattermost-ingress" in compose
-    assert "Dockerfile.web" in compose
-    assert "Dockerfile.migrate" in compose
+    assert "Dockerfile.web.clinical-candidate" in compose
+    assert "Dockerfile.migrate.clinical-candidate" in compose
     assert "clinical-socket-init.sh" in compose
     assert "internal: true" in compose
     assert "responseDigest" in control
@@ -76,12 +89,15 @@ def test_clinical_e2e_uses_current_hrh_build_provenance_and_atomic_policy_refres
     control = (HARNESS / "control.py").read_text(encoding="utf-8")
 
     assert "BUILD_SHA: ${CLINICAL_HRH_BUILD_SHA:?required}" in compose
-    assert 'HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"' in runner
-    assert 'HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"' in runner
+    assert 'HRH_SHA = "e30a4f968de6727519f49c08369f561fdf269ec5"' in runner
+    assert 'HRH_TREE = "7fb2543a2ceb1649f05c467b38708d1404106659"' in runner
     assert 'CLINICAL_E2E_HRH_ROOT' in runner
     assert 'CLINICAL_E2E_HRH_ROOT must name a clean HRH checkout' in runner
     assert r'C:\dev' not in runner
     assert '"CLINICAL_HRH_BUILD_SHA": HRH_SHA' in runner
+    assert "sealed_compose_environment" in runner
+    assert "SAFE_COMPOSE_PROCESS_ENV" in runner
+    assert "env=sealed_compose_environment()" in runner
     assert "no published HRH registry digest, SBOM, provenance attestation, or no-rebuild verification" in runner
     assert "os.replace" in control
     assert 'command == "policy-digest"' in control

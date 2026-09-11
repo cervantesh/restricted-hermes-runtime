@@ -604,6 +604,12 @@ class Ingress:
         self.executor = SerializedDeliveryExecutor(self)
 
     def preflight(self) -> None:
+        # Recover every durable delivery claim before any fallible remote
+        # identity/channel/roster dependency. A restart must not retain an
+        # encrypted IN_FLIGHT payload merely because Mattermost is unavailable.
+        # The outbox verifies all rows during this transition, so corruption
+        # still aborts preflight fail-closed.
+        self.outbox.stale_inflight_to_ambiguous()
         self._bot_identity()
         clinical_channels = {item["channel_id"] for item in self.policy.values.get("clinical_bindings", [])}
         if any(channel_id not in clinical_channels for channel_id in self.policy.values["allowed_channel_ids"]):
@@ -616,7 +622,6 @@ class Ingress:
             else:
                 self._private_channel(channel_id)
                 self._member(channel_id, self.policy.values["bot_user_id"])
-        self.outbox.stale_inflight_to_ambiguous()
         self.executor.drain()
 
     def _readiness_binding(self) -> None:
@@ -1059,8 +1064,26 @@ class SerializedDeliveryExecutor:
                 envelope = record.envelope
         if record.state is not DeliveryState.READY or envelope is None or not self._expiry_fence(record):
             return
+        # Preserve the original retryable, pre-effect source/policy check.
+        # No external delivery authorization has begun while the record remains
+        # READY, so a transient failure here must not consume it.
         try:
             self.ingress._revalidate_clinical_envelope(envelope)
+        except DefinitiveMattermostError:
+            self._block_or_expire(record, "delivery_authorization_rejected")
+            return
+        except (ContractError, OSError, TimeoutError, ValueError):
+            return
+        # Delivery authorization is an externally committed effect: after its
+        # outcome is unknown, retrying it from READY can create an unbounded
+        # audit stream. Reuse the durable claim CAS before that boundary; a
+        # caught unknown outcome becomes AMBIGUOUS immediately, while process
+        # death remains recoverable through the existing stale-IN_FLIGHT path.
+        claimed = self.ingress.outbox.claim_delivery(record)
+        if claimed is None or claimed.envelope is None or not self._expiry_fence(claimed):
+            return
+        envelope = claimed.envelope
+        try:
             authorization = self.ingress.clinical.reauthorize_delivery({
                 "mattermostActorId": envelope["actor_id"], "patientId": envelope["patient_id"],
                 "requestId": envelope["request_id"], "integrationId": envelope["integration_id"],
@@ -1072,30 +1095,33 @@ class SerializedDeliveryExecutor:
             logging.getLogger("restricted_mattermost").warning(
                 "mattermost_clinical_outcome=authorization_denied"
             )
-            self._block_or_expire(record, "delivery_authorization_denied")
+            self._block_or_expire(claimed, "delivery_authorization_denied")
             return
         except DefinitiveMattermostError:
-            self._block_or_expire(record, "delivery_authorization_rejected")
+            self._block_or_expire(claimed, "delivery_authorization_rejected")
             return
         except (ContractError, OSError, TimeoutError, ValueError):
+            self.ingress.outbox.terminal(
+                claimed, DeliveryState.AMBIGUOUS, reason="delivery_authorization_unknown"
+            )
             return
         if (
             not isinstance(authorization, dict)
             or set(authorization) != {"authorized"} or authorization.get("authorized") is not True
         ):
-            self._block_or_expire(record, "delivery_authorization_not_authorized")
+            self._block_or_expire(claimed, "delivery_authorization_not_authorized")
             return
         try:
             self.ingress._revalidate_clinical_envelope(envelope)
         except DefinitiveMattermostError:
-            self._block_or_expire(record, "post_authorization_source_rejected")
+            self._block_or_expire(claimed, "post_authorization_source_rejected")
             return
         except (ContractError, OSError, TimeoutError, ValueError):
+            self.ingress.outbox.terminal(
+                claimed, DeliveryState.AMBIGUOUS, reason="post_authorization_revalidation_unknown"
+            )
             return
-        if not self._expiry_fence(record):
-            return
-        claimed = self.ingress.outbox.claim_delivery(record)
-        if claimed is None or claimed.envelope is None or not self._expiry_fence(claimed):
+        if not self._expiry_fence(claimed):
             return
         outbound = {
             "channel_id": claimed.envelope["channel_id"], "root_id": claimed.envelope["root_id"],

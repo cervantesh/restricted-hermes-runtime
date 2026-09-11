@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+import ast
+import dataclasses
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,6 +42,29 @@ def test_state_path_is_absolute_bounded_and_project_specific(tmp_path: Path):
     ):
         with pytest.raises(module.SafetyError):
             module.validate_state_path(invalid, "clinicalstagingdemo")
+
+
+def test_backup_bundle_codec_is_an_immutable_one_way_leaf():
+    module = load_module()
+    codec = sys.modules["clinical_backup_bundle"]
+    contract = module._backup_contract()
+
+    assert dataclasses.is_dataclass(contract)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        contract.schema = "changed"  # type: ignore[misc]
+
+    tree = ast.parse(Path(codec.__file__).read_text(encoding="utf-8"))
+    assert all(
+        not (
+            isinstance(node, ast.Import)
+            and any(alias.name == "clinical_staging" for alias in node.names)
+        )
+        and not (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "clinical_staging"
+        )
+        for node in tree.body
+    )
 
 
 def test_clinical_staging_rejects_state_inside_either_build_context(tmp_path: Path):
@@ -126,6 +158,80 @@ def test_source_frame_requires_clean_runtime_ancestry_and_exact_clean_hrh(tmp_pa
         module.verify_source_frame(runtime, hrh, fake)
 
 
+def _write_candidate_dockerfiles(module, hrh: Path, *, web_bases: tuple[str, ...] | None = None,
+                                 migrate_bases: tuple[str, ...] | None = None) -> None:
+    for name, bases in (
+        (module.HRH_WEB_CANDIDATE_DOCKERFILE, web_bases or module.HRH_CANDIDATE_BASES[module.HRH_WEB_CANDIDATE_DOCKERFILE]),
+        (module.HRH_MIGRATE_CANDIDATE_DOCKERFILE, migrate_bases or module.HRH_CANDIDATE_BASES[module.HRH_MIGRATE_CANDIDATE_DOCKERFILE]),
+    ):
+        (hrh / name).write_text("\n".join(f"FROM {image} AS stage{index}" for index, image in enumerate(bases)) + "\n", encoding="utf-8")
+
+
+def test_candidate_dockerfile_preflight_requires_exact_pinned_base_contract(tmp_path: Path):
+    module = load_module()
+    hrh = tmp_path / "hrh"
+    hrh.mkdir()
+    _write_candidate_dockerfiles(module, hrh)
+
+    module.verify_hrh_candidate_build_inputs(hrh)
+    _write_candidate_dockerfiles(module, hrh, web_bases=("node:24-alpine",) * 3)
+    with pytest.raises(module.SafetyError, match="mutable base"):
+        module.verify_hrh_candidate_build_inputs(hrh)
+    _write_candidate_dockerfiles(module, hrh, web_bases=("node:24-alpine@sha256:" + "0" * 64,) * 3)
+    with pytest.raises(module.SafetyError, match="base digest"):
+        module.verify_hrh_candidate_build_inputs(hrh)
+
+
+def test_init_rejects_unclosed_candidate_dockerfile_before_compose(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    _write_candidate_dockerfiles(module, hrh, web_bases=("node:24-alpine",) * 3)
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingdemo", 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: {"runtime_head": "a" * 40, "runtime_tree": "b" * 40, "hrh_head": module.REQUIRED_HRH_SHA, "hrh_tree": module.REQUIRED_HRH_TREE})
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: pytest.fail("Compose must not run before candidate Dockerfile preflight"))
+
+    with pytest.raises(module.SafetyError, match="mutable base"):
+        staging.init()
+    assert not state.exists()
+
+
+def test_compose_interpolation_uses_sealed_environment_not_ambient_hrh_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "sealed-hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    sealed_root = hrh.as_posix()
+    (state / "compose.env").write_text(
+        f"CLINICAL_HRH_ROOT={sealed_root}\nCLINICAL_STAGING_PROJECT={project}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLINICAL_HRH_ROOT", "/ambient-poison")
+    monkeypatch.setenv("CLINICAL_UNDECLARED", "ambient-poison")
+    captured: dict[str, object] = {}
+
+    class CapturingShell:
+        def run(self, *args, **kwargs):
+            captured["args"] = args
+            captured["env"] = kwargs["env"]
+            return SimpleNamespace(stdout="", returncode=0)
+
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, shell=CapturingShell())
+    staging.compose("config", "--quiet")
+
+    assert "--env-file" in captured["args"]
+    assert captured["env"]["CLINICAL_HRH_ROOT"] == sealed_root
+    assert "CLINICAL_UNDECLARED" not in captured["env"]
+
+
 def test_destructive_volume_guard_rejects_missing_labels_and_unexpected_project_volume():
     module = load_module()
     project = "clinicalstagingdemo"
@@ -170,6 +276,7 @@ def test_partial_volume_set_is_cleanable_but_never_widens_the_allowlist():
         for name in present
     }
     assert module.verify_destructive_volumes(project, state_id, expected, labels, "initializing") == sorted(present)
+    assert module.verify_destructive_volumes(project, state_id, expected, labels, "recovering") == sorted(present)
     for lifecycle in ("ready", "stopped"):
         with pytest.raises(module.SafetyError, match="exact volume set"):
             module.verify_destructive_volumes(project, state_id, expected, labels, lifecycle)
@@ -259,6 +366,9 @@ def test_ready_resource_guard_requires_exact_services_once_and_exact_networks():
     subset_networks.pop(next(iter(subset_networks)))
     with pytest.raises(module.SafetyError, match="exact network set"):
         module.verify_destructive_resources(project, state_id, containers, subset_networks, "stopped")
+    assert module.verify_destructive_resources(project, state_id, {}, {}, "stopped") == ([], [])
+    with pytest.raises(module.SafetyError, match="exact service set or no resources"):
+        module.verify_destructive_resources(project, state_id, {next(iter(containers)): next(iter(containers.values()))}, {}, "stopped")
 
 
 def test_initializing_resource_guard_rejects_duplicate_service_containers():
@@ -796,6 +906,35 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
         staging.status()
 
 
+def test_authenticated_ingress_wait_is_generation_bound_and_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    staging = module.ClinicalStaging(
+        runtime, hrh, tmp_path / "clinicalstagingdemo.synthetic-clinical-staging", "clinicalstagingdemo", 18443,
+    )
+    marker = "mattermost_ingress_outcome=authenticated_ready\n"
+    delayed = iter(["", marker])
+    monkeypatch.setattr(staging, "_container_inspections", lambda: {"ingress": {"State": {"Running": True}}})
+    monkeypatch.setattr(
+        staging, "compose", lambda *_args, **_kwargs: SimpleNamespace(stdout=next(delayed), returncode=0),
+    )
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    staging._wait_for_authenticated_ingress("2026-09-06T15:00:00.000000000Z")
+
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: SimpleNamespace(stdout="", returncode=0))
+    ticks = iter([0.0, 0.0, float(module.INGRESS_READY_TIMEOUT_SECONDS), float(module.INGRESS_READY_TIMEOUT_SECONDS)])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(ticks))
+    with pytest.raises(module.SafetyError, match="did not become authenticated-ready"):
+        staging._wait_for_authenticated_ingress("2026-09-06T15:00:00.000000000Z")
+
+    monkeypatch.setattr(staging, "_container_inspections", lambda: {"ingress": {"State": {"Running": False}}})
+    with pytest.raises(module.SafetyError, match="ingress exited"):
+        staging._wait_for_authenticated_ingress("2026-09-06T15:00:00.000000000Z")
+
+
 @pytest.mark.parametrize("command", ("up", "status", "refresh_policy", "stop"))
 def test_operational_commands_reject_initializing_marker_before_compose(
     command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -851,3 +990,882 @@ def test_stop_failure_preserves_ready_marker_and_transition_evidence(
     assert marker["lifecycle"] == "ready"
     assert writes == []
     assert transition.read_bytes() == previous
+
+
+def _cold_backup_fixture(module, tmp_path: Path) -> tuple[Path, Path, str]:
+    """Create a content-free stopped-state bundle through the public helpers."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    project = "clinicalstagingdemo"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    state.mkdir(mode=0o700)
+    (state / "seed").mkdir(mode=0o700)
+    (state / "evidence").mkdir(mode=0o700)
+    (state / "seed" / "policy-private.pem").write_text("synthetic-key", encoding="utf-8")
+    (state / "compose.env").write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
+    marker = module.new_marker(
+        project=project,
+        state_dir=state,
+        state_id="1" * 32,
+        env_sha256=module.file_sha256(state / "compose.env"),
+        runtime_head="a" * 40,
+        runtime_tree="b" * 40,
+        hrh_head=module.REQUIRED_HRH_SHA,
+        hrh_tree=module.REQUIRED_HRH_TREE,
+        lifecycle="stopped",
+        expected_images={"ingress": "sha256:" + "c" * 64},
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    backup = tmp_path / "cold-backup"
+    backup.mkdir(mode=0o700)
+    (backup / "volumes").mkdir(mode=0o700)
+    module.create_state_archive(state, backup / "state.tar")
+    for key in module.BACKED_UP_VOLUME_KEYS:
+        archive = backup / "volumes" / f"{key}.tar"
+        with tarfile.open(archive, "w") as opened:
+            info = tarfile.TarInfo("fixture")
+            payload = b"synthetic-volume"
+            info.size = len(payload)
+            opened.addfile(info, __import__("io").BytesIO(payload))
+    manifest = module.build_backup_manifest(marker, state, backup)
+    module.write_backup_manifest(backup, manifest)
+    module.write_backup_completion(backup)
+    return state, backup, module.file_sha256(backup / module.BACKUP_MANIFEST_NAME)
+
+
+def test_cold_backup_bundle_requires_exact_complete_members_and_external_hash(tmp_path: Path):
+    module = load_module()
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
+    validated = module.validate_backup_bundle(backup, expected_hash, "clinicalstagingdemo", state)
+    assert validated["project"] == "clinicalstagingdemo"
+    assert validated["excluded_volume"] == "clinical_socket"
+
+    with pytest.raises(module.SafetyError, match="external manifest hash"):
+        module.validate_backup_bundle(backup, "0" * 64, "clinicalstagingdemo", state)
+
+    (backup / module.BACKUP_COMPLETE_NAME).unlink()
+    with pytest.raises(module.SafetyError, match="complete"):
+        module.validate_backup_bundle(backup, expected_hash, "clinicalstagingdemo", state)
+
+
+def test_cold_backup_bundle_rejects_unexpected_member_mixed_generation_and_excluded_socket(tmp_path: Path):
+    module = load_module()
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
+    (backup / "surprise").write_text("no", encoding="utf-8")
+    with pytest.raises(module.SafetyError, match="unexpected"):
+        module.validate_backup_bundle(backup, expected_hash, "clinicalstagingdemo", state)
+    (backup / "surprise").unlink()
+
+    (backup / "unexpected-directory").mkdir()
+    with pytest.raises(module.SafetyError, match="directories"):
+        module.validate_backup_bundle(backup, expected_hash, "clinicalstagingdemo", state)
+    (backup / "unexpected-directory").rmdir()
+
+    with (backup / "volumes" / "hrh_secret.tar").open("ab") as stream:
+        stream.write(b"different-generation")
+    with pytest.raises(module.SafetyError, match="hash"):
+        module.validate_backup_bundle(backup, expected_hash, "clinicalstagingdemo", state)
+
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path / "socket")
+    socket_archive = backup / "volumes" / "clinical_socket.tar"
+    socket_archive.write_bytes(b"forbidden")
+    with pytest.raises(module.SafetyError, match="unexpected"):
+        module.validate_backup_bundle(backup, expected_hash, "clinicalstagingdemo", state)
+
+
+def test_cold_backup_bundle_rejects_path_traversal_before_any_restore_mutation(tmp_path: Path):
+    module = load_module()
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
+    archive = backup / "state.tar"
+    with tarfile.open(archive, "w") as opened:
+        info = tarfile.TarInfo("../escape")
+        payload = b"escape"
+        info.size = len(payload)
+        opened.addfile(info, __import__("io").BytesIO(payload))
+    manifest = json.loads((backup / module.BACKUP_MANIFEST_NAME).read_text(encoding="utf-8"))
+    manifest["members"]["state.tar"]["sha256"] = module.file_sha256(archive)
+    manifest["members"]["state.tar"]["size"] = archive.stat().st_size
+    module.write_backup_manifest(backup, manifest)
+    expected_hash = module.file_sha256(backup / module.BACKUP_MANIFEST_NAME)
+    with pytest.raises(module.SafetyError, match="path"):
+        module.validate_backup_bundle(backup, expected_hash, "clinicalstagingdemo", state)
+
+
+@pytest.mark.parametrize("member", ("state.tar", "volumes/hrh_secret.tar"))
+def test_restore_snapshot_rejects_mid_copy_input_replacement_before_destination_mutation(
+    member: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    shutil.rmtree(state)
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    codec = sys.modules["clinical_backup_bundle"]
+    original_copy = codec._copy_regular_file
+    replaced = False
+
+    def replace_while_snapshotting(contract, source: Path, destination: Path) -> None:
+        nonlocal replaced
+        if source == backup / member and not replaced:
+            replaced = True
+            source.write_bytes(b"different-generation")
+        original_copy(contract, source, destination)
+
+    monkeypatch.setattr(codec, "_copy_regular_file", replace_while_snapshotting)
+    monkeypatch.setattr(
+        staging,
+        "_require_empty_restore_destination",
+        lambda: pytest.fail("destination checks must not follow a failed snapshot validation"),
+    )
+
+    with pytest.raises(module.SafetyError, match="hash or size"):
+        staging.restore(backup, expected_hash)
+    assert replaced
+    assert not state.exists()
+    assert not list(tmp_path.glob(".clinicalstagingdemo.synthetic-clinical-staging.bundle-*"))
+
+
+def test_backup_manifest_binds_content_safe_ownership_metadata(tmp_path: Path):
+    module = load_module()
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
+    manifest = module.validate_backup_bundle(backup, expected_hash, "clinicalstagingdemo", state)
+    metadata = manifest["members"]["volumes/hrh_secret.tar"]
+    assert set(metadata) == {"sha256", "size", "ownership_sha256"}
+    assert len(metadata["ownership_sha256"]) == 64
+
+
+def test_recovery_lifecycle_is_destroyable_but_never_operational(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    marker = module.new_marker(
+        project=project,
+        state_dir=state,
+        state_id="1" * 32,
+        env_sha256="2" * 64,
+        runtime_head="a" * 40,
+        runtime_tree="b" * 40,
+        hrh_head=module.REQUIRED_HRH_SHA,
+        hrh_tree=module.REQUIRED_HRH_TREE,
+        lifecycle="recovering",
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    assert module.read_marker(state, project)["lifecycle"] == "recovering"
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: pytest.fail("must not start recovery state"))
+    for command in ("up", "status", "stop"):
+        with pytest.raises(module.SafetyError, match="lifecycle"):
+            getattr(staging, command)()
+
+
+def test_verified_recovery_receipt_requires_all_causal_controls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / "evidence" / "recovery").mkdir(parents=True)
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32, env_sha256="2" * 64,
+        runtime_head="a" * 40, runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA,
+        hrh_tree=module.REQUIRED_HRH_TREE, lifecycle="ready",
+    )
+    manifest_hash = "d" * 64
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    module.write_json_atomic(
+        state / "evidence" / "recovery" / f"restore-{manifest_hash}.json",
+        {"manifest_sha256": manifest_hash, "verification": "mechanical_restore_only"}, mode=0o600,
+    )
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
+    with pytest.raises(module.SafetyError, match="incomplete"):
+        staging.finalize_cold_recovery_verification(manifest_hash, {})
+    receipt = staging.finalize_cold_recovery_verification(
+        manifest_hash, {key: True for key in module.CAUSAL_RECOVERY_CHECKS},
+    )
+    assert receipt["verification"] == "causal_e2e_verified"
+    assert "cold-ready" not in json.dumps(receipt)
+
+
+def test_restore_destination_rejects_preexisting_named_or_labeled_resources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+
+    class FakeShell:
+        def __init__(self):
+            self.existing_volume = False
+            self.project_named_container = False
+
+        def run(self, *args, **_kwargs):
+            if args[:3] in (("docker", "volume", "inspect"), ("docker", "network", "inspect")):
+                return SimpleNamespace(returncode=0 if self.existing_volume else 1, stdout="", stderr="")
+            if args[:4] == ("docker", "container", "ls", "--all"):
+                names = f"{project}-ingress-1\n" if self.project_named_container else "other\n"
+                return SimpleNamespace(returncode=0, stdout=names, stderr="")
+            raise AssertionError(args)
+
+    shell = FakeShell()
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, shell=shell)
+    monkeypatch.setattr(staging, "_labeled_resources", lambda _kind: {})
+    staging._require_empty_restore_destination()
+
+    shell.existing_volume = True
+    with pytest.raises(module.SafetyError, match="existing Docker volume"):
+        staging._require_empty_restore_destination()
+    shell.existing_volume = False
+    shell.project_named_container = True
+    with pytest.raises(module.SafetyError, match="project-named"):
+        staging._require_empty_restore_destination()
+
+
+def test_restore_argument_contract_and_backup_path_cannot_overlap_private_state(tmp_path: Path):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    state.mkdir()
+    with pytest.raises(module.SafetyError, match="outside state"):
+        module.validate_backup_path(state / "backup", state_dir=state)
+    parsed = module.parse_args([
+        "--hrh-root", "/hrh", "--state-dir", str(state), "--project", project,
+        "restore", "--backup-dir", "/backups/synthetic", "--expected-manifest-sha256", "a" * 64,
+    ])
+    assert parsed.command == "restore"
+    assert parsed.expected_manifest_sha256 == "a" * 64
+
+
+def test_volume_transfer_helper_is_pinned_networkless_and_never_uses_socket(tmp_path: Path):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    backup = tmp_path / "backup"
+    runtime.mkdir()
+    hrh.mkdir()
+    backup.mkdir()
+    (backup / module.BACKUP_VOLUME_DIR).mkdir()
+
+    class FakeShell:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, *args, **_kwargs):
+            self.calls.append(args)
+            if args[:3] == ("docker", "run", "--rm") and "/source" in " ".join(args):
+                archive = backup / module.BACKUP_VOLUME_DIR / "hrh_secret.tar"
+                with tarfile.open(archive, "w") as opened:
+                    info = tarfile.TarInfo("secret")
+                    info.size = 1
+                    opened.addfile(info, __import__("io").BytesIO(b"x"))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    shell = FakeShell()
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, shell=shell)
+    staging._backup_volume("hrh_secret", module.volume_names(project)["hrh_secret"], backup)
+    staging._restore_volume("hrh_secret", module.volume_names(project)["hrh_secret"], backup)
+    assert len(shell.calls) == 2
+    for call in shell.calls:
+        assert "--network" in call and call[call.index("--network") + 1] == "none"
+        assert "--read-only" in call
+        assert "--cap-drop" in call and call[call.index("--cap-drop") + 1] == "ALL"
+        assert "--user" in call and call[call.index("--user") + 1] == "0:0"
+        assert "--entrypoint" in call and call[call.index("--entrypoint") + 1] == "sh"
+        assert module.RECOVERY_HELPER_IMAGE in call
+    backup_caps = [call[index + 1] for index, value in enumerate(shell.calls[0][:-1]) if value == "--cap-add"]
+    restore_caps = [call[index + 1] for index, value in enumerate(shell.calls[1][:-1]) if value == "--cap-add"]
+    assert backup_caps == ["DAC_OVERRIDE"]
+    assert restore_caps == ["DAC_OVERRIDE", "CHOWN", "FOWNER"]
+    assert shell.calls[0][-1] == "tar --numeric-owner -C /source -cf /backup/volumes/hrh_secret.tar ."
+    assert shell.calls[1][-1] == "tar --numeric-owner -C /destination -xf /backup/volumes/hrh_secret.tar"
+    mounts = [shell.calls[0][index + 1] for index, value in enumerate(shell.calls[0][:-1]) if value == "--mount"]
+    module.verify_recovery_helper_boundary(
+        shell.calls[0], source_mount=mounts[0], backup_mount=mounts[1], capabilities=frozenset({"DAC_OVERRIDE"}),
+    )
+    extra_capability = list(shell.calls[0])
+    extra_capability[extra_capability.index(module.RECOVERY_HELPER_IMAGE):extra_capability.index(module.RECOVERY_HELPER_IMAGE)] = [
+        "--cap-add", "NET_ADMIN",
+    ]
+    with pytest.raises(module.SafetyError, match="security authority"):
+        module.verify_recovery_helper_boundary(
+            tuple(extra_capability), source_mount=mounts[0], backup_mount=mounts[1], capabilities=frozenset({"DAC_OVERRIDE"}),
+        )
+    backup_with_chown = list(shell.calls[0])
+    backup_with_chown[backup_with_chown.index(module.RECOVERY_HELPER_IMAGE):backup_with_chown.index(module.RECOVERY_HELPER_IMAGE)] = [
+        "--cap-add", "CHOWN",
+    ]
+    with pytest.raises(module.SafetyError, match="security authority"):
+        module.verify_recovery_helper_boundary(
+            tuple(backup_with_chown), source_mount=mounts[0], backup_mount=mounts[1], capabilities=frozenset({"DAC_OVERRIDE"}),
+        )
+    extra_mount = list(shell.calls[0])
+    extra_mount[extra_mount.index(module.RECOVERY_HELPER_IMAGE):extra_mount.index(module.RECOVERY_HELPER_IMAGE)] = [
+        "--mount", "type=bind,src=/tmp/unrelated,dst=/unexpected,readonly",
+    ]
+    with pytest.raises(module.SafetyError, match="unexpected mount"):
+        module.verify_recovery_helper_boundary(
+            tuple(extra_mount), source_mount=mounts[0], backup_mount=mounts[1], capabilities=frozenset({"DAC_OVERRIDE"}),
+        )
+    restore_mounts = [shell.calls[1][index + 1] for index, value in enumerate(shell.calls[1][:-1]) if value == "--mount"]
+    module.verify_recovery_helper_boundary(
+        shell.calls[1], source_mount=restore_mounts[0], backup_mount=restore_mounts[1],
+        capabilities=frozenset({"DAC_OVERRIDE", "CHOWN", "FOWNER"}),
+    )
+    backup_with_fowner = list(shell.calls[0])
+    backup_with_fowner[backup_with_fowner.index(module.RECOVERY_HELPER_IMAGE):backup_with_fowner.index(module.RECOVERY_HELPER_IMAGE)] = [
+        "--cap-add", "FOWNER",
+    ]
+    with pytest.raises(module.SafetyError, match="security authority"):
+        module.verify_recovery_helper_boundary(
+            tuple(backup_with_fowner), source_mount=mounts[0], backup_mount=mounts[1], capabilities=frozenset({"DAC_OVERRIDE"}),
+        )
+    restore_fourth_cap = list(shell.calls[1])
+    restore_fourth_cap[restore_fourth_cap.index(module.RECOVERY_HELPER_IMAGE):restore_fourth_cap.index(module.RECOVERY_HELPER_IMAGE)] = [
+        "--cap-add", "NET_ADMIN",
+    ]
+    with pytest.raises(module.SafetyError, match="security authority"):
+        module.verify_recovery_helper_boundary(
+            tuple(restore_fourth_cap), source_mount=restore_mounts[0], backup_mount=restore_mounts[1],
+            capabilities=frozenset({"DAC_OVERRIDE", "CHOWN", "FOWNER"}),
+        )
+    with pytest.raises(module.SafetyError, match="allowlist"):
+        staging._backup_volume("clinical_socket", module.volume_names(project)["clinical_socket"], backup)
+
+
+def test_cold_backup_rejects_even_unlabeled_container_mounting_an_exact_volume(tmp_path: Path):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+
+    class FakeShell:
+        def run(self, *args, **_kwargs):
+            if args[:4] == ("docker", "container", "ls", "--all"):
+                if args[-1] == f"volume={module.volume_names(project)['hrh_secret']}":
+                    return SimpleNamespace(returncode=0, stdout="unlabeled-debugger\n", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if args[:3] == ("docker", "container", "inspect"):
+                return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                    "Mounts": [{
+                        "Type": "volume", "Name": module.volume_names(project)["hrh_secret"], "RW": True,
+                    }],
+                }]), stderr="")
+            raise AssertionError(args)
+
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, shell=FakeShell())
+    with pytest.raises(module.SafetyError, match="unlabeled-debugger.*hrh_secret.*rw"):
+        staging._assert_unmounted_backup_volumes(module.volume_names(project))
+
+
+def test_backup_durably_flushes_archives_before_manifest_and_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / "seed").mkdir()
+    (state / "evidence").mkdir()
+    (state / "compose.env").write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32,
+        env_sha256=module.file_sha256(state / "compose.env"), runtime_head="a" * 40,
+        runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA, hrh_tree=module.REQUIRED_HRH_TREE,
+        lifecycle="stopped", expected_images={"ingress": "sha256:" + "c" * 64},
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+
+    class FakeShell:
+        def run(self, *args, **_kwargs):
+            if args[:3] == ("docker", "run", "--rm"):
+                command = args[-1]
+                key = command.split("/backup/volumes/", 1)[1].split(".tar", 1)[0]
+                archive = current_backup / module.BACKUP_VOLUME_DIR / f"{key}.tar"
+                with tarfile.open(archive, "w") as opened:
+                    info = tarfile.TarInfo("fixture")
+                    info.size = 1
+                    opened.addfile(info, __import__("io").BytesIO(b"x"))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(args)
+
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, shell=FakeShell())
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
+    monkeypatch.setattr(staging, "_verify_cold_quiescence", lambda _marker: None)
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(staging, "_assert_unmounted_backup_volumes", lambda _volumes: None)
+    events: list[str] = []
+    original_fsync_file = module.fsync_file
+    original_fsync_directory = module.fsync_directory
+    original_write_manifest = module.write_backup_manifest
+    original_write_completion = module.write_backup_completion
+    current_backup = tmp_path / "unused"
+
+    def record_fsync(path: Path) -> None:
+        events.append(path.relative_to(current_backup).as_posix())
+        original_fsync_file(path)
+
+    def record_manifest(directory: Path, value: dict) -> None:
+        events.append("manifest")
+        original_write_manifest(directory, value)
+
+    def record_completion(directory: Path) -> None:
+        events.append("complete")
+        original_write_completion(directory)
+
+    def record_directory(path: Path) -> None:
+        if path.name == module.BACKUP_VOLUME_DIR:
+            events.append("dir:volumes")
+        elif path == current_backup:
+            events.append("dir:bundle")
+        elif path == backup.parent:
+            events.append("dir:parent")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(module, "fsync_file", record_fsync)
+    monkeypatch.setattr(module, "fsync_directory", record_directory)
+    monkeypatch.setattr(module, "write_backup_manifest", record_manifest)
+    monkeypatch.setattr(module, "write_backup_completion", record_completion)
+    backup = tmp_path / "published-backup"
+    current_backup = backup.parent / f".{backup.name}.partial-placeholder"
+
+    # The exact randomized temporary name is not observable; bind the recorder
+    # lazily to its first archive parent instead.
+    def flexible_fsync(path: Path) -> None:
+        nonlocal current_backup
+        if current_backup.name.endswith("placeholder"):
+            current_backup = path.parent.parent if path.parent.name == module.BACKUP_VOLUME_DIR else path.parent
+        events.append(path.relative_to(current_backup).as_posix())
+        original_fsync_file(path)
+
+    monkeypatch.setattr(module, "fsync_file", flexible_fsync)
+    receipt = staging.backup(backup)
+    assert receipt["manifest_sha256"] == module.file_sha256(backup / module.BACKUP_MANIFEST_NAME)
+    assert events[0] == module.BACKUP_STATE_ARCHIVE
+    volume_events = [f"volumes/{key}.tar" for key in module.BACKED_UP_VOLUME_KEYS]
+    assert events[1:1 + len(volume_events)] == volume_events
+    assert events.index("dir:volumes") > events.index(volume_events[-1])
+    assert events.index("manifest") > events.index("dir:volumes")
+    assert events.index("dir:bundle") > events.index("manifest")
+    assert events.index("complete") > events.index("dir:bundle")
+    assert events[-1] == "dir:parent"
+    assert (backup / module.BACKUP_COMPLETE_NAME).read_bytes() == b"complete\n"
+
+
+def test_backup_interruption_never_publishes_a_complete_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / "seed").mkdir()
+    (state / "evidence").mkdir()
+    (state / "compose.env").write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32,
+        env_sha256=module.file_sha256(state / "compose.env"), runtime_head="a" * 40,
+        runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA, hrh_tree=module.REQUIRED_HRH_TREE,
+        lifecycle="stopped", expected_images={"ingress": "sha256:" + "c" * 64},
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
+    monkeypatch.setattr(staging, "_verify_cold_quiescence", lambda _marker: None)
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(staging, "_assert_unmounted_backup_volumes", lambda _volumes: None)
+    monkeypatch.setattr(staging, "_backup_volume", lambda *_args: (_ for _ in ()).throw(module.CommandError("interrupted")))
+    backup = tmp_path / "interrupted-backup"
+
+    with pytest.raises(module.CommandError, match="interrupted"):
+        staging.backup(backup)
+    assert not backup.exists()
+    assert not list(tmp_path.glob(".interrupted-backup.partial-*"))
+
+
+def test_backup_holds_the_operator_lock_after_final_unmounted_check_until_archive_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A concurrent ``up`` cannot reopen a volume after the final cold fence."""
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    runtime.mkdir()
+    hrh.mkdir()
+    state.mkdir()
+    (state / "seed").mkdir()
+    (state / "evidence").mkdir()
+    env = state / "compose.env"
+    env.write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32,
+        env_sha256=module.file_sha256(env), runtime_head="a" * 40,
+        runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA, hrh_tree=module.REQUIRED_HRH_TREE,
+        lifecycle="stopped", expected_images={"ingress": "sha256:" + "c" * 64},
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    backup_stage = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    up_stage = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    for staging in (backup_stage, up_stage):
+        monkeypatch.setattr(staging, "_require_linux", lambda: None)
+        monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
+    monkeypatch.setattr(backup_stage, "_verify_cold_quiescence", lambda _marker: None)
+    monkeypatch.setattr(
+        backup_stage, "compose", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(backup_stage, "_assert_unmounted_backup_volumes", lambda _volumes: None)
+    archive_paused = threading.Event()
+    release_archive = threading.Event()
+    last_key = module.BACKED_UP_VOLUME_KEYS[-1]
+
+    def pause_after_final_fence(key: str, *_args) -> None:
+        if key == last_key:
+            archive_paused.set()
+            assert release_archive.wait(timeout=3), "test did not release paused archive"
+            raise module.CommandError("synthetic archive interruption")
+
+    monkeypatch.setattr(backup_stage, "_backup_volume", pause_after_final_fence)
+    up_crossed = threading.Event()
+    monkeypatch.setattr(
+        up_stage,
+        "compose",
+        lambda *args, **_kwargs: (
+            up_crossed.set() if args == ("up", "--detach", *module.ONE_SHOT_SERVICES, *module.LONG_RUNNING_SERVICES) else None,
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )[1],
+    )
+    monkeypatch.setattr(up_stage, "control", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(up_stage, "status", lambda: {"lifecycle": "ready"})
+    failures: list[Exception] = []
+
+    def run_backup() -> None:
+        try:
+            backup_stage.backup(tmp_path / "serialized-backup")
+        except Exception as exc:
+            failures.append(exc)
+
+    backup_thread = threading.Thread(target=run_backup)
+    backup_thread.start()
+    assert archive_paused.wait(timeout=3)
+    up_thread = threading.Thread(target=up_stage.up)
+    up_thread.start()
+    time.sleep(0.15)
+    assert not up_crossed.is_set(), "up crossed the cold fence while backup still owned it"
+    release_archive.set()
+    backup_thread.join(timeout=3)
+    up_thread.join(timeout=3)
+    assert not backup_thread.is_alive() and not up_thread.is_alive()
+    assert len(failures) == 1 and isinstance(failures[0], module.CommandError)
+    assert up_crossed.is_set()
+
+
+@pytest.mark.parametrize("command", ("init", "restore", "destroy"))
+def test_other_lifecycle_mutators_wait_for_the_persistent_operator_lock(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Every state-mutating public command shares the same operator boundary."""
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    crossed = threading.Event()
+
+    def deny_after_lock() -> None:
+        crossed.set()
+        raise module.CommandError("stop after lock witness")
+
+    monkeypatch.setattr(staging, "_require_linux", deny_after_lock)
+    arguments = () if command != "restore" else (tmp_path / "backup", "a" * 64)
+    failures: list[Exception] = []
+    with module.persistent_operator_lock(state, project):
+        worker = threading.Thread(
+            target=lambda: _record_lifecycle_failure(failures, getattr(staging, command), *arguments),
+        )
+        worker.start()
+        time.sleep(0.15)
+        assert not crossed.is_set(), f"{command} crossed another mutator's operator lock"
+    worker.join(timeout=3)
+    assert not worker.is_alive() and crossed.is_set()
+    assert len(failures) == 1 and isinstance(failures[0], module.CommandError)
+
+
+def _record_lifecycle_failure(failures: list[Exception], callback, *args) -> None:
+    try:
+        callback(*args)
+    except Exception as exc:
+        failures.append(exc)
+
+
+def test_operator_lock_survives_exceptions_without_unlinking_its_persistent_boundary(tmp_path: Path):
+    module = load_module()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    lock_path = module.operator_lock_path(state)
+    with pytest.raises(module.CommandError, match="synthetic"):
+        with module._operator_lock(state):
+            raise module.CommandError("synthetic")
+    assert lock_path.is_file(), "release must not unlink the lock boundary"
+    with module._operator_lock(state):
+        with module._operator_lock(state):
+            assert lock_path.is_file(), "nested lifecycle calls must not deadlock"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership and no-follow semantics")
+def test_operator_lock_rejects_unsafe_persistent_lock_files(tmp_path: Path):
+    module = load_module()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    lock_path = module.operator_lock_path(state)
+    lock_path.write_text("unsafe", encoding="utf-8")
+    lock_path.chmod(0o644)
+    with pytest.raises(module.OperatorLockError, match="mode 0600"):
+        with module._operator_lock(state):
+            pass
+    lock_path.unlink()
+    target = tmp_path / "different-lock-target"
+    target.write_text("target", encoding="utf-8")
+    lock_path.symlink_to(target)
+    with pytest.raises(module.OperatorLockError, match="safely open"):
+        with module._operator_lock(state):
+            pass
+    lock_path.unlink()
+
+
+def test_operator_lock_uses_the_shared_project_namespace_not_private_state_path(tmp_path: Path):
+    module = load_module()
+    state_a = tmp_path / "a.synthetic-clinical-staging"
+    state_b = tmp_path / "b.synthetic-clinical-staging"
+    acquired = threading.Event()
+
+    def contender() -> None:
+        with module.persistent_operator_lock(state_b, "clinicalstagingdemo"):
+            acquired.set()
+
+    with module.persistent_operator_lock(state_a, "clinicalstagingdemo"):
+        worker = threading.Thread(target=contender)
+        worker.start()
+        time.sleep(0.15)
+        assert not acquired.is_set(), "separate state paths crossed one Compose project boundary"
+    worker.join(timeout=3)
+    assert not worker.is_alive() and acquired.is_set()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fcntl process serialization is POSIX-only")
+def test_operator_lock_blocks_an_independent_process_until_release(tmp_path: Path):
+    module = load_module()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    acquired = tmp_path / "child-acquired"
+    source = MODULE_PATH.parent / "clinical_operator_lock.py"
+    child = "\n".join((
+        "import importlib.util, pathlib, sys",
+        "spec = importlib.util.spec_from_file_location('operator_lock_child', sys.argv[1])",
+        "mod = importlib.util.module_from_spec(spec)",
+        "spec.loader.exec_module(mod)",
+        "with mod.persistent_operator_lock(pathlib.Path(sys.argv[2])):",
+        "    pathlib.Path(sys.argv[3]).write_text('ok')",
+    ))
+    with module._operator_lock(state):
+        process = subprocess.Popen([sys.executable, "-c", child, str(source), str(state), str(acquired)])
+        time.sleep(0.15)
+        assert not acquired.exists(), "independent process crossed the persistent operator lock"
+    assert process.wait(timeout=3) == 0
+    assert acquired.read_text(encoding="utf-8") == "ok"
+
+
+def test_destroy_fails_when_exact_project_resources_remain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    state.mkdir()
+    env = state / "compose.env"
+    env.write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32,
+        env_sha256=module.file_sha256(env), runtime_head="a" * 40,
+        runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA, hrh_tree=module.REQUIRED_HRH_TREE,
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+
+    class ResidualShell:
+        def run(self, *args, **_kwargs):
+            if args[:4] == ("docker", "container", "ls", "--all"):
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if args[:3] == ("docker", "network", "inspect"):
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            if args[:3] == ("docker", "volume", "inspect"):
+                remaining = args[3] == module.volume_names(project)["hrh_secret"]
+                return SimpleNamespace(returncode=0 if remaining else 1, stdout="", stderr="")
+            raise AssertionError(args)
+
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, shell=ResidualShell())
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(staging, "_destroy_resources", lambda: None)
+    with pytest.raises(module.SafetyError, match="project volume remains.*hrh_secret"):
+        staging.destroy()
+    assert state.exists(), "failed teardown must retain state for bounded operator recovery"
+
+
+def test_destroy_propagates_teardown_failure_and_keeps_recovery_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    state.mkdir()
+    env = state / "compose.env"
+    env.write_text("CLINICAL_SYNTHETIC=true\n", encoding="utf-8")
+    marker = module.new_marker(
+        project=project, state_dir=state, state_id="1" * 32,
+        env_sha256=module.file_sha256(env), runtime_head="a" * 40,
+        runtime_tree="b" * 40, hrh_head=module.REQUIRED_HRH_SHA, hrh_tree=module.REQUIRED_HRH_TREE,
+    )
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(
+        staging, "_destroy_resources", lambda: (_ for _ in ()).throw(module.CommandError("docker down failed")),
+    )
+    with pytest.raises(module.CommandError, match="docker down failed"):
+        staging.destroy()
+    assert state.exists() and (state / module.MARKER_NAME).exists()
+
+
+def test_restore_post_start_failure_returns_to_non_operational_recovering_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    shutil.rmtree(state)
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    manifest = module.validate_backup_bundle(backup, expected_hash, project, state)
+    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: manifest["source"])
+    monkeypatch.setattr(staging, "_require_empty_restore_destination", lambda: None)
+    monkeypatch.setattr(staging, "_create_volumes", lambda _marker: None)
+    monkeypatch.setattr(staging, "_restore_volume", lambda *_args: None)
+    monkeypatch.setattr(staging, "_start_restored_stack", lambda: None)
+    monkeypatch.setattr(
+        staging,
+        "status",
+        lambda *, _allow_recovering=False: (
+            (_ for _ in ()).throw(module.SafetyError("post-start readiness failed"))
+            if _allow_recovering else pytest.fail("recovery verification must opt in explicitly")
+        ),
+    )
+    compose_calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        staging,
+        "compose",
+        lambda *args, **_kwargs: (compose_calls.append(args), SimpleNamespace(returncode=0, stdout="", stderr=""))[1],
+    )
+
+    with pytest.raises(module.SafetyError, match="controlled recovery"):
+        staging.restore(backup, expected_hash)
+    assert module.read_marker(state, project)["lifecycle"] == "recovering"
+    assert compose_calls == [("stop", *module.LONG_RUNNING_SERVICES)]
+    assert not (state / "evidence" / "recovery" / f"restore-{expected_hash}.json").exists()
+
+
+@pytest.mark.parametrize("interruption", ("before-start", "during-start"))
+def test_restore_interruption_never_publishes_stopped_or_ready_and_blocks_normal_up(
+    interruption: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    state, backup, expected_hash = _cold_backup_fixture(module, tmp_path)
+    project = "clinicalstagingdemo"
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    shutil.rmtree(state)
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    manifest = module.validate_backup_bundle(backup, expected_hash, project, state)
+    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: manifest["source"])
+    monkeypatch.setattr(staging, "_require_empty_restore_destination", lambda: None)
+    monkeypatch.setattr(staging, "_create_volumes", lambda _marker: None)
+    monkeypatch.setattr(staging, "_restore_volume", lambda *_args: None)
+    if interruption == "before-start":
+        monkeypatch.setattr(
+            staging,
+            "_restore_volume",
+            lambda *_args: (_ for _ in ()).throw(module.CommandError("interrupted before startup")),
+        )
+    else:
+        monkeypatch.setattr(
+            staging,
+            "_start_restored_stack",
+            lambda: (_ for _ in ()).throw(module.CommandError("interrupted during startup")),
+        )
+    writes: list[str] = []
+    original_write = staging._write_marker
+    monkeypatch.setattr(
+        staging,
+        "_write_marker",
+        lambda marker: (writes.append(str(marker["lifecycle"])), original_write(marker))[1],
+    )
+    compose_calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        staging,
+        "compose",
+        lambda *args, **_kwargs: (compose_calls.append(args), SimpleNamespace(returncode=0, stdout="", stderr=""))[1],
+    )
+
+    with pytest.raises(module.SafetyError, match="controlled recovery"):
+        staging.restore(backup, expected_hash)
+    assert module.read_marker(state, project)["lifecycle"] == "recovering"
+    assert "stopped" not in writes and "ready" not in writes
+    assert compose_calls == [("stop", *module.LONG_RUNNING_SERVICES)]
+    monkeypatch.setattr(
+        staging,
+        "compose",
+        lambda *_args, **_kwargs: pytest.fail("ordinary up must not run from recovering state"),
+    )
+    with pytest.raises(module.SafetyError, match="lifecycle"):
+        staging.up()
