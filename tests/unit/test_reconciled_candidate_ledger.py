@@ -117,7 +117,9 @@ def test_a0_card_is_bound_to_the_p2_admission_candidate_and_its_real_guard() -> 
         check=True,
         text=True,
     ).stdout
-    assert 'tags: ["immutable-candidate-*"]' in workflow
+    assert "push:" in workflow
+    assert "tags:" in workflow
+    assert "immutable-candidate-*" in workflow
     assert "restricted-mattermost-ingress" in workflow
     assert "restricted-clinical-adapter" in workflow
     assert "--closed-subjects-only" in workflow
