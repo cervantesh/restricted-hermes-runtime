@@ -32,7 +32,8 @@ COMPOSE_FILE = HARNESS / "compose.yaml"
 MM_IMAGE = "mattermost/mattermost-team-edition:11.7.10@sha256:84a041d836bf6fbf6a9a78ab699fa5ebe5437bfb6a514b5afad4121fa3800696"
 PG_IMAGE = "postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f"
 NGINX_IMAGE = "nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284"
-RUNTIME_PRODUCT_SHA = "8049dd7612176b33e65ef19f61f5699aef7e0a28"
+# Must match deploy/clinical-staging/clinical_staging.py:RUNTIME_BASE_SHA.
+RUNTIME_PRODUCT_SHA = "c0fc85d894700823deb92a085d36291589160028"
 HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"
 HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"
 PROJECT = f"clinicale2e{os.getpid()}_{int(time.time())}"
@@ -561,21 +562,37 @@ def main() -> None:
     phase("source-deletion-before-delivery")
     control("mutate", "reset")
     before = int(control("grant-count").stdout.strip())
-    control("mutate", "crash-delay")
+    control("mutate", "source-delete-delay")
     control("send", "actor", "actor_dm", "018f22bb-414d-7cc4-b5a4-83cc8ec92cb1", "source-deleted")
     wait_grants(before)
     wait_delivery_delay()
-    ready_records = [row for row in paused_outbox_snapshot() if row.get("state") == "READY"]
-    if len(ready_records) != 1:
-        raise RuntimeError("source-deletion barrier did not isolate exactly one READY outbox record")
-    source_before = ready_records[0]
-    if source_before.get("reason") != "" or source_before.get("nonce_erased") or source_before.get("ciphertext_erased"):
-        raise RuntimeError("source-deletion READY record did not retain its encrypted payload")
-    source_record_tag = source_before.get("record_tag")
-    if not isinstance(source_record_tag, str) or len(source_record_tag) != 64:
-        raise RuntimeError("source-deletion READY record tag was invalid")
-    source_deletion = json.loads(control("delete-source", "source-deleted").stdout)
-    control("mutate", "drop-crash-delay", timeout=60)
+    # Reauthorization is an external effect, so the executor claims the row
+    # before it begins.  The harness delay holds that call after the durable
+    # claim and before delivery; the payload must still be retained.
+    # Hold the executor after its durable claim until the external source has
+    # been definitively deleted.  A probe snapshot that unpauses first leaves
+    # a race between the Mattermost DELETE and the final source revalidation.
+    compose("pause", "ingress")
+    try:
+        snapshot = json.loads(control("snapshot-outbox-records").stdout)
+        if not isinstance(snapshot, list):
+            raise RuntimeError("source-deletion outbox snapshot was not a list")
+        claimed_records = [row for row in snapshot if row.get("state") == "IN_FLIGHT"]
+        if len(claimed_records) != 1:
+            raise RuntimeError(
+                "source-deletion barrier did not isolate exactly one IN_FLIGHT outbox record "
+                f"(observed={len(claimed_records)})"
+            )
+        source_before = claimed_records[0]
+        if source_before.get("reason") != "" or source_before.get("nonce_erased") or source_before.get("ciphertext_erased"):
+            raise RuntimeError("source-deletion claimed record did not retain its encrypted payload")
+        source_record_tag = source_before.get("record_tag")
+        if not isinstance(source_record_tag, str) or len(source_record_tag) != 64:
+            raise RuntimeError("source-deletion claimed record tag was invalid")
+        source_deletion = json.loads(control("delete-source", "source-deleted").stdout)
+    finally:
+        compose("unpause", "ingress", check=False)
+    control("mutate", "drop-source-delete-delay", timeout=60)
     wait_delivery_reauthorized("source-deleted")
     control("expect", "source-deleted", "no-reply", timeout=45)
     terminal_records = paused_outbox_snapshot(source_record_tag)
@@ -585,7 +602,7 @@ def main() -> None:
     expected_after = {
         "record_tag": source_record_tag,
         "state": "BLOCKED",
-        "reason": "current_authorization_rejected",
+        "reason": "post_authorization_source_rejected",
         "generation": int(source_before["generation"]) + 1,
         "nonce_erased": True,
         "ciphertext_erased": True,
@@ -613,8 +630,14 @@ def main() -> None:
     control("mutate", "drop-crash-delay", timeout=60)
     compose("up", "--detach", "ingress")
     wait_ingress()
-    control("expect", "crash-retry", "reply", timeout=60)
+    control("expect", "crash-retry", "no-reply", timeout=60)
     after_recovery = json.loads(control("grant-evidence", "crash-retry").stdout)
+    crash_records = [
+        row for row in paused_outbox_snapshot()
+        if row.get("state") == "AMBIGUOUS" and row.get("reason") == "restart_in_flight"
+    ]
+    if len(crash_records) != 1 or not crash_records[0].get("nonce_erased") or not crash_records[0].get("ciphertext_erased"):
+        raise RuntimeError("crash recovery did not retain exactly one erased restart-IN_FLIGHT tombstone")
     crash_invariants = {
         "response_digest_equal": after_recovery["response_digest"] == before_crash["response_digest"],
         "read_authorized": after_recovery["audits"].get("restricted_hermes_next_appointment_read_authorized", 0),
@@ -626,9 +649,9 @@ def main() -> None:
         "response_digest_equal": True,
         "read_authorized": 1,
         "read_completed": 1,
-        # The first server-side reauthorization commits after the client is
-        # killed; recovery must obtain a second fresh authorization before post.
-        "delivery_reauthorized": 2,
+        # The first reauthorization may complete at the server after the
+        # ingress dies, but recovery must never reissue or deliver it.
+        "delivery_reauthorized": 1,
     }:
         raise RuntimeError(
             "crash recovery invariant mismatch: " + json.dumps(crash_invariants, sort_keys=True)

@@ -36,7 +36,9 @@ except ImportError:  # pragma: no cover - the supported operator path is Linux.
     fcntl = None
 
 
-RUNTIME_BASE_SHA = "c6c41a0980ed21de95d324c828ee9c5bb50cb8dd"
+# The candidate stack is rebased from this current common main ancestor.  Keep
+# this in lockstep with the composed E2E product anchor below.
+RUNTIME_BASE_SHA = "c0fc85d894700823deb92a085d36291589160028"
 # This must match the composed E2E build subject.  Keeping a second staging
 # subject here would make the two executable entry points disagree about what
 # source the candidate is allowed to use.
