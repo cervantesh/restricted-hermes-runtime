@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +33,19 @@ def _load_list(path: Path) -> list[Any]:
     return value
 
 
-def lock_record(name: str, repo_root: Path) -> dict[str, Any]:
+def _git_show(repo_root: Path, revision: str, path: str) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "show", f"{revision}:{path}"],
+        capture_output=True, timeout=30, check=False,
+    )
+    if result.returncode:
+        raise SystemExit(f"{path}: unavailable at source revision")
+    return result.stdout
+
+
+def lock_record(name: str, repo_root: Path, source_revision: str) -> dict[str, Any]:
     relative = LOCKS[name]
-    content = (repo_root / relative).read_bytes()
+    content = _git_show(repo_root, source_revision, relative)
     artifacts = []
     for raw in content.decode("utf-8").splitlines():
         match = LINE.fullmatch(raw.strip())
@@ -99,7 +110,7 @@ def main() -> int:
         platform_ref = _reference(platform_path, repo_root)
         subjects.append({
             "name": name, "image": image, "digest": digest, "platform": "linux/amd64",
-            "base_materials": source["base_materials"], "dependency_lock": lock_record(name, repo_root),
+            "base_materials": source["base_materials"], "dependency_lock": lock_record(name, repo_root, args.source_revision),
             "sbom": {"format": "spdxjson", "subject_digest": digest, "verification": {**attestation_ref, "subject_digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.run_url, "predicate_type": "https://spdx.dev/Document/v2.3"}},
             "provenance": {"subject_digest": digest, "verification": {**attestation_ref, "subject_digest": digest, "source_revision": args.source_revision, "workflow_run_url": args.run_url, "predicate_type": "https://slsa.dev/provenance/v1"}},
             "platform_receipt": platform_ref, "tests": receipts.get(name, []),

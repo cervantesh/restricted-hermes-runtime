@@ -221,19 +221,13 @@ def _verify_subject(errors: list[str], subject: object, source_revision: str, ru
     elif lock["path"] != expected_lock:
         _error(errors, f"{name}: designated dependency lock does not match subject")
     else:
-        lock_path = (repo_root / lock["path"]).resolve()
-        if not lock_path.is_relative_to(repo_root.resolve()):
-            _error(errors, f"{name}: dependency lock escapes repo root")
-        else:
-            try:
-                actual_hash = hashlib.sha256(lock_path.read_bytes()).hexdigest()
-            except OSError as exc:
-                _error(errors, f"{name}: dependency lock unavailable: {exc}")
-            else:
-                if actual_hash != lock["sha256"]:
-                    _error(errors, f"{name}: dependency lock hash does not match repo content")
-                elif lock.get("artifacts") != _lock_artifacts(lock_path.read_bytes()):
-                    _error(errors, f"{name}: dependency lock artifacts do not match repo content")
+        lock_bytes = _git_show(repo_root, source_revision, expected_lock)
+        if lock_bytes is None:
+            _error(errors, f"{name}: dependency lock is unavailable at the candidate revision")
+        elif hashlib.sha256(lock_bytes).hexdigest() != lock["sha256"]:
+            _error(errors, f"{name}: dependency lock hash does not match candidate source")
+        elif lock.get("artifacts") != _lock_artifacts(lock_bytes):
+            _error(errors, f"{name}: dependency lock artifacts do not match candidate source")
     _verify_attestation(errors, name, "SBOM", item.get("sbom"), str(image), str(digest), source_revision, run_url, repo_root)
     _verify_attestation(errors, name, "provenance", item.get("provenance"), str(image), str(digest), source_revision, run_url, repo_root)
     _verify_distinct_attestation_artifacts(errors, name, item, repo_root)
@@ -436,7 +430,11 @@ def verify_live_attestations(manifest: object, *, repo_root: Path = ROOT) -> lis
         # workflow's final status remains a separate GitHub check only while
         # this very run is emitting its evidence.  A later verifier has no
         # circularity excuse and must reject a failed run.
-        if os.environ.get("GITHUB_RUN_ID") != run_id and run.get("conclusion") != "success":
+        same_live_run = (
+            os.environ.get("GITHUB_RUN_ID") == run_id
+            and run.get("status") == "in_progress"
+        )
+        if not same_live_run and run.get("conclusion") != "success":
             errors.append("authenticated workflow run did not complete successfully")
             return errors
         try:

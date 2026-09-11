@@ -258,8 +258,9 @@ def test_published_mode_fails_before_any_docker_fallback_when_digest_is_absent()
         assert "requires an immutable digest" in result.stderr
 
 
-def test_candidate_verifier_accepts_matching_subjects_and_rejects_relational_failures(tmp_path: Path):
+def test_candidate_verifier_accepts_matching_subjects_and_rejects_relational_failures(tmp_path: Path, monkeypatch):
     verifier = _load_verifier()
+    monkeypatch.setattr(verifier, "_git_show", lambda _root, _revision, path: (ROOT / path).read_bytes())
     for lock in ("requirements/immutable/mattermost-ingress.txt", "requirements/immutable/clinical-adapter.txt"):
         target = tmp_path / lock
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -437,7 +438,7 @@ def test_live_attestation_verifier_rejects_a_failed_completed_run(tmp_path: Path
         subject["base_materials"] = verifier._expected_base_material((ROOT / verifier.EXPECTED_DOCKERFILES[subject["name"]]).read_bytes())
     monkeypatch.setattr(verifier.shutil, "which", lambda _command: "gh")
     monkeypatch.setattr(verifier, "_git_show", lambda _root, _revision, path: (ROOT / path).read_bytes())
-    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
 
     def run(command, **_kwargs):
         if command[:3] == ["gh", "attestation", "verify"]:
@@ -446,7 +447,7 @@ def test_live_attestation_verifier_rejects_a_failed_completed_run(tmp_path: Path
                     "runInvocationURI": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/1/attempts/1",
                 }}},
             }]))
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"head_sha": "d" * 40, "conclusion": "failure"}))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"head_sha": "d" * 40, "status": "completed", "conclusion": "failure"}))
 
     monkeypatch.setattr(verifier.subprocess, "run", run)
     assert verifier.verify_live_attestations(manifest) == ["authenticated workflow run did not complete successfully"]
@@ -478,7 +479,10 @@ def test_actual_candidate_layout_receipts_build_and_verify_from_repo_root(tmp_pa
         target = repo / lock
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((ROOT / lock).read_bytes())
-    revision = "d" * 40
+    for args in (("init",), ("config", "user.email", "test@invalid"), ("config", "user.name", "test"), ("add", "."), ("commit", "-m", "candidate locks")):
+        result = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
     run_url = "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/1"
     subjects: dict[str, dict[str, str]] = {}
     for name, marker in (("restricted-mattermost-ingress", "e"), ("restricted-clinical-adapter", "f")):
@@ -512,6 +516,11 @@ def test_actual_candidate_layout_receipts_build_and_verify_from_repo_root(tmp_pa
     verified = subprocess.run([sys.executable, str(ROOT / "tools" / "verify_immutable_candidate.py"), str(candidate / "candidate.manifest.json"), "--repo-root", str(repo), "--closed-subjects-only", "--offline-structure-only"], capture_output=True, text=True)
     assert verified.returncode == 3, verified.stderr
     assert "STRUCTURE ONLY" in verified.stdout
+    # A newer checkout must not invalidate a historical candidate whose source
+    # revision remains available; verifier reads the lock through that revision.
+    (repo / "requirements/immutable/mattermost-ingress.txt").write_text("changed\n", encoding="utf-8")
+    verified_after_checkout_change = subprocess.run([sys.executable, str(ROOT / "tools" / "verify_immutable_candidate.py"), str(candidate / "candidate.manifest.json"), "--repo-root", str(repo), "--closed-subjects-only", "--offline-structure-only"], capture_output=True, text=True)
+    assert verified_after_checkout_change.returncode == 3, verified_after_checkout_change.stderr
 
 
 def test_published_subject_harnesses_pull_digest_and_never_build_when_digest_is_supplied():
