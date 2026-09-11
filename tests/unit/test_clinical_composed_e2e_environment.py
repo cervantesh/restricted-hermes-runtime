@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 
@@ -49,6 +50,9 @@ def test_compose_ignores_inherited_clinical_variables_and_uses_generated_e30_fra
     environment = captured["env"]
     assert environment["CLINICAL_HRH_ROOT"] == "/synthetic/hrh-e30"
     assert environment["CLINICAL_HRH_BUILD_SHA"] == E30_HRH_SHA
+    assert environment["DOCKER_CONFIG"] == str(runner.DOCKER_CONFIG_DIR)
+    assert environment["TEMP"] == str(runner.DOCKER_CLIENT_TMP_DIR)
+    assert environment["TMP"] == str(runner.DOCKER_CLIENT_TMP_DIR)
     assert "CLINICAL_UNDECLARED_OVERRIDE" not in environment
     assert "/attacker/mixed-frame" not in environment.values()
     args = captured["args"]
@@ -59,3 +63,60 @@ def test_compose_ignores_inherited_clinical_variables_and_uses_generated_e30_fra
     compose = runner.COMPOSE_FILE.read_text(encoding="utf-8")
     assert "Dockerfile.web.clinical-candidate" in compose
     assert "Dockerfile.migrate.clinical-candidate" in compose
+
+
+def test_windows_compose_discovery_allows_only_installation_roots():
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+    environment = runner.compose_process_environment(
+        {
+            "PATH": "C:/safe/bin",
+            "ProgramFiles": "C:/Program Files",
+            "CLINICAL_HRH_ROOT": "C:/attacker/override",
+        },
+        platform_name="nt",
+    )
+
+    assert environment == {
+        "PATH": "C:/safe/bin",
+        "ProgramFiles": "C:/Program Files",
+    }
+
+
+def test_windows_compose_discovery_rejects_a_host_without_installation_root():
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+
+    try:
+        runner.compose_process_environment({"PATH": "C:/safe/bin"}, platform_name="nt")
+    except RuntimeError as exc:
+        assert str(exc) == "clinical composed E2E Docker Compose discovery is unavailable"
+    else:
+        raise AssertionError("missing Windows Docker Compose discovery was accepted")
+
+
+def test_retained_receipt_is_canonical_and_confined_to_the_evidence_root(tmp_path, monkeypatch):
+    runner = load_runner()
+    atexit.unregister(runner.cleanup)
+    root = tmp_path / "runtime"
+    evidence_root = root / "docs" / "evidence"
+    evidence_root.mkdir(parents=True)
+    monkeypatch.setattr(runner, "ROOT", root)
+    output = evidence_root / "receipt.json"
+    runner.write_retained_receipt(output, {"schema": "synthetic", "source": {"head": "a"}})
+
+    raw = output.read_bytes()
+    assert raw == b'{"schema":"synthetic","source":{"head":"a"}}\n'
+    assert json.loads(raw) == {"schema": "synthetic", "source": {"head": "a"}}
+    try:
+        runner.write_retained_receipt(root / "outside.json", {"schema": "synthetic"})
+    except RuntimeError as exc:
+        assert str(exc) == "clinical composed E2E receipt output is unsafe"
+    else:
+        raise AssertionError("outside receipt output was accepted")
+    try:
+        runner.write_retained_receipt(output, {"schema": "synthetic"})
+    except RuntimeError as exc:
+        assert str(exc) == "clinical composed E2E receipt output is unsafe"
+    else:
+        raise AssertionError("existing receipt output was overwritten")

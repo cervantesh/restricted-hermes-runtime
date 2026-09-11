@@ -1,0 +1,35 @@
+{
+  "record_id": "SG-PHI-GOV-001-UNRESOLVED",
+  "schema": "sg-phi-gov-001-decision-payload.v1",
+  "sections": {
+    "1": {
+      "decision_frame": "UNRESOLVED",
+      "effective_decision": "NO-GO",
+      "evidence_manifest_digest": "UNRESOLVED"
+    },
+    "2": {
+      "exact_candidate_and_external_subjects": "UNRESOLVED"
+    },
+    "3": {
+      "allowed_flow_and_disabled_surfaces": "UNRESOLVED"
+    },
+    "4": {
+      "named_decision_roles": "UNRESOLVED"
+    },
+    "5": {
+      "evidence_register": "UNRESOLVED"
+    },
+    "6": {
+      "residual_risks_and_nonclaims": "UNRESOLVED"
+    },
+    "7": {
+      "pilot_limits_and_rollback": "UNRESOLVED"
+    },
+    "8": {
+      "independent_decision": "UNRESOLVED"
+    },
+    "9": {
+      "fail_closed_gate": "UNRESOLVED"
+    }
+  }
+}

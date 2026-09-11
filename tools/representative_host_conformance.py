@@ -91,6 +91,7 @@ def verify_receipt(
     expected_runtime_head: str,
     expected_runtime_tree: str,
     expected_candidate_manifest_sha256: str,
+    expected_subject_set_sha256: str,
     expected_egress_receipt_sha256: str,
     expected_outcome: str,
 ) -> list[str]:
@@ -126,6 +127,8 @@ def verify_receipt(
             errors.append("runtime-tree")
         if candidate["candidate_manifest_sha256"] != expected_candidate_manifest_sha256:
             errors.append("manifest")
+        if candidate["subject_set_sha256"] != expected_subject_set_sha256:
+            errors.append("subject-set")
     inputs = value["inputs"]
     if not _closed(inputs, {"container_egress_receipt_sha256"}) or not _sha256(inputs.get("container_egress_receipt_sha256")) or inputs.get("container_egress_receipt_sha256") != expected_egress_receipt_sha256:
         errors.append("egress")

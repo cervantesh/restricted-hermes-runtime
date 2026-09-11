@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import argparse
 import base64
 import importlib.util
 import json
@@ -17,6 +18,7 @@ import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -37,14 +39,17 @@ HRH_SHA = "e30a4f968de6727519f49c08369f561fdf269ec5"
 HRH_TREE = "7fb2543a2ceb1649f05c467b38708d1404106659"
 COMPOSE_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 SAFE_COMPOSE_PROCESS_ENV = (
-    "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG",
+    "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT",
     "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR",
 )
+WINDOWS_COMPOSE_DISCOVERY_ENV = ("ProgramFiles", "ProgramW6432")
 PROJECT = f"clinicale2e{os.getpid()}_{int(time.time())}"
 STATE = Path(tempfile.mkdtemp(prefix="clinical-composed-e2e-"))
 SEED = STATE / "seed"
 EVIDENCE = STATE / "evidence"
 ENV_FILE = STATE / "compose.env"
+DOCKER_CONFIG_DIR = STATE / "docker-config"
+DOCKER_CLIENT_TMP_DIR = STATE / "docker-tmp"
 CANDIDATE_MANIFEST = os.environ.get("RESTRICTED_IMMUTABLE_CANDIDATE_MANIFEST")
 
 
@@ -87,6 +92,27 @@ def run(
     return result
 
 
+def compose_process_environment(
+    environ: dict[str, str] | None = None,
+    platform_name: str | None = None,
+) -> dict[str, str]:
+    """Return the non-clinical process variables Docker needs to start.
+
+    Windows Docker CLI plugin discovery uses the installation-root variables.
+    They describe the local Docker installation; they are not caller-provided
+    compose configuration and therefore cannot override the sealed contract.
+    """
+    source = os.environ if environ is None else environ
+    name = os.name if platform_name is None else platform_name
+    process = {key: source[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in source}
+    if name == "nt":
+        discovery = {key: source[key] for key in WINDOWS_COMPOSE_DISCOVERY_ENV if key in source}
+        if not discovery:
+            raise RuntimeError("clinical composed E2E Docker Compose discovery is unavailable")
+        process.update(discovery)
+    return process
+
+
 def sealed_compose_environment() -> dict[str, str]:
     """Return only Docker transport variables plus the generated E2E contract.
 
@@ -106,7 +132,16 @@ def sealed_compose_environment() -> dict[str, str]:
         sealed[key] = value
     if not sealed:
         raise RuntimeError("clinical composed E2E environment is empty")
-    process = {key: os.environ[key] for key in SAFE_COMPOSE_PROCESS_ENV if key in os.environ}
+    DOCKER_CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    DOCKER_CLIENT_TMP_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    process = compose_process_environment()
+    # Compose may create buildx/client state.  Keep it below the disposable
+    # harness directory rather than consulting or mutating operator config.
+    process["DOCKER_CONFIG"] = str(DOCKER_CONFIG_DIR)
+    # Docker/Buildx uses TEMP/TMP on Windows for metadata files.  With neither
+    # variable present it can default to a protected system directory.
+    process["TEMP"] = str(DOCKER_CLIENT_TMP_DIR)
+    process["TMP"] = str(DOCKER_CLIENT_TMP_DIR)
     process.update(sealed)
     return process
 
@@ -148,6 +183,31 @@ def emit_public_debug(label: str, *_discarded: subprocess.CompletedProcess[str])
     material for a public test stream.
     """
     print(f"clinical_composed_e2e debug={label} details=omitted", file=sys.stderr)
+
+
+def write_retained_receipt(output: Path, evidence: dict[str, Any]) -> None:
+    """Atomically retain content-safe E2E evidence in the public evidence root."""
+    evidence_root = (ROOT / "docs" / "evidence").resolve()
+    try:
+        target = output.resolve(strict=False)
+    except OSError as exc:
+        raise RuntimeError("clinical composed E2E receipt output is unsafe") from exc
+    if target.parent != evidence_root or target.exists() or not evidence_root.is_dir():
+        raise RuntimeError("clinical composed E2E receipt output is unsafe")
+    raw = (json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+    temporary = target.with_name(target.name + f".{os.getpid()}.tmp")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except OSError as exc:
+        raise RuntimeError("clinical composed E2E receipt output is unavailable") from exc
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def make_certificates() -> None:
@@ -501,7 +561,7 @@ def scan_logs(canaries: dict[str, str]) -> str:
     return logs
 
 
-def main() -> None:
+def main(receipt_output: Path | None = None) -> None:
     global CREATED
     phase("prepare")
     prepare()
@@ -692,6 +752,7 @@ def main() -> None:
     phase("evidence")
     logs = scan_logs(_known_secret_canaries())
     evidence = {
+        "schema": "restricted-runtime-composed-e2e-receipt.v1",
         **SOURCE_FRAME,
         "runtime_product_sha": RUNTIME_PRODUCT_SHA,
         "images": image_evidence()["images"], "boundaries": boundaries,
@@ -722,6 +783,8 @@ def main() -> None:
     }
     _assert_no_secret_canaries([logs, json.dumps(evidence, sort_keys=True)], _known_secret_canaries())
     (EVIDENCE / "report.json").write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+    if receipt_output is not None:
+        write_retained_receipt(receipt_output, evidence)
     print(json.dumps(evidence, sort_keys=True))
     phase("cleanup")
     compose("down", "--volumes", "--remove-orphans", timeout=300)
@@ -733,4 +796,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--receipt-output", type=Path)
+    options = parser.parse_args()
+    main(options.receipt_output)

@@ -103,3 +103,16 @@ def test_egress_failure_packet_is_content_safe_and_outside_disposable_state():
     packet = next(line for line in harness.splitlines() if '"schema":"restricted-runtime-representative-clinical-egress-diagnostic.v1"' in line)
     for forbidden in ("$network", "$sink", "$state", "$project", "$controlled_"):
         assert forbidden not in packet
+
+
+def test_representative_egress_admits_the_host_before_any_docker_collection():
+    harness = (ROOT / "tests" / "deployment" / "test_representative_clinical_egress.sh").read_text(encoding="utf-8")
+
+    admission = '"$python_bin" "$runtime/tools/p2_host_platform_admission.py"'
+    assert admission in harness
+    assert harness.index(admission) < harness.index("docker info >/dev/null 2>&1")
+    assert 'representative-clinical-egress: DENIED class=unsupported-host' in harness
+    assert '[[ -z "${DOCKER_HOST:-}" && -z "${DOCKER_CONTEXT:-}" ]]' in harness
+    assert 'docker context inspect default --format' in harness
+    assert '"$docker_endpoint" == "unix:///var/run/docker.sock"' in harness
+    assert 'representative-clinical-egress: DENIED class=unsupported-docker-endpoint' in harness
