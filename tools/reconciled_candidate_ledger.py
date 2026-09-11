@@ -56,6 +56,13 @@ def _git(repo_root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _git_bytes(repo_root: Path, *args: str) -> bytes:
+    result = subprocess.run(["git", "-C", str(repo_root), *args], capture_output=True, check=False, timeout=30)
+    if result.returncode:
+        raise ValueError("git " + " ".join(args) + " failed")
+    return result.stdout
+
+
 def _tree(repo_root: Path, revision: str) -> str:
     return _git(repo_root, "rev-parse", f"{revision}^{{tree}}")
 
@@ -67,14 +74,22 @@ def _ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
     ).returncode == 0
 
 
-def _sha(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _sha_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _read_json_bytes(raw: bytes) -> dict[str, Any] | None:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -104,13 +119,13 @@ def build_ledger(*, repo_root: Path, candidate_revision: str) -> dict[str, Any]:
     ]
     receipts: list[dict[str, Any]] = []
     for name, relative, runtime_head, runtime_tree, _schema in RECEIPTS:
-        path = repo_root / relative
-        value = _read_json(path)
+        tracked = _git_bytes(repo_root, "show", f"HEAD:{relative}")
+        value = _read_json_bytes(tracked)
         source = _receipt_source(value) if value else None
         if source is None or source["runtime_head"] != runtime_head or source["runtime_tree"] != runtime_tree or any(source[key] != expected for key, expected in FROZEN_HRH_SOURCE.items()):
             raise ValueError(f"{name}: retained receipt has unexpected source")
         receipts.append({
-            "name": name, "path": relative, "sha256": _sha(path),
+            "name": name, "path": relative, "sha256": _sha_bytes(tracked),
             "source": source,
         })
     return {
@@ -186,11 +201,12 @@ def verify_ledger(raw: bytes, *, repo_root: Path) -> list[str]:
         source = _source(item.get("source"))
         if name in seen_receipts or expected is None or item.get("path") != expected[0] or not isinstance(item.get("sha256"), str) or not RAW_SHA.fullmatch(item["sha256"]) or source is None or source["runtime_head"] != expected[1] or source["runtime_tree"] != expected[2] or any(source[key] != expected_value for key, expected_value in FROZEN_HRH_SOURCE.items()):
             return ["receipts"]
-        path = (repo_root / item["path"]).resolve()
-        if not path.is_relative_to(repo_root.resolve()) or not path.is_file() or _sha(path) != item["sha256"]:
+        try:
+            tracked = _git_bytes(repo_root, "show", f"HEAD:{item['path']}")
+        except ValueError:
             return ["receipts"]
-        retained = _read_json(path)
-        if retained is None or retained.get("schema") != expected[3] or _receipt_source(retained) != source:
+        retained = _read_json_bytes(tracked)
+        if _sha_bytes(tracked) != item["sha256"] or retained is None or retained.get("schema") != expected[3] or _receipt_source(retained) != source:
             return ["receipts"]
         try:
             if _tree(repo_root, source["runtime_head"]) != source["runtime_tree"] or not _ancestor(repo_root, PRODUCT_SHA, source["runtime_head"]) or not _ancestor(repo_root, source["runtime_head"], candidate["revision"]):
