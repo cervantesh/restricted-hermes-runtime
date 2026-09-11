@@ -21,11 +21,10 @@ from typing import Any, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA = "restricted-runtime-reconciled-candidate-ledger.v1"
+SCHEMA = "restricted-runtime-reconciled-candidate-ledger.v2"
 SHA = re.compile(r"[0-9a-f]{40}")
 RAW_SHA = re.compile(r"[0-9a-f]{64}")
 SOURCE_KEYS = {"runtime_head", "runtime_tree", "hrh_head", "hrh_tree"}
-PRODUCT_SHA = "c0fc85d894700823deb92a085d36291589160028"
 REQUIRED_LINES = (
     ("immutable_candidate_base", "76cf83e9cbb75e614f0394ed26886b25c25177ec"),
     ("lifecycle_serialization", "a14e864fb2c944dc27b0a888a2523b07a79dd5f2"),
@@ -36,7 +35,7 @@ REQUIRED_LINES = (
     ("composed_compose_seal", "efcc2e0b04a5b59c9a9c51c95d4505636363e1bb"),
 )
 RECEIPTS = (
-    ("clinical_egress", "docs/evidence/clinical-egress-wsl-receipt-2026-09-11.json", "29c321cb06076e935833e01e7b7d4f70d6bf7c10", "565e2198d09f5a046a91b77ebe4c2a95f3351b2f", "restricted-runtime-clinical-egress-witness.v1"),
+    ("clinical_egress", "docs/evidence/clinical-egress-wsl-v2-receipt-2026-09-11.json", "4ff9699d7839c4d00be6aa6ef3fbcac95bc4c3b7", "9446b5559fc115be40109cd00b6c57779bba7c34", "restricted-runtime-clinical-egress-witness.v2"),
     ("clinical_composed", "docs/evidence/clinical-composed-receipt-2026-09-11.json", "14793b98d310fab44ef4bc22086c55039e279d46", "cc83f7c4cad7e6f4da063c4ce9fcc90ad90bce19", "restricted-runtime-composed-e2e-receipt.v1"),
 )
 FROZEN_HRH_SOURCE = {
@@ -104,7 +103,7 @@ def _source(value: object) -> dict[str, str] | None:
 
 def _receipt_source(value: dict[str, Any]) -> dict[str, str] | None:
     """Extract the source frame without pretending both receipt schemas match."""
-    if value.get("schema") == "restricted-runtime-clinical-egress-witness.v1":
+    if value.get("schema") in {"restricted-runtime-clinical-egress-witness.v1", "restricted-runtime-clinical-egress-witness.v2"}:
         candidate = value.get("candidate_receipt")
         return _source(candidate.get("source")) if isinstance(candidate, dict) else None
     return _source(value.get("source"))
@@ -134,8 +133,10 @@ def build_ledger(*, repo_root: Path, candidate_revision: str) -> dict[str, Any]:
         "candidate": {"revision": candidate_revision, "tree": candidate_tree},
         "required_source_lines": source_lines,
         "retained_receipts": receipts,
+        "historical_receipts_only": True,
         "claims": {
             "bounded_source_reconciliation": True,
+            "historical_receipts_are_candidate_evidence": False,
             "published_immutable_subjects_reverified": False,
             "representative_host_verified": False,
             "phi_authorized": False,
@@ -158,8 +159,8 @@ def verify_ledger(raw: bytes, *, repo_root: Path) -> list[str]:
     value = _canonical(raw)
     if value is None:
         return ["canonical"]
-    required_fields = {"schema", "synthetic_non_phi_only", "candidate", "required_source_lines", "retained_receipts", "claims"}
-    if set(value) != required_fields or value.get("schema") != SCHEMA or value.get("synthetic_non_phi_only") is not True:
+    required_fields = {"schema", "synthetic_non_phi_only", "candidate", "required_source_lines", "retained_receipts", "historical_receipts_only", "claims"}
+    if set(value) != required_fields or value.get("schema") != SCHEMA or value.get("synthetic_non_phi_only") is not True or value.get("historical_receipts_only") is not True:
         return ["schema"]
     candidate = value.get("candidate")
     if not isinstance(candidate, dict) or set(candidate) != {"revision", "tree"} or not isinstance(candidate["revision"], str) or not SHA.fullmatch(candidate["revision"]) or not isinstance(candidate["tree"], str) or not SHA.fullmatch(candidate["tree"]):
@@ -208,17 +209,18 @@ def verify_ledger(raw: bytes, *, repo_root: Path) -> list[str]:
         retained = _read_json_bytes(tracked)
         if _sha_bytes(tracked) != item["sha256"] or retained is None or retained.get("schema") != expected[3] or _receipt_source(retained) != source:
             return ["receipts"]
-        try:
-            if _tree(repo_root, source["runtime_head"]) != source["runtime_tree"] or not _ancestor(repo_root, PRODUCT_SHA, source["runtime_head"]) or not _ancestor(repo_root, source["runtime_head"], candidate["revision"]):
-                return ["receipts"]
-        except ValueError:
-            return ["receipts"]
+        # A receipt remains a record of its original execution even when the
+        # active candidate is rebased to repair an upstream evidence contract.
+        # Only named control lines are candidate-ancestry requirements. Retained
+        # receipt bytes and their closed source frame are historical provenance,
+        # never proof that this candidate executed.
         seen_receipts.add(name)
     if seen_receipts != set(expected_receipts):
         return ["receipts"]
     claims = value.get("claims")
     expected_claims = {
         "bounded_source_reconciliation": True,
+        "historical_receipts_are_candidate_evidence": False,
         "published_immutable_subjects_reverified": False,
         "representative_host_verified": False,
         "phi_authorized": False,

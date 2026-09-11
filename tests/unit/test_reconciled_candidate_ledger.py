@@ -11,7 +11,6 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RETAINED_A0_CANDIDATE = "49dca06b7a2e2b8134e2c4e426112e55fa73d0c3"
 SPEC = importlib.util.spec_from_file_location("reconciled_candidate_ledger", ROOT / "tools" / "reconciled_candidate_ledger.py")
 assert SPEC and SPEC.loader
 ledger = importlib.util.module_from_spec(SPEC)
@@ -30,7 +29,7 @@ def test_current_candidate_ledger_verifies() -> None:
 
 def test_ledger_can_be_retained_in_a_later_evidence_frame() -> None:
     """The evidence file need not exist in the tree of the code subject it binds."""
-    candidate = git(ROOT, "rev-parse", RETAINED_A0_CANDIDATE)
+    candidate = git(ROOT, "rev-parse", "HEAD~1")
     value = ledger.build_ledger(repo_root=ROOT, candidate_revision=candidate)
     assert value["candidate"]["revision"] == candidate
     assert ledger.verify_ledger(ledger.canonical_bytes(value), repo_root=ROOT) == []
@@ -44,12 +43,16 @@ def test_ledger_can_be_retained_in_a_later_evidence_frame() -> None:
     ),
 )
 def test_retained_candidate_ledgers_verify_from_the_evidence_frame(name: str) -> None:
-    raw = (ROOT / "docs" / "evidence" / name).read_bytes()
+    raw = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"HEAD:docs/evidence/{name}"],
+        capture_output=True,
+        check=True,
+    ).stdout
     assert ledger.verify_ledger(raw, repo_root=ROOT) == []
 
 
 def test_receipt_hashes_bind_committed_git_bytes_not_worktree_line_endings() -> None:
-    value = ledger.build_ledger(repo_root=ROOT, candidate_revision=RETAINED_A0_CANDIDATE)
+    value = ledger.build_ledger(repo_root=ROOT, candidate_revision=git(ROOT, "rev-parse", "HEAD"))
     for receipt in value["retained_receipts"]:
         tracked = subprocess.run(
             ["git", "-C", str(ROOT), "show", f"HEAD:{receipt['path']}"],
@@ -76,6 +79,16 @@ def test_candidate_ledger_rejects_retained_receipt_hash_or_claim_escalation() ->
     changed_claim = copy.deepcopy(value)
     changed_claim["claims"]["phi_authorized"] = True
     assert ledger.verify_ledger(ledger.canonical_bytes(changed_claim), repo_root=ROOT) == ["claims"]
+
+
+def test_candidate_ledger_rejects_v1_or_elevated_historical_receipt_claim() -> None:
+    value = ledger.build_ledger(repo_root=ROOT, candidate_revision=git(ROOT, "rev-parse", "HEAD"))
+    changed_schema = copy.deepcopy(value)
+    changed_schema["schema"] = "restricted-runtime-reconciled-candidate-ledger.v1"
+    assert ledger.verify_ledger(ledger.canonical_bytes(changed_schema), repo_root=ROOT) == ["schema"]
+    changed_scope = copy.deepcopy(value)
+    changed_scope["claims"]["historical_receipts_are_candidate_evidence"] = True
+    assert ledger.verify_ledger(ledger.canonical_bytes(changed_scope), repo_root=ROOT) == ["claims"]
 
 
 def test_candidate_ledger_rejects_fabricated_source_tree_or_hrh_frame() -> None:

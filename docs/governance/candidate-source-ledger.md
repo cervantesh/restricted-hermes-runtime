@@ -4,12 +4,16 @@
 
 This ledger is complete only when it canonically records the exact candidate
 revision and tree, the required bounded source lines and trees, and the hashes
-of retained real-path synthetic receipts. Verification must prove that every
-named source and receipt runtime revision is an ancestor of the candidate.
+and closed recorded source frames of retained real-path synthetic receipts.
+Verification must prove that every named control line is an ancestor of the
+candidate. Receipts remain historical execution records: their bytes, schema,
+and recorded source frame are closed, but they are never relabeled as an
+execution of a rebased candidate.
 
-It fails closed if a Git object, tree, receipt path, receipt hash, receipt
-source frame, required source line, or claim differs. It must preserve these
-limits: no published-subject re-verification, representative-host receipt,
+It fails closed if a candidate Git object/tree, required source line, receipt
+path/hash/schema/source frame, or claim differs. It must preserve these
+limits: retained historical receipts are not candidate-execution evidence, and
+there is no published-subject re-verification, representative-host receipt,
 PHI authorization, or deployment-conformance claim.
 
 ## Use
