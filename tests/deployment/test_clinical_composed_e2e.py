@@ -566,18 +566,21 @@ def main() -> None:
     control("send", "actor", "actor_dm", "018f22bb-414d-7cc4-b5a4-83cc8ec92cb1", "source-deleted")
     wait_grants(before)
     wait_delivery_delay()
-    ready_records = [row for row in paused_outbox_snapshot() if row.get("state") == "READY"]
-    if len(ready_records) != 1:
+    # Reauthorization is an external effect, so the executor claims the row
+    # before it begins.  The harness delay holds that call after the durable
+    # claim and before delivery; the payload must still be retained.
+    claimed_records = [row for row in paused_outbox_snapshot() if row.get("state") == "IN_FLIGHT"]
+    if len(claimed_records) != 1:
         raise RuntimeError(
-            "source-deletion barrier did not isolate exactly one READY outbox record "
-            f"(observed={len(ready_records)})"
+            "source-deletion barrier did not isolate exactly one IN_FLIGHT outbox record "
+            f"(observed={len(claimed_records)})"
         )
-    source_before = ready_records[0]
+    source_before = claimed_records[0]
     if source_before.get("reason") != "" or source_before.get("nonce_erased") or source_before.get("ciphertext_erased"):
-        raise RuntimeError("source-deletion READY record did not retain its encrypted payload")
+        raise RuntimeError("source-deletion claimed record did not retain its encrypted payload")
     source_record_tag = source_before.get("record_tag")
     if not isinstance(source_record_tag, str) or len(source_record_tag) != 64:
-        raise RuntimeError("source-deletion READY record tag was invalid")
+        raise RuntimeError("source-deletion claimed record tag was invalid")
     source_deletion = json.loads(control("delete-source", "source-deleted").stdout)
     control("mutate", "drop-crash-delay", timeout=60)
     wait_delivery_reauthorized("source-deleted")
