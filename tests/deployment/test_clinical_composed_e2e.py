@@ -37,7 +37,7 @@ HRH_SHA = "e30a4f968de6727519f49c08369f561fdf269ec5"
 HRH_TREE = "7fb2543a2ceb1649f05c467b38708d1404106659"
 COMPOSE_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 SAFE_COMPOSE_PROCESS_ENV = (
-    "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG",
+    "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT",
     "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR",
 )
 WINDOWS_COMPOSE_DISCOVERY_ENV = ("ProgramFiles", "ProgramW6432")
@@ -46,6 +46,7 @@ STATE = Path(tempfile.mkdtemp(prefix="clinical-composed-e2e-"))
 SEED = STATE / "seed"
 EVIDENCE = STATE / "evidence"
 ENV_FILE = STATE / "compose.env"
+DOCKER_CONFIG_DIR = STATE / "docker-config"
 CANDIDATE_MANIFEST = os.environ.get("RESTRICTED_IMMUTABLE_CANDIDATE_MANIFEST")
 
 
@@ -128,7 +129,11 @@ def sealed_compose_environment() -> dict[str, str]:
         sealed[key] = value
     if not sealed:
         raise RuntimeError("clinical composed E2E environment is empty")
+    DOCKER_CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     process = compose_process_environment()
+    # Compose may create buildx/client state.  Keep it below the disposable
+    # harness directory rather than consulting or mutating operator config.
+    process["DOCKER_CONFIG"] = str(DOCKER_CONFIG_DIR)
     process.update(sealed)
     return process
 

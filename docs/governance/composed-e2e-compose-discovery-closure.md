@@ -10,14 +10,16 @@ host-conformance change.
 ## Closure contract
 
 1. The child environment contains only the generated E2E contract, Docker
-   transport variables, and the minimum Windows installation-discovery
-   variables (`ProgramFiles` or `ProgramW6432`) required by Docker CLI plugin
-   discovery.
+   transport variables, a disposable Docker configuration directory, and the
+   minimum Windows installation-discovery variables (`ProgramFiles` or
+   `ProgramW6432`) required by Docker CLI plugin discovery.
 2. No inherited `CLINICAL_*` variable can override a value from the generated
    environment file.
 3. On Windows, absence of both discovery variables fails before a Compose
    command is attempted, with a content-free diagnostic.
-4. The actual `docker compose --env-file ... version` probe succeeds in the
+4. Docker's mutable client state is written below the harness temporary state,
+   never below the source checkout or an operator's Docker configuration.
+5. The actual `docker compose --env-file ... version` probe succeeds in the
    sealed environment before the expensive build is used as evidence.
 
 ## Negative controls
@@ -27,6 +29,7 @@ host-conformance change.
 - A Windows environment with neither discovery variable is rejected.
 - The probe must still include `--env-file`; falling back to an ambient process
   environment is inadmissible.
+- A probe that writes `.docker/` under the source checkout is inadmissible.
 
 ## Nonclaims
 

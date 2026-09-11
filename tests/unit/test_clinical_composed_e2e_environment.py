@@ -49,6 +49,7 @@ def test_compose_ignores_inherited_clinical_variables_and_uses_generated_e30_fra
     environment = captured["env"]
     assert environment["CLINICAL_HRH_ROOT"] == "/synthetic/hrh-e30"
     assert environment["CLINICAL_HRH_BUILD_SHA"] == E30_HRH_SHA
+    assert environment["DOCKER_CONFIG"] == str(runner.DOCKER_CONFIG_DIR)
     assert "CLINICAL_UNDECLARED_OVERRIDE" not in environment
     assert "/attacker/mixed-frame" not in environment.values()
     args = captured["args"]
