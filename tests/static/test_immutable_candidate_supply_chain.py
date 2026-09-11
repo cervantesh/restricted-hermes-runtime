@@ -7,9 +7,11 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -81,6 +83,11 @@ def _subject(name: str, image: str, lock: str, marker: str, repo_root: Path) -> 
         path = repo_root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value), encoding="utf-8")
+    artifacts = []
+    for raw in lock_bytes.decode("utf-8").splitlines():
+        match = re.fullmatch(r"([A-Za-z0-9_.-]+)==([^\s]+)\s+--hash=sha256:([0-9a-f]{64})", raw.strip())
+        if match:
+            artifacts.append({"name": match.group(1), "version": match.group(2), "sha256": match.group(3)})
     return {
         "name": name,
         "image": f"{image}@{digest}",
@@ -94,7 +101,7 @@ def _subject(name: str, image: str, lock: str, marker: str, repo_root: Path) -> 
         "dependency_lock": {
             "path": lock,
             "sha256": hashlib.sha256(lock_bytes).hexdigest(),
-            "artifacts": [{"name": "closed", "version": "1.0.0", "sha256": "c" * 64}],
+            "artifacts": artifacts,
         },
         "sbom": {
             "format": "spdxjson",
@@ -288,6 +295,19 @@ def test_candidate_verifier_accepts_matching_subjects_and_rejects_relational_fai
     wrong_lock["subjects"][0]["dependency_lock"]["sha256"] = "0" * 64
     assert any("hash does not match" in error for error in verifier.verify(wrong_lock, repo_root=tmp_path))
 
+    swapped_lock = copy.deepcopy(manifest)
+    adapter_lock = tmp_path / "requirements/immutable/clinical-adapter.txt"
+    swapped_lock["subjects"][0]["dependency_lock"] = {
+        "path": "requirements/immutable/clinical-adapter.txt",
+        "sha256": hashlib.sha256(adapter_lock.read_bytes()).hexdigest(),
+        "artifacts": [],
+    }
+    assert any("designated dependency lock" in error for error in verifier.verify(swapped_lock, repo_root=tmp_path))
+
+    missing_artifacts = copy.deepcopy(manifest)
+    missing_artifacts["subjects"][0]["dependency_lock"]["artifacts"] = []
+    assert any("dependency lock artifacts" in error for error in verifier.verify(missing_artifacts, repo_root=tmp_path))
+
     wrong_claim = copy.deepcopy(manifest)
     wrong_claim["evidence"]["phi_authorized"] = True
     assert any("phi_authorized" in error for error in verifier.verify(wrong_claim, repo_root=tmp_path))
@@ -325,6 +345,59 @@ def test_candidate_verifier_accepts_matching_subjects_and_rejects_relational_fai
     raw_path.write_text(json.dumps(raw_receipt), encoding="utf-8")
     empty_raw["subjects"][0]["provenance"]["verification"]["receipt_sha256"] = hashlib.sha256(raw_path.read_bytes()).hexdigest()
     assert any("raw verification does not name the exact subject" in error for error in verifier.verify(empty_raw, repo_root=tmp_path))
+
+
+def test_cli_reverifies_attestations_by_default_and_structure_only_is_non_success(tmp_path: Path, monkeypatch, capsys):
+    verifier = _load_verifier()
+    manifest = tmp_path / "candidate.json"
+    manifest.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(verifier, "verify", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(verifier, "verify_live_attestations", lambda *_args, **_kwargs: ["attestation authentication failed"])
+
+    assert verifier.main([str(manifest)]) == 1
+    assert "attestation authentication failed" in capsys.readouterr().err
+
+    assert verifier.main([str(manifest), "--offline-structure-only"]) == 3
+    assert "STRUCTURE ONLY" in capsys.readouterr().out
+
+
+def test_live_attestation_verifier_binds_exact_subject_workflow_source_and_predicate(tmp_path: Path, monkeypatch):
+    verifier = _load_verifier()
+    manifest = valid_manifest(tmp_path)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(verifier.shutil, "which", lambda _command: "gh")
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(verifier.subprocess, "run", run)
+    assert verifier.verify_live_attestations(manifest) == []
+    assert len(commands) == 4
+    for command in commands:
+        assert command[:3] == ["gh", "attestation", "verify"]
+        assert command[3].startswith("oci://ghcr.io/cervantesh/restricted-")
+        assert ["--repo", verifier.REPOSITORY] == command[4:6]
+        assert ["--signer-workflow", f"{verifier.REPOSITORY}/{verifier.WORKFLOW}"] == command[6:8]
+        assert "--bundle-from-oci" in command
+        source_index = command.index("--source-digest")
+        assert command[source_index + 1] == "d" * 40
+        predicate_index = command.index("--predicate-type")
+        assert command[predicate_index + 1] in {"https://slsa.dev/provenance/v1", "https://spdx.dev/Document/v2.3"}
+
+
+def test_live_attestation_verifier_does_not_expose_provider_output(tmp_path: Path, monkeypatch):
+    verifier = _load_verifier()
+    manifest = valid_manifest(tmp_path)
+    monkeypatch.setattr(verifier.shutil, "which", lambda _command: "gh")
+    monkeypatch.setattr(
+        verifier.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout="private output", stderr="private failure"),
+    )
+    errors = verifier.verify_live_attestations(manifest)
+    assert len(errors) == 4
+    assert all("private" not in error for error in errors)
 
 
 def test_actual_candidate_layout_receipts_build_and_verify_from_repo_root(tmp_path: Path):
@@ -367,8 +440,9 @@ def test_actual_candidate_layout_receipts_build_and_verify_from_repo_root(tmp_pa
     built = subprocess.run([sys.executable, str(ROOT / "tools" / "build_immutable_candidate_manifest.py"), "--repo-root", str(repo), "--source-revision", revision, "--run-url", run_url, "--subject-dir", str(candidate), "--test-receipts", str(candidate / "test-receipts.json"), "--verification-dir", str(verification), "--evidence", str(candidate / "candidate-evidence.json"), "--external-subjects", str(candidate / "external-subjects.json"), "--output", str(candidate / "candidate.manifest.json")], capture_output=True, text=True)
     assert built.returncode == 0, built.stderr
     assert json.loads((candidate / "candidate.manifest.json").read_text())["external_subjects"] == external_subjects
-    verified = subprocess.run([sys.executable, str(ROOT / "tools" / "verify_immutable_candidate.py"), str(candidate / "candidate.manifest.json"), "--repo-root", str(repo), "--closed-subjects-only"], capture_output=True, text=True)
-    assert verified.returncode == 0, verified.stderr
+    verified = subprocess.run([sys.executable, str(ROOT / "tools" / "verify_immutable_candidate.py"), str(candidate / "candidate.manifest.json"), "--repo-root", str(repo), "--closed-subjects-only", "--offline-structure-only"], capture_output=True, text=True)
+    assert verified.returncode == 3, verified.stderr
+    assert "STRUCTURE ONLY" in verified.stdout
 
 
 def test_published_subject_harnesses_pull_digest_and_never_build_when_digest_is_supplied():
