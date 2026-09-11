@@ -477,6 +477,206 @@ def test_delivery_reauthorization_failures_never_post_phi(tmp_path, status):
     assert rest.created == []
 
 
+def test_clinical_delivery_is_claimed_before_reauthorization_and_posts_once(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    source = rest.posts[ROOT]
+    record_tag = service.outbox.record_tag(service._clinical_envelope(source, PATIENT))
+    original = clinical.reauthorize_delivery
+    states = []
+
+    def reauthorize_after_claim(request):
+        durable = service.outbox.get(record_tag)
+        assert durable is not None
+        states.append(durable.state)
+        return original(request)
+
+    clinical.reauthorize_delivery = reauthorize_after_claim
+    service.handle(event(source, channel_type="D"))
+
+    durable = service.outbox.get(record_tag)
+    assert states == [DeliveryState.IN_FLIGHT]
+    assert durable is not None and durable.state is DeliveryState.DELIVERED
+    assert len(clinical.reauthorizations) == 1
+    assert conversation.calls == [] and len(rest.created) == 1
+
+
+def test_clinical_delivery_definitive_denial_after_claim_blocks_and_erases(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    source = rest.posts[ROOT]
+    record_tag = service.outbox.record_tag(service._clinical_envelope(source, PATIENT))
+
+    def denied(_request):
+        raise ClinicalAuthorizationDenied("denied")
+
+    clinical.reauthorize_delivery = denied
+    service.handle(event(source, channel_type="D"))
+
+    durable = service.outbox.get(record_tag)
+    assert durable is not None
+    assert durable.state is DeliveryState.BLOCKED
+    assert durable.reason == "delivery_authorization_denied"
+    assert durable.envelope is None
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_clinical_delivery_preclaim_transient_revalidation_stays_ready_and_retries(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    source = rest.posts[ROOT]
+    record_tag = service.outbox.record_tag(service._clinical_envelope(source, PATIENT))
+    original_revalidate = service._revalidate_clinical_envelope
+    revalidations = 0
+
+    def preclaim_timeout(envelope):
+        nonlocal revalidations
+        revalidations += 1
+        # The first validation guards the still-WAITING source before the
+        # clinical query. The second is the retryable pre-authorization check
+        # after mark_ready().
+        if revalidations == 2:
+            raise TimeoutError
+        return original_revalidate(envelope)
+
+    service._revalidate_clinical_envelope = preclaim_timeout
+    service.handle(event(source, channel_type="D"))
+
+    ready = service.outbox.get(record_tag)
+    assert ready is not None and ready.state is DeliveryState.READY
+    assert clinical.reauthorizations == [] and rest.created == []
+
+    service._revalidate_clinical_envelope = original_revalidate
+    service.executor.drain()
+    durable = service.outbox.get(record_tag)
+    assert durable is not None and durable.state is DeliveryState.DELIVERED
+    assert len(clinical.reauthorizations) == 1
+    assert conversation.calls == [] and len(rest.created) == 1
+
+
+def test_clinical_delivery_timeout_after_claim_is_immediately_ambiguous_without_retry(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    source = rest.posts[ROOT]
+    record_tag = service.outbox.record_tag(service._clinical_envelope(source, PATIENT))
+    calls = []
+
+    def timed_out(request):
+        calls.append(request)
+        raise TimeoutError
+
+    clinical.reauthorize_delivery = timed_out
+    service.handle(event(source, channel_type="D"))
+    durable = service.outbox.get(record_tag)
+    assert durable is not None and durable.state is DeliveryState.AMBIGUOUS
+    assert durable.reason == "delivery_authorization_unknown" and durable.envelope is None
+    service.executor.drain()
+    assert len(calls) == 1
+    assert conversation.calls == [] and rest.created == []
+
+    database = service.outbox.path
+    service.outbox.close()
+    with sqlite3.connect(database) as connection:
+        raw = connection.execute(
+            "SELECT nonce, ciphertext FROM records WHERE record_tag=?",
+            (record_tag,),
+        ).fetchone()
+    assert raw == (None, None)
+
+
+def test_crash_after_clinical_delivery_claim_never_reauthorizes_or_posts_after_restart(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    source = rest.posts[ROOT]
+    record_tag = service.outbox.record_tag(service._clinical_envelope(source, PATIENT))
+
+    def interrupted(_request):
+        raise KeyboardInterrupt
+
+    clinical.reauthorize_delivery = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        service.handle(event(source, channel_type="D"))
+    in_flight = service.outbox.get(record_tag)
+    assert in_flight is not None and in_flight.state is DeliveryState.IN_FLIGHT
+
+    service.outbox.close()
+    clinical.reauthorize_delivery = Clinical().reauthorize_delivery
+    reopened = MattermostOutbox.open(
+        tmp_path / "outbox", tmp_path / "outbox.key",
+        expected_fingerprint=service.policy.values["outbox_key_fingerprint"],
+    )
+    replacement = Ingress(service.policy, rest, conversation, reopened, clinical=clinical)
+    replacement.preflight()
+    durable = reopened.get(record_tag)
+    assert durable is not None and durable.state is DeliveryState.AMBIGUOUS
+    assert durable.reason == "restart_in_flight" and durable.envelope is None
+    assert conversation.calls == [] and rest.created == []
+    reopened.close()
+
+
+def test_restart_claim_is_erased_before_remote_preflight_failure(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    source = rest.posts[ROOT]
+    record_tag = service.outbox.record_tag(service._clinical_envelope(source, PATIENT))
+
+    clinical.reauthorize_delivery = lambda _request: (_ for _ in ()).throw(KeyboardInterrupt)
+    with pytest.raises(KeyboardInterrupt):
+        service.handle(event(source, channel_type="D"))
+    claimed = service.outbox.get(record_tag)
+    assert claimed is not None and claimed.state is DeliveryState.IN_FLIGHT
+
+    service.outbox.close()
+    rest.get_me = lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError)
+    reopened = MattermostOutbox.open(
+        tmp_path / "outbox", tmp_path / "outbox.key",
+        expected_fingerprint=service.policy.values["outbox_key_fingerprint"],
+    )
+    replacement = Ingress(service.policy, rest, conversation, reopened, clinical=clinical)
+    with pytest.raises(TimeoutError):
+        replacement.preflight()
+    durable = reopened.get(record_tag)
+    assert durable is not None and durable.state is DeliveryState.AMBIGUOUS
+    assert durable.reason == "restart_in_flight" and durable.envelope is None
+    reopened.close()
+
+
+def test_clinical_post_timeout_after_reauthorization_is_ambiguous_and_erased(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    source = rest.posts[ROOT]
+    record_tag = service.outbox.record_tag(service._clinical_envelope(source, PATIENT))
+    rest.create_post = lambda _body: (_ for _ in ()).throw(TimeoutError)
+
+    service.handle(event(source, channel_type="D"))
+
+    durable = service.outbox.get(record_tag)
+    assert durable is not None and durable.state is DeliveryState.AMBIGUOUS
+    assert durable.reason == "clinical_post_attempt_unconfirmed" and durable.envelope is None
+    assert len(clinical.reauthorizations) == 1
+    assert conversation.calls == [] and rest.created == []
+
+
+def test_clinical_postauthorization_transient_revalidation_is_immediately_ambiguous(tmp_path):
+    service, rest, conversation, clinical = clinical_ingress(tmp_path)
+    source = rest.posts[ROOT]
+    record_tag = service.outbox.record_tag(service._clinical_envelope(source, PATIENT))
+    original_revalidate = service._revalidate_clinical_envelope
+    revalidations = 0
+
+    def postauthorization_timeout(envelope):
+        nonlocal revalidations
+        revalidations += 1
+        # The third validation follows the query-time and pre-authorization
+        # checks, immediately after reauthorize_delivery().
+        if revalidations == 3:
+            raise TimeoutError
+        return original_revalidate(envelope)
+
+    service._revalidate_clinical_envelope = postauthorization_timeout
+    service.handle(event(source, channel_type="D"))
+
+    durable = service.outbox.get(record_tag)
+    assert durable is not None and durable.state is DeliveryState.AMBIGUOUS
+    assert durable.reason == "post_authorization_revalidation_unknown" and durable.envelope is None
+    service.executor.drain()
+    assert len(clinical.reauthorizations) == 1
+    assert conversation.calls == [] and rest.created == []
+
+
 def test_authoritative_query_denial_is_terminal_and_never_revives(tmp_path):
     service, rest, conversation, clinical = clinical_ingress(tmp_path)
     original = clinical.query
