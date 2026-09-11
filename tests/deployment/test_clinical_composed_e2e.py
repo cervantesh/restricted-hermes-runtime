@@ -630,8 +630,14 @@ def main() -> None:
     control("mutate", "drop-crash-delay", timeout=60)
     compose("up", "--detach", "ingress")
     wait_ingress()
-    control("expect", "crash-retry", "reply", timeout=60)
+    control("expect", "crash-retry", "no-reply", timeout=60)
     after_recovery = json.loads(control("grant-evidence", "crash-retry").stdout)
+    crash_records = [
+        row for row in paused_outbox_snapshot()
+        if row.get("state") == "AMBIGUOUS" and row.get("reason") == "stale_in_flight"
+    ]
+    if len(crash_records) != 1 or not crash_records[0].get("nonce_erased") or not crash_records[0].get("ciphertext_erased"):
+        raise RuntimeError("crash recovery did not retain exactly one erased stale-IN_FLIGHT tombstone")
     crash_invariants = {
         "response_digest_equal": after_recovery["response_digest"] == before_crash["response_digest"],
         "read_authorized": after_recovery["audits"].get("restricted_hermes_next_appointment_read_authorized", 0),
@@ -643,9 +649,9 @@ def main() -> None:
         "response_digest_equal": True,
         "read_authorized": 1,
         "read_completed": 1,
-        # The first server-side reauthorization commits after the client is
-        # killed; recovery must obtain a second fresh authorization before post.
-        "delivery_reauthorized": 2,
+        # The first reauthorization may complete at the server after the
+        # ingress dies, but recovery must never reissue or deliver it.
+        "delivery_reauthorized": 1,
     }:
         raise RuntimeError(
             "crash recovery invariant mismatch: " + json.dumps(crash_invariants, sort_keys=True)
