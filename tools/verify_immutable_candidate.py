@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -432,7 +433,12 @@ def verify_live_attestations(manifest: object, *, repo_root: Path = ROOT) -> lis
         # circular: this check necessarily observes the run before its own job
         # can conclude.  Instead, require the exact authenticated run to show
         # successful build-and-publish jobs for both declared subjects.  The
-        # workflow's final status remains a separate GitHub check.
+        # workflow's final status remains a separate GitHub check only while
+        # this very run is emitting its evidence.  A later verifier has no
+        # circularity excuse and must reject a failed run.
+        if os.environ.get("GITHUB_RUN_ID") != run_id and run.get("conclusion") != "success":
+            errors.append("authenticated workflow run did not complete successfully")
+            return errors
         try:
             result = subprocess.run(
                 ["gh", "api", f"repos/{REPOSITORY}/actions/runs/{run_id}/jobs"],
