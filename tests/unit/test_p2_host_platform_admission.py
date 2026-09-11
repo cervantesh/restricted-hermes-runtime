@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import platform
 from pathlib import Path
 
 import pytest
@@ -48,3 +49,12 @@ def test_cli_reduces_a_real_platform_rejection_to_a_content_safe_error(monkeypat
 
     assert module.main() == 2
     assert capsys.readouterr().err == "p2-host-admission: DENIED class=unsupported-host\n"
+
+
+@pytest.mark.skipif(platform.system() != "Linux", reason="live representative-platform admission is Linux-only")
+def test_live_linux_runner_must_satisfy_the_explicit_platform_gate(capsys):
+    """Exercise the real os-release path; this is platform parsing, not P2 proof."""
+    module = load_module()
+
+    assert module.main() == 0
+    assert capsys.readouterr().out == "p2-host-admission: PASS class=ubuntu-24.04-lts-x86_64\n"
