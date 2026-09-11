@@ -202,20 +202,79 @@ def fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def write_json_atomic(path: Path, value: Mapping[str, Any], *, mode: int) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+def _assert_owned_regular(path: Path, *, mode: int, label: str) -> None:
+    metadata = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SafetyError(f"{label} is not a regular file")
+    if os.name == "posix" and (
+        metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        raise SafetyError(f"{label} is not an operator-owned mode-{mode:04o} file")
+
+
+@contextlib.contextmanager
+def _atomic_write_lock(path: Path):
+    """Serialize marker cleanup and replacement without following lock links."""
+    lock = path.with_name(f".{path.name}.atomic.lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    created = False
     try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, path)
-        fsync_directory(path.parent)
+        fd = os.open(lock, flags | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        _assert_owned_regular(lock, mode=0o600, label="atomic marker lock")
+        fd = os.open(lock, flags)
+    try:
+        if created and hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SafetyError("atomic marker lock is not a regular file")
+        if os.name == "posix" and (
+            metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise SafetyError("atomic marker lock is not an operator-owned mode-0600 file")
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
     finally:
-        if tmp.exists():
-            tmp.unlink()
+        os.close(fd)
+
+
+def _discard_abandoned_atomic_temp(path: Path, *, mode: int) -> None:
+    """Remove only the legacy fixed temporary once its writer lock is held."""
+    try:
+        _assert_owned_regular(path, mode=mode, label="abandoned atomic temporary")
+    except FileNotFoundError:
+        return
+    path.unlink()
+    fsync_directory(path.parent)
+
+
+def write_json_atomic(path: Path, value: Mapping[str, Any], *, mode: int) -> None:
+    raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    with _atomic_write_lock(path):
+        # Randomize the owned temporary so a killed prior writer cannot block
+        # a later writer.  A legacy fixed temporary is cleaned only after the
+        # lock and ownership/type checks establish that it is safe to touch.
+        _discard_abandoned_atomic_temp(path.with_name(path.name + ".tmp"), mode=mode)
+        tmp = path.with_name(f".{path.name}.tmp-{secrets.token_hex(16)}")
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+        )
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, path)
+            fsync_directory(path.parent)
+        finally:
+            if tmp.exists():
+                _assert_owned_regular(tmp, mode=mode, label="atomic temporary")
+                tmp.unlink()
 
 
 def read_marker(state_dir: Path, project: str) -> dict[str, Any]:

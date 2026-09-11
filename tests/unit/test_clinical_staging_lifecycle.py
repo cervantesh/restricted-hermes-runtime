@@ -83,6 +83,29 @@ def test_marker_is_closed_and_binds_project_path_and_synthetic_purpose(tmp_path:
             module.read_marker(state, "clinicalstagingdemo")
 
 
+@pytest.mark.skipif(os.name != "posix", reason="atomic marker ownership is Linux/POSIX-only")
+def test_atomic_marker_write_recovers_legacy_temp_and_rejects_symlink(tmp_path: Path):
+    module = load_module()
+    marker = tmp_path / "staging-state.json"
+    stale = marker.with_name(marker.name + ".tmp")
+    first = {"phase": "first"}
+    second = {"phase": "second"}
+
+    stale.write_text('{"incomplete": true}\n', encoding="utf-8")
+    stale.chmod(0o600)
+    module.write_json_atomic(marker, first, mode=0o600)
+    assert json.loads(marker.read_text(encoding="utf-8")) == first
+    assert not stale.exists()
+
+    sentinel = tmp_path / "must-not-remove"
+    sentinel.write_text("retain", encoding="ascii")
+    stale.symlink_to(sentinel)
+    with pytest.raises(module.SafetyError, match="regular file"):
+        module.write_json_atomic(marker, second, mode=0o600)
+    assert sentinel.read_text(encoding="ascii") == "retain"
+    assert stale.is_symlink()
+
+
 def test_source_frame_requires_clean_runtime_ancestry_and_exact_clean_hrh(tmp_path: Path):
     module = load_module()
     runtime = tmp_path / "runtime"
