@@ -62,3 +62,9 @@ def test_candidate_ledger_writer_never_replaces_existing_output(tmp_path: Path) 
     with pytest.raises(FileExistsError):
         ledger.write_new(output, b"new")
     assert output.read_bytes() == b"existing"
+
+
+def test_contract_ci_keeps_history_required_for_ledger_ancestry() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    contracts = workflow.split("  synthetic-linux-e2e:", maxsplit=1)[0]
+    assert "fetch-depth: 0" in contracts
