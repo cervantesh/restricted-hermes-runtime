@@ -146,12 +146,12 @@ def build_receipt(evidence: Mapping[str, Any], *, cleanup_complete: bool) -> dic
         "source_deletion": deletion,
         "cleanup": {"completed": True},
     }
-    if verify_receipt(canonical_bytes(receipt), expected_source=source, expected_images=images):
+    if verify_receipt(canonical_bytes(receipt), expected_source=source, expected_images=images, expected_product=product):
         raise ValueError("composed E2E receipt is not admissible")
     return receipt
 
 
-def verify_receipt(raw: bytes, *, expected_source: Mapping[str, str], expected_images: Mapping[str, str]) -> list[str]:
+def verify_receipt(raw: bytes, *, expected_source: Mapping[str, str], expected_images: Mapping[str, str], expected_product: str) -> list[str]:
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError):
@@ -166,7 +166,7 @@ def verify_receipt(raw: bytes, *, expected_source: Mapping[str, str], expected_i
     source = _source(value["source"])
     if source is None or not _strict_equal(source, expected_source):
         return ["source"]
-    if not isinstance(value["runtime_product_sha"], str) or not _SHA.fullmatch(value["runtime_product_sha"]):
+    if not isinstance(value["runtime_product_sha"], str) or not _SHA.fullmatch(value["runtime_product_sha"]) or value["runtime_product_sha"] != expected_product:
         return ["product"]
     images = value["edge_image_subjects"]
     if not isinstance(images, dict) or set(images) != set(SERVICES) or not all(isinstance(image, str) and _DIGEST.fullmatch(image) for image in images.values()) or not _strict_equal(images, expected_images):

@@ -54,21 +54,22 @@ def evidence():
 def subjects(values):
     source = {key: values[key] for key in ("runtime_head", "runtime_tree", "hrh_head", "hrh_tree")}
     images = {name: values["built_images"][name]["image_id"] for name in ("clinical-adapter", "ingress")}
-    return source, images
+    return source, images, values["runtime_product_sha"]
 
 
 def test_builds_a_closed_content_safe_receipt():
     module = load_module()
     values = evidence()
-    source, images = subjects(values)
+    source, images, product = subjects(values)
     receipt = module.build_receipt(values, cleanup_complete=True)
     raw = module.canonical_bytes(receipt)
-    assert module.verify_receipt(raw, expected_source=source, expected_images=images) == []
+    assert module.verify_receipt(raw, expected_source=source, expected_images=images, expected_product=product) == []
     assert b"record_tag" not in raw and b"not-retained" not in raw
 
 
 @pytest.mark.parametrize("mutate, expected", [
     (lambda receipt: receipt["edge_image_subjects"].update(ingress="sha256:" + "2" * 64), "images"),
+    (lambda receipt: receipt.update(runtime_product_sha="2" * 40), "product"),
     (lambda receipt: receipt["boundaries"].update(edge_cannot_resolve_hrh=1), "boundaries"),
     (lambda receipt: receipt["source_deletion"]["after"].update(ciphertext_erased=1), "source-deletion"),
     (lambda receipt: receipt.update(raw_log="forbidden"), "fields"),
@@ -76,10 +77,10 @@ def test_builds_a_closed_content_safe_receipt():
 def test_rejects_substitution_and_non_boolean_claims(mutate, expected):
     module = load_module()
     values = evidence()
-    source, images = subjects(values)
+    source, images, product = subjects(values)
     receipt = deepcopy(module.build_receipt(values, cleanup_complete=True))
     mutate(receipt)
-    assert module.verify_receipt(module.canonical_bytes(receipt), expected_source=source, expected_images=images) == [expected]
+    assert module.verify_receipt(module.canonical_bytes(receipt), expected_source=source, expected_images=images, expected_product=product) == [expected]
 
 
 def test_builder_requires_completed_cleanup_and_exact_e2e_outcomes():
