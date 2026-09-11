@@ -100,10 +100,10 @@ def test_versioned_wsl_receipt_is_canonical_and_bound_to_its_recorded_subject():
     module = load_module()
     raw = (ROOT / "docs" / "evidence" / "clinical-egress-wsl-receipt-2026-09-11.json").read_bytes()
     expected = {
-        "runtime_head": "350afec376c7133a7caa5068f18e8c011bfe2f4a",
-        "runtime_tree": "9411109faad5f3baa22d0badba92c502bb75d788",
+        "runtime_head": "793feea781f2c9b70d0aa3f846c537826db889eb",
+        "runtime_tree": "83539372e8c46cc3ebccecf148a17304805fcf70",
         "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
         "hrh_tree": "f217b0b1cf7f438422528dfe178d81b78212c68b",
     }
     assert module.verify_receipt(raw, expected_source=expected) == []
-    assert hashlib.sha256(raw).hexdigest() == "833e63b36df9e2474991fdc1b79b281cd0ab21d4943124d38c347d965f990a28"
+    assert hashlib.sha256(raw).hexdigest() == "920284a6a411396f5befb5433a95e89fc6a0cb1d896aa85faf00e87a498ac914"
