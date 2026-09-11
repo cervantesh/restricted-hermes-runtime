@@ -202,7 +202,18 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
         if created_network:
             command("docker", "network", "rm", network, check=False)
         if initialized and (state / "staging-state.json").exists():
-            command(sys.executable, str(STAGING), "--runtime-root", str(ROOT), "--hrh-root", str(args.hrh_root), "--state-dir", str(state), "--project", project, "destroy", check=False, timeout=900)
+            destroyed = command(sys.executable, str(STAGING), "--runtime-root", str(ROOT), "--hrh-root", str(args.hrh_root), "--state-dir", str(state), "--project", project, "destroy", check=False, timeout=900)
+            if destroyed.returncode:
+                # A receipt cannot survive a failed teardown of the synthetic
+                # project that produced it.  Preserve only a fixed failure
+                # class; raw lifecycle output remains private and transient.
+                args.output.unlink(missing_ok=True)
+                if args.diagnostic is not None:
+                    args.diagnostic.write_bytes(json.dumps({"schema": "restricted-runtime-clinical-egress-diagnostic.v1", "phase": "staging-cleanup", "reason": "destroy"}, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+                    args.diagnostic.chmod(0o600)
+                print("clinical-egress-witness: DENIED phase=staging-cleanup", file=sys.stderr)
+                shutil.rmtree(scratch, ignore_errors=True)
+                raise SystemExit(2)
         shutil.rmtree(scratch, ignore_errors=True)
 
 
