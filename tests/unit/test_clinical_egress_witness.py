@@ -55,6 +55,13 @@ def test_selects_only_the_two_edge_image_subjects_from_full_staging_status():
     assert set(receipt["effective_images"]) == set(module.SERVICES)
 
 
+def test_accepts_a_normal_distribution_qualified_compose_version_without_accepting_content():
+    module = load_module()
+    values = list(inputs(module))
+    values[2]["compose"] = "2.40.3+ds1-0ubuntu1~24.04.1"
+    assert module.verify_receipt(module.canonical_bytes(module.build_receipt(*values)), expected_source=values[0]["source"]) == []
+
+
 @pytest.mark.parametrize("mutate, expected", [
     (lambda receipt: receipt["controlled_red"].update(ingress=False), "red"),
     (lambda receipt: receipt["cleanup"].update(sink_absent=False), "cleanup"),

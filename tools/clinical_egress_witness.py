@@ -24,7 +24,7 @@ EXPECTED_NETWORKS = {
     "clinical-adapter": ["clinical_upstream"],
     "ingress": ["mattermost_edge"],
 }
-_VERSION = re.compile(r"[A-Za-z0-9._+:/-]{1,160}")
+_VERSION = re.compile(r"[A-Za-z0-9._+:/~:-]{1,160}")
 _IMAGE = re.compile(r"sha256:[a-f0-9]{64}")
 
 
