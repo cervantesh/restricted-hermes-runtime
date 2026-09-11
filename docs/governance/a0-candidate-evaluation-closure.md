@@ -8,19 +8,19 @@ hosted synthetic evaluation. It is not an authorization record and does not
 permit PHI, a controlled pilot, or deployment on a representative host.
 
 The only admissible source subject is revision
-`3da46f930cc560e83328eadad44bc2127f772f53`, tree
-`f501f90f2b8bfe7dc5902dbea92f0e159bd70230`, as named by
-`docs/evidence/p2-collector-candidate-ledger-2026-09-11.json`. The ledger is
+`70217864aefc473759c739448831a8203ae81ded`, tree
+`73d10d5a90197a6e4984cc6b83e0a97f480e3869`, as named by
+`docs/evidence/p2-admission-candidate-ledger-2026-09-11.json`. The ledger is
 retained in a later evidence frame; it verifies the source subject's Git
 objects and ancestry but does not claim to be part of that source tree. This
-subject includes the candidate-bound P2 collector; it does not itself claim a
-P2 host receipt.
+subject includes the candidate-bound P2 collector and its pre-collection host
+and local-Docker admission control; it does not itself claim a P2 host receipt.
 
 ## Closure contract
 
 The execution is complete only if all conditions below hold:
 
-1. A new, unique `immutable-candidate-<date>-3da46f9` tag resolves exactly to
+1. A new, unique `immutable-candidate-<date>-7021786` tag resolves exactly to
    the subject revision. A previous tag or a moved tag is inadmissible.
 2. `Immutable clinical-edge candidate` completes successfully for that tag and
    produces digest-pinned `restricted-mattermost-ingress` and
