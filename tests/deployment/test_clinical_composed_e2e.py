@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import argparse
 import base64
 import importlib.util
 import json
@@ -25,6 +26,9 @@ from cryptography.x509.oid import NameOID
 
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from tools import clinical_composed_receipt
 HRH_ROOT_VALUE = os.environ.get("CLINICAL_E2E_HRH_ROOT")
 HRH_ROOT = Path(HRH_ROOT_VALUE).resolve() if HRH_ROOT_VALUE else None
 HARNESS = ROOT / "tests" / "deployment" / "clinical-composed-e2e"
@@ -492,8 +496,15 @@ def scan_logs() -> None:
         raise RuntimeError("container logs contain synthetic clinical identifiers")
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the synthetic composed clinical E2E")
+    parser.add_argument("--receipt", type=Path, help="new content-safe canonical receipt path")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
     global CREATED
+    args = parse_args(argv)
     phase("prepare")
     prepare()
     if PUBLISHED_SUBJECTS:
@@ -707,6 +718,9 @@ def main() -> None:
     CREATED = False
     shutil.rmtree(STATE)
     atexit.unregister(cleanup)
+    if args.receipt is not None:
+        receipt = clinical_composed_receipt.build_receipt(evidence, cleanup_complete=True)
+        clinical_composed_receipt.write_new(args.receipt, receipt)
     print("Clinical composed E2E: PASS", flush=True)
 
 
