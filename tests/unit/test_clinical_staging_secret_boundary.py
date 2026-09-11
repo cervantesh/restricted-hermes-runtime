@@ -76,6 +76,45 @@ def test_shell_failure_public_message_never_copies_child_output(monkeypatch: pyt
     assert all(canary not in public for canary in canaries.values())
 
 
+def test_composed_e2e_strips_host_clinical_environment_before_compose(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_composed_e2e(monkeypatch)
+    monkeypatch.setenv("CLINICAL_HRH_ROOT", "host-override-must-not-reach-compose")
+    monkeypatch.setenv("CLINICAL_POLICY_PUBLIC_KEY", "host-override-must-not-reach-compose")
+    monkeypatch.setenv("UNRELATED_OPERATOR_SETTING", "preserved")
+    observed: dict[str, object] = {}
+
+    def fake_run(*_args, **kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    module.compose("config", "--quiet")
+
+    env = observed["env"]
+    assert "CLINICAL_HRH_ROOT" not in env
+    assert "CLINICAL_POLICY_PUBLIC_KEY" not in env
+    assert env["UNRELATED_OPERATOR_SETTING"] == "preserved"
+
+
+def test_composed_e2e_sealed_environment_reaches_a_real_child_process(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_composed_e2e(monkeypatch)
+    monkeypatch.setenv("CLINICAL_HRH_ROOT", "host-override-must-not-reach-child")
+    monkeypatch.setenv("UNRELATED_OPERATOR_SETTING", "preserved")
+
+    result = module.run(
+        sys.executable,
+        "-c",
+        "import os; print(os.getenv('CLINICAL_HRH_ROOT')); print(os.getenv('UNRELATED_OPERATOR_SETTING'))",
+        env=module._sealed_compose_environment(),
+    )
+
+    assert result.stdout.splitlines() == ["None", "preserved"]
+
+
 def test_initial_admin_provisioner_never_passes_password_to_host_command_arguments(
     tmp_path: Path,
 ):

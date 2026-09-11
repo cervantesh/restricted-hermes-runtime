@@ -15,6 +15,7 @@ import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Mapping
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -64,16 +65,53 @@ CREATED = False
 SOURCE_FRAME: dict[str, str] = {}
 
 
-def run(*args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(args, cwd=ROOT, text=True, capture_output=True, timeout=timeout, check=False, encoding="utf-8", errors="replace")
+def run(
+    *args: str,
+    check: bool = True,
+    timeout: int = 300,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        args,
+        cwd=ROOT,
+        env=dict(env) if env is not None else None,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+        encoding="utf-8",
+        errors="replace",
+    )
     if check and result.returncode:
         command = Path(args[0]).name if args and Path(args[0]).name in {"docker", "git"} else "child"
         raise RuntimeError(f"command failed: {command} exit={result.returncode}")
     return result
 
 
+def _sealed_compose_environment() -> dict[str, str]:
+    """The generated ENV_FILE is the only `CLINICAL_*` Compose authority."""
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if not name.upper().startswith("CLINICAL_")
+    }
+
+
 def compose(*args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[str]:
-    return run("docker", "compose", "--env-file", str(ENV_FILE), "--project-name", PROJECT, "--file", str(COMPOSE_FILE), *args, check=check, timeout=timeout)
+    return run(
+        "docker",
+        "compose",
+        "--env-file",
+        str(ENV_FILE),
+        "--project-name",
+        PROJECT,
+        "--file",
+        str(COMPOSE_FILE),
+        *args,
+        check=check,
+        timeout=timeout,
+        env=_sealed_compose_environment(),
+    )
 
 
 def cleanup() -> None:
