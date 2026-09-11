@@ -15,7 +15,7 @@ generated synthetic fixtures.
 
 - Linux with Docker Engine and Compose v2.
 - A clean runtime checkout descending from
-  `c6c41a0980ed21de95d324c828ee9c5bb50cb8dd`.
+  `c0fc85d894700823deb92a085d36291589160028`.
 - A clean Health-Record-Hub checkout at exactly
   `ad13735e9881a48580a9e138daac137f8c865dea`.
 - A fresh absolute state directory outside either repository. Its basename must

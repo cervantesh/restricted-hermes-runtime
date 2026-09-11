@@ -242,6 +242,17 @@ def test_staging_source_frame_matches_composed_current_hrh_subject_and_rejects_p
         module.verify_source_frame(runtime, hrh, FakeGit(previous_head, current_tree))
 
 
+def test_runtime_ancestry_anchor_is_shared_by_lifecycle_composed_runner_and_runbook():
+    """A stack rebase must not leave either real entry path behind."""
+    module = load_module()
+    current_anchor = "c0fc85d894700823deb92a085d36291589160028"
+    runner = (ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py").read_text(encoding="utf-8")
+    readme = (ROOT / "deploy" / "clinical-staging" / "README.md").read_text(encoding="utf-8")
+    assert module.RUNTIME_BASE_SHA == current_anchor
+    assert f'RUNTIME_PRODUCT_SHA = "{current_anchor}"' in runner
+    assert current_anchor in readme
+
+
 def test_destructive_volume_guard_rejects_missing_labels_and_unexpected_project_volume():
     module = load_module()
     project = "clinicalstagingdemo"
