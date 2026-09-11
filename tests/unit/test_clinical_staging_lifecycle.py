@@ -535,6 +535,43 @@ def test_init_rejects_invalid_tls_lease_before_any_provisioning(
     assert provisioned == []
 
 
+def test_init_rechecks_tls_lease_after_build_before_seeding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    state.mkdir(mode=0o700)
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingdemo", 18443)
+    marker = {"lifecycle": "initializing"}
+    operations: list[str] = []
+    lease_checks = 0
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(module.os, "getuid", lambda: state.stat().st_uid, raising=False)
+    monkeypatch.setattr(module.stat, "S_IMODE", lambda _mode: 0o700)
+    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: {})
+    monkeypatch.setattr(staging, "_prepare_new_state", lambda _frame: marker)
+    monkeypatch.setattr(staging, "_create_volumes", lambda _marker: operations.append("volumes"))
+    monkeypatch.setattr(staging, "compose", lambda *args, **_kwargs: operations.append(args[0]))
+    monkeypatch.setattr(staging, "_build_images", lambda: operations.append("build"))
+
+    def lease(_marker):
+        nonlocal lease_checks
+        lease_checks += 1
+        if lease_checks == 2:
+            raise module.SafetyError("TLS lease expired during build")
+
+    monkeypatch.setattr(staging, "_require_tls_lease", lease)
+    monkeypatch.setattr(staging, "control", lambda *_args: pytest.fail("seed must not run after lease expiry"))
+
+    with pytest.raises(module.SafetyError, match="expired during build"):
+        staging.init()
+
+    assert operations == ["volumes", "config", "build"]
+
+
 def test_host_tls_probe_fails_closed_on_connection_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     module = load_module()
     runtime = tmp_path / "runtime"
@@ -688,7 +725,8 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
     staging = module.ClinicalStaging(runtime, hrh, state, project, 18443)
     monkeypatch.setattr(staging, "_require_linux", lambda: None)
     monkeypatch.setattr(staging, "_verify_marker_and_source", lambda: marker)
-    monkeypatch.setattr(staging, "_require_tls_lease", lambda _marker: None)
+    lease_checks: list[dict[str, object]] = []
+    monkeypatch.setattr(staging, "_require_tls_lease", lambda value: lease_checks.append(dict(value)))
     rows = _compose_rows(module)
     monkeypatch.setattr(staging, "_containers", lambda **_kwargs: rows)
     controller_checks: list[str] = []
@@ -774,6 +812,9 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
     assert result["network_exception"] == "operator-proxy only: operator_access is non-internal"
     assert result["ingress_started_at"] == "2026-09-06T15:00:00.000000000Z"
     assert "policy-live" in policy_controls
+    # The first failing status run checks at entry.  The succeeding run checks
+    # at entry and again immediately before writing its ready receipt.
+    assert len(lease_checks) == 3
     assert ingress_log_calls == [
         (
             "logs",

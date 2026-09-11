@@ -741,11 +741,16 @@ class ClinicalStaging:
         self._create_volumes(marker)
         self.compose("config", "--quiet")
         self._build_images()
+        # Builds can legitimately be long.  Do not copy an expired or
+        # substituted generation into volumes after that work completes.
+        self._require_tls_lease(marker)
         self.control("seed-volumes")
+        self._require_tls_lease(marker)
         self.compose("up", "--detach", "mattermost-postgres", "hrh-postgres", "hrh-migrate", timeout=900)
         migrated = self.compose("wait", "hrh-migrate", check=False, timeout=900)
         if migrated.returncode:
             raise CommandError("HRH migration did not complete successfully")
+        self._require_tls_lease(marker)
         self.compose("up", "--detach", "mattermost", timeout=600)
         self.control("wait-mm")
         password = (self.state_dir / "seed" / "admin_password").read_text(encoding="ascii")
@@ -769,10 +774,14 @@ class ClinicalStaging:
         )
         if public_key != env_public:
             raise SafetyError("provisioned policy public key differs from the sealed environment")
+        self._require_tls_lease(marker)
         self.compose("up", "--detach", *ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
         self.control("wait-mm")
         self.control("wait-hrh")
         marker["expected_images"] = self._built_images()
+        # The marker is a readiness claim, not merely a transition record.
+        # Recheck after all slow work and immediately before committing it.
+        self._require_tls_lease(marker)
         marker["lifecycle"] = "ready"
         self._write_marker(marker)
         self.up()
@@ -951,6 +960,9 @@ class ClinicalStaging:
         policy_digest = self.control("policy-live")
         if not re.fullmatch(r"[a-f0-9]{64}", policy_digest):
             raise SafetyError("live policy verification did not return a digest")
+        # Every preceding observation is only useful if the exact TLS
+        # generation remains current at the moment this receipt is written.
+        self._require_tls_lease(marker)
         evidence = {
             "schema": SCHEMA,
             "synthetic_only": True,
