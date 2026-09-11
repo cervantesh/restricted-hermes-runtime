@@ -633,7 +633,13 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
         )
 
     monkeypatch.setattr(staging, "compose", fake_compose)
-    monkeypatch.setattr(staging, "control", lambda command, *_args: "2" * 64 if command == "policy-digest" else "")
+    policy_controls: list[str] = []
+
+    def control(command, *_args):
+        policy_controls.append(command)
+        return "2" * 64 if command in {"policy-digest", "policy-live"} else ""
+
+    monkeypatch.setattr(staging, "control", control)
     monkeypatch.setattr(
         module,
         "write_json_atomic",
@@ -667,6 +673,7 @@ def test_status_requires_exact_images_and_sole_loopback_publisher(tmp_path: Path
     assert result["tls_probe"] == tls_probe
     assert result["network_exception"] == "operator-proxy only: operator_access is non-internal"
     assert result["ingress_started_at"] == "2026-09-06T15:00:00.000000000Z"
+    assert "policy-live" in policy_controls
     assert ingress_log_calls == [
         (
             "logs",

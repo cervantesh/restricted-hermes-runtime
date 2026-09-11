@@ -23,8 +23,9 @@ import psycopg
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from restricted_runtime.contracts import jcs_bytes
+from restricted_runtime.contracts import jcs_bytes, load_closed_json
 from restricted_runtime.mattermost_ingress import request_identity
+from restricted_runtime.mattermost_policy import MattermostPolicy
 from restricted_runtime.mattermost_outbox import MattermostOutbox, key_fingerprint
 
 
@@ -321,6 +322,16 @@ def policy_digest() -> str:
     return verify_policy_pair(INGRESS, policy_private().public_key())
 
 
+def policy_live() -> str:
+    """Verify the signed policy and its current validity window."""
+    digest = verify_policy_pair(INGRESS, policy_private().public_key())
+    values = load_closed_json((INGRESS / "policy.json").read_bytes())
+    if not isinstance(values, dict):
+        raise RuntimeError("policy is not an object")
+    MattermostPolicy(values, digest).validate()
+    return digest
+
+
 def initialize_outbox() -> None:
     if OUTBOX.exists():
         os.chmod(OUTBOX, 0o700)
@@ -567,6 +578,8 @@ def main() -> None:
         print(policy_digest())
     elif command == "policy-verify":
         print(policy_digest())
+    elif command == "policy-live":
+        print(policy_live())
     elif command == "public-key":
         print((STATE / "policy-public").read_text())
     elif command == "outbox-init":

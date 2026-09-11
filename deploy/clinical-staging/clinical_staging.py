@@ -812,6 +812,9 @@ class ClinicalStaging:
         current_images = self._built_images()
         if not marker["expected_images"] or current_images != marker["expected_images"]:
             raise SafetyError("running service image identities differ from initialized receipt")
+        policy_digest = self.control("policy-live")
+        if not re.fullmatch(r"[a-f0-9]{64}", policy_digest):
+            raise SafetyError("live policy verification did not return a digest")
         evidence = {
             "schema": SCHEMA,
             "synthetic_only": True,
@@ -820,7 +823,7 @@ class ClinicalStaging:
             "source": {key: marker[key] for key in ("runtime_head", "runtime_tree", "hrh_head", "hrh_tree")},
             "built_images": current_images,
             "compose_env_sha256": marker["compose_env_sha256"],
-            "policy_digest": self.control("policy-digest"),
+            "policy_digest": policy_digest,
             "lifecycle": "ready",
             "mattermost": f"https://127.0.0.1:{self.port}",
             "mattermost_publisher": publisher,
