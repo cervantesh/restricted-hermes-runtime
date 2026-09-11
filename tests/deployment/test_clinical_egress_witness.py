@@ -41,6 +41,15 @@ def write_json(path: Path, value: Any) -> None:
     path.chmod(0o600)
 
 
+def write_new(path: Path, value: Any) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def exact_absent(kind: str, name: str) -> bool:
     args = ("docker", kind, "ls", "--format", "{{.Names}}")
     if kind == "container":
@@ -70,8 +79,10 @@ def main(argv: list[str] | None = None) -> int:
     project = "clinicalstagingegress" + secrets.token_hex(6)
     state = scratch / f"{project}.synthetic-clinical-staging"
     network = project + "-red"
+    open_network = project + "-open-control"
     sink = project + "-sink"
-    created_network = created_sink = initialized = False
+    created_network = created_open_network = created_sink = initialized = False
+    target_ids: dict[str, str] = {}
     phase = "preflight"
     failure = "unknown"
 
@@ -95,12 +106,26 @@ def main(argv: list[str] | None = None) -> int:
             return 77
         created_network = True
         phase = "create-controlled-sink"
-        command("docker", "run", "--detach", "--name", sink, "--network", network, "--network-alias", "controlled-probe", "--network-alias", "synthetic-metadata-probe", SINK_IMAGE)
+        command("docker", "run", "--detach", "--name", sink, "--network", network, "--network-alias", "controlled-probe", "--network-alias", "synthetic-metadata-probe", "--publish", "80", SINK_IMAGE)
         created_sink = True
-        inspect = json.loads(command("docker", "inspect", sink).stdout)[0]["NetworkSettings"]["Networks"][network]
+        sink_inspect = json.loads(command("docker", "inspect", sink).stdout)[0]
+        inspect = sink_inspect["NetworkSettings"]["Networks"][network]
         controlled_v4, controlled_v6 = inspect["IPAddress"], inspect["GlobalIPv6Address"]
         if not controlled_v4 or not controlled_v6:
             print("clinical-egress-witness: SKIP controlled-ipv6-address-unavailable")
+            return 77
+        host_gateway = json.loads(command("docker", "network", "inspect", "bridge").stdout)[0]["IPAM"]["Config"][0]["Gateway"]
+        bindings = sink_inspect["NetworkSettings"]["Ports"].get("80/tcp")
+        if not isinstance(host_gateway, str) or not isinstance(bindings, list) or not bindings or not isinstance(bindings[0].get("HostPort"), str):
+            print("clinical-egress-witness: SKIP controlled-external-canary-unavailable")
+            return 77
+        host_port = bindings[0]["HostPort"]
+        phase = "create-open-control"
+        command("docker", "network", "create", open_network)
+        created_open_network = True
+        canary = command("docker", "run", "--rm", "--network", open_network, SINK_IMAGE, "sh", "-c", f"wget -q -T 3 -O /dev/null http://{host_gateway}:{host_port}", check=False)
+        if canary.returncode:
+            print("clinical-egress-witness: SKIP controlled-external-canary-unreachable")
             return 77
         probe = """import json,os,socket
 def v4(host, port):
@@ -130,6 +155,7 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
             target = compose("ps", "--quiet", service).stdout.strip()
             if not target:
                 raise RuntimeError("clinical egress witness failed: service lookup")
+            target_ids[service] = target
             command("docker", "network", "connect", network, target)
             try:
                 red[service] = service_probe(service, red=True) == {"reachable": True}
@@ -137,6 +163,13 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
                 command("docker", "network", "disconnect", network, target)
             if not red[service]:
                 raise RuntimeError("clinical egress witness failed: controlled RED was not reachable")
+        external: dict[str, bool] = {"open_control": True}
+        for service in SERVICES:
+            phase = "external-" + service
+            result = compose("exec", "--no-TTY", service, "python", "-c", f"import socket;s=socket.socket();s.settimeout(2);s.connect(('{host_gateway}',{host_port}));s.close()", check=False)
+            external[service] = result.returncode == 0
+        if external != {"open_control": True, **{service: False for service in SERVICES}}:
+            raise RuntimeError("clinical egress witness failed: controlled external path was not denied")
         phase = "green-status"
         status = staging("status")
         observations: dict[str, dict[str, dict[str, bool]]] = {}
@@ -171,7 +204,7 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
         if not exact_absent("container", sink) or not exact_absent("network", network):
             raise RuntimeError("clinical egress witness failed: cleanup")
         phase = "receipt"
-        inputs = {"status": status, "observations": observations, "environment": environment, "networks": networks, "red": red, "cleanup": {"network_absent": True, "sink_absent": True}}
+        inputs = {"status": status, "observations": observations, "environment": environment, "networks": networks, "red": red, "external": external, "cleanup": {"network_absent": True, "sink_absent": True}}
         for name, value in inputs.items():
             write_json(scratch / f"{name}.json", value)
         built = command(sys.executable, str(WITNESS), "build", *(item for name in inputs for item in (f"--{name}", str(scratch / f"{name}.json"))), "--output", str(args.output), check=False)
@@ -192,15 +225,30 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
         if args.diagnostic is not None:
             # This is intentionally the only retained failure diagnostic: it
             # contains a fixed phase name and no child output or local detail.
-            args.diagnostic.write_bytes(json.dumps({"schema": "restricted-runtime-clinical-egress-diagnostic.v1", "phase": phase, "reason": failure}, sort_keys=True, separators=(",", ":")).encode() + b"\n")
-            args.diagnostic.chmod(0o600)
+            write_new(args.diagnostic, {"schema": "restricted-runtime-clinical-egress-diagnostic.v1", "phase": phase, "reason": failure})
         print(f"clinical-egress-witness: DENIED phase={phase}", file=sys.stderr)
         return 2
     finally:
         if created_sink:
             command("docker", "container", "rm", "--force", sink, check=False)
         if created_network:
+            for target in target_ids.values():
+                command("docker", "network", "disconnect", "--force", network, target, check=False)
             command("docker", "network", "rm", network, check=False)
+        if created_open_network:
+            command("docker", "network", "rm", open_network, check=False)
+        controlled_cleanup_failed = (
+            (created_sink and not exact_absent("container", sink))
+            or (created_network and not exact_absent("network", network))
+            or (created_open_network and not exact_absent("network", open_network))
+        )
+        if controlled_cleanup_failed:
+            args.output.unlink(missing_ok=True)
+            if args.diagnostic is not None and not args.diagnostic.exists():
+                write_new(args.diagnostic, {"schema": "restricted-runtime-clinical-egress-diagnostic.v1", "phase": "controlled-cleanup", "reason": "cleanup"})
+            print("clinical-egress-witness: DENIED phase=controlled-cleanup", file=sys.stderr)
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise SystemExit(2)
         if initialized and (state / "staging-state.json").exists():
             destroyed = command(sys.executable, str(STAGING), "--runtime-root", str(ROOT), "--hrh-root", str(args.hrh_root), "--state-dir", str(state), "--project", project, "destroy", check=False, timeout=900)
             if destroyed.returncode:
@@ -209,8 +257,8 @@ print(json.dumps({'public_ipv4':v4('198.51.100.1',443),'public_ipv6':v6('2001:db
                 # class; raw lifecycle output remains private and transient.
                 args.output.unlink(missing_ok=True)
                 if args.diagnostic is not None:
-                    args.diagnostic.write_bytes(json.dumps({"schema": "restricted-runtime-clinical-egress-diagnostic.v1", "phase": "staging-cleanup", "reason": "destroy"}, sort_keys=True, separators=(",", ":")).encode() + b"\n")
-                    args.diagnostic.chmod(0o600)
+                    if not args.diagnostic.exists():
+                        write_new(args.diagnostic, {"schema": "restricted-runtime-clinical-egress-diagnostic.v1", "phase": "staging-cleanup", "reason": "destroy"})
                 print("clinical-egress-witness: DENIED phase=staging-cleanup", file=sys.stderr)
                 shutil.rmtree(scratch, ignore_errors=True)
                 raise SystemExit(2)

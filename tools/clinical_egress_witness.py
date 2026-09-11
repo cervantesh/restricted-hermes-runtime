@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Mapping
@@ -39,6 +40,17 @@ def _candidate():
 
 def canonical_bytes(value: Mapping[str, Any]) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+
+
+def write_new(path: Path, value: Mapping[str, Any]) -> None:
+    """Create a receipt once without following a caller-provided symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(canonical_bytes(value))
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _closed_mapping(value: object, keys: set[str]) -> dict[str, Any] | None:
@@ -85,7 +97,7 @@ def _images(status: Mapping[str, Any]) -> dict[str, str] | None:
 
 def build_receipt(
     status: Mapping[str, Any], observations: Mapping[str, Any], environment: Mapping[str, Any],
-    networks: Mapping[str, Any], red: Mapping[str, Any], cleanup: Mapping[str, Any],
+    networks: Mapping[str, Any], red: Mapping[str, Any], external: Mapping[str, Any], cleanup: Mapping[str, Any],
 ) -> dict[str, Any]:
     candidate = _candidate()
     candidate_receipt = candidate.build_receipt(status, observations)
@@ -93,6 +105,7 @@ def build_receipt(
     valid_environment = _environment(environment)
     valid_networks = _networks(networks)
     valid_red = _closed_mapping(red, set(SERVICES))
+    valid_external = _closed_mapping(external, {"open_control", *SERVICES})
     valid_cleanup = _closed_mapping(cleanup, {"network_absent", "sink_absent"})
     if images is None:
         raise ValueError("image-binding")
@@ -102,6 +115,8 @@ def build_receipt(
         raise ValueError("network-binding")
     if valid_red != {service: True for service in SERVICES}:
         raise ValueError("controlled RED observations are incomplete")
+    if valid_external != {"open_control": True, **{service: False for service in SERVICES}}:
+        raise ValueError("controlled external observations are incomplete")
     if valid_cleanup != {"network_absent": True, "sink_absent": True}:
         raise ValueError("controlled resource cleanup is incomplete")
     receipt = {
@@ -112,6 +127,7 @@ def build_receipt(
         "environment": valid_environment,
         "network_membership": valid_networks,
         "controlled_red": valid_red,
+        "controlled_external": valid_external,
         "cleanup": valid_cleanup,
     }
     if verify_receipt(canonical_bytes(receipt), expected_source=status.get("source")):
@@ -126,7 +142,7 @@ def verify_receipt(raw: bytes, *, expected_source: object) -> list[str]:
         return ["canonical"]
     if not isinstance(value, dict) or canonical_bytes(value) != raw:
         return ["canonical"]
-    if set(value) != {"schema", "synthetic_non_phi_only", "candidate_receipt", "effective_images", "environment", "network_membership", "controlled_red", "cleanup"}:
+    if set(value) != {"schema", "synthetic_non_phi_only", "candidate_receipt", "effective_images", "environment", "network_membership", "controlled_red", "controlled_external", "cleanup"}:
         return ["fields"]
     if value["schema"] != SCHEMA or value["synthetic_non_phi_only"] is not True:
         return ["schema"]
@@ -141,6 +157,8 @@ def verify_receipt(raw: bytes, *, expected_source: object) -> list[str]:
         return ["networks"]
     if value["controlled_red"] != {service: True for service in SERVICES}:
         return ["red"]
+    if value["controlled_external"] != {"open_control": True, **{service: False for service in SERVICES}}:
+        return ["external"]
     if value["cleanup"] != {"network_absent": True, "sink_absent": True}:
         return ["cleanup"]
     return []
@@ -157,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     build = sub.add_parser("build")
-    for name in ("status", "observations", "environment", "networks", "red", "cleanup"):
+    for name in ("status", "observations", "environment", "networks", "red", "external", "cleanup"):
         build.add_argument(f"--{name}", required=True, type=Path)
     build.add_argument("--output", required=True, type=Path)
     verify = sub.add_parser("verify")
@@ -166,8 +184,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "build":
-            receipt = build_receipt(*(_read(getattr(args, name)) for name in ("status", "observations", "environment", "networks", "red", "cleanup")))
-            args.output.write_bytes(canonical_bytes(receipt))
+            receipt = build_receipt(*(_read(getattr(args, name)) for name in ("status", "observations", "environment", "networks", "red", "external", "cleanup")))
+            write_new(args.output, receipt)
         else:
             errors = verify_receipt(args.receipt.read_bytes(), expected_source=_read(args.status).get("source"))
             if errors:
@@ -182,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
             "controlled RED observations are incomplete", "controlled resource cleanup is incomplete",
             "status is not an admissible candidate binding", "observations are not an admissible content-safe egress receipt",
             "candidate witness is not admissible", "canonical", "fields", "schema", "candidate-receipt",
-            "images", "environment", "networks", "red", "cleanup",
+            "images", "environment", "networks", "red", "external", "cleanup",
         }
         if reason not in allowed:
             reason = "input"

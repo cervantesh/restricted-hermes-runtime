@@ -36,7 +36,7 @@ def observations(module):
 
 
 def inputs(module):
-    return (status(module), observations(module), {"system": "Linux", "kernel": "6.8.0", "architecture": "x86_64", "docker": "29.4.3", "compose": "2.40.3"}, {"clinical-adapter": ["clinical_upstream"], "ingress": ["mattermost_edge"]}, {service: True for service in module.SERVICES}, {"network_absent": True, "sink_absent": True})
+    return (status(module), observations(module), {"system": "Linux", "kernel": "6.8.0", "architecture": "x86_64", "docker": "29.4.3", "compose": "2.40.3"}, {"clinical-adapter": ["clinical_upstream"], "ingress": ["mattermost_edge"]}, {service: True for service in module.SERVICES}, {"open_control": True, **{service: False for service in module.SERVICES}}, {"network_absent": True, "sink_absent": True})
 
 
 def test_builds_closed_content_safe_witness():
@@ -65,6 +65,7 @@ def test_accepts_a_normal_distribution_qualified_compose_version_without_accepti
 
 @pytest.mark.parametrize("mutate, expected", [
     (lambda receipt: receipt["controlled_red"].update(ingress=False), "red"),
+    (lambda receipt: receipt["controlled_external"].update(ingress=True), "external"),
     (lambda receipt: receipt["cleanup"].update(sink_absent=False), "cleanup"),
     (lambda receipt: receipt["network_membership"].update(ingress=["mattermost_edge", "red"]), "networks"),
     (lambda receipt: receipt["effective_images"].update(ingress="latest"), "images"),
