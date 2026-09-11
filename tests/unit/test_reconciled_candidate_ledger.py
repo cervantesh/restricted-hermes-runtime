@@ -39,6 +39,7 @@ def test_ledger_can_be_retained_in_a_later_evidence_frame() -> None:
     "name",
     (
         "reconciled-a0-candidate-ledger-2026-09-11.json",
+        "p2-collector-candidate-ledger-2026-09-11.json",
     ),
 )
 def test_retained_candidate_ledgers_verify_from_the_evidence_frame(name: str) -> None:
@@ -48,6 +49,21 @@ def test_retained_candidate_ledgers_verify_from_the_evidence_frame(name: str) ->
         check=True,
     ).stdout
     assert ledger.verify_ledger(raw, repo_root=ROOT) == []
+
+
+def test_p2_collector_ledger_names_the_immediately_preceding_candidate_subject() -> None:
+    raw = subprocess.run(
+        ["git", "-C", str(ROOT), "show", "HEAD:docs/evidence/p2-collector-candidate-ledger-2026-09-11.json"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    value = json.loads(raw)
+    candidate = git(ROOT, "rev-parse", "HEAD~1")
+
+    assert value["candidate"] == {
+        "revision": candidate,
+        "tree": git(ROOT, "rev-parse", f"{candidate}^{{tree}}"),
+    }
 
 
 def test_receipt_hashes_bind_committed_git_bytes_not_worktree_line_endings() -> None:
