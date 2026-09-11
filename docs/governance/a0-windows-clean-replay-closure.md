@@ -1,8 +1,8 @@
 # A0 Windows clean-replay closure card
 
-**Frame:** `A0-WINDOWS-REPLAY v1`  
-**Candidate:** `6bc01cbccb5f701e18ef8632eb1f0747e6451f26`  
-**Immutable tag:** `immutable-candidate-2026-09-11-6bc01cb`  
+**Frame:** `A0-WINDOWS-REPLAY v1`
+**Candidate:** `6bc01cbccb5f701e18ef8632eb1f0747e6451f26`
+**Immutable tag:** `immutable-candidate-2026-09-11-6bc01cb`
 **Published workflow:** [run 34650455783](https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/34650455783)
 
 ## Strict scope
