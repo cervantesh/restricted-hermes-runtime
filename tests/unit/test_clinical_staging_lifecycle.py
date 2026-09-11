@@ -131,6 +131,48 @@ def test_source_frame_requires_clean_runtime_ancestry_and_exact_clean_hrh(tmp_pa
         module.verify_source_frame(runtime, hrh, fake)
 
 
+def test_staging_source_frame_matches_composed_current_hrh_subject_and_rejects_previous_subject(
+    tmp_path: Path,
+):
+    """The operator lifecycle and composed runner must bind one HRH source."""
+    module = load_module()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    current_head = "ad13735e9881a48580a9e138daac137f8c865dea"
+    current_tree = "f217b0b1cf7f438422528dfe178d81b78212c68b"
+    previous_head = "89fea476ef95a0dfd3cd60a587ec6cb9e1d3aa1f"
+
+    class FakeGit:
+        def __init__(self, hrh_head: str, hrh_tree: str):
+            self.values = {
+                (runtime, "rev-parse", "HEAD"): "d" * 40,
+                (runtime, "rev-parse", "HEAD^{tree}"): "e" * 40,
+                (runtime, "status", "--porcelain=v1"): "",
+                (hrh, "rev-parse", "HEAD"): hrh_head,
+                (hrh, "rev-parse", "HEAD^{tree}"): hrh_tree,
+                (hrh, "status", "--porcelain=v1"): "",
+            }
+
+        def git(self, cwd: Path, *args: str) -> str:
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                return ""
+            return self.values[(cwd, *args)]
+
+    assert module.REQUIRED_HRH_SHA == current_head
+    assert module.REQUIRED_HRH_TREE == current_tree
+    runner = (ROOT / "tests" / "deployment" / "test_clinical_composed_e2e.py").read_text(encoding="utf-8")
+    readme = (ROOT / "deploy" / "clinical-staging" / "README.md").read_text(encoding="utf-8")
+    assert f'HRH_SHA = "{current_head}"' in runner
+    assert f'HRH_TREE = "{current_tree}"' in runner
+    assert current_head in readme
+    assert previous_head not in readme
+    assert module.verify_source_frame(runtime, hrh, FakeGit(current_head, current_tree))["hrh_head"] == current_head
+    with pytest.raises(module.SafetyError, match="HRH.*exact"):
+        module.verify_source_frame(runtime, hrh, FakeGit(previous_head, current_tree))
+
+
 def test_destructive_volume_guard_rejects_missing_labels_and_unexpected_project_volume():
     module = load_module()
     project = "clinicalstagingdemo"
