@@ -165,9 +165,9 @@ jobs:
             gh attestation verify "oci://$image" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/immutable-candidate.yml" --bundle-from-oci --source-digest "$GITHUB_SHA" --predicate-type https://spdx.dev/Document/v2.3 --format=json > "candidate-subjects/candidate-verification/$name.sbom.json"
             python tools/verify_published_attestations.py --image "$image" --source-revision "$GITHUB_SHA" --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --provenance "candidate-subjects/candidate-verification/$name.provenance.json" --sbom "candidate-subjects/candidate-verification/$name.sbom.json" --output "candidate-subjects/candidate-verification/$name.attestations.json"
           done
-      - name: Prove the bounded clinical adapter protocol remains closed
+      - name: Prove the bounded clinical adapter protocol in its published image
         id: clinical-protocol
-        run: python -m pytest tests/unit/test_clinical_adapter.py tests/integration/test_clinical_adapter_process.py
+        run: bash tests/deployment/test_clinical_adapter_image.sh
       - name: Run the published ingress through Mattermost ESR without rebuilding it
         id: mattermost-esr
         run: |
@@ -196,7 +196,7 @@ jobs:
               {"id": "subject-platform-source-inspection", "command": "python tools/inspect_published_subject.py (two digest-pinned subjects)", "outcome": "passed", "exit_code": 0},
               {"id": "provenance-predicate-verification", "command": "gh attestation verify --predicate-type https://slsa.dev/provenance/v1 (two exact OCI subjects)", "outcome": "passed", "exit_code": 0},
               {"id": "spdx-sbom-predicate-verification", "command": "gh attestation verify --predicate-type https://spdx.dev/Document/v2.3 (two exact OCI subjects)", "outcome": "passed", "exit_code": 0},
-              {"id": "clinical-protocol", "command": "python -m pytest tests/unit/test_clinical_adapter.py tests/integration/test_clinical_adapter_process.py", "outcome": "passed", "exit_code": 0},
+              {"id": "clinical-protocol", "command": "bash tests/deployment/test_clinical_adapter_image.sh (digest-pinned published adapter)", "outcome": "passed", "exit_code": 0},
               {"id": "mattermost-esr", "command": "python tests/deployment/test_mattermost_esr_staging.py", "outcome": "passed", "exit_code": 0},
           ]
           evidence = {"source_revision": "${{ github.sha }}", "workflow_run_url": url, "phi_authorized": False, "deployment_conformant": False, "commands": commands, "results": {item["id"]: item["outcome"] for item in commands}, "summary": {"passed": len(commands), "skipped": 0, "failed": 0}, "subject_digests": {name: item["digest"] for name, item in records.items()}}

@@ -42,6 +42,41 @@ def _error(errors: list[str], message: str) -> None:
     errors.append(message)
 
 
+def _attestation_entries(value: object) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [entry for entry in value if isinstance(entry, dict)]
+    if isinstance(value, dict) and isinstance(value.get("verificationResults"), list):
+        return [entry for entry in value["verificationResults"] if isinstance(entry, dict)]
+    return [value] if isinstance(value, dict) else []
+
+
+def _raw_names_subject(value: object, digest: str, predicate: str) -> bool:
+    for entry in _attestation_entries(value):
+        verification_result = _mapping(entry.get("verificationResult"))
+        statement = _mapping(verification_result.get("statement")) if verification_result else None
+        if statement is None or statement.get("predicateType") != predicate:
+            continue
+        subjects = statement.get("subject")
+        if not isinstance(subjects, list):
+            continue
+        for subject in subjects:
+            item = _mapping(subject)
+            digest_map = _mapping(item.get("digest")) if item else None
+            if digest_map and digest_map.get("sha256") == digest.removeprefix("sha256:"):
+                return True
+    return False
+
+
+def _raw_names_revision(value: object, revision: str) -> bool:
+    if value == revision:
+        return True
+    if isinstance(value, dict):
+        return any(_raw_names_revision(child, revision) for child in value.values())
+    if isinstance(value, list):
+        return any(_raw_names_revision(child, revision) for child in value)
+    return False
+
+
 def _read_hashed_json(repo_root: Path, relative: object, expected_hash: object, errors: list[str], context: str, *, object_required: bool = True) -> dict[str, Any] | object | None:
     if not isinstance(relative, str) or not _raw_hash(expected_hash):
         _error(errors, f"{context}: receipt reference and sha256 are required")
@@ -95,6 +130,10 @@ def _verify_attestation(errors: list[str], name: str, kind: str, value: object, 
     raw = _read_hashed_json(repo_root, part.get("raw_artifact"), part.get("raw_sha256"), errors, f"{name}: {kind} raw verification", object_required=False)
     if raw is None:
         return
+    if not _raw_names_subject(raw, digest, expected_predicate):
+        _error(errors, f"{name}: {kind} raw verification does not name the exact subject")
+    if kind == "provenance" and not _raw_names_revision(raw, source_revision):
+        _error(errors, f"{name}: provenance raw verification does not name the expected source revision")
 
 
 def _verify_platform(errors: list[str], name: str, item: dict[str, Any], image: str, digest: str, source_revision: str, run_url: str, repo_root: Path) -> None:
