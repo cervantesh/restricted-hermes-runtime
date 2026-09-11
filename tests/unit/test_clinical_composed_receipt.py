@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 from copy import deepcopy
 from pathlib import Path
@@ -107,3 +108,20 @@ def test_composed_runner_emits_a_receipt_only_after_successful_teardown():
     assert 'parser.add_argument("--receipt", type=Path' in runner
     assert runner.index('compose("down", "--volumes", "--remove-orphans"') < runner.index("build_receipt(evidence, cleanup_complete=True)")
     assert runner.index("build_receipt(evidence, cleanup_complete=True)") < runner.index("Clinical composed E2E: PASS")
+
+
+def test_versioned_composed_receipt_is_canonical_and_bound_to_its_subjects():
+    module = load_module()
+    raw = (ROOT / "docs" / "evidence" / "clinical-composed-receipt-2026-09-11.json").read_bytes().replace(b"\r\n", b"\n")
+    source = {
+        "runtime_head": "14793b98d310fab44ef4bc22086c55039e279d46",
+        "runtime_tree": "cc83f7c4cad7e6f4da063c4ce9fcc90ad90bce19",
+        "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
+        "hrh_tree": "f217b0b1cf7f438422528dfe178d81b78212c68b",
+    }
+    images = {
+        "clinical-adapter": "sha256:d15716b12846576175686928de84cb7c7b9c6ee3f1dca2034a618372ca59b99f",
+        "ingress": "sha256:2114445b55496a67eb71831d70889ac39a66f741d88eba7aeec99f0cfc731064",
+    }
+    assert module.verify_receipt(raw, expected_source=source, expected_images=images, expected_product="c0fc85d894700823deb92a085d36291589160028") == []
+    assert hashlib.sha256(raw).hexdigest() == "f126f48d8146efa9b9e877d56724b7d12a17ae476bab9c56e58e9d1db8597cc7"
