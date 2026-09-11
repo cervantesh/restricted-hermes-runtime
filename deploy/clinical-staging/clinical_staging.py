@@ -164,6 +164,7 @@ def new_marker(
     lifecycle: str = "initializing",
     expected_images: Mapping[str, str] | None = None,
     certificate_not_after: str,
+    tls_generation_sha256: str,
 ) -> dict[str, Any]:
     validate_state_path(state_dir, project)
     return {
@@ -181,6 +182,7 @@ def new_marker(
         "volumes": volume_names(project),
         "expected_images": dict(expected_images or {}),
         "certificate_not_after": certificate_not_after,
+        "tls_generation_sha256": tls_generation_sha256,
     }
 
 
@@ -221,6 +223,7 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         "schema", "synthetic_only", "project", "state_dir", "state_id",
         "compose_env_sha256", "lifecycle", "runtime_head", "runtime_tree",
         "hrh_head", "hrh_tree", "volumes", "expected_images", "certificate_not_after",
+        "tls_generation_sha256",
     }
     if set(value) != expected_keys:
         raise SafetyError("staging marker has unknown or missing fields")
@@ -236,6 +239,7 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         or value["lifecycle"] not in {"initializing", "ready", "stopped"}
         or not isinstance(value["expected_images"], dict)
         or not isinstance(value["certificate_not_after"], str)
+        or not re.fullmatch(r"[a-f0-9]{64}", value["tls_generation_sha256"])
     ):
         raise SafetyError("staging marker does not match the requested synthetic target")
     try:
@@ -496,6 +500,27 @@ def certificate_not_after(seed: Path) -> datetime:
     return min(expiries)
 
 
+TLS_GENERATION_FILES = (
+    "ca.crt", "mattermost.crt", "mattermost.key", "hrh-tls.crt", "hrh-tls.key",
+)
+
+
+def tls_generation_sha256(seed: Path) -> str:
+    """Hash the complete sealed TLS generation with unambiguous file framing."""
+    digest = hashlib.sha256()
+    try:
+        for name in TLS_GENERATION_FILES:
+            raw = (seed / name).read_bytes()
+            encoded_name = name.encode("ascii")
+            digest.update(len(encoded_name).to_bytes(2, "big"))
+            digest.update(encoded_name)
+            digest.update(len(raw).to_bytes(8, "big"))
+            digest.update(raw)
+    except OSError as exc:
+        raise SafetyError("synthetic TLS generation is missing or invalid") from exc
+    return digest.hexdigest()
+
+
 class ClinicalStaging:
     def __init__(self, runtime: Path, hrh: Path, state_dir: Path, project: str, port: int, shell: Shell | None = None):
         self.runtime = runtime.resolve()
@@ -659,12 +684,14 @@ class ClinicalStaging:
             (temporary / "evidence").mkdir(mode=0o700)
             self._seed_material(temporary)
             tls_expiry = certificate_not_after(temporary / "seed").isoformat()
+            tls_digest = tls_generation_sha256(temporary / "seed")
             marker = new_marker(
                 project=self.project,
                 state_dir=self.state_dir,
                 state_id=secrets.token_hex(16),
                 env_sha256="0" * 64,
                 certificate_not_after=tls_expiry,
+                tls_generation_sha256=tls_digest,
                 **frame,
             )
             values = self._env_values(marker, seed_root=temporary)
@@ -708,6 +735,9 @@ class ClinicalStaging:
         state_stat = self.state_dir.stat()
         if state_stat.st_uid != os.getuid() or stat.S_IMODE(state_stat.st_mode) != 0o700:
             raise SafetyError("state directory must be owned by the operator with mode 0700")
+        # This is deliberately before every provisioning or Compose operation.
+        # A resumed initializing marker must not start a stale TLS generation.
+        self._require_tls_lease(marker)
         self._create_volumes(marker)
         self.compose("config", "--quiet")
         self._build_images()
@@ -780,6 +810,8 @@ class ClinicalStaging:
         observed = certificate_not_after(self.state_dir / "seed")
         if observed != expected:
             raise SafetyError("staging marker TLS lease differs from sealed certificate material")
+        if tls_generation_sha256(self.state_dir / "seed") != marker["tls_generation_sha256"]:
+            raise SafetyError("staging marker TLS generation differs from sealed certificate material")
         if (now or datetime.now(UTC)) >= observed:
             raise SafetyError("synthetic TLS lease expired; initialize a fresh synthetic staging target")
 
