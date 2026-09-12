@@ -26,12 +26,17 @@ def test_current_candidate_ledger_verifies() -> None:
     assert ledger.verify_ledger(ledger.canonical_bytes(value), repo_root=ROOT) == []
 
 
-def test_ledger_can_be_retained_in_a_later_evidence_frame() -> None:
-    """The evidence file need not exist in the tree of the code subject it binds."""
-    candidate = git(ROOT, "rev-parse", "HEAD~1")
+def test_ledger_can_be_retained_outside_the_candidate_tree(tmp_path: Path) -> None:
+    """A later evidence frame is bound by its named revision, not `HEAD~1`."""
+    # Pull-request CI checks out a synthetic merge commit, whose first parent is
+    # the base branch rather than the candidate branch.  Using HEAD~1 here made
+    # the test validate CI topology, not retained-ledger semantics.
+    candidate = git(ROOT, "rev-parse", "HEAD")
     value = ledger.build_ledger(repo_root=ROOT, candidate_revision=candidate)
+    retained = tmp_path / "later-evidence-frame.json"
+    retained.write_bytes(ledger.canonical_bytes(value))
     assert value["candidate"]["revision"] == candidate
-    assert ledger.verify_ledger(ledger.canonical_bytes(value), repo_root=ROOT) == []
+    assert ledger.verify_ledger(retained.read_bytes(), repo_root=ROOT) == []
 
 
 @pytest.mark.parametrize(
