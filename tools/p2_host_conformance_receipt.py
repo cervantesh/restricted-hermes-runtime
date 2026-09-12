@@ -118,19 +118,30 @@ def _proofs(value: object) -> dict[str, str] | None:
     return dict(value)
 
 
-def build_receipt(evidence: Mapping[str, Any]) -> dict[str, Any]:
+def _proof_hashes(evidence_dir: Path) -> dict[str, str]:
+    if not evidence_dir.is_dir():
+        raise ValueError("proofs")
+    result: dict[str, str] = {}
+    for name in CONTROL_NAMES:
+        path = evidence_dir / f"{name}.json"
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("proofs")
+        result[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return result
+
+
+def build_receipt(evidence: Mapping[str, Any], *, expected_candidate: Mapping[str, Any], evidence_dir: Path) -> dict[str, Any]:
     candidate = _candidate(evidence.get("candidate"))
     host = _host(evidence.get("host"))
     controls = _controls(evidence.get("controls"))
-    proofs = _proofs(evidence.get("proofs"))
-    if candidate is None:
+    expected = _candidate(expected_candidate)
+    if candidate is None or expected is None or not _strict_equal(candidate, expected):
         raise ValueError("candidate evidence is incomplete")
     if host is None:
         raise ValueError("host evidence is incomplete")
     if controls is None:
         raise ValueError("controls are incomplete")
-    if proofs is None:
-        raise ValueError("proof digests are incomplete")
+    proofs = _proof_hashes(evidence_dir)
     receipt = {
         "schema": SCHEMA,
         "synthetic_non_phi_only": True,
@@ -140,12 +151,12 @@ def build_receipt(evidence: Mapping[str, Any]) -> dict[str, Any]:
         "controls": controls,
         "proofs": proofs,
     }
-    if verify_receipt(canonical_bytes(receipt), expected_candidate=candidate):
+    if verify_receipt(canonical_bytes(receipt), expected_candidate=candidate, evidence_dir=evidence_dir):
         raise ValueError("P2 receipt is not admissible")
     return receipt
 
 
-def verify_receipt(raw: bytes, *, expected_candidate: Mapping[str, Any]) -> list[str]:
+def verify_receipt(raw: bytes, *, expected_candidate: Mapping[str, Any], evidence_dir: Path) -> list[str]:
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError):
@@ -166,7 +177,12 @@ def verify_receipt(raw: bytes, *, expected_candidate: Mapping[str, Any]) -> list
         return ["host"]
     if _controls(value["controls"]) is None:
         return ["controls"]
-    if _proofs(value["proofs"]) is None:
+    proofs = _proofs(value["proofs"])
+    try:
+        actual_proofs = _proof_hashes(evidence_dir)
+    except (OSError, ValueError):
+        actual_proofs = None
+    if proofs is None or actual_proofs is None or not _strict_equal(proofs, actual_proofs):
         return ["proofs"]
     return []
 
@@ -184,19 +200,20 @@ def main(argv: list[str] | None = None) -> int:
     action.add_argument("--evidence", type=Path)
     action.add_argument("--verify", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--candidate", type=Path)
+    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--proof-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.evidence:
-            if args.output is None or args.candidate is not None:
+            if args.output is None:
                 raise ValueError("input")
-            receipt = build_receipt(_read_object(args.evidence))
+            receipt = build_receipt(_read_object(args.evidence), expected_candidate=_read_object(args.candidate), evidence_dir=args.proof_dir)
             write_new(args.output, receipt)
             print("p2-host-conformance: PASS receipt_sha256=" + hashlib.sha256(canonical_bytes(receipt)).hexdigest())
             return 0
-        if args.candidate is None or args.output is not None:
+        if args.output is not None:
             raise ValueError("input")
-        errors = verify_receipt(args.verify.read_bytes(), expected_candidate=_read_object(args.candidate))
+        errors = verify_receipt(args.verify.read_bytes(), expected_candidate=_read_object(args.candidate), evidence_dir=args.proof_dir)
         if errors:
             raise ValueError("receipt")
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):

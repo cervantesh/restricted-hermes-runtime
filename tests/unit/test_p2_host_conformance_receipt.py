@@ -55,17 +55,36 @@ def evidence(module):
             "cleanup": {"green": "pass", "non_owned_resource": "deny"},
             "replay": {"independent": "pass"},
         },
-        "proofs": {name: "c" * 64 for name in module.CONTROL_NAMES},
     }
 
 
-def test_builds_a_closed_canonical_receipt_bound_to_all_required_controls():
+def proof_dir(tmp_path):
+    root = tmp_path / "proofs"
+    root.mkdir(parents=True)
+    for name in load_module().CONTROL_NAMES:
+        (root / f"{name}.json").write_bytes(f"proof:{name}\n".encode("ascii"))
+    return root
+
+
+def receipt(module, tmp_path):
+    values = evidence(module)
+    return module.build_receipt(
+        values,
+        expected_candidate=values["candidate"],
+        evidence_dir=proof_dir(tmp_path),
+    )
+
+
+def test_builds_a_closed_canonical_receipt_bound_to_all_required_controls(tmp_path):
     module = load_module()
-    value = module.build_receipt(evidence(module))
+    values = evidence(module)
+    proofs = proof_dir(tmp_path)
+    value = module.build_receipt(values, expected_candidate=values["candidate"], evidence_dir=proofs)
     raw = module.canonical_bytes(value)
     assert module.verify_receipt(
         raw,
-        expected_candidate=evidence(module)["candidate"],
+        expected_candidate=values["candidate"],
+        evidence_dir=proofs,
     ) == []
     assert b"endpoint" not in raw and b"token" not in raw and b"credential" not in raw
 
@@ -79,20 +98,20 @@ def test_builds_a_closed_canonical_receipt_bound_to_all_required_controls():
     (lambda value: value["claims"].update({"phi_authorized": True}), "claims"),
     (lambda value: value.update({"raw_log": "forbidden"}), "fields"),
 ])
-def test_rejects_subject_substitution_incomplete_matrix_claim_escalation_and_extra_fields(mutate, expected):
+def test_rejects_subject_substitution_incomplete_matrix_claim_escalation_and_extra_fields(mutate, expected, tmp_path):
     module = load_module()
     source = evidence(module)
-    receipt = module.build_receipt(source)
-    mutate(receipt)
-    assert module.verify_receipt(module.canonical_bytes(receipt), expected_candidate=source["candidate"]) == [expected]
+    value = receipt(module, tmp_path)
+    mutate(value)
+    assert module.verify_receipt(module.canonical_bytes(value), expected_candidate=source["candidate"], evidence_dir=tmp_path / "proofs") == [expected]
 
 
-def test_builder_refuses_any_missing_or_noncanonical_control_evidence():
+def test_builder_refuses_any_missing_or_noncanonical_control_evidence(tmp_path):
     module = load_module()
     values = evidence(module)
     values["controls"]["secrets"]["rotation"] = "deny"
     with pytest.raises(ValueError, match="controls"):
-        module.build_receipt(values)
+        module.build_receipt(values, expected_candidate=values["candidate"], evidence_dir=proof_dir(tmp_path))
 
 
 def test_writer_does_not_replace_existing_receipt(tmp_path):
@@ -100,16 +119,17 @@ def test_writer_does_not_replace_existing_receipt(tmp_path):
     output = tmp_path / "receipt.json"
     output.write_bytes(b"sentinel")
     with pytest.raises(FileExistsError):
-        module.write_new(output, module.build_receipt(evidence(module)))
+        module.write_new(output, receipt(module, tmp_path))
     assert output.read_bytes() == b"sentinel"
 
 
-def test_receipt_is_immutable_from_caller_mutation():
+def test_receipt_is_immutable_from_caller_mutation(tmp_path):
     module = load_module()
     values = evidence(module)
-    receipt = module.build_receipt(values)
-    receipt["controls"]["cleanup"]["green"] = "deny"
-    assert module.build_receipt(values)["controls"]["cleanup"]["green"] == "pass"
+    value = receipt(module, tmp_path)
+    value["controls"]["cleanup"]["green"] = "deny"
+    next_proofs = proof_dir(tmp_path / "next")
+    assert module.build_receipt(values, expected_candidate=values["candidate"], evidence_dir=next_proofs)["controls"]["cleanup"]["green"] == "pass"
 
 
 def test_cli_builds_and_verifies_without_echoing_source_inputs(tmp_path, capsys):
@@ -118,12 +138,13 @@ def test_cli_builds_and_verifies_without_echoing_source_inputs(tmp_path, capsys)
     evidence_path = tmp_path / "evidence.json"
     candidate_path = tmp_path / "candidate.json"
     output = tmp_path / "receipt.json"
+    proofs = proof_dir(tmp_path)
     evidence_path.write_text(json.dumps(values), encoding="utf-8")
     candidate_path.write_text(json.dumps(values["candidate"]), encoding="utf-8")
 
-    assert module.main(["--evidence", str(evidence_path), "--output", str(output)]) == 0
+    assert module.main(["--evidence", str(evidence_path), "--candidate", str(candidate_path), "--proof-dir", str(proofs), "--output", str(output)]) == 0
     assert capsys.readouterr().out.startswith("p2-host-conformance: PASS receipt_sha256=")
-    assert module.main(["--verify", str(output), "--candidate", str(candidate_path)]) == 0
+    assert module.main(["--verify", str(output), "--candidate", str(candidate_path), "--proof-dir", str(proofs)]) == 0
     assert capsys.readouterr().out == "p2-host-conformance: PASS\n"
 
 
@@ -131,7 +152,9 @@ def test_cli_denies_invalid_input_without_echoing_its_contents(tmp_path, capsys)
     module = load_module()
     evidence_path = tmp_path / "evidence.json"
     evidence_path.write_text('{"secret":"must-not-echo"}', encoding="utf-8")
-    assert module.main(["--evidence", str(evidence_path), "--output", str(tmp_path / "receipt.json")]) == 2
+    candidate_path = tmp_path / "candidate.json"
+    candidate_path.write_text(json.dumps(evidence(module)["candidate"]), encoding="utf-8")
+    assert module.main(["--evidence", str(evidence_path), "--candidate", str(candidate_path), "--proof-dir", str(proof_dir(tmp_path)), "--output", str(tmp_path / "receipt.json")]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "p2-host-conformance: DENIED class=input\n"
