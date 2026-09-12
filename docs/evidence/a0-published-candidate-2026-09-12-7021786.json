@@ -1,0 +1,35 @@
+{
+  "schema": "restricted-runtime-a0-published-candidate.v1",
+  "synthetic_non_phi_only": true,
+  "candidate": {
+    "revision": "70217864aefc473759c739448831a8203ae81ded",
+    "tree": "73d10d5a90197a6e4984cc6b83e0a97f480e3869",
+    "tag": "immutable-candidate-2026-09-12-7021786"
+  },
+  "workflow": {
+    "run_id": "34703552764",
+    "run_url": "https://github.com/cervantesh/restricted-hermes-runtime/actions/runs/34703552764",
+    "conclusion": "success"
+  },
+  "published_subjects": [
+    "ghcr.io/cervantesh/restricted-mattermost-ingress@sha256:5dbc4a7e17910f62fdcba1162328eefc7e185c2cffe8c81eeb31eefae1e98fd1",
+    "ghcr.io/cervantesh/restricted-clinical-adapter@sha256:50ade779752dfcefd135b75ee7058afb1d2051c95643423652cdbe7a7754163c"
+  ],
+  "artifact": {
+    "name": "immutable-candidate-evidence",
+    "candidate_manifest_sha256": "cf2e089e8baf4979c9ab293e1acd53d45ac7675fe01e6fae91359a358aed3c0d",
+    "published_subjects_sha256": "6fe9828122944a4fc080a9f4bf72a2ec3a06006c61aed0158cef41f0c680893f",
+    "test_receipts_sha256": "30cdeb543024910f38d2a4db897989642a138fee2e37f2a98edf440a96417ef0"
+  },
+  "clean_windows_replay": {
+    "verifier_revision": "59e2bcc5db2a4e157a0072170e3ce842f1954d6c",
+    "candidate_checkout": "immutable-candidate-2026-09-12-7021786",
+    "command": "python tools/verify_immutable_candidate.py candidate-subjects/candidate.manifest.json --repo-root <clean-candidate-checkout> --closed-subjects-only",
+    "result": "PASS"
+  },
+  "claims": {
+    "phi_authorized": false,
+    "deployment_conformant": false,
+    "clinical_ready": false
+  }
+}
