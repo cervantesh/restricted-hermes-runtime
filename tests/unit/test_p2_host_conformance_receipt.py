@@ -16,8 +16,8 @@ RUNTIME_TREE = "3" * 40
 HRH_HEAD = "a" * 40
 HRH_TREE = "f" * 40
 SUBJECTS = {
-    "clinical-adapter": "sha256:" + "5" * 64,
-    "mattermost-ingress": "sha256:" + "d" * 64,
+    "restricted-clinical-adapter": "sha256:" + "5" * 64,
+    "restricted-mattermost-ingress": "sha256:" + "d" * 64,
 }
 
 
@@ -90,7 +90,7 @@ def test_builds_a_closed_canonical_receipt_bound_to_all_required_controls(tmp_pa
 
 
 @pytest.mark.parametrize("mutate, expected", [
-    (lambda value: value["candidate"]["subjects"].update({"mattermost-ingress": "sha256:" + "0" * 64}), "candidate"),
+    (lambda value: value["candidate"]["subjects"].update({"restricted-mattermost-ingress": "sha256:" + "0" * 64}), "candidate"),
     (lambda value: value["host"].update({"architecture": "arm64"}), "host"),
     (lambda value: value["controls"]["egress"].update({"metadata": "pass"}), "controls"),
     (lambda value: value["controls"].pop("replay"), "controls"),
@@ -118,7 +118,7 @@ def test_builder_refuses_a_self_reported_candidate_that_differs_from_the_externa
     module = load_module()
     values = evidence(module)
     expected = deepcopy(values["candidate"])
-    values["candidate"]["subjects"]["clinical-adapter"] = "sha256:" + "0" * 64
+    values["candidate"]["subjects"]["restricted-clinical-adapter"] = "sha256:" + "0" * 64
     with pytest.raises(ValueError, match="candidate"):
         module.build_receipt(values, expected_candidate=expected, evidence_dir=proof_dir(tmp_path))
 
