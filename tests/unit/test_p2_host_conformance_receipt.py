@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -58,11 +59,13 @@ def evidence(module):
     }
 
 
-def proof_dir(tmp_path):
+def proof_dir(tmp_path, module, values):
     root = tmp_path / "proofs"
     root.mkdir(parents=True)
-    for name in load_module().CONTROL_NAMES:
-        (root / f"{name}.json").write_bytes(f"proof:{name}\n".encode("ascii"))
+    candidate_sha256 = hashlib.sha256(module.canonical_bytes(values["candidate"])).hexdigest()
+    for name in module.CONTROL_NAMES:
+        proof = {"schema": module.PROOF_SCHEMA, "control": name, "candidate_sha256": candidate_sha256, "outcomes": values["controls"][name]}
+        (root / f"{name}.json").write_bytes(module.canonical_bytes(proof))
     return root
 
 
@@ -71,14 +74,14 @@ def receipt(module, tmp_path):
     return module.build_receipt(
         values,
         expected_candidate=values["candidate"],
-        evidence_dir=proof_dir(tmp_path),
+        evidence_dir=proof_dir(tmp_path, module, values),
     )
 
 
 def test_builds_a_closed_canonical_receipt_bound_to_all_required_controls(tmp_path):
     module = load_module()
     values = evidence(module)
-    proofs = proof_dir(tmp_path)
+    proofs = proof_dir(tmp_path, module, values)
     value = module.build_receipt(values, expected_candidate=values["candidate"], evidence_dir=proofs)
     raw = module.canonical_bytes(value)
     assert module.verify_receipt(
@@ -111,7 +114,7 @@ def test_builder_refuses_any_missing_or_noncanonical_control_evidence(tmp_path):
     values = evidence(module)
     values["controls"]["secrets"]["rotation"] = "deny"
     with pytest.raises(ValueError, match="controls"):
-        module.build_receipt(values, expected_candidate=values["candidate"], evidence_dir=proof_dir(tmp_path))
+        module.build_receipt(values, expected_candidate=values["candidate"], evidence_dir=proof_dir(tmp_path, module, values))
 
 
 def test_builder_refuses_a_self_reported_candidate_that_differs_from_the_external_frame(tmp_path):
@@ -120,13 +123,13 @@ def test_builder_refuses_a_self_reported_candidate_that_differs_from_the_externa
     expected = deepcopy(values["candidate"])
     values["candidate"]["subjects"]["restricted-clinical-adapter"] = "sha256:" + "0" * 64
     with pytest.raises(ValueError, match="candidate"):
-        module.build_receipt(values, expected_candidate=expected, evidence_dir=proof_dir(tmp_path))
+        module.build_receipt(values, expected_candidate=expected, evidence_dir=proof_dir(tmp_path, module, values))
 
 
 def test_verifier_rejects_a_sidecar_altered_after_receipt_generation(tmp_path):
     module = load_module()
     values = evidence(module)
-    proofs = proof_dir(tmp_path)
+    proofs = proof_dir(tmp_path, module, values)
     value = module.build_receipt(values, expected_candidate=values["candidate"], evidence_dir=proofs)
     (proofs / "egress.json").write_bytes(b"altered")
     assert module.verify_receipt(module.canonical_bytes(value), expected_candidate=values["candidate"], evidence_dir=proofs) == ["proofs"]
@@ -146,7 +149,7 @@ def test_receipt_is_immutable_from_caller_mutation(tmp_path):
     values = evidence(module)
     value = receipt(module, tmp_path)
     value["controls"]["cleanup"]["green"] = "deny"
-    next_proofs = proof_dir(tmp_path / "next")
+    next_proofs = proof_dir(tmp_path / "next", module, values)
     assert module.build_receipt(values, expected_candidate=values["candidate"], evidence_dir=next_proofs)["controls"]["cleanup"]["green"] == "pass"
 
 
@@ -156,7 +159,7 @@ def test_cli_builds_and_verifies_without_echoing_source_inputs(tmp_path, capsys)
     evidence_path = tmp_path / "evidence.json"
     candidate_path = tmp_path / "candidate.json"
     output = tmp_path / "receipt.json"
-    proofs = proof_dir(tmp_path)
+    proofs = proof_dir(tmp_path, module, values)
     evidence_path.write_text(json.dumps(values), encoding="utf-8")
     candidate_path.write_text(json.dumps(values["candidate"]), encoding="utf-8")
 
@@ -172,10 +175,21 @@ def test_cli_denies_invalid_input_without_echoing_its_contents(tmp_path, capsys)
     evidence_path.write_text('{"secret":"must-not-echo"}', encoding="utf-8")
     candidate_path = tmp_path / "candidate.json"
     candidate_path.write_text(json.dumps(evidence(module)["candidate"]), encoding="utf-8")
-    assert module.main(["--evidence", str(evidence_path), "--candidate", str(candidate_path), "--proof-dir", str(proof_dir(tmp_path)), "--output", str(tmp_path / "receipt.json")]) == 2
+    invalid_values = evidence(module)
+    assert module.main(["--evidence", str(evidence_path), "--candidate", str(candidate_path), "--proof-dir", str(proof_dir(tmp_path, module, invalid_values)), "--output", str(tmp_path / "receipt.json")]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "p2-host-conformance: DENIED class=input\n"
+
+
+def test_builder_rejects_a_canonical_sidecar_with_wrong_control_outcomes(tmp_path):
+    module = load_module()
+    values = evidence(module)
+    proofs = proof_dir(tmp_path, module, values)
+    candidate_sha256 = hashlib.sha256(module.canonical_bytes(values["candidate"])).hexdigest()
+    (proofs / "egress.json").write_bytes(module.canonical_bytes({"schema": module.PROOF_SCHEMA, "control": "egress", "candidate_sha256": candidate_sha256, "outcomes": {"green": "pass"}}))
+    with pytest.raises(ValueError, match="proof"):
+        module.build_receipt(values, expected_candidate=values["candidate"], evidence_dir=proofs)
 
 
 def test_candidate_frame_is_derived_from_the_exact_tag_clean_sources_and_published_manifest(tmp_path, monkeypatch):
