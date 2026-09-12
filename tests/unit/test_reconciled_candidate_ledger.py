@@ -40,6 +40,7 @@ def test_ledger_can_be_retained_in_a_later_evidence_frame() -> None:
     (
         "reconciled-a0-candidate-ledger-2026-09-11.json",
         "p2-collector-candidate-ledger-2026-09-11.json",
+        "p2-admission-candidate-ledger-2026-09-11.json",
     ),
 )
 def test_retained_candidate_ledgers_verify_from_the_evidence_frame(name: str) -> None:
@@ -51,8 +52,15 @@ def test_retained_candidate_ledgers_verify_from_the_evidence_frame(name: str) ->
     assert ledger.verify_ledger(raw, repo_root=ROOT) == []
 
 
-def test_p2_collector_ledger_names_the_immediately_preceding_candidate_subject() -> None:
-    path = "docs/evidence/p2-collector-candidate-ledger-2026-09-11.json"
+@pytest.mark.parametrize(
+    "name",
+    (
+        "p2-collector-candidate-ledger-2026-09-11.json",
+        "p2-admission-candidate-ledger-2026-09-11.json",
+    ),
+)
+def test_p2_candidate_ledgers_name_their_immediately_preceding_candidate_subject(name: str) -> None:
+    path = "docs/evidence/" + name
     raw = subprocess.run(
         ["git", "-C", str(ROOT), "show", f"HEAD:{path}"],
         capture_output=True,
@@ -66,6 +74,66 @@ def test_p2_collector_ledger_names_the_immediately_preceding_candidate_subject()
         "revision": candidate,
         "tree": git(ROOT, "rev-parse", f"{candidate}^{{tree}}"),
     }
+
+
+def test_a0_card_is_bound_to_the_p2_admission_candidate_and_its_real_guard() -> None:
+    ledger_path = "docs/evidence/p2-admission-candidate-ledger-2026-09-11.json"
+    raw = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"HEAD:{ledger_path}"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    candidate = json.loads(raw)["candidate"]
+    card = subprocess.run(
+        ["git", "-C", str(ROOT), "show", "HEAD:docs/governance/a0-candidate-evaluation-closure.md"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    assert candidate["revision"] in card
+    assert candidate["tree"] in card
+    assert "immutable-candidate-<date>-" + candidate["revision"][:7] in card
+
+    admission = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"{candidate['revision']}:tools/p2_host_platform_admission.py"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    harness = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"{candidate['revision']}:tests/deployment/test_representative_clinical_egress.sh"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    assert "ubuntu-24.04-lts-x86_64" in admission
+    assert "systemd-detect-virt" in admission
+    assert "container_detected=_container_detected()" in admission
+    assert "p2_host_platform_admission.py" in harness
+    assert harness.index("p2_host_platform_admission.py") < harness.index("docker info")
+    assert harness.index("DOCKER_HOST") < harness.index("docker info")
+
+    workflow = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"{candidate['revision']}:.github/workflows/immutable-candidate.yml"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    assert "push:" in workflow
+    assert "tags:" in workflow
+    assert "immutable-candidate-*" in workflow
+    assert "restricted-mattermost-ingress" in workflow
+    assert "restricted-clinical-adapter" in workflow
+    assert "--closed-subjects-only" in workflow
+    for path in (
+        "Dockerfile.mattermost-ingress",
+        "Dockerfile.clinical-adapter",
+        "tools/verify_immutable_candidate.py",
+    ):
+        subprocess.run(
+            ["git", "-C", str(ROOT), "cat-file", "-e", f"{candidate['revision']}:{path}"],
+            check=True,
+        )
 
 
 def test_receipt_hashes_bind_committed_git_bytes_not_worktree_line_endings() -> None:
