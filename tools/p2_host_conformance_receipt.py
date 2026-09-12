@@ -8,6 +8,7 @@ host observations privately. It does not itself execute privileged host work.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -19,6 +20,7 @@ from typing import Any, Mapping
 
 SCHEMA = "restricted-runtime-p2-host-conformance.v1"
 HOST_CLASS = "ubuntu-24.04-lts-x86_64"
+IMMUTABLE_TAG = "immutable-candidate-2026-09-12-7021786"
 CONTROL_NAMES = (
     "admission", "subjects", "secrets", "egress",
     "trust_audit_retention", "recovery", "cleanup", "replay",
@@ -32,6 +34,7 @@ _CLAIMS = {
     "deployment_conformant": False,
     "independent_assessment": False,
 }
+_SUBJECT_NAMES = {"restricted-clinical-adapter", "restricted-mattermost-ingress"}
 _CONTROL_EXPECTATIONS = {
     "admission": {"green": "pass", "unsupported_topology": "deny", "remote_docker": "deny", "unapproved_action": "deny"},
     "subjects": {"green": "pass", "missing": "deny", "substituted": "deny", "mutable": "deny"},
@@ -80,13 +83,73 @@ def _candidate(value: object) -> dict[str, Any] | None:
     if not all(isinstance(value[key], str) and _SHA.fullmatch(value[key]) for key in ("runtime_head", "runtime_tree", "hrh_head", "hrh_tree")):
         return None
     subjects = value["subjects"]
-    if not isinstance(subjects, dict) or set(subjects) != {"restricted-clinical-adapter", "restricted-mattermost-ingress"}:
+    if not isinstance(subjects, dict) or set(subjects) != _SUBJECT_NAMES:
         return None
     if not all(isinstance(digest, str) and _DIGEST.fullmatch(digest) for digest in subjects.values()):
         return None
     if not isinstance(value["manifest_sha256"], str) or not _HEX256.fullmatch(value["manifest_sha256"]):
         return None
     return deepcopy(value)
+
+
+def _git(path: Path, *args: str) -> str:
+    import subprocess
+
+    result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, encoding="utf-8", errors="strict", timeout=30, check=False)
+    if result.returncode:
+        raise ValueError("candidate")
+    return result.stdout.strip()
+
+
+def _required_hrh(runtime: Path) -> tuple[str, str]:
+    path = runtime / "deploy" / "clinical-staging" / "clinical_staging.py"
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, SyntaxError) as exc:
+        raise ValueError("candidate") from exc
+    values: dict[str, str] = {}
+    for item in tree.body:
+        if isinstance(item, ast.Assign) and len(item.targets) == 1 and isinstance(item.targets[0], ast.Name) and item.targets[0].id in {"REQUIRED_HRH_SHA", "REQUIRED_HRH_TREE"} and isinstance(item.value, ast.Constant) and isinstance(item.value.value, str):
+            values[item.targets[0].id] = item.value.value
+    head, tree_id = values.get("REQUIRED_HRH_SHA"), values.get("REQUIRED_HRH_TREE")
+    if not isinstance(head, str) or not isinstance(tree_id, str) or not _SHA.fullmatch(head) or not _SHA.fullmatch(tree_id):
+        raise ValueError("candidate")
+    return head, tree_id
+
+
+def candidate_from_manifest(runtime: Path, hrh: Path, manifest_path: Path) -> dict[str, Any]:
+    runtime_head = _git(runtime, "rev-parse", "HEAD")
+    runtime_tree = _git(runtime, "rev-parse", "HEAD^{tree}")
+    if (not _SHA.fullmatch(runtime_head) or not _SHA.fullmatch(runtime_tree)
+            or _git(runtime, f"rev-parse", f"refs/tags/{IMMUTABLE_TAG}^{{commit}}") != runtime_head
+            or _git(runtime, "status", "--porcelain") != ""):
+        raise ValueError("candidate")
+    hrh_head, hrh_tree = _git(hrh, "rev-parse", "HEAD"), _git(hrh, "rev-parse", "HEAD^{tree}")
+    required_hrh_head, required_hrh_tree = _required_hrh(runtime)
+    if hrh_head != required_hrh_head or hrh_tree != required_hrh_tree or _git(hrh, "status", "--porcelain") != "":
+        raise ValueError("candidate")
+    raw = manifest_path.read_bytes()
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("candidate") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != "restricted-runtime-immutable-candidate.v1" or manifest.get("source_revision") != runtime_head or manifest.get("platform") != "linux/amd64" or not isinstance(manifest.get("subjects"), list):
+        raise ValueError("candidate")
+    subjects: dict[str, str] = {}
+    for subject in manifest["subjects"]:
+        if not isinstance(subject, dict):
+            raise ValueError("candidate")
+        name, digest, image = subject.get("name"), subject.get("digest"), subject.get("image")
+        if not isinstance(name, str) or name not in _SUBJECT_NAMES or name in subjects or not isinstance(digest, str) or not _DIGEST.fullmatch(digest) or not isinstance(image, str) or not image.endswith("@" + digest) or subject.get("platform") != "linux/amd64":
+            raise ValueError("candidate")
+        subjects[name] = digest
+    if set(subjects) != _SUBJECT_NAMES:
+        raise ValueError("candidate")
+    return {
+        "runtime_head": runtime_head, "runtime_tree": runtime_tree,
+        "hrh_head": hrh_head, "hrh_tree": hrh_tree,
+        "subjects": subjects, "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+    }
 
 
 def _host(value: object) -> dict[str, Any] | None:
@@ -199,19 +262,31 @@ def main(argv: list[str] | None = None) -> int:
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--evidence", type=Path)
     action.add_argument("--verify", type=Path)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--candidate", type=Path, required=True)
-    parser.add_argument("--proof-dir", type=Path, required=True)
+    action.add_argument("--derive-candidate", action="store_true")
+    parser.add_argument("--output", type=Path, help="new P2 receipt path")
+    parser.add_argument("--candidate", type=Path, help="pre-derived candidate frame")
+    parser.add_argument("--proof-dir", type=Path)
+    parser.add_argument("--runtime-root", type=Path)
+    parser.add_argument("--hrh-root", type=Path)
+    parser.add_argument("--candidate-manifest", type=Path)
+    parser.add_argument("--candidate-output", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.derive_candidate:
+            if any(value is None for value in (args.runtime_root, args.hrh_root, args.candidate_manifest, args.candidate_output)) or any(value is not None for value in (args.output, args.candidate, args.proof_dir)):
+                raise ValueError("input")
+            candidate = candidate_from_manifest(args.runtime_root, args.hrh_root, args.candidate_manifest)
+            write_new(args.candidate_output, candidate)
+            print("p2-host-conformance: CANDIDATE-FRAME sha256=" + hashlib.sha256(canonical_bytes(candidate)).hexdigest())
+            return 0
         if args.evidence:
-            if args.output is None:
+            if args.output is None or args.candidate is None or args.proof_dir is None:
                 raise ValueError("input")
             receipt = build_receipt(_read_object(args.evidence), expected_candidate=_read_object(args.candidate), evidence_dir=args.proof_dir)
             write_new(args.output, receipt)
             print("p2-host-conformance: PASS receipt_sha256=" + hashlib.sha256(canonical_bytes(receipt)).hexdigest())
             return 0
-        if args.output is not None:
+        if args.output is not None or args.candidate is None or args.proof_dir is None:
             raise ValueError("input")
         errors = verify_receipt(args.verify.read_bytes(), expected_candidate=_read_object(args.candidate), evidence_dir=args.proof_dir)
         if errors:
