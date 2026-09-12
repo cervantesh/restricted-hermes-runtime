@@ -114,6 +114,24 @@ def test_builder_refuses_any_missing_or_noncanonical_control_evidence(tmp_path):
         module.build_receipt(values, expected_candidate=values["candidate"], evidence_dir=proof_dir(tmp_path))
 
 
+def test_builder_refuses_a_self_reported_candidate_that_differs_from_the_external_frame(tmp_path):
+    module = load_module()
+    values = evidence(module)
+    expected = deepcopy(values["candidate"])
+    values["candidate"]["subjects"]["clinical-adapter"] = "sha256:" + "0" * 64
+    with pytest.raises(ValueError, match="candidate"):
+        module.build_receipt(values, expected_candidate=expected, evidence_dir=proof_dir(tmp_path))
+
+
+def test_verifier_rejects_a_sidecar_altered_after_receipt_generation(tmp_path):
+    module = load_module()
+    values = evidence(module)
+    proofs = proof_dir(tmp_path)
+    value = module.build_receipt(values, expected_candidate=values["candidate"], evidence_dir=proofs)
+    (proofs / "egress.json").write_bytes(b"altered")
+    assert module.verify_receipt(module.canonical_bytes(value), expected_candidate=values["candidate"], evidence_dir=proofs) == ["proofs"]
+
+
 def test_writer_does_not_replace_existing_receipt(tmp_path):
     module = load_module()
     output = tmp_path / "receipt.json"
