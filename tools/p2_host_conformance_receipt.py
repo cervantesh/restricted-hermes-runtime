@@ -80,7 +80,7 @@ def _candidate(value: object) -> dict[str, Any] | None:
     if not all(isinstance(value[key], str) and _SHA.fullmatch(value[key]) for key in ("runtime_head", "runtime_tree", "hrh_head", "hrh_tree")):
         return None
     subjects = value["subjects"]
-    if not isinstance(subjects, dict) or set(subjects) != {"clinical-adapter", "mattermost-ingress"}:
+    if not isinstance(subjects, dict) or set(subjects) != {"restricted-clinical-adapter", "restricted-mattermost-ingress"}:
         return None
     if not all(isinstance(digest, str) and _DIGEST.fullmatch(digest) for digest in subjects.values()):
         return None
