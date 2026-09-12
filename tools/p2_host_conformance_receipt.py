@@ -19,6 +19,7 @@ from typing import Any, Mapping
 
 
 SCHEMA = "restricted-runtime-p2-host-conformance.v1"
+PROOF_SCHEMA = "restricted-runtime-p2-control-proof.v1"
 HOST_CLASS = "ubuntu-24.04-lts-x86_64"
 IMMUTABLE_TAG = "immutable-candidate-2026-09-12-7021786"
 CONTROL_NAMES = (
@@ -181,7 +182,7 @@ def _proofs(value: object) -> dict[str, str] | None:
     return dict(value)
 
 
-def _proof_hashes(evidence_dir: Path) -> dict[str, str]:
+def _proof_hashes(evidence_dir: Path, candidate: Mapping[str, Any], controls: Mapping[str, Any]) -> dict[str, str]:
     if not evidence_dir.is_dir():
         raise ValueError("proofs")
     result: dict[str, str] = {}
@@ -189,7 +190,18 @@ def _proof_hashes(evidence_dir: Path) -> dict[str, str]:
         path = evidence_dir / f"{name}.json"
         if not path.is_file() or path.is_symlink():
             raise ValueError("proofs")
-        result[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        raw = path.read_bytes()
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("proofs") from exc
+        if (not isinstance(value, dict) or canonical_bytes(value) != raw
+                or set(value) != {"schema", "control", "candidate_sha256", "outcomes"}
+                or value["schema"] != PROOF_SCHEMA or value["control"] != name
+                or value["candidate_sha256"] != hashlib.sha256(canonical_bytes(candidate)).hexdigest()
+                or not _strict_equal(value["outcomes"], controls[name])):
+            raise ValueError("proofs")
+        result[name] = hashlib.sha256(raw).hexdigest()
     return result
 
 
@@ -204,7 +216,7 @@ def build_receipt(evidence: Mapping[str, Any], *, expected_candidate: Mapping[st
         raise ValueError("host evidence is incomplete")
     if controls is None:
         raise ValueError("controls are incomplete")
-    proofs = _proof_hashes(evidence_dir)
+    proofs = _proof_hashes(evidence_dir, candidate, controls)
     receipt = {
         "schema": SCHEMA,
         "synthetic_non_phi_only": True,
@@ -242,7 +254,7 @@ def verify_receipt(raw: bytes, *, expected_candidate: Mapping[str, Any], evidenc
         return ["controls"]
     proofs = _proofs(value["proofs"])
     try:
-        actual_proofs = _proof_hashes(evidence_dir)
+        actual_proofs = _proof_hashes(evidence_dir, candidate, value["controls"])
     except (OSError, ValueError):
         actual_proofs = None
     if proofs is None or actual_proofs is None or not _strict_equal(proofs, actual_proofs):
