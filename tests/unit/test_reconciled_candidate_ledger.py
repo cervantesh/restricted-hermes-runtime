@@ -107,6 +107,8 @@ def test_a0_card_is_bound_to_the_p2_admission_candidate_and_its_real_guard() -> 
         text=True,
     ).stdout
     assert "ubuntu-24.04-lts-x86_64" in admission
+    assert "systemd-detect-virt" in admission
+    assert "container_detected=_container_detected()" in admission
     assert "p2_host_platform_admission.py" in harness
     assert harness.index("p2_host_platform_admission.py") < harness.index("docker info")
     assert harness.index("DOCKER_HOST") < harness.index("docker info")
