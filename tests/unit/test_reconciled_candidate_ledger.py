@@ -137,6 +137,40 @@ def test_a0_card_is_bound_to_the_p2_admission_candidate_and_its_real_guard() -> 
         )
 
 
+def test_current_a0_tag_preflight_receipt_binds_the_selected_candidate() -> None:
+    ledger_path = "docs/evidence/p2-admission-candidate-ledger-2026-09-11.json"
+    preflight_path = "docs/evidence/a0-tag-preflight-2026-09-12-7021786.json"
+    ledger_raw = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"HEAD:{ledger_path}"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    preflight_raw = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"HEAD:{preflight_path}"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    candidate = json.loads(ledger_raw)["candidate"]
+    value = json.loads(preflight_raw)
+
+    assert ledger.canonical_bytes(value) == preflight_raw
+    assert value["schema"] == "restricted-runtime-a0-tag-preflight.v1"
+    assert value["candidate"] == candidate
+    assert value["tag"] == "immutable-candidate-2026-09-12-" + candidate["revision"][:7]
+    assert value["checks"] == {
+        "candidate_binding": True,
+        "remote_tag_absent": True,
+        "workflow_source": True,
+    }
+    assert value["claims"] == {
+        "tag_created": False,
+        "image_published": False,
+        "a0_completed": False,
+        "phi_authorized": False,
+        "deployment_conformant": False,
+    }
+
+
 def test_receipt_hashes_bind_committed_git_bytes_not_worktree_line_endings() -> None:
     value = ledger.build_ledger(repo_root=ROOT, candidate_revision=git(ROOT, "rev-parse", "HEAD"))
     for receipt in value["retained_receipts"]:
