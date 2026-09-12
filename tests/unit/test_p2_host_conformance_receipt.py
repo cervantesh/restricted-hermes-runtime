@@ -176,3 +176,95 @@ def test_cli_denies_invalid_input_without_echoing_its_contents(tmp_path, capsys)
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "p2-host-conformance: DENIED class=input\n"
+
+
+def test_candidate_frame_is_derived_from_the_exact_tag_clean_sources_and_published_manifest(tmp_path, monkeypatch):
+    module = load_module()
+    runtime = tmp_path / "runtime"
+    hrh = tmp_path / "hrh"
+    staging = runtime / "deploy" / "clinical-staging"
+    staging.mkdir(parents=True)
+    hrh.mkdir()
+    (staging / "clinical_staging.py").write_text(
+        f'REQUIRED_HRH_SHA = "{HRH_HEAD}"\nREQUIRED_HRH_TREE = "{HRH_TREE}"\n', encoding="utf-8"
+    )
+    manifest = {
+        "schema_version": "restricted-runtime-immutable-candidate.v1",
+        "source_revision": RUNTIME_HEAD,
+        "platform": "linux/amd64",
+        "subjects": [
+            {"name": name, "digest": digest, "image": "ghcr.io/example/" + name + "@" + digest, "platform": "linux/amd64"}
+            for name, digest in SUBJECTS.items()
+        ],
+    }
+    manifest_path = tmp_path / "candidate.manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def fake_git(path, *args):
+        key = (Path(path).name, *args)
+        values = {
+            ("runtime", "rev-parse", "HEAD"): RUNTIME_HEAD,
+            ("runtime", "rev-parse", "HEAD^{tree}"): RUNTIME_TREE,
+            ("runtime", "rev-parse", f"refs/tags/{module.IMMUTABLE_TAG}^{{commit}}") : RUNTIME_HEAD,
+            ("runtime", "status", "--porcelain"): "",
+            ("hrh", "rev-parse", "HEAD"): HRH_HEAD,
+            ("hrh", "rev-parse", "HEAD^{tree}"): HRH_TREE,
+            ("hrh", "status", "--porcelain"): "",
+        }
+        return values[key]
+
+    monkeypatch.setattr(module, "_git", fake_git)
+    frame = module.candidate_from_manifest(runtime, hrh, manifest_path)
+    assert frame["runtime_head"] == RUNTIME_HEAD
+    assert frame["runtime_tree"] == RUNTIME_TREE
+    assert frame["hrh_head"] == HRH_HEAD
+    assert frame["subjects"] == SUBJECTS
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda manifest: manifest.update(source_revision="0" * 40),
+    lambda manifest: manifest["subjects"].pop(),
+    lambda manifest: manifest["subjects"][0].update(digest="sha256:" + "0" * 64),
+])
+def test_candidate_frame_rejects_manifest_substitution(tmp_path, monkeypatch, mutate):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    staging = runtime / "deploy" / "clinical-staging"
+    staging.mkdir(parents=True)
+    hrh.mkdir()
+    (staging / "clinical_staging.py").write_text(
+        f'REQUIRED_HRH_SHA = "{HRH_HEAD}"\nREQUIRED_HRH_TREE = "{HRH_TREE}"\n', encoding="utf-8"
+    )
+    manifest = {"schema_version": "restricted-runtime-immutable-candidate.v1", "source_revision": RUNTIME_HEAD,
+                "platform": "linux/amd64", "subjects": [{"name": name, "digest": digest, "image": "x@" + digest, "platform": "linux/amd64"} for name, digest in SUBJECTS.items()]}
+    mutate(manifest)
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(module, "_git", lambda path, *args: {
+        ("runtime", "rev-parse", "HEAD"): RUNTIME_HEAD, ("runtime", "rev-parse", "HEAD^{tree}"): RUNTIME_TREE,
+        ("runtime", "rev-parse", f"refs/tags/{module.IMMUTABLE_TAG}^{{commit}}") : RUNTIME_HEAD, ("runtime", "status", "--porcelain"): "",
+        ("hrh", "rev-parse", "HEAD"): HRH_HEAD, ("hrh", "rev-parse", "HEAD^{tree}"): HRH_TREE, ("hrh", "status", "--porcelain"): "",
+    }[(Path(path).name, *args)])
+    with pytest.raises(ValueError, match="candidate"):
+        module.candidate_from_manifest(runtime, hrh, path)
+
+
+def test_cli_derives_a_safe_candidate_frame(tmp_path, monkeypatch, capsys):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    staging = runtime / "deploy" / "clinical-staging"
+    staging.mkdir(parents=True)
+    hrh.mkdir()
+    (staging / "clinical_staging.py").write_text(f'REQUIRED_HRH_SHA = "{HRH_HEAD}"\nREQUIRED_HRH_TREE = "{HRH_TREE}"\n', encoding="utf-8")
+    manifest = {"schema_version": "restricted-runtime-immutable-candidate.v1", "source_revision": RUNTIME_HEAD,
+                "platform": "linux/amd64", "subjects": [{"name": name, "digest": digest, "image": "x@" + digest, "platform": "linux/amd64"} for name, digest in SUBJECTS.items()]}
+    manifest_path, output = tmp_path / "manifest.json", tmp_path / "candidate.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(module, "_git", lambda path, *args: {
+        ("runtime", "rev-parse", "HEAD"): RUNTIME_HEAD, ("runtime", "rev-parse", "HEAD^{tree}"): RUNTIME_TREE,
+        ("runtime", "rev-parse", f"refs/tags/{module.IMMUTABLE_TAG}^{{commit}}") : RUNTIME_HEAD, ("runtime", "status", "--porcelain"): "",
+        ("hrh", "rev-parse", "HEAD"): HRH_HEAD, ("hrh", "rev-parse", "HEAD^{tree}"): HRH_TREE, ("hrh", "status", "--porcelain"): "",
+    }[(Path(path).name, *args)])
+    assert module.main(["--derive-candidate", "--runtime-root", str(runtime), "--hrh-root", str(hrh), "--candidate-manifest", str(manifest_path), "--candidate-output", str(output)]) == 0
+    assert capsys.readouterr().out.startswith("p2-host-conformance: CANDIDATE-FRAME sha256=")
+    assert json.loads(output.read_text(encoding="utf-8"))["subjects"] == SUBJECTS
