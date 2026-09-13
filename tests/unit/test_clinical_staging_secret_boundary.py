@@ -314,7 +314,7 @@ def test_next_init_invocation_resumes_finalizing_before_operational_lifecycle(
     state.mkdir()
     (state / module.MARKER_NAME).write_text("synthetic", encoding="ascii")
     staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingsecret", 18443)
-    marker = {"lifecycle": "finalizing"}
+    marker = {"lifecycle": "finalizing", "image_mode": "exact-source", "subject_admission": {}}
     resumed: list[str] = []
     original_stat = Path.stat
     operator_uid = 1000
