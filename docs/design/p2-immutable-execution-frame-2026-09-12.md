@@ -95,10 +95,24 @@ Therefore this card must be used to preserve the exact execution frame and to
 avoid a misleading witness. It must not be cited as proof of representative
 host conformance.
 
-## Minimum unblocker
+## 2026-09-13 representative-host execution update
 
-The immediate external blocker is a dedicated administrator-provisioned host
-that satisfies the input requirements above. Once it exists, the egress slice
-can run without new source mutation. Completing P2 still additionally requires
-the bounded unified verifier and the remaining controls listed above; creating
-or using an arbitrary shared VM would not substitute for either requirement.
+The dedicated-host input is now satisfied for one synthetic, non-production
+execution. Its public content-safe result card is retained at
+[`p2-representative-host-egress-2026-09-12.json`](../evidence/p2-representative-host-egress-2026-09-12.json),
+and its content-safe result card is
+[`p2-representative-host-egress-2026-09-12.md`](../evidence/p2-representative-host-egress-2026-09-12.md).
+
+That run passed the exact-source egress RED/GREEN witness and independent
+verification of its retained canonical receipt. The two published OCI subjects were also pulled by their
+frozen digests on the same host and passed their role-closure tests. These are
+two complementary proofs, not one combined claim: the composed egress harness
+still builds its restricted services from the exact source frame. It therefore
+does not demonstrate that the published OCI subjects were the containers which
+exercised the egress witness.
+
+The host prerequisite is no longer the immediate blocker. Completing P2 still
+requires the bounded unified verifier and the remaining controls listed above,
+including a subject-admitted E2E path and independent replay. This update is
+not a P2 closure, PHI authorization, HIPAA/BAA evidence, production approval,
+or a clinical-readiness claim.

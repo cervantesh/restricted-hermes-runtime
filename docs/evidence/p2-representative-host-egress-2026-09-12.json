@@ -1,0 +1,142 @@
+{
+  "docker": {
+    "compose_version": "2.40.3+ds1-0ubuntu1~24.04.1",
+    "server_version": "29.1.3"
+  },
+  "host": {
+    "architecture": "x86_64",
+    "kernel": "7.0.0-1011-gcp"
+  },
+  "red_witness": {
+    "cleanup": {
+      "network_absent": true,
+      "sink_absent": true
+    },
+    "fixed": {
+      "clinical-adapter": {
+        "metadata_ipv4": "network-unreachable",
+        "metadata_ipv6": "network-unreachable",
+        "public_dns_example_com": false
+      },
+      "ingress": {
+        "metadata_ipv4": "network-unreachable",
+        "metadata_ipv6": "network-unreachable",
+        "public_dns_example_com": false
+      }
+    },
+    "fixed_control": {
+      "clinical-adapter": {
+        "metadata_ipv4": "connected",
+        "metadata_ipv6": "network-unreachable",
+        "public_dns_example_com": true
+      },
+      "ingress": {
+        "metadata_ipv4": "connected",
+        "metadata_ipv6": "network-unreachable",
+        "public_dns_example_com": true
+      }
+    },
+    "green": {
+      "clinical-adapter": {
+        "controlled_dns": true,
+        "controlled_ipv4": true,
+        "controlled_ipv6": true,
+        "synthetic_metadata_dns": true,
+        "synthetic_metadata_ipv4": true,
+        "synthetic_metadata_ipv6": true
+      },
+      "ingress": {
+        "controlled_dns": true,
+        "controlled_ipv4": true,
+        "controlled_ipv6": true,
+        "synthetic_metadata_dns": true,
+        "synthetic_metadata_ipv4": true,
+        "synthetic_metadata_ipv6": true
+      }
+    },
+    "green_proof_sha256": "5106263ef15db19ee55b4bb54d2f9ead6fa43d572a75f3f372cb93edfa15fb7e",
+    "metadata_ipv6_attribution": {
+      "clinical-adapter": "host-bound-control-unreachable",
+      "ingress": "host-bound-control-unreachable"
+    },
+    "metadata_scope": "fixed-classes-content-free",
+    "proof_sha256": {
+      "clinical-adapter": "7fa987dfc9317f4f2b6dad9b6a0f0e3a4997894d961353500cf0e611e74d47f4",
+      "ingress": "3403931425eeeb12c40c92b3c60e75337bf71befc9b6c947faedb2af3dd32007"
+    }
+  },
+  "runtime": {
+    "head": "70217864aefc473759c739448831a8203ae81ded",
+    "tree": "73d10d5a90197a6e4984cc6b83e0a97f480e3869"
+  },
+  "schema": "restricted-runtime-representative-clinical-egress-public-summary.v1",
+  "canonical_receipt_sha256": "2d3f94cb4631725256a0cc28de2da0dabb0bedb11facc60750b83dedc0c74e98",
+  "execution_subject": "clean-exact-source-worktree",
+  "services": {
+    "clinical-adapter": {
+      "controls": {
+        "capabilities_restricted": true,
+        "mount_destinations_exact": true,
+        "read_only_rootfs": true
+      },
+      "denied": {
+        "controlled_dns": true,
+        "controlled_ipv4": true,
+        "controlled_ipv6": true,
+        "synthetic_metadata_dns": true,
+        "synthetic_metadata_ipv4": true,
+        "synthetic_metadata_ipv6": true
+      },
+      "denied_internal": {
+        "mattermost": true
+      },
+      "image_id": "sha256:832e7e6dfae631917a6cf062e0664e60a93f679c180d6d5ded08bc43f7fbe93b",
+      "networks": ["clinical_upstream"],
+      "permitted_internal": {
+        "hrh-tls": true
+      },
+      "proxy_environment_absent": true
+    },
+    "ingress": {
+      "controls": {
+        "capabilities_restricted": true,
+        "mount_destinations_exact": true,
+        "read_only_rootfs": true
+      },
+      "denied": {
+        "controlled_dns": true,
+        "controlled_ipv4": true,
+        "controlled_ipv6": true,
+        "synthetic_metadata_dns": true,
+        "synthetic_metadata_ipv4": true,
+        "synthetic_metadata_ipv6": true
+      },
+      "denied_internal": {
+        "hrh-tls": true
+      },
+      "image_id": "sha256:1f1aaf1c2d0e27165dd9f52e852a2ea7c261d4505bd378b8e8d86eaa72c4c161",
+      "networks": ["mattermost_edge"],
+      "permitted_internal": {
+        "mattermost": true
+      },
+      "proxy_environment_absent": true
+    }
+  },
+  "staging": {
+    "marker": {
+      "compose_env_sha256": "c652c745f6b050f3316a463c9c1e059a55025740ab802815dd3fe536b68b0681",
+      "lifecycle": "ready",
+      "marker_sha256": "20d60e6d5ce563ef42915d5121444b1a349121da3947070fce1863470ee644d8",
+      "schema": "restricted-runtime-representative-clinical-egress-marker-proof.v1",
+      "source": {
+        "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
+        "hrh_tree": "f217b0b1cf7f438422528dfe178d81b78212c68b",
+        "runtime_head": "70217864aefc473759c739448831a8203ae81ded",
+        "runtime_tree": "73d10d5a90197a6e4984cc6b83e0a97f480e3869"
+      },
+      "volume_keys": ["clinical_config", "clinical_socket", "controller_state", "hrh_db", "hrh_secret", "hrh_tls", "ingress_config", "ingress_outbox", "mattermost_data", "mattermost_db", "mattermost_tls"]
+    },
+    "marker_proof_sha256": "8961388eb096c4e713eca94a07409261463b21b81652ae7a9298b5820e1df54c"
+  },
+  "synthetic_non_phi_only": true
+}
