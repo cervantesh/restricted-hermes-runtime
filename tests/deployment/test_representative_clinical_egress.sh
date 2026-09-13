@@ -4,11 +4,13 @@
 set -euo pipefail
 
 runtime="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-hrh_root="${1:?usage: $0 /absolute/path/to/Health-Record-Hub /absolute/path/to/receipt.json}"
-receipt="${2:?usage: $0 /absolute/path/to/Health-Record-Hub /absolute/path/to/receipt.json}"
+hrh_root="${1:?usage: $0 /absolute/path/to/Health-Record-Hub /absolute/path/to/receipt.json [candidate-manifest.json]}"
+receipt="${2:?usage: $0 /absolute/path/to/Health-Record-Hub /absolute/path/to/receipt.json [candidate-manifest.json]}"
+subject_manifest="${3:-}"
 [[ "$(uname -s)" == "Linux" ]] || { echo "representative-clinical-egress: SKIP linux-required"; exit 77; }
 [[ "$hrh_root" = /* && -d "$hrh_root/.git" ]] || { echo "representative-clinical-egress: DENIED" >&2; exit 2; }
 [[ "$receipt" = /* && ! -e "$receipt" && -d "$(dirname "$receipt")" ]] || { echo "representative-clinical-egress: DENIED" >&2; exit 2; }
+[[ -z "$subject_manifest" || ( "$subject_manifest" = /* && -f "$subject_manifest" ) ]] || { echo "representative-clinical-egress: DENIED" >&2; exit 2; }
 evidence_dir="$receipt.evidence"
 diagnostic_dir="$receipt.diagnostic"
 [[ ! -e "$evidence_dir" ]] || { echo "representative-clinical-egress: DENIED" >&2; exit 2; }
@@ -41,6 +43,8 @@ network="$project-egress-red"
 sink="$project-egress-sink"
 staging="$runtime/deploy/clinical-staging/clinical_staging.py"
 collector="$runtime/tools/representative_clinical_egress.py"
+staging_args=(--runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project")
+if [[ -n "$subject_manifest" ]]; then staging_args+=(--subject-manifest "$subject_manifest"); fi
 target_ids=()
 passed=0
 phase=preflight
@@ -137,7 +141,7 @@ cleanup() {
   docker container rm --force "$sink" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   if [[ -f "$state/staging-state.json" ]]; then
-    "$python_bin" "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" destroy >/dev/null 2>&1 || true
+    "$python_bin" "$staging" "${staging_args[@]}" destroy >/dev/null 2>&1 || true
   fi
   if exact_name_absent network "$network"; then cleanup_network_absent=true; fi
   if exact_name_absent container "$sink"; then cleanup_sink_absent=true; fi
@@ -153,8 +157,9 @@ trap cleanup EXIT
 mkdir -m 0700 "$evidence_dir"
 
 phase=initialize
-"$python_bin" "$staging" --runtime-root "$runtime" --hrh-root "$hrh_root" --state-dir "$state" --project "$project" init >/dev/null 2>&1
+"$python_bin" "$staging" "${staging_args[@]}" init >/dev/null 2>&1
 compose=(docker compose --env-file "$state/compose.env" --project-name "$project" --file "$runtime/tests/deployment/clinical-composed-e2e/compose.yaml" --file "$runtime/deploy/clinical-staging/compose.yaml")
+if [[ -n "$subject_manifest" ]]; then compose+=(--file "$runtime/deploy/clinical-staging/compose.subject-admitted.yaml"); fi
 if ! docker network create --ipv6 "$network" >/dev/null; then
   echo "representative-clinical-egress: SKIP controlled-ipv6-network-unavailable"
   exit 77

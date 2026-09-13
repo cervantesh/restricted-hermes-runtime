@@ -43,6 +43,7 @@ def receipt(module):
         "schema": module.MARKER_PROOF_SCHEMA, "marker_sha256": "c" * 64,
         "source": {"runtime_head": HEAD, "runtime_tree": TREE, "hrh_head": module.STAGING_HRH_HEAD, "hrh_tree": module.STAGING_HRH_TREE},
         "lifecycle": "ready", "compose_env_sha256": "f" * 64, "expected_images": images,
+        "image_mode": "exact-source", "subject_admission": {},
         "volume_keys": ["clinical_config", "clinical_socket", "controller_state", "hrh_db", "hrh_secret", "hrh_tls", "ingress_config", "ingress_outbox", "mattermost_data", "mattermost_db", "mattermost_tls"],
     }
     return {
@@ -54,6 +55,7 @@ def receipt(module):
         },
         "host": {"kernel": "6.8.0-test", "architecture": "x86_64"},
         "docker": {"server_version": "27.5.1", "compose_version": "v2.31.0"},
+        "execution": {"mode": "exact-source", "executed_subject_repo_digests": {}},
         "services": {
             "ingress": {
                 "image_id": "sha256:" + "a" * 64,
@@ -96,6 +98,27 @@ def test_valid_candidate_bound_receipt_verifies_and_contains_no_probe_content():
     assert "169.254.169.254" not in rendered
     assert "HTTP_PROXY=" not in rendered
     assert "PASSWORD_SECRET_CANARY" not in rendered
+
+
+def test_subject_admitted_receipt_binds_mode_and_executed_repo_digests():
+    module = load_module()
+    value = receipt(module)
+    ingress = "ghcr.io/cervantesh/restricted-mattermost-ingress@sha256:" + "a" * 64
+    adapter = "ghcr.io/cervantesh/restricted-clinical-adapter@sha256:" + "b" * 64
+    value["staging"]["marker"]["image_mode"] = "subject-admitted"
+    value["staging"]["marker"]["subject_admission"] = {
+        "manifest_sha256": "c" * 64,
+        "subjects": {"ingress": ingress, "clinical-adapter": adapter},
+        "executed_repo_digests": {"ingress": ingress, "clinical-adapter": adapter},
+    }
+    value["execution"] = {
+        "mode": "subject-admitted",
+        "executed_subject_repo_digests": {"ingress": ingress, "clinical-adapter": adapter},
+    }
+
+    assert module.verify_receipt(value, expected_head=HEAD, expected_tree=TREE) == []
+    value["execution"]["executed_subject_repo_digests"]["ingress"] = adapter
+    assert "execution binding is invalid" in module.verify_receipt(value, expected_head=HEAD, expected_tree=TREE)
 
 
 def test_marker_from_current_composed_staging_frame_is_admissible(tmp_path):
@@ -251,7 +274,7 @@ def test_receipt_builder_records_only_classes_booleans_versions_and_hashes():
     )
 
     assert module.verify_receipt(value, expected_head=HEAD, expected_tree=TREE) == []
-    assert set(value) == {"schema", "synthetic_non_phi_only", "runtime", "staging", "host", "docker", "services", "red_witness"}
+    assert set(value) == {"schema", "synthetic_non_phi_only", "runtime", "staging", "host", "docker", "execution", "services", "red_witness"}
 
 
 def test_builder_rejects_a_syntactically_valid_swapped_container_image():
@@ -366,10 +389,11 @@ def test_verifier_error_producers_have_an_exhaustive_closed_opaque_code_map():
         "receipt schema or synthetic marker is invalid": "receipt-schema",
         "runtime head does not bind the candidate": "runtime-head",
         "runtime tree does not bind the candidate": "runtime-tree",
-        "staging marker binding is invalid": "staging-marker",
-        "host versions are invalid": "host-versions",
-        "docker versions are invalid": "docker-versions",
-        "service classes are not exact": "service-classes",
+            "staging marker binding is invalid": "staging-marker",
+            "host versions are invalid": "host-versions",
+            "docker versions are invalid": "docker-versions",
+            "execution binding is invalid": "execution-binding",
+            "service classes are not exact": "service-classes",
         "red witness fields are invalid": "witness-fields",
         "red witness proof is invalid": "red-proof",
         "green witness proof is invalid": "green-proof",
