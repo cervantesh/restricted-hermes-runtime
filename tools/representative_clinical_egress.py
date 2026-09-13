@@ -379,7 +379,7 @@ def _inspect_container(container_id: str) -> dict[str, Any]:
     return raw[0]
 
 
-def _container_repo_digest(container_id: str) -> str:
+def _container_repo_digest(container_id: str, expected_reference: str) -> str:
     """Return the exact pulled RepoDigest for a live restricted container."""
     inspected = _inspect_container(container_id)
     image_id = inspected.get("Image")
@@ -390,9 +390,11 @@ def _container_repo_digest(container_id: str) -> str:
         repo_digests = raw[0].get("RepoDigests") if isinstance(raw, list) and len(raw) == 1 else None
     except (json.JSONDecodeError, TypeError, IndexError) as exc:
         raise ReceiptError("container inspection was invalid") from exc
-    if not isinstance(repo_digests, list) or len(repo_digests) < 1 or any(not isinstance(item, str) for item in repo_digests):
+    if (not isinstance(repo_digests, list) or len(repo_digests) < 1
+            or any(not isinstance(item, str) for item in repo_digests)
+            or expected_reference not in repo_digests):
         raise ReceiptError("container inspection was invalid")
-    return repo_digests[0]
+    return expected_reference
 
 
 def _verify_live_subjects(marker: Mapping[str, Any], runtime: Path, state_dir: Path, project: str) -> None:
@@ -402,7 +404,7 @@ def _verify_live_subjects(marker: Mapping[str, Any], runtime: Path, state_dir: P
     if not isinstance(expected, dict) or set(expected) != set(POLICIES):
         raise ReceiptError("container inspection was invalid")
     for service in POLICIES:
-        if _container_repo_digest(_service_id(runtime, state_dir, project, service)) != expected[service]:
+        if _container_repo_digest(_service_id(runtime, state_dir, project, service), expected[service]) != expected[service]:
             raise ReceiptError("container image differs from initialized image")
 
 
@@ -439,9 +441,13 @@ def _validate_marker_projection(value: object, head: str, tree: str) -> None:
     if mode != "subject-admitted" or not isinstance(admission, dict) or set(admission) != {"manifest_sha256", "subjects", "executed_repo_digests"}:
         raise ReceiptError("marker proof does not retain the exact staging frame")
     subjects, executed = admission.get("subjects"), admission.get("executed_repo_digests")
+    expected_repositories = {
+        "ingress": "ghcr.io/cervantesh/restricted-mattermost-ingress@sha256:",
+        "clinical-adapter": "ghcr.io/cervantesh/restricted-clinical-adapter@sha256:",
+    }
     if (not isinstance(admission.get("manifest_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", admission["manifest_sha256"])
             or not isinstance(subjects, dict) or set(subjects) != set(POLICIES) or executed != subjects
-            or any(not isinstance(ref, str) or not re.fullmatch(r"ghcr\.io/cervantesh/restricted-(?:mattermost-ingress|clinical-adapter)@sha256:[a-f0-9]{64}", ref) for ref in subjects.values())):
+            or any(not isinstance(subjects.get(service), str) or not re.fullmatch(re.escape(prefix) + r"[a-f0-9]{64}", subjects[service]) for service, prefix in expected_repositories.items())):
         raise ReceiptError("marker proof does not retain the exact staging frame")
 
 

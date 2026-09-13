@@ -7,6 +7,7 @@ import base64
 import contextlib
 import functools
 import hashlib
+import importlib.util
 import http.client
 import ipaddress
 import json
@@ -371,6 +372,21 @@ def _validate_subject_admission(value: object, *, require_executed: bool) -> dic
     return value
 
 
+def _verify_subject_candidate(manifest: object, runtime: Path) -> None:
+    verifier_path = runtime / "tools" / "verify_immutable_candidate.py"
+    spec = importlib.util.spec_from_file_location("clinical_staging_candidate_verifier", verifier_path)
+    if spec is None or spec.loader is None:
+        raise SafetyError("subject admission verifier is unavailable")
+    verifier = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(verifier)
+        errors = verifier.verify(manifest, require_external=True, repo_root=runtime)
+    except Exception as exc:
+        raise SafetyError("subject admission verifier is unavailable") from exc
+    if not isinstance(errors, list) or errors:
+        raise SafetyError("subject admission manifest is not a valid immutable candidate")
+
+
 def read_subject_admission(path: Path, *, runtime: Path | None = None) -> dict[str, Any]:
     """Read exactly the two immutable subjects accepted by clinical staging."""
     try:
@@ -394,6 +410,7 @@ def read_subject_admission(path: Path, *, runtime: Path | None = None) -> dict[s
             raise SafetyError("subject admission source frame is unavailable") from exc
         if current.returncode or current.stdout.strip() != revision:
             raise SafetyError("subject admission source revision differs from runtime")
+        _verify_subject_candidate(manifest, runtime)
     by_name: dict[str, dict[str, Any]] = {}
     for subject in manifest["subjects"]:
         if not isinstance(subject, dict) or not isinstance(subject.get("name"), str) or subject["name"] in by_name:

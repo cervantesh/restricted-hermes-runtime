@@ -121,6 +121,33 @@ def test_subject_admitted_receipt_binds_mode_and_executed_repo_digests():
     assert "execution binding is invalid" in module.verify_receipt(value, expected_head=HEAD, expected_tree=TREE)
 
 
+def test_subject_admitted_receipt_rejects_a_coherent_service_repo_swap():
+    module = load_module()
+    value = receipt(module)
+    ingress = "ghcr.io/cervantesh/restricted-mattermost-ingress@sha256:" + "a" * 64
+    adapter = "ghcr.io/cervantesh/restricted-clinical-adapter@sha256:" + "b" * 64
+    swapped = {"ingress": adapter, "clinical-adapter": ingress}
+    value["staging"]["marker"].update({
+        "image_mode": "subject-admitted",
+        "subject_admission": {"manifest_sha256": "c" * 64, "subjects": swapped, "executed_repo_digests": swapped},
+    })
+    value["execution"] = {"mode": "subject-admitted", "executed_subject_repo_digests": swapped}
+
+    assert "staging marker binding is invalid" in module.verify_receipt(value, expected_head=HEAD, expected_tree=TREE)
+
+
+def test_live_repo_digest_selects_the_expected_full_reference_and_rejects_suffix_collision(monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    expected = "ghcr.io/cervantesh/restricted-mattermost-ingress@sha256:" + "a" * 64
+    wrong_repo = "ghcr.io/cervantesh/restricted-clinical-adapter@sha256:" + "a" * 64
+    monkeypatch.setattr(module, "_inspect_container", lambda _container: {"Image": "sha256:" + "b" * 64})
+    monkeypatch.setattr(module, "_stdout", lambda *_args: json.dumps([{"RepoDigests": [wrong_repo, expected]}]))
+    assert module._container_repo_digest("container", expected) == expected
+    monkeypatch.setattr(module, "_stdout", lambda *_args: json.dumps([{"RepoDigests": [wrong_repo]}]))
+    with pytest.raises(module.ReceiptError, match="container inspection"):
+        module._container_repo_digest("container", expected)
+
+
 def test_marker_from_current_composed_staging_frame_is_admissible(tmp_path):
     module = load_module()
     staging = load_staging_module()

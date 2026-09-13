@@ -220,7 +220,7 @@ def test_missing_subject_manifest_fails_before_staging_can_reach_compose(tmp_pat
     ]) == 2
 
 
-def test_subject_admission_binds_manifest_source_revision_to_runtime(tmp_path: Path):
+def test_subject_admission_binds_manifest_source_revision_to_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     module = load_module()
     revision = subprocess.run(
         ("git", "rev-parse", "HEAD"), cwd=ROOT, text=True, capture_output=True, check=True,
@@ -235,12 +235,36 @@ def test_subject_admission_binds_manifest_source_revision_to_runtime(tmp_path: P
         ],
     }), encoding="utf-8")
 
+    verified: list[object] = []
+    monkeypatch.setattr(module, "_verify_subject_candidate", lambda value, runtime: verified.append((value, runtime)))
     module.read_subject_admission(manifest, runtime=ROOT)
+    assert verified and verified[0][1] == ROOT
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["source_revision"] = "f" * 40
     manifest.write_text(json.dumps(value), encoding="utf-8")
     with pytest.raises(module.SafetyError, match="source revision differs"):
         module.read_subject_admission(manifest, runtime=ROOT)
+
+
+def test_invalid_canonical_candidate_fails_before_staging_or_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    manifest = tmp_path / "candidate.manifest.json"
+    manifest.write_text(json.dumps({
+        "schema_version": "restricted-runtime-immutable-candidate.v1", "source_revision": "d" * 40,
+        "platform": "linux/amd64", "subjects": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(module.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="d" * 40 + "\n"))
+    monkeypatch.setattr(module, "_verify_subject_candidate", lambda *_args: (_ for _ in ()).throw(module.SafetyError("subject admission manifest is not a valid immutable candidate")))
+    monkeypatch.setattr(module, "ClinicalStaging", lambda *_args, **_kwargs: pytest.fail("invalid admission must not construct staging"))
+
+    assert module.main([
+        "--runtime-root", str(runtime), "--hrh-root", str(hrh), "--state-dir", str(state),
+        "--project", "clinicalstagingdemo", "--subject-manifest", str(manifest), "init",
+    ]) == 2
 
 
 @pytest.mark.skipif(os.name != "posix", reason="atomic marker ownership is Linux/POSIX-only")
