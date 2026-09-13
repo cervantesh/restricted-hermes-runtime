@@ -372,6 +372,16 @@ def _validate_subject_admission(value: object, *, require_executed: bool) -> dic
     return value
 
 
+def _sealed_subject_binding(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The pre-Docker admission identity; observed RepoDigests are not input."""
+    if not value:
+        return {}
+    return {
+        "manifest_sha256": value.get("manifest_sha256"),
+        "subjects": value.get("subjects"),
+    }
+
+
 def _verify_subject_candidate(manifest: object, runtime: Path) -> None:
     verifier_path = runtime / "tools" / "verify_immutable_candidate.py"
     spec = importlib.util.spec_from_file_location("clinical_staging_candidate_verifier", verifier_path)
@@ -1118,6 +1128,11 @@ class ClinicalStaging:
             marker = read_marker(self.state_dir, self.project)
             if marker["lifecycle"] not in {"initializing", "finalizing"}:
                 raise SafetyError("staging target is already initialized")
+            expected_mode = "subject-admitted" if self.subject_admission else "exact-source"
+            if (marker["image_mode"] != expected_mode
+                    or _sealed_subject_binding(marker["subject_admission"])
+                    != _sealed_subject_binding(self.subject_admission)):
+                raise SafetyError("resumed initialization subject admission differs from sealed target")
             verify_effective_env(self.state_dir, marker)
             if any(marker[key] != value for key, value in frame.items()):
                 raise SafetyError("initializing marker source frame changed")
