@@ -382,7 +382,7 @@ def _sealed_subject_binding(value: Mapping[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _verify_subject_candidate(manifest: object, runtime: Path) -> None:
+def _verify_subject_candidate(manifest: object, runtime: Path, evidence_root: Path) -> None:
     verifier_path = runtime / "tools" / "verify_immutable_candidate.py"
     spec = importlib.util.spec_from_file_location("clinical_staging_candidate_verifier", verifier_path)
     if spec is None or spec.loader is None:
@@ -393,7 +393,7 @@ def _verify_subject_candidate(manifest: object, runtime: Path) -> None:
         # The staging admission is deliberately closed over the two OCI
         # subjects it will execute.  Health Record Hub remains a separately
         # pinned source frame, not a third OCI subject in this manifest.
-        errors = verifier.verify(manifest, require_external=False, repo_root=runtime)
+        errors = verifier.verify(manifest, require_external=False, repo_root=runtime, evidence_root=evidence_root)
     except Exception as exc:
         raise SafetyError("subject admission verifier is unavailable") from exc
     if not isinstance(errors, list) or errors:
@@ -423,7 +423,7 @@ def read_subject_admission(path: Path, *, runtime: Path | None = None) -> dict[s
             raise SafetyError("subject admission source frame is unavailable") from exc
         if current.returncode or current.stdout.strip() != revision:
             raise SafetyError("subject admission source revision differs from runtime")
-        _verify_subject_candidate(manifest, runtime)
+        _verify_subject_candidate(manifest, runtime, path.parent.parent)
     by_name: dict[str, dict[str, Any]] = {}
     for subject in manifest["subjects"]:
         if not isinstance(subject, dict) or not isinstance(subject.get("name"), str) or subject["name"] in by_name:

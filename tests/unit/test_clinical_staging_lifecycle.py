@@ -237,9 +237,10 @@ def test_subject_admission_binds_manifest_source_revision_to_runtime(tmp_path: P
     }), encoding="utf-8")
 
     verified: list[object] = []
-    monkeypatch.setattr(module, "_verify_subject_candidate", lambda value, runtime: verified.append((value, runtime)))
+    monkeypatch.setattr(module, "_verify_subject_candidate", lambda value, runtime, evidence_root: verified.append((value, runtime, evidence_root)))
     module.read_subject_admission(manifest, runtime=ROOT)
     assert verified and verified[0][1] == ROOT
+    assert verified[0][2] == manifest.parent.parent
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["source_revision"] = "f" * 40
     manifest.write_text(json.dumps(value), encoding="utf-8")
@@ -253,12 +254,14 @@ def test_subject_admission_verifies_the_closed_oci_subject_set_only(tmp_path: Pa
     verifier = runtime / "tools" / "verify_immutable_candidate.py"
     verifier.parent.mkdir(parents=True)
     verifier.write_text(
-        "def verify(manifest, *, require_external, repo_root):\n"
-        "    return [] if require_external is False and repo_root.name == 'runtime' else ['unexpected scope']\n",
+        "def verify(manifest, *, require_external, repo_root, evidence_root):\n"
+        "    return [] if require_external is False and repo_root.name == 'runtime' and evidence_root.name == 'evidence' else ['unexpected scope']\n",
         encoding="utf-8",
     )
 
-    module._verify_subject_candidate({"schema_version": "restricted-runtime-immutable-candidate.v1"}, runtime)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    module._verify_subject_candidate({"schema_version": "restricted-runtime-immutable-candidate.v1"}, runtime, evidence)
 
 
 def test_invalid_canonical_candidate_fails_before_staging_or_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

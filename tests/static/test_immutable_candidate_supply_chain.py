@@ -348,6 +348,18 @@ def test_candidate_verifier_accepts_matching_subjects_and_rejects_relational_fai
     assert any("raw verification does not name the exact subject" in error for error in verifier.verify(empty_raw, repo_root=tmp_path))
 
 
+def test_candidate_verifier_separates_immutable_source_from_external_evidence(tmp_path: Path, monkeypatch):
+    verifier = _load_verifier()
+    source_root = tmp_path / "source"
+    evidence_root = tmp_path / "evidence"
+    source_root.mkdir()
+    evidence_root.mkdir()
+    manifest = valid_manifest(evidence_root)
+    monkeypatch.setattr(verifier, "_git_show", lambda _root, _revision, path: (ROOT / path).read_bytes())
+
+    assert verifier.verify(manifest, require_external=False, repo_root=source_root, evidence_root=evidence_root) == []
+
+
 def test_cli_reverifies_attestations_by_default_and_structure_only_is_non_success(tmp_path: Path, monkeypatch, capsys):
     verifier = _load_verifier()
     manifest = tmp_path / "candidate.json"
