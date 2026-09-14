@@ -38,9 +38,13 @@ class LocalGatewayClient:
             headers={}
             for line in lines[1:]:
                 key,value=line.split(b":",1);key=key.lower()
-                if key in headers or key not in {b"content-length",b"content-type"}:raise ValueError
+                # The closed client intentionally requests HTTP/1.0 so the
+                # response body is delimited by EOF. Uvicorn therefore emits
+                # this framing header even with its date and server headers
+                # disabled. It is permitted only in its exact safe form.
+                if key in headers or key not in {b"content-length",b"content-type",b"connection"}:raise ValueError
                 headers[key]=value.strip()
-            if set(headers)!={b"content-length",b"content-type"} or headers[b"content-type"]!=b"application/json" or int(headers[b"content-length"])!=len(payload):raise ValueError
+            if set(headers)!={b"content-length",b"content-type",b"connection"} or headers[b"content-type"]!=b"application/json" or headers[b"connection"].lower()!=b"close" or int(headers[b"content-length"])!=len(payload):raise ValueError
             value=load_closed_json(payload)
             if not isinstance(value,dict):raise ValueError
             return value

@@ -54,6 +54,7 @@ VERIFICATION_ERROR_CODES = {
     "staging marker binding is invalid": "staging-marker",
     "host versions are invalid": "host-versions",
     "docker versions are invalid": "docker-versions",
+    "execution binding is invalid": "execution-binding",
     "service classes are not exact": "service-classes",
     "red witness fields are invalid": "witness-fields",
     "red witness proof is invalid": "red-proof",
@@ -193,6 +194,10 @@ def build_receipt(*, head: str, tree: str, kernel: str, architecture: str,
         "staging": {"marker": marker, "marker_proof_sha256": marker_proof_sha256},
         "host": {"kernel": kernel, "architecture": architecture},
         "docker": {"server_version": docker_version, "compose_version": compose_version},
+        "execution": {
+            "mode": marker["image_mode"],
+            "executed_subject_repo_digests": marker["subject_admission"].get("executed_repo_digests", {}),
+        },
         "services": observations,
         "red_witness": {
             "proof_sha256": proof_sha256, "green_proof_sha256": green_proof_sha256, "green": green, "cleanup": cleanup,
@@ -206,7 +211,7 @@ def verify_receipt(value: object, *, expected_head: str, expected_tree: str, evi
     errors: list[str] = []
     if not isinstance(value, dict):
         return ["receipt is not an object"]
-    if set(value) != {"schema", "synthetic_non_phi_only", "runtime", "staging", "host", "docker", "services", "red_witness"}:
+    if set(value) != {"schema", "synthetic_non_phi_only", "runtime", "staging", "host", "docker", "execution", "services", "red_witness"}:
         errors.append("receipt fields are not exact")
     if value.get("schema") != SCHEMA or value.get("synthetic_non_phi_only") is not True:
         errors.append("receipt schema or synthetic marker is invalid")
@@ -227,6 +232,13 @@ def verify_receipt(value: object, *, expected_head: str, expected_tree: str, evi
             initialized_images = marker["expected_images"]
         except ReceiptError:
             errors.append("staging marker binding is invalid")
+    execution = value.get("execution")
+    expected_execution = {
+        "mode": marker.get("image_mode"),
+        "executed_subject_repo_digests": marker.get("subject_admission", {}).get("executed_repo_digests", {}),
+    }
+    if execution != expected_execution:
+        errors.append("execution binding is invalid")
     for group, fields in (("host", ("kernel", "architecture")), ("docker", ("server_version", "compose_version"))):
         item = value.get(group)
         if not isinstance(item, dict) or set(item) != set(fields) or any(not isinstance(item.get(field), str) or not SAFE_VERSION.fullmatch(item[field]) for field in fields):
@@ -343,11 +355,18 @@ def _git(runtime: Path, revision: str) -> str:
 
 
 def _compose(runtime: Path, state_dir: Path, project: str, *args: str) -> tuple[str, ...]:
-    return (
+    files: tuple[str, ...] = (
         "docker", "compose", "--env-file", str(state_dir / "compose.env"), "--project-name", project,
         "--file", str(runtime / "tests" / "deployment" / "clinical-composed-e2e" / "compose.yaml"),
-        "--file", str(runtime / "deploy" / "clinical-staging" / "compose.yaml"), *args,
+        "--file", str(runtime / "deploy" / "clinical-staging" / "compose.yaml"),
     )
+    try:
+        marker = json.loads((state_dir / "staging-state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        marker = {}
+    if marker.get("image_mode") == "subject-admitted":
+        files += ("--file", str(runtime / "deploy" / "clinical-staging" / "compose.subject-admitted.yaml"))
+    return (*files, *args)
 
 
 def _inspect_container(container_id: str) -> dict[str, Any]:
@@ -358,6 +377,35 @@ def _inspect_container(container_id: str) -> dict[str, Any]:
     if not isinstance(raw, list) or len(raw) != 1 or not isinstance(raw[0], dict):
         raise ReceiptError("container inspection was invalid")
     return raw[0]
+
+
+def _container_repo_digest(container_id: str, expected_reference: str) -> str:
+    """Return the exact pulled RepoDigest for a live restricted container."""
+    inspected = _inspect_container(container_id)
+    image_id = inspected.get("Image")
+    if not isinstance(image_id, str) or not SHA256.fullmatch(image_id):
+        raise ReceiptError("container inspection was invalid")
+    try:
+        raw = json.loads(_stdout("docker", "image", "inspect", image_id))
+        repo_digests = raw[0].get("RepoDigests") if isinstance(raw, list) and len(raw) == 1 else None
+    except (json.JSONDecodeError, TypeError, IndexError) as exc:
+        raise ReceiptError("container inspection was invalid") from exc
+    if (not isinstance(repo_digests, list) or len(repo_digests) < 1
+            or any(not isinstance(item, str) for item in repo_digests)
+            or expected_reference not in repo_digests):
+        raise ReceiptError("container inspection was invalid")
+    return expected_reference
+
+
+def _verify_live_subjects(marker: Mapping[str, Any], runtime: Path, state_dir: Path, project: str) -> None:
+    if marker.get("image_mode") != "subject-admitted":
+        return
+    expected = marker.get("subject_admission", {}).get("executed_repo_digests")
+    if not isinstance(expected, dict) or set(expected) != set(POLICIES):
+        raise ReceiptError("container inspection was invalid")
+    for service in POLICIES:
+        if _container_repo_digest(_service_id(runtime, state_dir, project, service), expected[service]) != expected[service]:
+            raise ReceiptError("container image differs from initialized image")
 
 
 def _load_staging_module(runtime: Path) -> Any:
@@ -374,7 +422,7 @@ def _load_staging_module(runtime: Path) -> Any:
 
 
 def _validate_marker_projection(value: object, head: str, tree: str) -> None:
-    if not isinstance(value, dict) or set(value) != {"schema", "marker_sha256", "source", "lifecycle", "compose_env_sha256", "expected_images", "volume_keys"}:
+    if not isinstance(value, dict) or set(value) != {"schema", "marker_sha256", "source", "lifecycle", "compose_env_sha256", "expected_images", "image_mode", "subject_admission", "volume_keys"}:
         raise ReceiptError("marker proof shape is invalid")
     source = value.get("source")
     images = value.get("expected_images")
@@ -386,6 +434,20 @@ def _validate_marker_projection(value: object, head: str, tree: str) -> None:
             or not isinstance(images, dict) or set(images) != {"mattermost-postgres", "mattermost", "hrh-postgres", "hrh", "hrh-tls", "clinical-adapter", "ingress", "operator-proxy"}
             or any(not isinstance(image, str) or not SHA256.fullmatch(image) for image in images.values())
             or not isinstance(value.get("volume_keys"), list) or value["volume_keys"] != ["clinical_config", "clinical_socket", "controller_state", "hrh_db", "hrh_secret", "hrh_tls", "ingress_config", "ingress_outbox", "mattermost_data", "mattermost_db", "mattermost_tls"]):
+        raise ReceiptError("marker proof does not retain the exact staging frame")
+    mode, admission = value.get("image_mode"), value.get("subject_admission")
+    if mode == "exact-source" and admission == {}:
+        return
+    if mode != "subject-admitted" or not isinstance(admission, dict) or set(admission) != {"manifest_sha256", "subjects", "executed_repo_digests"}:
+        raise ReceiptError("marker proof does not retain the exact staging frame")
+    subjects, executed = admission.get("subjects"), admission.get("executed_repo_digests")
+    expected_repositories = {
+        "ingress": "ghcr.io/cervantesh/restricted-mattermost-ingress@sha256:",
+        "clinical-adapter": "ghcr.io/cervantesh/restricted-clinical-adapter@sha256:",
+    }
+    if (not isinstance(admission.get("manifest_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", admission["manifest_sha256"])
+            or not isinstance(subjects, dict) or set(subjects) != set(POLICIES) or executed != subjects
+            or any(not isinstance(subjects.get(service), str) or not re.fullmatch(re.escape(prefix) + r"[a-f0-9]{64}", subjects[service]) for service, prefix in expected_repositories.items())):
         raise ReceiptError("marker proof does not retain the exact staging frame")
 
 
@@ -403,7 +465,8 @@ def _marker(state_dir: Path, project: str, head: str, tree: str, runtime: Path) 
         "schema": MARKER_PROOF_SCHEMA, "marker_sha256": hashlib.sha256(raw).hexdigest(),
         "source": {key: value[key] for key in ("runtime_head", "runtime_tree", "hrh_head", "hrh_tree")},
         "lifecycle": value["lifecycle"], "compose_env_sha256": value["compose_env_sha256"],
-        "expected_images": value["expected_images"], "volume_keys": sorted(value["volumes"]),
+        "expected_images": value["expected_images"], "image_mode": value["image_mode"],
+        "subject_admission": value["subject_admission"], "volume_keys": sorted(value["volumes"]),
     }
     _validate_marker_projection(projection, head, tree)
     return projection
@@ -632,6 +695,7 @@ def collect_red(*, runtime: Path, state_dir: Path, project: str, expected_head: 
     if _read_json(marker_proof) != marker:
         raise ReceiptError("red marker proof does not match initialized staging")
     initialized = marker["expected_images"]
+    _final_collect_step("service-inspection", lambda: _verify_live_subjects(marker, runtime, state_dir, project))
     container_id = _service_id(runtime, state_dir, project, service)
     inspected = _inspect_container(container_id)
     image_id = inspected.get("Image")
@@ -714,6 +778,7 @@ def collect(*, runtime: Path, state_dir: Path, project: str, expected_head: str,
     if _final_collect_step("marker-proof", lambda: _read_json(marker_proof)) != marker:
         raise FinalReceiptError("marker-proof")
     initialized = marker["expected_images"]
+    _final_collect_step("service-inspection", lambda: _verify_live_subjects(marker, runtime, state_dir, project))
     if not GIT_SHA.fullmatch(expected_head) or not GIT_SHA.fullmatch(expected_tree):
         raise FinalReceiptError("source-marker")
     observations: dict[str, dict[str, Any]] = {}

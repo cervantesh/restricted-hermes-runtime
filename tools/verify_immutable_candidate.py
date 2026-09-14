@@ -125,7 +125,7 @@ def _read_hashed_json(repo_root: Path, relative: object, expected_hash: object, 
     return record
 
 
-def _verify_attestation(errors: list[str], name: str, kind: str, value: object, image: str, digest: str, source_revision: str, run_url: str, repo_root: Path) -> None:
+def _verify_attestation(errors: list[str], name: str, kind: str, value: object, image: str, digest: str, source_revision: str, run_url: str, evidence_root: Path) -> None:
     record = _mapping(value)
     if record is None or record.get("subject_digest") != digest:
         _error(errors, f"{name}: {kind} subject digest does not match image subject")
@@ -138,7 +138,7 @@ def _verify_attestation(errors: list[str], name: str, kind: str, value: object, 
     if (verification.get("subject_digest") != digest or verification.get("source_revision") != source_revision
             or verification.get("workflow_run_url") != run_url or verification.get("predicate_type") != expected_predicate):
         _error(errors, f"{name}: {kind} verification binding mismatch")
-    receipt = _read_hashed_json(repo_root, verification.get("receipt"), verification.get("receipt_sha256"), errors, f"{name}: {kind}")
+    receipt = _read_hashed_json(evidence_root, verification.get("receipt"), verification.get("receipt_sha256"), errors, f"{name}: {kind}")
     if receipt is None:
         return
     part = _mapping(receipt.get(kind.lower()))
@@ -149,7 +149,7 @@ def _verify_attestation(errors: list[str], name: str, kind: str, value: object, 
             or not _raw_hash(part.get("raw_sha256"))):
         _error(errors, f"{name}: {kind} receipt does not prove the exact OCI subject")
         return
-    raw = _read_hashed_json(repo_root, part.get("raw_artifact"), part.get("raw_sha256"), errors, f"{name}: {kind} raw verification", object_required=False)
+    raw = _read_hashed_json(evidence_root, part.get("raw_artifact"), part.get("raw_sha256"), errors, f"{name}: {kind} raw verification", object_required=False)
     if raw is None:
         return
     if not _raw_names_subject(raw, digest, expected_predicate):
@@ -158,12 +158,12 @@ def _verify_attestation(errors: list[str], name: str, kind: str, value: object, 
         _error(errors, f"{name}: provenance raw verification does not name the expected source revision")
 
 
-def _verify_platform(errors: list[str], name: str, item: dict[str, Any], image: str, digest: str, source_revision: str, run_url: str, repo_root: Path) -> None:
+def _verify_platform(errors: list[str], name: str, item: dict[str, Any], image: str, digest: str, source_revision: str, run_url: str, evidence_root: Path) -> None:
     reference = _mapping(item.get("platform_receipt"))
     if reference is None:
         _error(errors, f"{name}: platform receipt is missing")
         return
-    receipt = _read_hashed_json(repo_root, reference.get("receipt"), reference.get("receipt_sha256"), errors, f"{name}: platform")
+    receipt = _read_hashed_json(evidence_root, reference.get("receipt"), reference.get("receipt_sha256"), errors, f"{name}: platform")
     if receipt is None:
         return
     if (receipt.get("schema_version") != "restricted-runtime-subject-receipt.v1" or receipt.get("image") != image
@@ -176,12 +176,12 @@ def _verify_platform(errors: list[str], name: str, item: dict[str, Any], image: 
         _error(errors, f"{name}: platform receipt does not prove linux/amd64 exact subject")
 
 
-def _verify_distinct_attestation_artifacts(errors: list[str], name: str, item: dict[str, Any], repo_root: Path) -> None:
+def _verify_distinct_attestation_artifacts(errors: list[str], name: str, item: dict[str, Any], evidence_root: Path) -> None:
     sbom = _mapping(item.get("sbom"))
     verification = _mapping(sbom.get("verification")) if sbom else None
     if verification is None:
         return
-    receipt = _read_hashed_json(repo_root, verification.get("receipt"), verification.get("receipt_sha256"), errors, f"{name}: attestation pair")
+    receipt = _read_hashed_json(evidence_root, verification.get("receipt"), verification.get("receipt_sha256"), errors, f"{name}: attestation pair")
     if receipt is None:
         return
     provenance = _mapping(receipt.get("provenance"))
@@ -192,7 +192,7 @@ def _verify_distinct_attestation_artifacts(errors: list[str], name: str, item: d
         _error(errors, f"{name}: provenance and SBOM must be distinct predicate artifacts")
 
 
-def _verify_subject(errors: list[str], subject: object, source_revision: str, run_url: str, repo_root: Path) -> str | None:
+def _verify_subject(errors: list[str], subject: object, source_revision: str, run_url: str, repo_root: Path, evidence_root: Path) -> str | None:
     item = _mapping(subject)
     if item is None:
         _error(errors, "subject is not an object")
@@ -228,10 +228,10 @@ def _verify_subject(errors: list[str], subject: object, source_revision: str, ru
             _error(errors, f"{name}: dependency lock hash does not match candidate source")
         elif lock.get("artifacts") != _lock_artifacts(lock_bytes):
             _error(errors, f"{name}: dependency lock artifacts do not match candidate source")
-    _verify_attestation(errors, name, "SBOM", item.get("sbom"), str(image), str(digest), source_revision, run_url, repo_root)
-    _verify_attestation(errors, name, "provenance", item.get("provenance"), str(image), str(digest), source_revision, run_url, repo_root)
-    _verify_distinct_attestation_artifacts(errors, name, item, repo_root)
-    _verify_platform(errors, name, item, str(image), str(digest), source_revision, run_url, repo_root)
+    _verify_attestation(errors, name, "SBOM", item.get("sbom"), str(image), str(digest), source_revision, run_url, evidence_root)
+    _verify_attestation(errors, name, "provenance", item.get("provenance"), str(image), str(digest), source_revision, run_url, evidence_root)
+    _verify_distinct_attestation_artifacts(errors, name, item, evidence_root)
+    _verify_platform(errors, name, item, str(image), str(digest), source_revision, run_url, evidence_root)
     tests = item.get("tests")
     if not isinstance(tests, list) or not tests or any(_mapping(x) is None or _mapping(x).get("outcome") != "passed" or _mapping(x).get("subject_digest") != digest or _mapping(x).get("receipt") != run_url for x in tests):
         _error(errors, f"{name}: test receipt does not prove this exact subject and run")
@@ -297,9 +297,10 @@ def _verify_external_subjects(errors: list[str], value: object) -> None:
         _error(errors, "health-record-hub external subject is missing")
 
 
-def verify(manifest: object, *, require_external: bool = True, repo_root: Path = ROOT) -> list[str]:
+def verify(manifest: object, *, require_external: bool = True, repo_root: Path = ROOT, evidence_root: Path | None = None) -> list[str]:
     errors: list[str] = []
     root = _mapping(manifest)
+    evidence_root = (evidence_root or repo_root).resolve()
     if root is None:
         return ["manifest is not an object"]
     if root.get("schema_version") != SCHEMA:
@@ -323,7 +324,7 @@ def verify(manifest: object, *, require_external: bool = True, repo_root: Path =
         _error(errors, "subjects are missing")
     else:
         for subject in subjects:
-            name = _verify_subject(errors, subject, source_revision, run_url, repo_root)
+            name = _verify_subject(errors, subject, source_revision, run_url, repo_root, evidence_root)
             if name in names:
                 _error(errors, f"duplicate subject {name}")
             if name:
@@ -482,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--repo-root", type=Path, default=ROOT)
+    parser.add_argument("--evidence-root", type=Path, help="root used to resolve retained candidate receipt paths")
     parser.add_argument("--closed-subjects-only", action="store_true")
     parser.add_argument("--offline-structure-only", action="store_true")
     args = parser.parse_args(argv)
@@ -490,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError) as exc:
         print(f"immutable candidate: unreadable manifest: {exc}", file=sys.stderr)
         return 2
-    errors = verify(manifest, require_external=not args.closed_subjects_only, repo_root=args.repo_root)
+    errors = verify(manifest, require_external=not args.closed_subjects_only, repo_root=args.repo_root, evidence_root=args.evidence_root or args.repo_root)
     if not errors and not args.offline_structure_only:
         errors.extend(verify_live_attestations(manifest, repo_root=args.repo_root))
     if errors:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -127,6 +128,224 @@ def test_marker_is_closed_and_binds_project_path_and_synthetic_purpose(tmp_path:
         (state / module.MARKER_NAME).write_text(json.dumps(changed), encoding="utf-8")
         with pytest.raises(module.SafetyError):
             module.read_marker(state, "clinicalstagingdemo")
+
+
+def test_subject_admission_requires_the_two_exact_immutable_ghcr_subjects(tmp_path: Path):
+    module = load_module()
+    manifest = tmp_path / "candidate.manifest.json"
+    ingress = "sha256:" + "a" * 64
+    adapter = "sha256:" + "b" * 64
+    manifest.write_text(json.dumps({
+        "schema_version": "restricted-runtime-immutable-candidate.v1",
+        "source_revision": "d" * 40,
+        "platform": "linux/amd64",
+        "subjects": [
+            {"name": "restricted-mattermost-ingress", "image": f"ghcr.io/cervantesh/restricted-mattermost-ingress@{ingress}", "digest": ingress, "platform": "linux/amd64"},
+            {"name": "restricted-clinical-adapter", "image": f"ghcr.io/cervantesh/restricted-clinical-adapter@{adapter}", "digest": adapter, "platform": "linux/amd64"},
+        ],
+    }), encoding="utf-8")
+
+    admission = module.read_subject_admission(manifest)
+    original = json.loads(manifest.read_text(encoding="utf-8"))
+
+    assert admission["subjects"] == {
+        "ingress": f"ghcr.io/cervantesh/restricted-mattermost-ingress@{ingress}",
+        "clinical-adapter": f"ghcr.io/cervantesh/restricted-clinical-adapter@{adapter}",
+    }
+    for mutate in (
+        lambda value: value.pop("subjects"),
+        lambda value: value["subjects"].__setitem__(0, {"name": "restricted-mattermost-ingress", "image": "ghcr.io/cervantesh/restricted-mattermost-ingress:latest", "digest": ingress, "platform": "linux/amd64"}),
+        lambda value: value["subjects"].__setitem__(0, {"name": "restricted-mattermost-ingress", "image": f"ghcr.io/cervantesh/restricted-mattermost-ingress@{adapter}", "digest": ingress, "platform": "linux/amd64"}),
+    ):
+        value = json.loads(json.dumps(original))
+        mutate(value)
+        manifest.write_text(json.dumps(value), encoding="utf-8")
+        with pytest.raises(module.SafetyError, match="subject admission"):
+            module.read_subject_admission(manifest)
+
+
+def test_subject_admitted_compose_never_builds_restricted_subjects(tmp_path: Path):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    admission = {
+        "manifest_sha256": "a" * 64, "executed_repo_digests": {},
+        "subjects": {
+            "ingress": "ghcr.io/cervantesh/restricted-mattermost-ingress@sha256:" + "b" * 64,
+            "clinical-adapter": "ghcr.io/cervantesh/restricted-clinical-adapter@sha256:" + "c" * 64,
+        },
+    }
+    staging = module.ClinicalStaging(runtime, hrh, state, "clinicalstagingdemo", 18443, subject_admission=admission)
+
+    assert str(staging.subject_overlay) in staging._compose_args()
+    assert staging._subject_build_services() == ("controller", "hrh-migrate", "hrh")
+    assert "ingress" not in staging._subject_build_services()
+    assert "clinical-adapter" not in staging._subject_build_services()
+
+    overlay = (ROOT / "deploy" / "clinical-staging" / "compose.subject-admitted.yaml").read_text(encoding="utf-8")
+    assert "clinical-socket-init:" in overlay
+    assert "clinical-adapter:" in overlay
+    assert "ingress:" in overlay
+    assert overlay.count("build: !reset null") == 3
+
+    commands: list[tuple[str, ...]] = []
+
+    class InspectingShell:
+        def run(self, *args, **_kwargs):
+            assert args[:3] == ("docker", "image", "inspect")
+            return SimpleNamespace(stdout=json.dumps([{"RepoDigests": [args[3]]}]), returncode=0)
+
+    staging.shell = InspectingShell()
+    staging.compose = lambda *args, **_kwargs: commands.append(args) or SimpleNamespace(returncode=0, stdout="", stderr="")
+    staging._build_images()
+
+    assert commands[0] == ("pull", "ingress", "clinical-adapter", "clinical-socket-init")
+    assert commands[1] == ("build", "controller", "hrh-migrate", "hrh")
+    assert all("ingress" not in command[1:] or command[0] != "build" for command in commands)
+
+
+def test_missing_subject_manifest_fails_before_staging_can_reach_compose(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+
+    monkeypatch.setattr(module, "ClinicalStaging", lambda *_args, **_kwargs: pytest.fail("staging must not be constructed"))
+
+    assert module.main([
+        "--runtime-root", str(runtime), "--hrh-root", str(hrh), "--state-dir", str(state),
+        "--project", "clinicalstagingdemo", "--subject-manifest", str(tmp_path / "missing.json"), "init",
+    ]) == 2
+
+
+def test_subject_admission_binds_manifest_source_revision_to_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    revision = subprocess.run(
+        ("git", "rev-parse", "HEAD"), cwd=ROOT, text=True, capture_output=True, check=True,
+    ).stdout.strip()
+    digest = "sha256:" + "a" * 64
+    manifest = tmp_path / "candidate.manifest.json"
+    manifest.write_text(json.dumps({
+        "schema_version": "restricted-runtime-immutable-candidate.v1", "source_revision": revision,
+        "platform": "linux/amd64", "subjects": [
+            {"name": "restricted-mattermost-ingress", "image": f"ghcr.io/cervantesh/restricted-mattermost-ingress@{digest}", "digest": digest, "platform": "linux/amd64"},
+            {"name": "restricted-clinical-adapter", "image": f"ghcr.io/cervantesh/restricted-clinical-adapter@{digest}", "digest": digest, "platform": "linux/amd64"},
+        ],
+    }), encoding="utf-8")
+
+    verified: list[object] = []
+    monkeypatch.setattr(module, "_verify_subject_candidate", lambda value, runtime, evidence_root: verified.append((value, runtime, evidence_root)))
+    module.read_subject_admission(manifest, runtime=ROOT)
+    assert verified and verified[0][1] == ROOT
+    assert verified[0][2] == manifest.parent.parent
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value["source_revision"] = "f" * 40
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(module.SafetyError, match="source revision differs"):
+        module.read_subject_admission(manifest, runtime=ROOT)
+
+
+def test_subject_admission_verifies_the_closed_oci_subject_set_only(tmp_path: Path):
+    module = load_module()
+    runtime = tmp_path / "runtime"
+    verifier = runtime / "tools" / "verify_immutable_candidate.py"
+    verifier.parent.mkdir(parents=True)
+    verifier.write_text(
+        "def verify(manifest, *, require_external, repo_root, evidence_root):\n"
+        "    return [] if require_external is False and repo_root.name == 'runtime' and evidence_root.name == 'evidence' else ['unexpected scope']\n"
+        "def verify_live_attestations(manifest, *, repo_root):\n"
+        "    return [] if repo_root.name == 'runtime' else ['unexpected live scope']\n",
+        encoding="utf-8",
+    )
+
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    module._verify_subject_candidate({"schema_version": "restricted-runtime-immutable-candidate.v1"}, runtime, evidence)
+
+
+def test_subject_admission_rejects_structurally_valid_candidate_without_live_attestation(tmp_path: Path):
+    module = load_module()
+    runtime = tmp_path / "runtime"
+    verifier = runtime / "tools" / "verify_immutable_candidate.py"
+    verifier.parent.mkdir(parents=True)
+    verifier.write_text(
+        "def verify(*args, **kwargs):\n    return []\n"
+        "def verify_live_attestations(*args, **kwargs):\n    return ['attestation authentication failed']\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.SafetyError, match="valid immutable candidate"):
+        module._verify_subject_candidate({}, runtime, tmp_path)
+
+
+def test_invalid_canonical_candidate_fails_before_staging_or_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / "clinicalstagingdemo.synthetic-clinical-staging"
+    manifest = tmp_path / "candidate.manifest.json"
+    manifest.write_text(json.dumps({
+        "schema_version": "restricted-runtime-immutable-candidate.v1", "source_revision": "d" * 40,
+        "platform": "linux/amd64", "subjects": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(module.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="d" * 40 + "\n"))
+    monkeypatch.setattr(module, "_verify_subject_candidate", lambda *_args: (_ for _ in ()).throw(module.SafetyError("subject admission manifest is not a valid immutable candidate")))
+    monkeypatch.setattr(module, "ClinicalStaging", lambda *_args, **_kwargs: pytest.fail("invalid admission must not construct staging"))
+
+    assert module.main([
+        "--runtime-root", str(runtime), "--hrh-root", str(hrh), "--state-dir", str(state),
+        "--project", "clinicalstagingdemo", "--subject-manifest", str(manifest), "init",
+    ]) == 2
+
+
+def test_resumed_initialization_seals_subject_admission_before_any_docker_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_module()
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    project = "clinicalstagingdemo"
+    state = tmp_path / f"{project}.synthetic-clinical-staging"
+    state.mkdir()
+    frame = {"runtime_head": "a" * 40, "runtime_tree": "b" * 40, "hrh_head": module.REQUIRED_HRH_SHA, "hrh_tree": module.REQUIRED_HRH_TREE}
+    subject_a = {
+        "manifest_sha256": "1" * 64, "executed_repo_digests": {},
+        "subjects": {
+            "ingress": "ghcr.io/cervantesh/restricted-mattermost-ingress@sha256:" + "a" * 64,
+            "clinical-adapter": "ghcr.io/cervantesh/restricted-clinical-adapter@sha256:" + "b" * 64,
+        },
+    }
+    subject_b = {**subject_a, "manifest_sha256": "2" * 64}
+    marker = module.new_marker(project=project, state_dir=state, state_id="c" * 32,
+        env_sha256=hashlib.sha256(b"").hexdigest(), lifecycle="initializing", subject_admission=subject_a,
+        image_mode="subject-admitted", expected_images={}, **frame)
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    (state / "compose.env").write_bytes(b"")
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, subject_admission=subject_b)
+    calls: list[str] = []
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: frame)
+    monkeypatch.setattr(staging, "compose", lambda *_args, **_kwargs: calls.append("compose"))
+    monkeypatch.setattr(staging, "control", lambda *_args, **_kwargs: calls.append("control"))
+    monkeypatch.setattr(staging, "_write_marker", lambda *_args: calls.append("write"))
+
+    with pytest.raises(module.SafetyError, match="resumed initialization subject admission"):
+        staging.init()
+    assert calls == []
+
+    staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, subject_admission=subject_a)
+    monkeypatch.setattr(staging, "_require_linux", lambda: None)
+    monkeypatch.setattr(module.os, "getuid", lambda: state.stat().st_uid, raising=False)
+    monkeypatch.setattr(module.stat, "S_IMODE", lambda _mode: 0o700)
+    monkeypatch.setattr(module, "verify_source_frame", lambda *_args: frame)
+    monkeypatch.setattr(staging, "_create_volumes", lambda *_args: (_ for _ in ()).throw(RuntimeError("reached-after-admission")))
+    with pytest.raises(RuntimeError, match="reached-after-admission"):
+        staging.init()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="atomic marker ownership is Linux/POSIX-only")

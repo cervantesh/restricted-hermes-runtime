@@ -7,6 +7,7 @@ import base64
 import contextlib
 import functools
 import hashlib
+import importlib.util
 import http.client
 import ipaddress
 import json
@@ -51,6 +52,16 @@ MAX_INITIALIZATION_ORPHANS = 8
 PROJECT_LABEL = "io.cervantesh.restricted-runtime.project"
 STATE_LABEL = "io.cervantesh.restricted-runtime.state-id"
 SYNTHETIC_LABEL = "io.cervantesh.restricted-runtime.synthetic-clinical"
+SUBJECT_ADMISSION_SCHEMA = "restricted-runtime-immutable-candidate.v1"
+SUBJECT_IMAGES = {
+    "ingress": "ghcr.io/cervantesh/restricted-mattermost-ingress",
+    "clinical-adapter": "ghcr.io/cervantesh/restricted-clinical-adapter",
+}
+SUBJECT_NAMES = {
+    "ingress": "restricted-mattermost-ingress",
+    "clinical-adapter": "restricted-clinical-adapter",
+}
+OCI_SUBJECT_RE = re.compile(r"^ghcr\.io/cervantesh/[a-z0-9-]+@sha256:[a-f0-9]{64}$")
 PROJECT_RE = re.compile(r"^clinicalstaging[a-z0-9]{1,32}$")
 VOLUME_KEYS = (
     "mattermost_db", "mattermost_data", "mattermost_tls", "hrh_db",
@@ -198,6 +209,8 @@ def new_marker(
     hrh_tree: str,
     lifecycle: str = "initializing",
     expected_images: Mapping[str, str] | None = None,
+    image_mode: str = "exact-source",
+    subject_admission: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_state_path(state_dir, project)
     return {
@@ -214,6 +227,8 @@ def new_marker(
         "hrh_tree": hrh_tree,
         "volumes": volume_names(project),
         "expected_images": dict(expected_images or {}),
+        "image_mode": image_mode,
+        "subject_admission": dict(subject_admission or {}),
     }
 
 
@@ -312,7 +327,7 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
     expected_keys = {
         "schema", "synthetic_only", "project", "state_dir", "state_id",
         "compose_env_sha256", "lifecycle", "runtime_head", "runtime_tree",
-        "hrh_head", "hrh_tree", "volumes", "expected_images",
+        "hrh_head", "hrh_tree", "volumes", "expected_images", "image_mode", "subject_admission",
     }
     if set(value) != expected_keys:
         raise SafetyError("staging marker has unknown or missing fields")
@@ -327,9 +342,110 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         or not re.fullmatch(r"[a-f0-9]{64}", value["compose_env_sha256"])
         or value["lifecycle"] not in {"initializing", "finalizing", "ready", "stopped"}
         or not isinstance(value["expected_images"], dict)
+        or value["image_mode"] not in {"exact-source", "subject-admitted"}
+        or not isinstance(value["subject_admission"], dict)
     ):
         raise SafetyError("staging marker does not match the requested synthetic target")
+    if value["image_mode"] == "exact-source" and value["subject_admission"]:
+        raise SafetyError("exact-source marker cannot retain subject admission")
+    if value["image_mode"] == "subject-admitted":
+        _validate_subject_admission(value["subject_admission"], require_executed=value["lifecycle"] != "initializing")
     return value
+
+
+def _validate_subject_admission(value: object, *, require_executed: bool) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"manifest_sha256", "subjects", "executed_repo_digests"}:
+        raise SafetyError("subject admission has unknown or missing fields")
+    manifest_sha256 = value.get("manifest_sha256")
+    subjects = value.get("subjects")
+    executed = value.get("executed_repo_digests")
+    if (not isinstance(manifest_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", manifest_sha256)
+            or not isinstance(subjects, dict) or set(subjects) != set(SUBJECT_IMAGES)
+            or not isinstance(executed, dict) or set(executed) != (set(SUBJECT_IMAGES) if require_executed else set())):
+        raise SafetyError("subject admission is not closed")
+    for service, image in SUBJECT_IMAGES.items():
+        expected = image + "@sha256:"
+        if not isinstance(subjects.get(service), str) or not subjects[service].startswith(expected) or not OCI_SUBJECT_RE.fullmatch(subjects[service]):
+            raise SafetyError("subject admission image is invalid")
+        if require_executed and executed.get(service) != subjects[service]:
+            raise SafetyError("subject admission executed digest differs from manifest")
+    return value
+
+
+def _sealed_subject_binding(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The pre-Docker admission identity; observed RepoDigests are not input."""
+    if not value:
+        return {}
+    return {
+        "manifest_sha256": value.get("manifest_sha256"),
+        "subjects": value.get("subjects"),
+    }
+
+
+def _verify_subject_candidate(manifest: object, runtime: Path, evidence_root: Path) -> None:
+    verifier_path = runtime / "tools" / "verify_immutable_candidate.py"
+    spec = importlib.util.spec_from_file_location("clinical_staging_candidate_verifier", verifier_path)
+    if spec is None or spec.loader is None:
+        raise SafetyError("subject admission verifier is unavailable")
+    verifier = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(verifier)
+        # The staging admission is deliberately closed over the two OCI
+        # subjects it will execute.  Health Record Hub remains a separately
+        # pinned source frame, not a third OCI subject in this manifest.
+        errors = verifier.verify(manifest, require_external=False, repo_root=runtime, evidence_root=evidence_root)
+        if not errors:
+            errors = verifier.verify_live_attestations(manifest, repo_root=runtime)
+    except Exception as exc:
+        raise SafetyError("subject admission verifier is unavailable") from exc
+    if not isinstance(errors, list) or errors:
+        raise SafetyError("subject admission manifest is not a valid immutable candidate")
+
+
+def read_subject_admission(path: Path, *, runtime: Path | None = None) -> dict[str, Any]:
+    """Read exactly the two immutable subjects accepted by clinical staging."""
+    try:
+        raw = path.read_bytes()
+        manifest = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SafetyError("subject admission manifest is unavailable") from exc
+    if (not isinstance(manifest, dict) or manifest.get("schema_version") != SUBJECT_ADMISSION_SCHEMA
+            or manifest.get("platform") != "linux/amd64" or not isinstance(manifest.get("subjects"), list)):
+        raise SafetyError("subject admission manifest is invalid")
+    revision = manifest.get("source_revision")
+    if not isinstance(revision, str) or not re.fullmatch(r"[a-f0-9]{40}", revision):
+        raise SafetyError("subject admission source revision is invalid")
+    if runtime is not None:
+        try:
+            current = subprocess.run(
+                ("git", "-C", str(runtime), "rev-parse", "HEAD"), text=True, encoding="utf-8",
+                errors="replace", capture_output=True, timeout=20, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SafetyError("subject admission source frame is unavailable") from exc
+        if current.returncode or current.stdout.strip() != revision:
+            raise SafetyError("subject admission source revision differs from runtime")
+        _verify_subject_candidate(manifest, runtime, path.parent.parent)
+    by_name: dict[str, dict[str, Any]] = {}
+    for subject in manifest["subjects"]:
+        if not isinstance(subject, dict) or not isinstance(subject.get("name"), str) or subject["name"] in by_name:
+            raise SafetyError("subject admission manifest is invalid")
+        by_name[subject["name"]] = subject
+    if set(by_name) != set(SUBJECT_NAMES.values()):
+        raise SafetyError("subject admission manifest has unexpected subjects")
+    subjects: dict[str, str] = {}
+    for service, name in SUBJECT_NAMES.items():
+        subject = by_name[name]
+        digest, image = subject.get("digest"), subject.get("image")
+        if (not isinstance(digest, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", digest)
+                or image != f"{SUBJECT_IMAGES[service]}@{digest}" or subject.get("platform") != "linux/amd64"):
+            raise SafetyError("subject admission subject is invalid")
+        subjects[service] = image
+    return {
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "subjects": subjects,
+        "executed_repo_digests": {},
+    }
 
 
 def file_sha256(path: Path) -> str:
@@ -668,7 +784,8 @@ def _certificate_material(seed: Path) -> None:
 
 
 class ClinicalStaging:
-    def __init__(self, runtime: Path, hrh: Path, state_dir: Path, project: str, port: int, shell: Shell | None = None):
+    def __init__(self, runtime: Path, hrh: Path, state_dir: Path, project: str, port: int, shell: Shell | None = None,
+                 subject_admission: Mapping[str, Any] | None = None):
         self.runtime = runtime.resolve()
         self.hrh = hrh.resolve()
         self.project = validate_project(project)
@@ -683,8 +800,12 @@ class ClinicalStaging:
         self.shell = shell or Shell()
         self.base_compose = self.runtime / "tests" / "deployment" / "clinical-composed-e2e" / "compose.yaml"
         self.overlay = self.runtime / "deploy" / "clinical-staging" / "compose.yaml"
+        self.subject_overlay = self.runtime / "deploy" / "clinical-staging" / "compose.subject-admitted.yaml"
         self.harness = self.runtime / "tests" / "deployment" / "clinical-composed-e2e"
         self.env_file = self.state_dir / "compose.env"
+        self.subject_admission = dict(subject_admission or {})
+        if self.subject_admission:
+            _validate_subject_admission(self.subject_admission, require_executed=False)
         self._lifecycle_thread_lock = threading.RLock()
         self._lifecycle_thread_state = threading.local()
 
@@ -734,11 +855,14 @@ class ClinicalStaging:
             raise SafetyError("operator staging lifecycle is supported only on local Linux")
 
     def _compose_args(self) -> tuple[str, ...]:
-        return (
+        paths = (
             "docker", "compose", "--env-file", str(self.env_file),
             "--project-name", self.project, "--file", str(self.base_compose),
             "--file", str(self.overlay),
         )
+        if self.subject_admission:
+            return (*paths, "--file", str(self.subject_overlay))
+        return paths
 
     @staticmethod
     def _sealed_compose_environment() -> dict[str, str]:
@@ -786,8 +910,8 @@ class ClinicalStaging:
             "CLINICAL_HRH_ROOT": self.hrh.as_posix(),
             "CLINICAL_HARNESS": self.harness.as_posix(),
             "CLINICAL_SEED": effective_seed.as_posix(),
-            "CLINICAL_INGRESS_IMAGE": f"restricted-clinical-ingress:{self.project}",
-            "CLINICAL_ADAPTER_IMAGE": f"restricted-clinical-adapter:{self.project}",
+            "CLINICAL_INGRESS_IMAGE": self.subject_admission.get("subjects", {}).get("ingress", f"restricted-clinical-ingress:{self.project}"),
+            "CLINICAL_ADAPTER_IMAGE": self.subject_admission.get("subjects", {}).get("clinical-adapter", f"restricted-clinical-adapter:{self.project}"),
             "CLINICAL_POLICY_PUBLIC_KEY": policy_public,
             "CLINICAL_HRH_BUILD_SHA": marker["hrh_head"],
             "CLINICAL_STAGING_PROJECT": self.project,
@@ -905,6 +1029,8 @@ class ClinicalStaging:
                 state_dir=self.state_dir,
                 state_id=secrets.token_hex(16),
                 env_sha256="0" * 64,
+                image_mode="subject-admitted" if self.subject_admission else "exact-source",
+                subject_admission=self.subject_admission,
                 **frame,
             )
             values = self._env_values(marker, seed_root=temporary)
@@ -925,11 +1051,41 @@ class ClinicalStaging:
     def _write_marker(self, marker: Mapping[str, Any]) -> None:
         write_json_atomic(self.state_dir / MARKER_NAME, marker, mode=0o600)
 
+    def _subject_build_services(self) -> tuple[str, ...]:
+        return ("controller", "hrh-migrate", "hrh") if self.subject_admission else ("ingress", "clinical-adapter", "controller", "hrh-migrate", "hrh")
+
+    def _up_services(self, *services: str, timeout: int) -> subprocess.CompletedProcess[str]:
+        if self.subject_admission:
+            return self.compose("up", "--detach", "--no-build", *services, timeout=timeout)
+        return self.compose("up", "--detach", *services, timeout=timeout)
+
+    def _admit_published_subjects(self) -> None:
+        """Pull and inspect immutable subjects before any service is started."""
+        if not self.subject_admission:
+            return
+        self.compose("pull", "ingress", "clinical-adapter", "clinical-socket-init", timeout=2400)
+        executed: dict[str, str] = {}
+        for service, reference in self.subject_admission["subjects"].items():
+            raw = self.shell.run("docker", "image", "inspect", reference, cwd=self.runtime).stdout
+            try:
+                value = json.loads(raw)
+                repo_digests = value[0].get("RepoDigests") if isinstance(value, list) and len(value) == 1 else None
+            except (json.JSONDecodeError, TypeError, IndexError) as exc:
+                raise SafetyError("subject admission inspection is invalid") from exc
+            if not isinstance(repo_digests, list) or reference not in repo_digests:
+                raise SafetyError("subject admission RepoDigest differs from manifest")
+            executed[service] = reference
+        self.subject_admission["executed_repo_digests"] = executed
+
     def _build_images(self) -> None:
         # controller is FROM the locally tagged ingress image, so its build
         # cannot share a parallel Compose phase with ingress.
-        self.compose("build", "ingress", "clinical-adapter", timeout=2400)
-        self.compose("build", "controller", "hrh-migrate", "hrh", timeout=2400)
+        if not self.subject_admission:
+            self.compose("build", "ingress", "clinical-adapter", timeout=2400)
+            self.compose("build", "controller", "hrh-migrate", "hrh", timeout=2400)
+            return
+        self._admit_published_subjects()
+        self.compose("build", *self._subject_build_services(), timeout=2400)
 
     def _provision_initial_mattermost_admin(self) -> None:
         """Create the initial admin inside the provisioner boundary.
@@ -977,6 +1133,11 @@ class ClinicalStaging:
             marker = read_marker(self.state_dir, self.project)
             if marker["lifecycle"] not in {"initializing", "finalizing"}:
                 raise SafetyError("staging target is already initialized")
+            expected_mode = "subject-admitted" if self.subject_admission else "exact-source"
+            if (marker["image_mode"] != expected_mode
+                    or _sealed_subject_binding(marker["subject_admission"])
+                    != _sealed_subject_binding(self.subject_admission)):
+                raise SafetyError("resumed initialization subject admission differs from sealed target")
             verify_effective_env(self.state_dir, marker)
             if any(marker[key] != value for key, value in frame.items()):
                 raise SafetyError("initializing marker source frame changed")
@@ -993,11 +1154,11 @@ class ClinicalStaging:
         self.compose("config", "--quiet")
         self._build_images()
         self.control("seed-volumes")
-        self.compose("up", "--detach", "mattermost-postgres", "hrh-postgres", "hrh-migrate", timeout=900)
+        self._up_services("mattermost-postgres", "hrh-postgres", "hrh-migrate", timeout=900)
         migrated = self.compose("wait", "hrh-migrate", check=False, timeout=900)
         if migrated.returncode:
             raise CommandError("HRH migration did not complete successfully")
-        self.compose("up", "--detach", "mattermost", timeout=600)
+        self._up_services("mattermost", timeout=600)
         self.control("wait-mm")
         self._provision_initial_mattermost_admin()
         self.control("bootstrap-mm")
@@ -1013,10 +1174,12 @@ class ClinicalStaging:
         )
         if public_key != env_public:
             raise SafetyError("provisioned policy public key differs from the sealed environment")
-        self.compose("up", "--detach", *ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
+        self._up_services(*ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
         self.control("wait-mm")
         self.control("wait-hrh")
         marker["expected_images"] = self._built_images()
+        if self.subject_admission:
+            marker["subject_admission"] = dict(self.subject_admission)
         marker["lifecycle"] = "finalizing"
         self._write_marker(marker)
         self._finalize_initialization(marker)
@@ -1027,7 +1190,7 @@ class ClinicalStaging:
         self._require_linux()
         marker = self._verify_marker_and_source()
         self._require_lifecycle(marker, "up", {"ready", "stopped"})
-        self.compose("up", "--detach", *ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
+        self._up_services(*ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
         self.control("wait-mm")
         self.control("wait-hrh")
         if marker["lifecycle"] == "stopped":
@@ -1037,6 +1200,11 @@ class ClinicalStaging:
 
     def _verify_marker_and_source(self) -> dict[str, Any]:
         marker = read_marker(self.state_dir, self.project)
+        marker_admission = marker["subject_admission"]
+        if bool(marker_admission) != bool(self.subject_admission):
+            raise SafetyError("subject-admitted marker requires the same admission manifest")
+        if marker_admission and marker_admission.get("manifest_sha256") != self.subject_admission.get("manifest_sha256"):
+            raise SafetyError("subject admission manifest differs from initialized target")
         verify_effective_env(self.state_dir, marker)
         frame = verify_source_frame(self.runtime, self.hrh, self.shell)
         for key, value in frame.items():
@@ -1324,6 +1492,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--port", type=int, default=18443)
+    parser.add_argument("--subject-manifest", type=Path)
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("init", "up", "status", "stop", "reset", "destroy"):
         sub.add_parser(name)
@@ -1334,8 +1503,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
-    staging = ClinicalStaging(args.runtime_root, args.hrh_root, args.state_dir, args.project, args.port)
     try:
+        admission = read_subject_admission(args.subject_manifest, runtime=args.runtime_root) if args.subject_manifest else None
+        staging = ClinicalStaging(args.runtime_root, args.hrh_root, args.state_dir, args.project, args.port, subject_admission=admission)
         if args.command == "refresh-policy":
             result = staging.refresh_policy(args.epoch)
         else:

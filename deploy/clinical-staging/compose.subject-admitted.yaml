@@ -1,0 +1,10 @@
+# This overlay is selected only after ClinicalStaging validates a closed
+# candidate manifest and pulls the two exact GHCR subjects.  `!reset` removes
+# every inherited build instruction, rather than merely overriding its context.
+services:
+  clinical-socket-init:
+    build: !reset null
+  clinical-adapter:
+    build: !reset null
+  ingress:
+    build: !reset null
