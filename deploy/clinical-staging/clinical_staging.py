@@ -390,7 +390,10 @@ def _verify_subject_candidate(manifest: object, runtime: Path) -> None:
     verifier = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(verifier)
-        errors = verifier.verify(manifest, require_external=True, repo_root=runtime)
+        # The staging admission is deliberately closed over the two OCI
+        # subjects it will execute.  Health Record Hub remains a separately
+        # pinned source frame, not a third OCI subject in this manifest.
+        errors = verifier.verify(manifest, require_external=False, repo_root=runtime)
     except Exception as exc:
         raise SafetyError("subject admission verifier is unavailable") from exc
     if not isinstance(errors, list) or errors:

@@ -247,6 +247,20 @@ def test_subject_admission_binds_manifest_source_revision_to_runtime(tmp_path: P
         module.read_subject_admission(manifest, runtime=ROOT)
 
 
+def test_subject_admission_verifies_the_closed_oci_subject_set_only(tmp_path: Path):
+    module = load_module()
+    runtime = tmp_path / "runtime"
+    verifier = runtime / "tools" / "verify_immutable_candidate.py"
+    verifier.parent.mkdir(parents=True)
+    verifier.write_text(
+        "def verify(manifest, *, require_external, repo_root):\n"
+        "    return [] if require_external is False and repo_root.name == 'runtime' else ['unexpected scope']\n",
+        encoding="utf-8",
+    )
+
+    module._verify_subject_candidate({"schema_version": "restricted-runtime-immutable-candidate.v1"}, runtime)
+
+
 def test_invalid_canonical_candidate_fails_before_staging_or_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     module = load_module()
     runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
