@@ -380,11 +380,13 @@ def test_live_attestation_verifier_binds_exact_subject_workflow_source_and_predi
     for subject in manifest["subjects"]:
         subject["base_materials"] = verifier._expected_base_material((ROOT / verifier.EXPECTED_DOCKERFILES[subject["name"]]).read_bytes())
     commands: list[list[str]] = []
+    run_kwargs: list[dict[str, object]] = []
     monkeypatch.setattr(verifier.shutil, "which", lambda _command: "gh")
     monkeypatch.setattr(verifier, "_git_show", lambda _root, _revision, path: (ROOT / path).read_bytes())
 
-    def run(command, **_kwargs):
+    def run(command, **kwargs):
         commands.append(command)
+        run_kwargs.append(kwargs)
         if command[:3] == ["gh", "attestation", "verify"]:
             predicate = command[command.index("--predicate-type") + 1]
             return SimpleNamespace(returncode=0, stdout=json.dumps([{
@@ -415,6 +417,7 @@ def test_live_attestation_verifier_binds_exact_subject_workflow_source_and_predi
         assert command[predicate_index + 1] in {"https://slsa.dev/provenance/v1", "https://spdx.dev/Document/v2.3"}
     assert commands[-2] == ["gh", "api", "repos/cervantesh/restricted-hermes-runtime/actions/runs/1"]
     assert commands[-1] == ["gh", "api", "repos/cervantesh/restricted-hermes-runtime/actions/runs/1/jobs"]
+    assert all(kwargs["encoding"] == "utf-8" and kwargs["errors"] == "strict" for kwargs in run_kwargs)
 
 
 def test_live_attestation_verifier_rejects_missing_authenticated_subject_build(tmp_path: Path, monkeypatch):
