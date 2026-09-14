@@ -394,6 +394,8 @@ def _verify_subject_candidate(manifest: object, runtime: Path, evidence_root: Pa
         # subjects it will execute.  Health Record Hub remains a separately
         # pinned source frame, not a third OCI subject in this manifest.
         errors = verifier.verify(manifest, require_external=False, repo_root=runtime, evidence_root=evidence_root)
+        if not errors:
+            errors = verifier.verify_live_attestations(manifest, repo_root=runtime)
     except Exception as exc:
         raise SafetyError("subject admission verifier is unavailable") from exc
     if not isinstance(errors, list) or errors:

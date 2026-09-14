@@ -255,13 +255,30 @@ def test_subject_admission_verifies_the_closed_oci_subject_set_only(tmp_path: Pa
     verifier.parent.mkdir(parents=True)
     verifier.write_text(
         "def verify(manifest, *, require_external, repo_root, evidence_root):\n"
-        "    return [] if require_external is False and repo_root.name == 'runtime' and evidence_root.name == 'evidence' else ['unexpected scope']\n",
+        "    return [] if require_external is False and repo_root.name == 'runtime' and evidence_root.name == 'evidence' else ['unexpected scope']\n"
+        "def verify_live_attestations(manifest, *, repo_root):\n"
+        "    return [] if repo_root.name == 'runtime' else ['unexpected live scope']\n",
         encoding="utf-8",
     )
 
     evidence = tmp_path / "evidence"
     evidence.mkdir()
     module._verify_subject_candidate({"schema_version": "restricted-runtime-immutable-candidate.v1"}, runtime, evidence)
+
+
+def test_subject_admission_rejects_structurally_valid_candidate_without_live_attestation(tmp_path: Path):
+    module = load_module()
+    runtime = tmp_path / "runtime"
+    verifier = runtime / "tools" / "verify_immutable_candidate.py"
+    verifier.parent.mkdir(parents=True)
+    verifier.write_text(
+        "def verify(*args, **kwargs):\n    return []\n"
+        "def verify_live_attestations(*args, **kwargs):\n    return ['attestation authentication failed']\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.SafetyError, match="valid immutable candidate"):
+        module._verify_subject_candidate({}, runtime, tmp_path)
 
 
 def test_invalid_canonical_candidate_fails_before_staging_or_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
