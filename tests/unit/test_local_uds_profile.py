@@ -240,6 +240,57 @@ def test_local_gateway_failure_diagnostics_are_closed_categories():
     assert _closed_failure_code(RuntimeError()) == "unexpected"
 
 
+def test_local_gateway_client_accepts_only_uvicorn_http10_close_framing(monkeypatch):
+    from restricted_runtime import local_gateway_client
+    from restricted_runtime.local_gateway_client import LocalGatewayClient
+
+    payload = b'{"status":"ready","policy_epoch":"e1","policy_digest":"d1"}'
+    # The parser is platform-neutral even though the production transport is
+    # AF_UNIX. Keep this contract test runnable on the Windows development
+    # host by supplying only the symbolic socket family the fake needs.
+    monkeypatch.setattr(local_gateway_client.socket, "AF_UNIX", object(), raising=False)
+
+    class Socket:
+        def __init__(self, response):
+            self.response = response
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def settimeout(self, _value):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendall(self, _request):
+            pass
+
+        def recv(self, _size):
+            value, self.response = self.response, b""
+            return value
+
+    def ready(response):
+        monkeypatch.setattr(local_gateway_client.socket, "socket", lambda *_args: Socket(response))
+        return LocalGatewayClient("/run/restricted-inference/gateway.sock").ready("e1", "d1")
+
+    accepted = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        + b"Connection: close\r\nContent-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
+    )
+    assert ready(accepted)
+
+    unexpected = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        + b"Connection: close\r\nServer: uvicorn\r\nContent-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
+    )
+    with pytest.raises(ContractError, match="local gateway unavailable"):
+        ready(unexpected)
+
+
 def test_reconciliation_rejects_expired_authority_before_claim_or_gateway_call():
     from restricted_runtime.reconciliation_driver import ReconciliationDriver
 
