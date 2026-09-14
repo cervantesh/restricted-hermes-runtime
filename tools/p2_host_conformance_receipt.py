@@ -24,7 +24,7 @@ HOST_CLASS = "ubuntu-24.04-lts-x86_64"
 # This evaluator must derive its frame from the source line that contains the
 # admitted-subject control, not from the historical pre-reconciliation tag.
 # The tag is created only after this complete source line is frozen.
-IMMUTABLE_TAG = "immutable-candidate-2026-09-14-p2-conformance-v1"
+IMMUTABLE_TAG = "immutable-candidate-2026-09-14-p2-conformance-v2"
 CONTROL_NAMES = (
     "admission", "subjects", "secrets", "egress",
     "trust_audit_retention", "recovery", "cleanup", "replay",
