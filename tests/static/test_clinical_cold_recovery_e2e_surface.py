@@ -59,17 +59,37 @@ def test_witness_crosses_a_real_restart_boundary():
     )
 
 
-def test_witness_asserts_both_distinct_terminal_delivery_contracts():
+def test_witness_asserts_all_three_distinct_terminal_delivery_contracts():
     source = harness()
-    # A definitively rejected later source lookup, and an unknown result across
-    # the restart: distinct reasons, both erased, neither posting.
+    # Three faults, three terminal contracts, all erased and none posting:
+    #   unknown result, source deleted        -> AMBIGUOUS(delivery_authorization_unknown)
+    #   unknown result across a restart       -> AMBIGUOUS(restart_in_flight)
+    #   known authorization, source rejected  -> BLOCKED(post_authorization_source_rejected)
     assert '"reason": "delivery_authorization_unknown"' in source
     assert '"reason": "restart_in_flight"' in source
+    assert '"reason": "post_authorization_source_rejected"' in source
     assert source.count('"state": "AMBIGUOUS"') == 2
-    assert source.count('"nonce_erased": True') == 2
-    assert source.count('"ciphertext_erased": True') == 2
+    assert source.count('"state": "BLOCKED"') == 1
+    assert source.count('"nonce_erased": True') == 3
+    assert source.count('"ciphertext_erased": True') == 3
     assert 'post-count", "cold-unknown")) != 0' in source
     assert "already delivered work was delivered again after restore" in source
+
+
+def test_witness_separates_known_rejection_from_unknown_result():
+    """The two faults must be induced by different mutations, not spelled differently."""
+    source = harness()
+    # `crash-delay` exceeds the adapter's upstream deadline, so the result is
+    # unknown; `source-delete-delay` stays inside it, so the authorization is
+    # known and only the later source lookup is rejected.
+    assert '"mutate", "crash-delay"' in source
+    assert '"mutate", "source-delete-delay"' in source
+    assert '"mutate", "drop-source-delete-delay"' in source
+    assert "blocked_source_record(staging)" in source
+    # The blocked record must be carried across the fence and re-checked.
+    assert 'snapshot(restored, str(blocked_after["record_tag"])) != [blocked_after]' in source
+    assert 'post-count", "cold-blocked")) != 0' in source
+    assert source.index("blocked_source_record(staging)") < source.index("staging.stop()")
 
 
 def test_witness_recomposes_the_non_recovery_controls_after_restore():
@@ -86,7 +106,9 @@ def test_witness_recomposes_the_non_recovery_controls_after_restore():
         assert control in source, control
     # Isolation and policy expiry are re-proven on the restored stack.
     assert '"denied", "denied_dm"' in source
-    assert '"policy", "cold-expired", "-1"' in source
+    # The lifetime itself is contracted below: it must clear the policy clock
+    # skew, which `-1` did not.
+    assert '"policy", "cold-expired", str(EXPIRED_POLICY_SECONDS)' in source
 
 
 def test_witness_binds_the_published_immutable_subjects_when_present():
@@ -138,3 +160,54 @@ def test_recovery_helper_image_matches_the_admitted_composed_subject():
         ROOT / "tests" / "deployment" / "clinical-composed-e2e" / "compose.yaml"
     ).read_text(encoding="utf-8")
     assert f"image: {module.RECOVERY_HELPER_IMAGE}" in compose
+
+
+def test_witness_reobserves_delivery_counts_after_restore():
+    """`post-count` is a cached value that the restore repopulates.
+
+    Reading it after restore without a fresh live observation would compare the
+    archived number with itself, so `already_delivered_not_redelivered` could
+    never fail. The live `expect` has to come first.
+    """
+    source = harness()
+    live = 'restored.control("expect", "cold-already-delivered", "reply")'
+    cached = 'restored.control("post-count", "cold-already-delivered")'
+    assert live in source
+    assert cached in source
+    assert source.index(live) < source.index(cached)
+
+
+def test_witness_expires_the_policy_past_the_clock_skew():
+    """A policy that expired one second ago is still valid.
+
+    The generated policy carries `clock_skew_seconds: 30` and the predicate is
+    `now - skew > expires_at`, so the fixture has to clear the skew or it
+    records a success it never observed.
+    """
+    source = harness()
+    assert "EXPIRED_POLICY_SECONDS" in source
+    namespace: dict = {}
+    for line in source.splitlines():
+        if line.startswith("EXPIRED_POLICY_SECONDS"):
+            exec(line, namespace)  # noqa: S102 - reading our own constant
+    value = namespace["EXPIRED_POLICY_SECONDS"]
+    assert value <= -60, "the expiry fixture must clear the 30s policy clock skew"
+    assert 'restored.control("policy", "cold-expired", str(EXPIRED_POLICY_SECONDS))' in source
+    assert '"cold-expired", "-1"' not in source
+
+
+def test_witness_observes_the_refusal_not_merely_the_silence():
+    """An expired policy is refused at load, so ingress exits instead of serving.
+
+    Silence right after `up --detach` is unreadiness, not a fail-closed
+    control, so the witness must observe the refusal itself and must reject the
+    outcome where ingress becomes ready anyway.
+    """
+    source = harness()
+    assert "restored._await_ingress_ready(started_at)" in source
+    assert "ingress became authenticated-ready with an expired policy" in source
+    assert "exited before authenticated readiness" in source
+    assert "ingress exited cleanly rather than refusing the expired policy" in source
+    ready = source.index("restored._await_ingress_ready(started_at)")
+    send = source.index('restored.control("send", "actor", "actor_dm", PATIENT, "cold-expired")')
+    assert ready < send

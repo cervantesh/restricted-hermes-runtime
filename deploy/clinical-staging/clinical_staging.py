@@ -91,6 +91,10 @@ BACKUP_VOLUME_DIR = "volumes"
 # came back and the stack started; these say the behavior survived.
 CAUSAL_RECOVERY_CHECKS = frozenset({
     "source_deletion_persisted",
+    # A definitive rejection observed after a *known* authorization must stay
+    # BLOCKED across the fence.  Collapsing it into one of the ambiguous
+    # results would lose the distinction #35 adjudicated.
+    "blocked_rejection_persisted",
     "unknown_delivery_is_ambiguous_once",
     "already_delivered_not_redelivered",
     "isolation_preserved",
@@ -2143,6 +2147,11 @@ class ClinicalStaging:
             or mechanical.get("verification") != "mechanical_restore_only"
             or mechanical.get("state_id") != marker["state_id"]
             or mechanical.get("project") != self.project
+            or mechanical.get("schema") != BACKUP_SCHEMA
+            or mechanical.get("source") != {
+                key: marker[key]
+                for key in ("runtime_head", "runtime_tree", "hrh_head", "hrh_tree")
+            }
         ):
             raise SafetyError("mechanical restore receipt does not bind this verification")
         receipt = {

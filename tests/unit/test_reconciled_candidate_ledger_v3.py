@@ -13,7 +13,9 @@ established from git rather than declared.
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -30,7 +32,12 @@ assert SPEC and SPEC.loader
 ledger = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ledger)
 
-LEDGER_PATH = "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15.json"
+LEDGER_PATHS = (
+    "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15.json",
+    "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-blocked.json",
+    "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-observed.json",
+    "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-egress.json",
+)
 
 
 def git(*args: str) -> str:
@@ -47,7 +54,7 @@ def build(candidate: str | None = None) -> dict:
     return ledger.build_ledger_v3(
         repo_root=ROOT,
         candidate_revision=candidate or git("rev-parse", "HEAD"),
-        extra_receipts=ledger.COLD_RECOVERY_RECEIPTS,
+        extra_receipts=ledger.COLD_RECOVERY_RECEIPTS + ledger.EGRESS_RECEIPTS,
     )
 
 
@@ -138,7 +145,12 @@ def test_v3_rejects_a_replay_claim_without_a_qualifying_receipt(good):
         for item in value["retained_receipts"]
         if item["schema"] != ledger.COLD_RECOVERY_SCHEMA
     ]
-    value["historical_receipts_only"] = True
+    # Other candidate_ancestor evidence (the egress witness) may remain, so
+    # keep the provenance summary consistent: the only thing under test is a
+    # claim whose own evidence is gone.
+    value["historical_receipts_only"] = all(
+        item["provenance"] == "historical" for item in value["retained_receipts"]
+    )
     # Claim retained, evidence removed.
     assert value["claims"]["cold_recovery_replayed_on_candidate_ancestor"] is True
     assert verify(value) == ["claims"]
@@ -220,9 +232,11 @@ def test_v2_ledgers_are_unaffected_by_the_v3_dispatch():
         assert ledger.verify_ledger(raw, repo_root=ROOT) == [], name
 
 
-def test_retained_v3_ledger_verifies_and_names_its_preceding_candidate():
+@pytest.mark.parametrize("path", LEDGER_PATHS)
+def test_retained_v3_ledger_verifies_and_names_its_preceding_candidate(path):
+    """Each retained v3 ledger stays valid, including the superseded one."""
     tracked = subprocess.run(
-        ["git", "-C", str(ROOT), "show", f"HEAD:{LEDGER_PATH}"],
+        ["git", "-C", str(ROOT), "show", f"HEAD:{path}"],
         capture_output=True,
         timeout=30,
         check=False,
@@ -232,9 +246,141 @@ def test_retained_v3_ledger_verifies_and_names_its_preceding_candidate():
     raw = tracked.stdout
     assert ledger.verify_ledger(raw, repo_root=ROOT) == []
     value = json.loads(raw)
-    ledger_commit = git("log", "-1", "--format=%H", "--", LEDGER_PATH)
+    ledger_commit = git("log", "-1", "--format=%H", "--", path)
     candidate = git("rev-parse", f"{ledger_commit}~1")
     assert value["candidate"] == {
         "revision": candidate,
         "tree": git("rev-parse", f"{candidate}^{{tree}}"),
     }
+
+
+# --------------------------------------------------------------------------
+# The replay claim is gated on the witness's substance, not on its label
+#
+# `backup()`, `restore()` and the composed witness all publish
+# COLD_RECOVERY_SCHEMA. Gating the claim on the schema string alone let a
+# `mechanical_restore_only` receipt -- which by its own text proves only that
+# the bytes came back and the stack started -- satisfy a claim about the
+# composed cycle.
+# --------------------------------------------------------------------------
+
+
+def mechanical_restore_receipt(source: dict) -> dict:
+    """Exactly what `ClinicalStaging.restore` publishes."""
+    return {
+        "schema": ledger.COLD_RECOVERY_SCHEMA,
+        "synthetic_only": True,
+        "project": "clinicalstagingrecoveryforged",
+        "state_id": "a" * 32,
+        "manifest_sha256": "b" * 64,
+        "excluded_volume": "clinical_socket",
+        "source": dict(source),
+        "status_observed_at": "2026-09-15T00:00:00+00:00",
+        "verification": "mechanical_restore_only",
+        "restored_at": "2026-09-15T00:00:00+00:00",
+        "nonclaims": ["not a causal recovery verification"],
+    }
+
+
+def substitute_cold_receipts(value: dict, replacement) -> dict:
+    """Point every cold-recovery entry at `replacement(source)` bytes."""
+    blobs: dict[str, bytes] = {}
+    for item in value["retained_receipts"]:
+        if item["schema"] != ledger.COLD_RECOVERY_SCHEMA:
+            continue
+        raw = (
+            json.dumps(replacement(item["source"]), sort_keys=True) + "\n"
+        ).encode("utf-8")
+        item["path"] = "docs/evidence/substituted-" + item["name"] + ".json"
+        item["sha256"] = hashlib.sha256(raw).hexdigest()
+        blobs[item["path"].rsplit("/", 1)[-1]] = raw
+    return blobs
+
+
+@contextlib.contextmanager
+def tracked_bytes(blobs: dict):
+    original = ledger._git_bytes
+
+    def patched(repo_root, *args):
+        for name, raw in blobs.items():
+            if args and args[-1].endswith(name):
+                return raw
+        return original(repo_root, *args)
+
+    ledger._git_bytes = patched
+    try:
+        yield
+    finally:
+        ledger._git_bytes = original
+
+
+def test_v3_rejects_a_mechanical_restore_receipt_as_replay_evidence(good):
+    value = copy.deepcopy(good)
+    blobs = substitute_cold_receipts(value, mechanical_restore_receipt)
+    assert blobs, "the ledger must list at least one cold-recovery receipt"
+    with tracked_bytes(blobs):
+        # The claim is retained while every listed receipt proves only a
+        # mechanical restore.
+        assert value["claims"]["cold_recovery_replayed_on_candidate_ancestor"] is True
+        assert verify(value) == ["claims"]
+        # The same ledger is accepted once it stops claiming more than it has.
+        value["claims"]["cold_recovery_replayed_on_candidate_ancestor"] = False
+        assert verify(value) == []
+
+
+def test_v3_builder_refuses_to_emit_a_non_witness_receipt(good):
+    source = cold_entry(good)["source"]
+    raw = (
+        json.dumps(mechanical_restore_receipt(source), sort_keys=True) + "\n"
+    ).encode("utf-8")
+    with tracked_bytes({"substituted-builder.json": raw}):
+        with pytest.raises(ValueError, match="not a composed cold-recovery witness"):
+            ledger.build_ledger_v3(
+                repo_root=ROOT,
+                candidate_revision=git("rev-parse", "HEAD"),
+                extra_receipts=(
+                    (
+                        "substituted",
+                        "docs/evidence/substituted-builder.json",
+                        ledger.COLD_RECOVERY_SCHEMA,
+                        "candidate_ancestor",
+                    ),
+                ),
+            )
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    [
+        ("unerased payload", lambda v: v["source_deletion_after"].update(nonce_erased=False)),
+        ("missing terminal", lambda v: v.pop("unknown_delivery_after")),
+        ("unverified tls", lambda v: v["restored_tls_probe"].update(verified=False)),
+        ("no images", lambda v: v.update(restored_built_images={})),
+        ("one record twice", lambda v: v["unknown_delivery_after"].update(
+            record_tag=v["source_deletion_after"]["record_tag"])),
+        ("not synthetic", lambda v: v.update(synthetic_only=False)),
+    ],
+)
+def test_v3_replay_claim_needs_a_complete_witness(good, label, mutate):
+    """Each piece the claim rests on must actually be present in the receipt."""
+    real = json.loads(
+        subprocess.run(
+            ["git", "-C", str(ROOT), "show", f"HEAD:{cold_entry(good)['path']}"],
+            capture_output=True,
+            check=True,
+            timeout=30,
+        ).stdout.decode("utf-8")
+    )
+
+    def damaged(source):
+        value = copy.deepcopy(real)
+        # Keep each entry's own declared source frame, so the only thing the
+        # verifier can object to is the damage under test.
+        value["source"] = dict(source)
+        mutate(value)
+        return value
+
+    value = copy.deepcopy(good)
+    blobs = substitute_cold_receipts(value, damaged)
+    with tracked_bytes(blobs):
+        assert verify(value) == ["claims"], label

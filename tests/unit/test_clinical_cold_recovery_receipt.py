@@ -20,6 +20,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 RECEIPT = ROOT / "docs" / "evidence" / "clinical-cold-recovery-receipt-2026-09-15.json"
+BLOCKED_RECEIPT = (
+    ROOT / "docs" / "evidence" / "clinical-cold-recovery-receipt-2026-09-15-blocked.json"
+)
 STAGING = ROOT / "deploy" / "clinical-staging" / "clinical_staging.py"
 FROZEN_HRH = {
     "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
@@ -158,3 +161,69 @@ def test_receipt_bytes_match_the_committed_object(raw):
     if tracked.returncode:
         pytest.skip("receipt is not committed yet")
     assert hashlib.sha256(tracked.stdout).hexdigest() == hashlib.sha256(raw).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# The later replay additionally carries the definitive rejection across the
+# fence, which is the third closure predicate's whole point.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def blocked_receipt() -> dict:
+    return json.loads(BLOCKED_RECEIPT.read_bytes().decode("utf-8"))
+
+
+def test_blocked_receipt_records_three_distinct_terminal_contracts(blocked_receipt):
+    keys = ("source_deletion_after", "unknown_delivery_after", "blocked_rejection_after")
+    observed = {blocked_receipt[key]["record_tag"] for key in keys}
+    assert len(observed) == 3, "the three fixtures must be three distinct records"
+    reasons = {blocked_receipt[key]["reason"] for key in keys}
+    assert reasons == {
+        "delivery_authorization_unknown",
+        "restart_in_flight",
+        "post_authorization_source_rejected",
+    }
+    states = sorted(blocked_receipt[key]["state"] for key in keys)
+    assert states == ["AMBIGUOUS", "AMBIGUOUS", "BLOCKED"]
+    for key in keys:
+        after = blocked_receipt[key]
+        before = blocked_receipt[key.replace("_after", "_before")]
+        assert before["state"] == "IN_FLIGHT"
+        assert before["nonce_erased"] is False and before["ciphertext_erased"] is False
+        assert after["nonce_erased"] is True and after["ciphertext_erased"] is True
+        assert after["generation"] == before["generation"] + 1
+        assert after["record_tag"] == before["record_tag"]
+
+
+def test_blocked_receipt_keeps_the_known_rejection_out_of_the_ambiguous_states(
+    blocked_receipt,
+):
+    """A known authorization followed by a definitive rejection is not ambiguous."""
+    blocked = blocked_receipt["blocked_rejection_after"]
+    assert blocked["state"] == "BLOCKED"
+    assert blocked["reason"] == "post_authorization_source_rejected"
+    ambiguous_tags = {
+        blocked_receipt[key]["record_tag"]
+        for key in ("source_deletion_after", "unknown_delivery_after")
+    }
+    assert blocked["record_tag"] not in ambiguous_tags
+
+
+def test_blocked_receipt_is_bounded_and_binds_a_real_ancestor(blocked_receipt):
+    module = load_staging()
+    assert blocked_receipt["schema"] == module.BACKUP_SCHEMA
+    assert blocked_receipt["synthetic_only"] is True
+    assert blocked_receipt["subject_admitted"] is False
+    assert blocked_receipt["restored_tls_probe"]["verified"] is True
+    source = blocked_receipt["source"]
+    for key, value in FROZEN_HRH.items():
+        assert source[key] == value, key
+    assert git("rev-parse", f"{source['runtime_head']}^{{tree}}") == source["runtime_tree"]
+    git("merge-base", "--is-ancestor", source["runtime_head"], "HEAD")
+
+
+def test_blocked_receipt_carries_no_fixture_content(blocked_receipt):
+    text = json.dumps(blocked_receipt, sort_keys=True)
+    for token in ("cold-blocked", "cold-unknown", "cold-allowed", "password", "seed"):
+        assert token not in text, token
