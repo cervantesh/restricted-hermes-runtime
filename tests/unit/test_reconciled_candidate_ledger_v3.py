@@ -35,6 +35,7 @@ SPEC.loader.exec_module(ledger)
 LEDGER_PATHS = (
     "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15.json",
     "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-blocked.json",
+    "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-observed.json",
 )
 
 

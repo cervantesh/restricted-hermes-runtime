@@ -59,6 +59,17 @@ COLD_RECOVERY_RECEIPTS = (
         "restricted-synthetic-clinical-cold-backup.v1",
         "candidate_ancestor",
     ),
+    # The run after two causal checks stopped being vacuous.  The two earlier
+    # receipts record real executions and real terminal contracts, but their
+    # harness could not have failed `already_delivered_not_redelivered` or
+    # `expired_policy_fails_closed`.  Each receipt pins its own
+    # `source.runtime_head`, so which harness produced which is checkable.
+    (
+        "clinical_cold_recovery_observed",
+        "docs/evidence/clinical-cold-recovery-receipt-2026-09-15-observed.json",
+        "restricted-synthetic-clinical-cold-backup.v1",
+        "candidate_ancestor",
+    ),
 )
 FROZEN_HRH_SOURCE = {
     "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
