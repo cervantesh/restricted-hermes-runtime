@@ -1233,3 +1233,99 @@ def test_destroy_absence_check_stays_inside_the_project_namespace(module, tmp_pa
 
     source.shell = ForeignShell()
     source._assert_destroyed_absent()
+
+
+# --------------------------------------------------------------------------
+# Ingress readiness is a bounded barrier, not a single observation
+# --------------------------------------------------------------------------
+
+
+READY_LINE = "mattermost_ingress_outcome=authenticated_ready\n"
+STARTED_AT = "2026-09-15T03:01:37.109884947Z"
+
+
+def _ready_target(module, tmp_path, monkeypatch, *, states, logs):
+    """A staging instance whose ingress inspections and logs are scripted."""
+    source, _marker, _values = make_target(module, tmp_path)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    inspections = list(states)
+    log_values = list(logs)
+
+    def next_inspection():
+        value = inspections.pop(0) if len(inspections) > 1 else inspections[0]
+        return {"ingress": {"State": value}}
+
+    def fake_compose(*args, **_kwargs):
+        if args[:2] == ("logs", "--no-color"):
+            assert args[3] == STARTED_AT, "the window must be the container start time"
+            value = log_values.pop(0) if len(log_values) > 1 else log_values[0]
+            return SimpleNamespace(returncode=0, stdout=value, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(source, "_container_inspections", next_inspection)
+    monkeypatch.setattr(source, "compose", fake_compose)
+    return source
+
+
+@posix_only
+def test_ingress_readiness_waits_instead_of_racing(module, tmp_path, monkeypatch):
+    """Restore starts ingress moments before status observes it."""
+    running = {"Running": True, "Status": "running"}
+    source = _ready_target(
+        module,
+        tmp_path,
+        monkeypatch,
+        states=[running],
+        logs=["", "", READY_LINE],
+    )
+    source._await_ingress_ready(STARTED_AT)
+
+
+@posix_only
+def test_ingress_readiness_fails_fast_when_ingress_exits(module, tmp_path, monkeypatch):
+    source = _ready_target(
+        module,
+        tmp_path,
+        monkeypatch,
+        states=[{"Running": False, "Status": "exited"}],
+        logs=[""],
+    )
+    with pytest.raises(module.SafetyError, match="exited before authenticated readiness"):
+        source._await_ingress_ready(STARTED_AT)
+
+
+@posix_only
+def test_ingress_readiness_still_fails_closed_on_timeout(module, tmp_path, monkeypatch):
+    source = _ready_target(
+        module,
+        tmp_path,
+        monkeypatch,
+        states=[{"Running": True, "Status": "running"}],
+        logs=[""],
+    )
+    clock = iter([0.0, 0.0, 1000.0, 1000.0, 2000.0, 2000.0])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(clock))
+    with pytest.raises(module.SafetyError, match="not authenticated-ready"):
+        source._await_ingress_ready(STARTED_AT)
+
+
+@posix_only
+def test_ingress_readiness_never_accepts_an_earlier_run(module, tmp_path, monkeypatch):
+    """The window is the container's own start time, so a stale line cannot pass."""
+    source, _marker, _values = make_target(module, tmp_path)
+    windows: list[str] = []
+
+    def fake_compose(*args, **_kwargs):
+        if args[:2] == ("logs", "--no-color"):
+            windows.append(args[3])
+            return SimpleNamespace(returncode=0, stdout=READY_LINE, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        source,
+        "_container_inspections",
+        lambda: {"ingress": {"State": {"Running": True, "Status": "running"}}},
+    )
+    monkeypatch.setattr(source, "compose", fake_compose)
+    source._await_ingress_ready(STARTED_AT)
+    assert windows == [STARTED_AT]

@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -103,6 +104,12 @@ RECOVERY_HELPER_IMAGE = (
     "postgres:17.10-bookworm@sha256:"
     "9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f"
 )
+# `status` may be called immediately after `restore` starts ingress, so the
+# authenticated-ready observation needs a bounded barrier rather than a single
+# shot.  The window is the container's own start time, so this waits for the
+# current process to authenticate -- it can never satisfy itself from an
+# earlier run's logs.
+INGRESS_READY_TIMEOUT_SECONDS = 60
 LIFECYCLE_STATES = (
     "initializing", "finalizing", "ready", "stopped", "cold", "recovering",
 )
@@ -1516,6 +1523,31 @@ class ClinicalStaging:
             "path": "/api/v4/system/ping",
         }
 
+    def _await_ingress_ready(self, started_at: str) -> None:
+        """Wait, bounded, for the current ingress process to authenticate.
+
+        `up` reaches this after a long provisioning sequence, so a single
+        observation was enough there.  `restore` reaches it moments after
+        starting ingress, where a single observation is a race: the process is
+        running but has not authenticated yet.  Waiting does not weaken the
+        control -- the window is still the container's own `StartedAt`, an
+        ingress that exits fails immediately rather than after the timeout, and
+        an ingress that never authenticates still fails closed.
+        """
+        deadline = time.monotonic() + INGRESS_READY_TIMEOUT_SECONDS
+        while True:
+            state = self._container_inspections().get("ingress", {}).get("State", {})
+            if state.get("Running") is False or state.get("Status") in {"exited", "dead"}:
+                raise SafetyError("Mattermost ingress exited before authenticated readiness")
+            logs = self.compose(
+                "logs", "--no-color", "--since", started_at, "ingress", check=False,
+            ).stdout
+            if "mattermost_ingress_outcome=authenticated_ready" in logs:
+                return
+            if time.monotonic() >= deadline:
+                raise SafetyError("Mattermost ingress is not authenticated-ready")
+            time.sleep(0.25)
+
     def _assert_no_controller(self) -> None:
         containers = self._labeled_resources("container")
         if any(labels.get("com.docker.compose.service") == "controller" for labels in containers.values()):
@@ -1572,16 +1604,7 @@ class ClinicalStaging:
             ingress_started_at,
         ) or ingress_started_at.startswith("0001-"):
             raise SafetyError("current Mattermost ingress start time is unavailable")
-        logs = self.compose(
-            "logs",
-            "--no-color",
-            "--since",
-            ingress_started_at,
-            "ingress",
-            check=False,
-        ).stdout
-        if "mattermost_ingress_outcome=authenticated_ready" not in logs:
-            raise SafetyError("Mattermost ingress is not authenticated-ready")
+        self._await_ingress_ready(ingress_started_at)
         current_images = self._built_images()
         if not marker["expected_images"] or current_images != marker["expected_images"]:
             raise SafetyError("running service image identities differ from initialized receipt")
