@@ -165,6 +165,79 @@ def ambiguous_source_record(staging) -> tuple[dict[str, object], dict[str, objec
     return before, after
 
 
+def blocked_source_record(staging) -> tuple[dict[str, object], dict[str, object]]:
+    """A *known* successful reauthorization whose source is then definitively gone.
+
+    This is the control the other two fixtures cannot stand in for.
+    `source-delete-delay` holds the pre-revalidation window open while keeping
+    the authorization response inside the adapter's upstream deadline, so the
+    reauthorization result is **known**. A definitive rejection observed after
+    a known authorization must terminalize `BLOCKED`, never `AMBIGUOUS`:
+    collapsing the two would lose exactly the distinction #35 adjudicated.
+
+    The deletion happens while ingress is paused, because otherwise the
+    Mattermost DELETE races the final source revalidation.
+    """
+    staging.control("mutate", "reset")
+    before_grants = int(staging.control("grant-count"))
+    staging.control("mutate", "source-delete-delay")
+    staging.control("send", "actor", "actor_dm", PATIENT, "cold-blocked")
+    wait_until(
+        lambda: int(staging.control("grant-count")) > before_grants,
+        "clinical read was not granted for cold-blocked",
+    )
+    staging.compose("pause", "ingress")
+    try:
+        rows = json.loads(staging.control("snapshot-outbox-records"))
+        if not isinstance(rows, list):
+            raise RuntimeError("blocked fixture snapshot was not a list")
+        in_flight = [row for row in rows if row.get("state") == "IN_FLIGHT"]
+        if len(in_flight) != 1:
+            raise RuntimeError(
+                "blocked fixture did not isolate one IN_FLIGHT record "
+                f"(observed={len(in_flight)})"
+            )
+        before = in_flight[0]
+        tag = before.get("record_tag")
+        if not isinstance(tag, str) or len(tag) != 64:
+            raise RuntimeError("blocked fixture record tag is invalid")
+        if (
+            before.get("reason") != ""
+            or before.get("nonce_erased")
+            or before.get("ciphertext_erased")
+        ):
+            raise RuntimeError("blocked fixture claimed record did not retain its payload")
+        staging.control("delete-source", "cold-blocked")
+    finally:
+        staging.compose("unpause", "ingress", check=False)
+    staging.control("mutate", "drop-source-delete-delay")
+    wait_until(
+        lambda: reauthorizations(staging, "cold-blocked") == 1,
+        "blocked fixture authorization did not commit exactly once",
+    )
+    staging.control("expect", "cold-blocked", "no-reply")
+    rows = snapshot(staging, tag)
+    if len(rows) != 1:
+        raise RuntimeError("terminal blocked record is missing")
+    after = rows[0]
+    expected = {
+        "record_tag": tag,
+        "state": "BLOCKED",
+        "reason": "post_authorization_source_rejected",
+        "generation": int(before["generation"]) + 1,
+        "nonce_erased": True,
+        "ciphertext_erased": True,
+    }
+    if after != expected:
+        raise RuntimeError(
+            "known-authorization source rejection did not terminalize BLOCKED: "
+            + json.dumps(after, sort_keys=True)
+        )
+    if int(staging.control("post-count", "cold-blocked")) != 0:
+        raise RuntimeError("definitively rejected delivery produced a post")
+    return before, after
+
+
 def assert_composed_controls(status: dict[str, object]) -> None:
     """The restored stack must still satisfy the non-recovery controls.
 
@@ -230,6 +303,9 @@ def main() -> None:
                 )
 
             source_before, source_after = ambiguous_source_record(staging)
+
+
+            blocked_before, blocked_after = blocked_source_record(staging)
 
             # This item is IN_FLIGHT at the cold fence with a deliberately
             # unknown authorization outcome.  Restore must classify it
@@ -302,6 +378,14 @@ def main() -> None:
                 raise RuntimeError(
                     "deleted-source terminal erased state changed after restore"
                 )
+            # The definitive rejection must still be BLOCKED, not collapsed into
+            # one of the ambiguous results, and must still not post.
+            if snapshot(restored, str(blocked_after["record_tag"])) != [blocked_after]:
+                raise RuntimeError(
+                    "definitively rejected terminal state changed after restore"
+                )
+            if int(restored.control("post-count", "cold-blocked")) != 0:
+                raise RuntimeError("definitively rejected record posted after restore")
 
             restored.control("send", "denied", "denied_dm", PATIENT, "cold-isolation")
             restored.control("expect", "cold-isolation", "no-reply")
@@ -319,6 +403,7 @@ def main() -> None:
             fixture_tokens = (
                 "cold-source-deleted",
                 "cold-unknown",
+                "cold-blocked",
                 "cold-allowed",
                 PATIENT,
             )
@@ -342,6 +427,7 @@ def main() -> None:
                 "unknown_delivery_is_ambiguous_once": True,
                 "already_delivered_not_redelivered": True,
                 "isolation_preserved": True,
+                "blocked_rejection_persisted": True,
                 "expired_policy_fails_closed": True,
                 "artifacts_clean": True,
                 "duration_bounded": elapsed <= DURATION_BOUND_SECONDS,
@@ -363,6 +449,8 @@ def main() -> None:
                 "subject_admitted": bool(subject_admission),
                 "source_deletion_before": source_before,
                 "source_deletion_after": source_after,
+                "blocked_rejection_before": blocked_before,
+                "blocked_rejection_after": blocked_after,
                 "delivered_count_before_after": delivered_before,
                 "unknown_delivery_before": unknown_before,
                 "unknown_delivery_after": unknown_after,

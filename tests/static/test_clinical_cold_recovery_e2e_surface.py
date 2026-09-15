@@ -59,17 +59,37 @@ def test_witness_crosses_a_real_restart_boundary():
     )
 
 
-def test_witness_asserts_both_distinct_terminal_delivery_contracts():
+def test_witness_asserts_all_three_distinct_terminal_delivery_contracts():
     source = harness()
-    # A definitively rejected later source lookup, and an unknown result across
-    # the restart: distinct reasons, both erased, neither posting.
+    # Three faults, three terminal contracts, all erased and none posting:
+    #   unknown result, source deleted        -> AMBIGUOUS(delivery_authorization_unknown)
+    #   unknown result across a restart       -> AMBIGUOUS(restart_in_flight)
+    #   known authorization, source rejected  -> BLOCKED(post_authorization_source_rejected)
     assert '"reason": "delivery_authorization_unknown"' in source
     assert '"reason": "restart_in_flight"' in source
+    assert '"reason": "post_authorization_source_rejected"' in source
     assert source.count('"state": "AMBIGUOUS"') == 2
-    assert source.count('"nonce_erased": True') == 2
-    assert source.count('"ciphertext_erased": True') == 2
+    assert source.count('"state": "BLOCKED"') == 1
+    assert source.count('"nonce_erased": True') == 3
+    assert source.count('"ciphertext_erased": True') == 3
     assert 'post-count", "cold-unknown")) != 0' in source
     assert "already delivered work was delivered again after restore" in source
+
+
+def test_witness_separates_known_rejection_from_unknown_result():
+    """The two faults must be induced by different mutations, not spelled differently."""
+    source = harness()
+    # `crash-delay` exceeds the adapter's upstream deadline, so the result is
+    # unknown; `source-delete-delay` stays inside it, so the authorization is
+    # known and only the later source lookup is rejected.
+    assert '"mutate", "crash-delay"' in source
+    assert '"mutate", "source-delete-delay"' in source
+    assert '"mutate", "drop-source-delete-delay"' in source
+    assert "blocked_source_record(staging)" in source
+    # The blocked record must be carried across the fence and re-checked.
+    assert 'snapshot(restored, str(blocked_after["record_tag"])) != [blocked_after]' in source
+    assert 'post-count", "cold-blocked")) != 0' in source
+    assert source.index("blocked_source_record(staging)") < source.index("staging.stop()")
 
 
 def test_witness_recomposes_the_non_recovery_controls_after_restore():

@@ -44,6 +44,22 @@ be merged or relabeled as validation of this candidate.
 3. A restart during delivery preserves the existing terminal-state distinction:
    known reauthorization rejection becomes `BLOCKED`; an unknown result becomes
    content-erased `AMBIGUOUS`; neither posts after the prohibited boundary.
+
+   On the current source these are three named contracts, all reached after the
+   delivery claim in `_process_clinical`, all content-erased, none posting:
+
+   | Fault | Terminal |
+   | --- | --- |
+   | reauthorization result unknown (exceeds the adapter's upstream deadline) | `AMBIGUOUS(delivery_authorization_unknown)` |
+   | unknown result carried across a restart | `AMBIGUOUS(restart_in_flight)` |
+   | authorization known-successful, later source lookup definitively rejected | `BLOCKED(post_authorization_source_rejected)` |
+
+   Issue #35 records this contract as `BLOCKED(current_authorization_rejected)`.
+   That names the *pre-claim* revalidation path, which the earlier source-bridge
+   form observed as `READY -> BLOCKED`. The current line reaches the
+   post-authorization rejection from a claimed record instead. Both are
+   `BLOCKED`; the predicate is about preserving the distinction, not the
+   spelling, and the reason strings above are the ones a receipt must show.
 4. The current source/HRH/OCI-subject vector remains admitted before lifecycle
    mutation. A historical or substituted vector fails closed.
 5. All egress and recovery evidence is replayed on the exact final candidate,
