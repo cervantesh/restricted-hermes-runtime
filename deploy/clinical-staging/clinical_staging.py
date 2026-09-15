@@ -86,6 +86,17 @@ BACKUP_MANIFEST_NAME = "backup-manifest.json"
 BACKUP_COMPLETE_NAME = "COMPLETE"
 BACKUP_STATE_ARCHIVE = "state.tar"
 BACKUP_VOLUME_DIR = "volumes"
+# The behaviors only a composed run can witness.  `restore` proves the bytes
+# came back and the stack started; these say the behavior survived.
+CAUSAL_RECOVERY_CHECKS = frozenset({
+    "source_deletion_persisted",
+    "unknown_delivery_is_ambiguous_once",
+    "already_delivered_not_redelivered",
+    "isolation_preserved",
+    "expired_policy_fails_closed",
+    "artifacts_clean",
+    "duration_bounded",
+})
 # Deliberately the image the composed E2E already admits, so cold recovery adds
 # no new supply-chain subject.  A static contract keeps the two in lockstep.
 RECOVERY_HELPER_IMAGE = (
@@ -2045,6 +2056,95 @@ class ClinicalStaging:
             if snapshot.exists():
                 shutil.rmtree(snapshot)
 
+    def _assert_destroyed_absent(self) -> None:
+        """Prove the exact bounded project namespace is gone after destroy.
+
+        The check is deliberately narrower than a Docker-wide sweep: it covers
+        only the fixed Compose-name prefix, the fixed network names, and the
+        volume allowlist that `destroy` was authorized to remove.  A teardown
+        that cannot establish this condition is a failed teardown, even though
+        a later operator may still perform manual cleanup.
+        """
+        names = self.shell.run("docker", "container", "ls", "--all", "--format", "{{.Names}}")
+        prefix = f"{self.project}-"
+        remaining = sorted(
+            line.strip() for line in names.stdout.splitlines()
+            if line.strip().startswith(prefix)
+        )
+        if remaining:
+            raise SafetyError("project containers remain after destroy: " + ", ".join(remaining))
+        for key in NETWORK_KEYS:
+            name = f"{self.project}_{key}"
+            if self.shell.run("docker", "network", "inspect", name, check=False).returncode == 0:
+                raise SafetyError(f"project network remains after destroy: {name}")
+        for name in volume_names(self.project).values():
+            if self.shell.run("docker", "volume", "inspect", name, check=False).returncode == 0:
+                raise SafetyError(f"project volume remains after destroy: {name}")
+
+    @serialized_lifecycle
+    def finalize_cold_recovery_verification(
+        self, expected_manifest_sha256: str, causal_checks: Mapping[str, bool],
+    ) -> dict[str, Any]:
+        """Publish a verified receipt only after the external causal drill passes.
+
+        `restore` can only witness that the bytes came back and the stack
+        started; it deliberately publishes `mechanical_restore_only`.  Whether
+        the *behavior* survived -- an already-delivered item is not
+        redelivered, an unknown delivery stays erased and ambiguous, isolation
+        and policy expiry still fail closed -- is only observable from the
+        composed E2E, so that drill supplies the result here.
+
+        This receipt is still not a compliance or production claim.  It says
+        one synthetic composed run reproduced the named behaviors on this exact
+        candidate.
+        """
+        self._require_linux()
+        _bundle.require_sha256(
+            self._backup_contract(), expected_manifest_sha256, name="external manifest hash"
+        )
+        marker = self._verify_marker_and_source()
+        self._require_lifecycle(marker, "finalize-cold-recovery-verification", {"ready"})
+        if set(causal_checks) != CAUSAL_RECOVERY_CHECKS or any(
+            value is not True for value in causal_checks.values()
+        ):
+            raise SafetyError("causal recovery verification is incomplete or invalid")
+        receipt_dir = self.state_dir / "evidence" / "recovery"
+        mechanical_path = receipt_dir / f"restore-{expected_manifest_sha256}.json"
+        try:
+            mechanical = json.loads(mechanical_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SafetyError("mechanical restore receipt is unavailable") from exc
+        if (
+            not isinstance(mechanical, dict)
+            or mechanical.get("manifest_sha256") != expected_manifest_sha256
+            or mechanical.get("verification") != "mechanical_restore_only"
+            or mechanical.get("state_id") != marker["state_id"]
+            or mechanical.get("project") != self.project
+        ):
+            raise SafetyError("mechanical restore receipt does not bind this verification")
+        receipt = {
+            "schema": BACKUP_SCHEMA,
+            "synthetic_only": True,
+            "project": self.project,
+            "state_id": marker["state_id"],
+            "manifest_sha256": expected_manifest_sha256,
+            "source": {
+                key: marker[key]
+                for key in ("runtime_head", "runtime_tree", "hrh_head", "hrh_tree")
+            },
+            "verification": "causal_e2e_verified",
+            "causal_checks": {key: True for key in sorted(CAUSAL_RECOVERY_CHECKS)},
+            "verified_at": datetime.now(UTC).isoformat(),
+            "nonclaims": [
+                "not PHI", "not production", "not a compliance certification",
+                "not a representative-host receipt",
+            ],
+        }
+        write_json_atomic(
+            receipt_dir / f"verified-{expected_manifest_sha256}.json", receipt, mode=0o600
+        )
+        return receipt
+
     def _volume_labels(self) -> dict[str, dict[str, str]]:
         names: set[str] = set(volume_names(self.project).values())
         for key, value in ((PROJECT_LABEL, self.project), ("com.docker.compose.project", self.project)):
@@ -2115,6 +2215,9 @@ class ClinicalStaging:
         # state directory, not inside it, so removing the target alone leaves
         # them on disk.
         self._reconcile_owned_initialization_orphans()
+        # A teardown that cannot establish its own bounded absence is a failed
+        # teardown, not a successful one with a caveat.
+        self._assert_destroyed_absent()
         return result
 
 
