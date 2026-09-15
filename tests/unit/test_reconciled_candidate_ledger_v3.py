@@ -36,6 +36,7 @@ LEDGER_PATHS = (
     "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15.json",
     "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-blocked.json",
     "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-observed.json",
+    "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-egress.json",
 )
 
 
@@ -53,7 +54,7 @@ def build(candidate: str | None = None) -> dict:
     return ledger.build_ledger_v3(
         repo_root=ROOT,
         candidate_revision=candidate or git("rev-parse", "HEAD"),
-        extra_receipts=ledger.COLD_RECOVERY_RECEIPTS,
+        extra_receipts=ledger.COLD_RECOVERY_RECEIPTS + ledger.EGRESS_RECEIPTS,
     )
 
 

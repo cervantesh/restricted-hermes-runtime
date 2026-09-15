@@ -71,6 +71,16 @@ COLD_RECOVERY_RECEIPTS = (
         "candidate_ancestor",
     ),
 )
+# The egress witness replayed on this line, rather than the 2026-09-11 run the
+# v2 floor pins as historical.  Same shape of evidence, current provenance.
+EGRESS_RECEIPTS = (
+    (
+        "clinical_egress_replayed",
+        "docs/evidence/clinical-egress-receipt-2026-09-15.json",
+        "restricted-runtime-clinical-egress-witness.v2",
+        "candidate_ancestor",
+    ),
+)
 FROZEN_HRH_SOURCE = {
     "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
     "hrh_tree": "f217b0b1cf7f438422528dfe178d81b78212c68b",
@@ -614,7 +624,7 @@ def main(argv: list[str] | None = None) -> int:
             ledger = build_ledger_v3(
                 repo_root=repo_root,
                 candidate_revision=args.candidate_revision,
-                extra_receipts=COLD_RECOVERY_RECEIPTS,
+                extra_receipts=COLD_RECOVERY_RECEIPTS + EGRESS_RECEIPTS,
             )
         else:
             ledger = build_ledger(repo_root=repo_root, candidate_revision=args.candidate_revision)
