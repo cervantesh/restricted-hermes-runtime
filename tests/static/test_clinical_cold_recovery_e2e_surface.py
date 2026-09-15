@@ -196,10 +196,18 @@ def test_witness_expires_the_policy_past_the_clock_skew():
     assert '"cold-expired", "-1"' not in source
 
 
-def test_witness_waits_for_readiness_before_measuring_silence():
-    """Silence right after `up --detach` is unreadiness, not a fail-closed control."""
+def test_witness_observes_the_refusal_not_merely_the_silence():
+    """An expired policy is refused at load, so ingress exits instead of serving.
+
+    Silence right after `up --detach` is unreadiness, not a fail-closed
+    control, so the witness must observe the refusal itself and must reject the
+    outcome where ingress becomes ready anyway.
+    """
     source = harness()
     assert "restored._await_ingress_ready(started_at)" in source
+    assert "ingress became authenticated-ready with an expired policy" in source
+    assert "exited before authenticated readiness" in source
+    assert "ingress exited cleanly rather than refusing the expired policy" in source
     ready = source.index("restored._await_ingress_ready(started_at)")
     send = source.index('restored.control("send", "actor", "actor_dm", PATIENT, "cold-expired")')
     assert ready < send

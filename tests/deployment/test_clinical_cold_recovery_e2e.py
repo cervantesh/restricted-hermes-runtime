@@ -408,12 +408,32 @@ def main() -> None:
             restored.compose("stop", "ingress")
             restored.control("policy", "cold-expired", str(EXPIRED_POLICY_SECONDS))
             restored.compose("up", "--detach", "ingress")
-            # Without this barrier the no-reply window is also the ingress
-            # unreadiness window, so silence would prove nothing.
+            # This is an A/B on the policy alone: the same container was
+            # authenticated-ready moments ago, under a valid policy, because
+            # restore's own status() established that.  A genuinely expired
+            # policy is refused where it is loaded, at startup, so ingress
+            # exits instead of becoming ready -- and that refusal is the
+            # fail-closed control.  Measuring silence alone would not
+            # distinguish it from an ingress that simply had not started yet.
             started_at = restored._container_inspections()["ingress"]["State"][
                 "StartedAt"
             ]
-            restored._await_ingress_ready(started_at)
+            try:
+                restored._await_ingress_ready(started_at)
+            except module.SafetyError as exc:
+                if "exited before authenticated readiness" not in str(exc):
+                    raise
+            else:
+                raise RuntimeError(
+                    "ingress became authenticated-ready with an expired policy"
+                )
+            exit_code = restored._container_inspections()["ingress"]["State"].get(
+                "ExitCode"
+            )
+            if not isinstance(exit_code, int) or exit_code == 0:
+                raise RuntimeError(
+                    "ingress exited cleanly rather than refusing the expired policy"
+                )
             restored.control("send", "actor", "actor_dm", PATIENT, "cold-expired")
             restored.control("expect", "cold-expired", "no-reply")
 
