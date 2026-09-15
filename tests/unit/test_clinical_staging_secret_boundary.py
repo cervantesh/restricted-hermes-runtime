@@ -317,7 +317,10 @@ def test_next_init_invocation_resumes_finalizing_before_operational_lifecycle(
     marker = {"lifecycle": "finalizing", "image_mode": "exact-source", "subject_admission": {}}
     resumed: list[str] = []
     original_stat = Path.stat
-    operator_uid = 1000
+    # The real uid, not a fixed one: the durable operator lock that every
+    # lifecycle command now takes reads os.getuid() and fails closed when the
+    # lock parent it finds is owned by somebody else.
+    operator_uid = os.getuid()
 
     def fake_stat(path: Path, *args: object, **kwargs: object):
         if path == state:

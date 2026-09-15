@@ -20,6 +20,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import tarfile
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -47,6 +48,14 @@ REQUIRED_HRH_SHA = "ad13735e9881a48580a9e138daac137f8c865dea"
 REQUIRED_HRH_TREE = "f217b0b1cf7f438422528dfe178d81b78212c68b"
 SCHEMA = "restricted-synthetic-clinical-staging.v1"
 MARKER_NAME = "staging-state.json"
+# The exact closed marker contract.  Cold recovery validates archived markers
+# against this same set, so a bundle cannot reintroduce an older marker shape.
+MARKER_KEYS = (
+    "schema", "synthetic_only", "project", "state_dir", "state_id",
+    "compose_env_sha256", "lifecycle", "runtime_head", "runtime_tree",
+    "hrh_head", "hrh_tree", "volumes", "expected_images", "image_mode",
+    "subject_admission",
+)
 INIT_ORPHAN_RE_TEMPLATE = r"^\.{state}\.init-[a-f0-9]{{16}}$"
 MAX_INITIALIZATION_ORPHANS = 8
 PROJECT_LABEL = "io.cervantesh.restricted-runtime.project"
@@ -67,6 +76,45 @@ VOLUME_KEYS = (
     "mattermost_db", "mattermost_data", "mattermost_tls", "hrh_db",
     "hrh_tls", "hrh_secret", "clinical_config", "clinical_socket",
     "ingress_config", "ingress_outbox", "controller_state",
+)
+# The transport socket volume is recreated empty on restore; archiving a live
+# UNIX socket directory would carry no recoverable state.
+EXCLUDED_RECOVERY_VOLUME = "clinical_socket"
+BACKED_UP_VOLUME_KEYS = tuple(key for key in VOLUME_KEYS if key != EXCLUDED_RECOVERY_VOLUME)
+BACKUP_SCHEMA = "restricted-synthetic-clinical-cold-backup.v1"
+BACKUP_MANIFEST_NAME = "backup-manifest.json"
+BACKUP_COMPLETE_NAME = "COMPLETE"
+BACKUP_STATE_ARCHIVE = "state.tar"
+BACKUP_VOLUME_DIR = "volumes"
+# Deliberately the image the composed E2E already admits, so cold recovery adds
+# no new supply-chain subject.  A static contract keeps the two in lockstep.
+RECOVERY_HELPER_IMAGE = (
+    "postgres:17.10-bookworm@sha256:"
+    "9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f"
+)
+LIFECYCLE_STATES = (
+    "initializing", "finalizing", "ready", "stopped", "cold", "recovering",
+)
+# `recovering` and `cold` are published-but-non-operational states.  They are
+# deliberately treated like `initializing` by the destructive guards:
+#
+# * a restore that dies between publishing the state directory and creating
+#   volumes must still be cleanable by `destroy`;
+# * `backup` must remove the stopped Compose containers before it can archive
+#   the volumes they still mount, which leaves a target whose volumes exist but
+#   whose services and networks do not.
+#
+# An exact-set requirement in either state would strand the target: `destroy`
+# and `reset` would refuse it and the volumes could only be removed out of
+# band.  The allowlist and label checks still apply, and `_create_volumes`
+# keeps its own exact post-check.
+SETTLED_LIFECYCLES = frozenset({"finalizing", "ready", "stopped"})
+# Remnant roots a dead lifecycle command can leave beside the state directory.
+ORPHAN_RE_TEMPLATES = (
+    r"^\.{state}\.init-[a-f0-9]{{16}}$",
+    r"^\.{state}\.recovering-[a-f0-9]{{16}}$",
+    r"^\.{state}\.bundle-[a-f0-9]{{16}}$",
+    r"^\.{state}\.partial-[a-f0-9]{{16}}$",
 )
 LONG_RUNNING_SERVICES = (
     "mattermost-postgres", "mattermost", "hrh-postgres", "hrh", "hrh-tls",
@@ -115,6 +163,27 @@ class SafetyError(RuntimeError):
 
 class CommandError(RuntimeError):
     pass
+
+
+def _load_sibling(name: str):
+    """Load a cold-recovery dependency by path, not by ``sys.path`` luck.
+
+    This module is executed both as a script and through
+    ``spec_from_file_location``; a bare sibling import would resolve only in
+    the first case.
+    """
+    path = Path(__file__).resolve().parent / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"clinical_staging_{name}", path)
+    if spec is None or spec.loader is None:
+        raise SafetyError(f"cold-recovery dependency is unavailable: {name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_bundle = _load_sibling("clinical_backup_bundle")
+_operator_lock = _load_sibling("clinical_operator_lock")
 
 
 def serialized_lifecycle(method):
@@ -192,6 +261,27 @@ def validate_state_path(
     return resolved
 
 
+def validate_backup_path(
+    path: Path,
+    *,
+    state_dir: Path,
+    forbidden_roots: Iterable[Path] = (),
+) -> Path:
+    """A backup is a new sibling-owned directory, never build or live state input."""
+    if not path.is_absolute():
+        raise SafetyError("backup path must be absolute")
+    resolved = path.resolve()
+    if resolved.name in {"", ".", resolved.anchor} or resolved == state_dir.resolve():
+        raise SafetyError("backup path is too broad or conflicts with staging state")
+    for root in (state_dir, *(Path(item).resolve() for item in forbidden_roots)):
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        raise SafetyError("backup path must remain outside state and repository build contexts")
+    return resolved
+
+
 def volume_names(project: str) -> dict[str, str]:
     validate_project(project)
     return {key: f"{project}_{key}" for key in VOLUME_KEYS}
@@ -237,6 +327,22 @@ def fsync_directory(path: Path) -> None:
         return
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def fsync_file(path: Path) -> None:
+    """Durably flush an already-created regular recovery artifact."""
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise SafetyError(f"could not fsync recovery artifact: {path.name}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SafetyError(f"recovery artifact is not a regular file: {path.name}")
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -324,23 +430,32 @@ def read_marker(state_dir: Path, project: str) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SafetyError("closed staging marker is missing or invalid") from exc
-    expected_keys = {
-        "schema", "synthetic_only", "project", "state_dir", "state_id",
-        "compose_env_sha256", "lifecycle", "runtime_head", "runtime_tree",
-        "hrh_head", "hrh_tree", "volumes", "expected_images", "image_mode", "subject_admission",
-    }
-    if set(value) != expected_keys:
+    return validate_marker_value(value, project=project, state_dir=state_dir)
+
+
+def validate_marker_value(
+    value: object, *, project: str, state_dir: Path
+) -> dict[str, Any]:
+    """Apply the closed marker contract to an in-memory marker.
+
+    ``read_marker`` is the live caller.  Cold recovery needs the same rules for
+    a marker that has been archived rather than read from the live state
+    directory, and must not be allowed to drift into a weaker copy of them.
+    """
+    if not isinstance(value, dict):
+        raise SafetyError("staging marker must be an object")
+    if set(value) != set(MARKER_KEYS):
         raise SafetyError("staging marker has unknown or missing fields")
     if (
         value["schema"] != SCHEMA
         or value["synthetic_only"] is not True
         or value["project"] != project
-        or value["state_dir"] != str(state_dir)
+        or value["state_dir"] != str(state_dir.resolve())
         or value["hrh_head"] != REQUIRED_HRH_SHA
         or value["volumes"] != volume_names(project)
         or not re.fullmatch(r"[a-f0-9]{32}", value["state_id"])
         or not re.fullmatch(r"[a-f0-9]{64}", value["compose_env_sha256"])
-        or value["lifecycle"] not in {"initializing", "finalizing", "ready", "stopped"}
+        or value["lifecycle"] not in set(LIFECYCLE_STATES)
         or not isinstance(value["expected_images"], dict)
         or value["image_mode"] not in {"exact-source", "subject-admitted"}
         or not isinstance(value["subject_admission"], dict)
@@ -455,6 +570,66 @@ def file_sha256(path: Path) -> str:
         raise SafetyError(f"required file is unavailable: {path.name}") from exc
 
 
+def verify_recovery_helper_boundary(
+    command: tuple[str, ...],
+    *,
+    source_mount: str,
+    backup_mount: str,
+    capabilities: frozenset[str],
+) -> None:
+    """Fail closed if the one-shot archive helper gains any authority."""
+    if command[:3] != ("docker", "run", "--rm") or command.count("--read-only") != 1:
+        raise SafetyError("recovery helper command is not ephemeral and read-only")
+    expected_single = {
+        "--network": "none",
+        "--cap-drop": "ALL",
+        "--security-opt": "no-new-privileges:true",
+        "--user": "0:0",
+        "--entrypoint": "sh",
+    }
+    for flag, value in expected_single.items():
+        if command.count(flag) != 1 or command[command.index(flag) + 1] != value:
+            raise SafetyError("recovery helper command has an unexpected security authority")
+    cap_adds = {command[index + 1] for index, item in enumerate(command[:-1]) if item == "--cap-add"}
+    if cap_adds != capabilities or command.count("--cap-add") != len(capabilities):
+        raise SafetyError("recovery helper command has an unexpected security authority")
+    mounts = [command[index + 1] for index, item in enumerate(command[:-1]) if item == "--mount"]
+    if len(mounts) != 2 or set(mounts) != {source_mount, backup_mount}:
+        raise SafetyError("recovery helper command has an unexpected mount")
+    if RECOVERY_HELPER_IMAGE not in command:
+        raise SafetyError("recovery helper command does not use the admitted helper image")
+    if "--privileged" in command or "-v" in command or "--volume" in command:
+        raise SafetyError("recovery helper command has an unexpected authority")
+
+
+def backup_contract(project: str, state_dir: Path):
+    """Bind the cold-recovery codec to the *current* staging contract."""
+    def validate_marker(marker: Mapping[str, Any]) -> None:
+        validate_marker_value(marker, project=project, state_dir=state_dir)
+
+    return _bundle.BackupContract(
+        error_type=SafetyError,
+        schema=SCHEMA,
+        marker_name=MARKER_NAME,
+        backup_schema=BACKUP_SCHEMA,
+        manifest_name=BACKUP_MANIFEST_NAME,
+        complete_name=BACKUP_COMPLETE_NAME,
+        state_archive_name=BACKUP_STATE_ARCHIVE,
+        volume_directory=BACKUP_VOLUME_DIR,
+        volume_keys=VOLUME_KEYS,
+        backup_volume_keys=BACKED_UP_VOLUME_KEYS,
+        excluded_volume=EXCLUDED_RECOVERY_VOLUME,
+        required_hrh_head=REQUIRED_HRH_SHA,
+        required_hrh_tree=REQUIRED_HRH_TREE,
+        marker_keys=frozenset(MARKER_KEYS),
+        volume_names=volume_names,
+        validate_project=validate_project,
+        validate_marker=validate_marker,
+        fsync_file=fsync_file,
+        fsync_directory=fsync_directory,
+    )
+
+
 def verify_effective_env(state_dir: Path, marker: Mapping[str, Any]) -> None:
     if file_sha256(state_dir / "compose.env") != marker["compose_env_sha256"]:
         raise SafetyError("compose.env differs from the initialized exact content")
@@ -501,9 +676,9 @@ def verify_destructive_volumes(
     for name in discovered:
         if any(discovered[name].get(key) != value for key, value in required.items()):
             raise SafetyError(f"volume label mismatch: {name}")
-    if lifecycle in {"finalizing", "ready", "stopped"} and set(discovered) != expected:
+    if lifecycle in SETTLED_LIFECYCLES and set(discovered) != expected:
         raise SafetyError("finalizing/ready/stopped staging requires the exact volume set")
-    if lifecycle not in {"initializing", "finalizing", "ready", "stopped"}:
+    if lifecycle not in set(LIFECYCLE_STATES):
         raise SafetyError("unknown lifecycle for destructive volume verification")
     return sorted(discovered)
 
@@ -534,7 +709,7 @@ def verify_destructive_resources(
     duplicates = sorted({service for service in services if services.count(service) > 1})
     if duplicates:
         raise SafetyError("duplicate project service containers: " + ", ".join(duplicates))
-    if lifecycle in {"finalizing", "ready", "stopped"}:
+    if lifecycle in SETTLED_LIFECYCLES:
         if "controller" in services:
             raise SafetyError("controller must be absent from finalizing/ready/stopped staging")
         expected_services = set(LONG_RUNNING_SERVICES) | set(ONE_SHOT_SERVICES)
@@ -542,7 +717,7 @@ def verify_destructive_resources(
             raise SafetyError("finalizing/ready/stopped staging requires the exact service set")
         if set(networks) != allowed_networks:
             raise SafetyError("finalizing/ready/stopped staging requires the exact network set")
-    elif lifecycle != "initializing":
+    elif lifecycle not in {"initializing", "recovering", "cold"}:
         raise SafetyError("unknown lifecycle for destructive resource verification")
     return sorted(containers), sorted(networks)
 
@@ -811,6 +986,26 @@ class ClinicalStaging:
 
     @contextlib.contextmanager
     def _lifecycle_lock(self):
+        """Take the one durable operator boundary for this staging target.
+
+        Two locks are held, in this order, and every lifecycle command —
+        including cold backup and restore — goes through both:
+
+        * a persistent lock keyed by the *Compose project*, because two
+          independently supplied state directories can name the same project
+          and therefore race over the same external Docker volumes.  The
+          per-state lock below cannot see that collision.
+        * the per-state advisory lock, reentrant for nested command calls.
+        """
+        try:
+            with _operator_lock.persistent_operator_lock(self.state_dir, self.project):
+                with self._state_lifecycle_lock():
+                    yield
+        except _operator_lock.OperatorLockError as exc:
+            raise SafetyError(str(exc)) from exc
+
+    @contextlib.contextmanager
+    def _state_lifecycle_lock(self):
         """Take a per-state advisory lock, reentrant for nested command calls."""
         # The process-local RLock remains held across the whole lifecycle
         # operation.  flock covers independent operators; RLock covers two
@@ -838,8 +1033,12 @@ class ClinicalStaging:
                     self._lifecycle_thread_state.depth = 0
                 return
 
-            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            fd = os.open(
+                lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600
+            )
             try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise SafetyError("lifecycle lock is not a regular file")
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 self._lifecycle_thread_state.depth = 1
                 try:
@@ -965,20 +1164,29 @@ class ClinicalStaging:
         policy_path.chmod(0o600)
 
     def _owned_initialization_orphans(self) -> list[Path]:
-        """Return only this target's bounded pre-rename initialization roots.
+        """Return only this target's bounded pre-rename remnant roots.
 
-        ``init`` already holds the per-target lifecycle lock before it calls
-        this helper.  The random suffix prevents an unrelated directory from
-        becoming a cleanup target through a predictable name.
+        The caller already holds the lifecycle lock.  The random suffix
+        prevents an unrelated directory from becoming a cleanup target through
+        a predictable name.
+
+        Cold recovery adds two more shapes.  A process killed mid-restore can
+        leave an extracted state tree (``.recovering-``) or a full private copy
+        of the bundle (``.bundle-``), and a killed backup can leave a partial
+        bundle (``.partial-``).  All three carry generated secret material, so
+        they belong to the same bounded cleanup as a dead ``init``.
         """
-        expression = re.compile(
-            INIT_ORPHAN_RE_TEMPLATE.format(state=re.escape(self.state_dir.name))
-        )
+        name = re.escape(self.state_dir.name)
+        expressions = [
+            re.compile(template.format(state=name)) for template in ORPHAN_RE_TEMPLATES
+        ]
+        if not self.state_dir.parent.is_dir():
+            return []
         candidates = [
             entry for entry in self.state_dir.parent.iterdir()
-            if expression.fullmatch(entry.name)
+            if any(expression.fullmatch(entry.name) for expression in expressions)
         ]
-        if len(candidates) > MAX_INITIALIZATION_ORPHANS:
+        if len(candidates) > MAX_INITIALIZATION_ORPHANS * len(ORPHAN_RE_TEMPLATES):
             raise SafetyError("too many initialization remnants; refusing cleanup")
         return candidates
 
@@ -1189,11 +1397,13 @@ class ClinicalStaging:
     def up(self) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
-        self._require_lifecycle(marker, "up", {"ready", "stopped"})
+        # `cold` is a stopped target whose Compose containers and networks were
+        # removed so its volumes could be archived.  `up` recreates them.
+        self._require_lifecycle(marker, "up", {"ready", "stopped", "cold"})
         self._up_services(*ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
         self.control("wait-mm")
         self.control("wait-hrh")
-        if marker["lifecycle"] == "stopped":
+        if marker["lifecycle"] in {"stopped", "cold"}:
             marker["lifecycle"] = "ready"
             self._write_marker(marker)
         return self.status()
@@ -1314,10 +1524,15 @@ class ClinicalStaging:
         return verify_restricted_process_identities(observed)
 
     @serialized_lifecycle
-    def status(self) -> dict[str, Any]:
+    def status(self, *, _allow_recovering: bool = False) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
-        self._require_lifecycle(marker, "status", {"ready"})
+        # `recovering` is accepted only from inside `restore`, which has
+        # already validated the bundle and published controlled state.  The CLI
+        # cannot reach this allowance.
+        self._require_lifecycle(
+            marker, "status", {"ready", "recovering"} if _allow_recovering else {"ready"}
+        )
         rows = self._containers(all_containers=True)
         verify_compose_rows(rows)
         self._assert_no_controller()
@@ -1371,7 +1586,7 @@ class ClinicalStaging:
             "built_images": current_images,
             "compose_env_sha256": marker["compose_env_sha256"],
             "policy_digest": policy_digest,
-            "lifecycle": "ready",
+            "lifecycle": marker["lifecycle"],
             "mattermost": f"https://127.0.0.1:{self.port}",
             "mattermost_publisher": publisher,
             "ingress_started_at": ingress_started_at,
@@ -1415,6 +1630,420 @@ class ClinicalStaging:
         evidence = {"schema": SCHEMA, "project": self.project, "state_id": marker["state_id"], "lifecycle": "stopped", "observed_at": datetime.now(UTC).isoformat()}
         write_json_atomic(self.state_dir / "evidence" / "last-transition.json", evidence, mode=0o600)
         return evidence
+
+    # ------------------------------------------------------------------
+    # Cold backup / restore
+    # ------------------------------------------------------------------
+
+    def _backup_contract(self):
+        return backup_contract(self.project, self.state_dir)
+
+    def _verify_cold_quiescence(self, marker: Mapping[str, Any]) -> None:
+        """A stopped marker alone is not a fence; Docker state must agree."""
+        self._require_lifecycle(marker, "backup", {"stopped"})
+        verify_destructive_volumes(
+            self.project, marker["state_id"], set(marker["volumes"].values()),
+            self._volume_labels(), "stopped",
+        )
+        verify_destructive_resources(
+            self.project, marker["state_id"],
+            self._labeled_resources("container"), self._labeled_resources("network"), "stopped",
+        )
+        by_service = {str(row.get("Service")): row for row in self._containers(all_containers=True)}
+        if set(by_service) != set(LONG_RUNNING_SERVICES) | set(ONE_SHOT_SERVICES):
+            raise SafetyError("backup quiescence does not cover the exact Compose service set")
+        running = sorted(
+            service for service in LONG_RUNNING_SERVICES
+            if str(by_service[service].get("State", "")).lower() in {"running", "restarting", "created"}
+        )
+        if running:
+            raise SafetyError("backup requires fully stopped staging services: " + ", ".join(running))
+
+    def _assert_unmounted_backup_volumes(self, volumes: Mapping[str, str]) -> None:
+        """Refuse archival while *any* container retains an in-scope volume mount.
+
+        Compose labels are not sufficient: a manually created or orphaned
+        container can be unlabeled yet still write an exact project volume.
+        This check runs after Compose has removed its stopped containers and
+        immediately before every archive read.
+        """
+        expected = set(volumes.values())
+        if expected != set(volume_names(self.project).values()):
+            raise SafetyError("backup volume fence does not cover the exact volume set")
+        for volume in sorted(expected):
+            raw = self.shell.run(
+                "docker", "container", "ls", "--all", "--quiet", "--filter", f"volume={volume}",
+            ).stdout
+            for container_id in (line.strip() for line in raw.splitlines() if line.strip()):
+                inspected = self.shell.run("docker", "container", "inspect", container_id)
+                try:
+                    mounts = json.loads(inspected.stdout)[0]["Mounts"]
+                except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                    raise SafetyError("could not verify backup volume mount fence") from exc
+                matching = [
+                    mount for mount in mounts
+                    if isinstance(mount, Mapping) and mount.get("Type") == "volume"
+                    and mount.get("Name") == volume
+                ]
+                if not matching:
+                    raise SafetyError("volume-filtered container inspection is inconsistent")
+                modes = sorted({
+                    "rw" if mount.get("RW") is True else "ro" if mount.get("RW") is False else "unknown"
+                    for mount in matching
+                })
+                raise SafetyError(
+                    f"backup volume remains mounted by container {container_id}: "
+                    + f"{volume} (" + ", ".join(modes) + ")"
+                )
+
+    def _backup_volume(self, key: str, volume: str, backup_dir: Path) -> None:
+        if key not in BACKED_UP_VOLUME_KEYS or volume != volume_names(self.project)[key]:
+            raise SafetyError("backup volume is outside the exact allowlist")
+        archive = f"/backup/{BACKUP_VOLUME_DIR}/{key}.tar"
+        # The private bind is mode 0700 and source files may be owned by a
+        # service UID.  Root plus this single DAC capability is the minimum
+        # needed for this read/export endpoint; network, writable rootfs and
+        # every other capability remain unavailable.
+        source_mount = f"type=volume,src={volume},dst=/source,readonly"
+        backup_mount = f"type=bind,src={backup_dir},dst=/backup"
+        command = (
+            "docker", "run", "--rm", "--network", "none", "--read-only",
+            "--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE",
+            "--security-opt", "no-new-privileges:true", "--user", "0:0",
+            "--entrypoint", "sh",
+            "--mount", source_mount,
+            "--mount", backup_mount,
+            RECOVERY_HELPER_IMAGE,
+            "-ec", f"tar --numeric-owner -C /source -cf {archive} .",
+        )
+        verify_recovery_helper_boundary(
+            command, source_mount=source_mount, backup_mount=backup_mount,
+            capabilities=frozenset({"DAC_OVERRIDE"}),
+        )
+        self.shell.run(*command, cwd=self.runtime, timeout=1200)
+        produced = backup_dir / BACKUP_VOLUME_DIR / f"{key}.tar"
+        _bundle.inspect_safe_tar(self._backup_contract(), produced, require_regular_file=True)
+        fsync_file(produced)
+
+    @serialized_lifecycle
+    def backup(self, backup_dir: Path) -> dict[str, Any]:
+        """Create an atomically published, cold-only backup.  No overwrite exists."""
+        self._require_linux()
+        contract = self._backup_contract()
+        marker = self._verify_marker_and_source()
+        self._verify_cold_quiescence(marker)
+        backup_dir = validate_backup_path(
+            backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime, self.hrh),
+        )
+        if backup_dir.exists():
+            raise SafetyError("backup target must be a new directory")
+        if not backup_dir.parent.is_dir():
+            raise SafetyError("backup parent directory must already exist")
+        temporary = backup_dir.parent / f".{backup_dir.name}.partial-{secrets.token_hex(8)}"
+        try:
+            temporary.mkdir(mode=0o700)
+            (temporary / BACKUP_VOLUME_DIR).mkdir(mode=0o700)
+            _bundle.create_state_archive(contract, self.state_dir, temporary / BACKUP_STATE_ARCHIVE)
+            # Stop leaves Compose containers present.  Remove only the exact
+            # already-validated stack, then reject every remaining mount,
+            # including unlabeled debug/orphan containers, before each read.
+            #
+            # The marker records the teardown *before* it happens.  Afterwards
+            # this target no longer has the exact service and network set that
+            # a `stopped` marker promises, and `destroy`/`reset` would refuse a
+            # target that still claimed to be `stopped`.
+            marker["lifecycle"] = "cold"
+            self._write_marker(marker)
+            self.compose("down", timeout=600)
+            for key in BACKED_UP_VOLUME_KEYS:
+                self._assert_unmounted_backup_volumes(marker["volumes"])
+                self._backup_volume(key, marker["volumes"][key], temporary)
+            fsync_directory(temporary / BACKUP_VOLUME_DIR)
+            manifest = _bundle.build_backup_manifest(contract, marker, self.state_dir, temporary)
+            _bundle.write_backup_manifest(contract, temporary, manifest)
+            _bundle.write_backup_completion(contract, temporary)
+            fsync_directory(temporary)
+            # A partially written bundle never carries the published name, so an
+            # interrupted backup cannot later be mistaken for a restorable one.
+            os.replace(temporary, backup_dir)
+            fsync_directory(backup_dir.parent)
+        except Exception:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+            raise
+        return {
+            "schema": BACKUP_SCHEMA,
+            "synthetic_only": True,
+            "project": self.project,
+            "state_id": marker["state_id"],
+            "backup_dir": str(backup_dir),
+            "manifest_sha256": file_sha256(backup_dir / BACKUP_MANIFEST_NAME),
+            "excluded_volume": EXCLUDED_RECOVERY_VOLUME,
+            # The bundle captures a stopped target; the target it was taken
+            # from is now cold and must be brought `up` before it serves again.
+            "archived_lifecycle": "stopped",
+            "lifecycle": "cold",
+            "nonclaims": ["not a scheduled backup", "not encrypted", "not production"],
+        }
+
+    def _require_empty_restore_destination(self) -> None:
+        if self.state_dir.exists() and any(self.state_dir.iterdir()):
+            raise SafetyError("restore requires an absent or empty state destination")
+        if not self.state_dir.parent.is_dir():
+            raise SafetyError("restore state parent directory must already exist")
+        if self._labeled_resources("container") | self._labeled_resources("network"):
+            raise SafetyError("restore destination conflicts with labeled Docker resources")
+        for volume in volume_names(self.project).values():
+            if self.shell.run("docker", "volume", "inspect", volume, check=False).returncode == 0:
+                raise SafetyError(f"restore destination conflicts with existing Docker volume: {volume}")
+        for key in NETWORK_KEYS:
+            name = f"{self.project}_{key}"
+            if self.shell.run("docker", "network", "inspect", name, check=False).returncode == 0:
+                raise SafetyError(f"restore destination conflicts with existing Docker network: {name}")
+        names = self.shell.run("docker", "container", "ls", "--all", "--format", "{{.Names}}")
+        if any(line.strip().startswith(f"{self.project}-") for line in names.stdout.splitlines()):
+            raise SafetyError("restore destination conflicts with a project-named Docker container")
+
+    def _extract_safe_state_archive(self, archive_path: Path, destination: Path) -> None:
+        """Extract an already validated archive without ``tarfile.extractall``."""
+        contract = self._backup_contract()
+        try:
+            with tarfile.open(archive_path, "r:") as archive:
+                for member in archive.getmembers():
+                    name = _bundle.safe_archive_name(contract, member.name)
+                    if not name:
+                        if member.isdir():
+                            continue
+                        raise SafetyError("backup state archive has an invalid root member")
+                    if not (member.isdir() or member.isreg()):
+                        raise SafetyError("backup state archive contains a non-regular member")
+                    target = destination.joinpath(*name.split("/"))
+                    try:
+                        target.resolve().relative_to(destination.resolve())
+                    except ValueError as exc:
+                        raise SafetyError("backup state archive escapes its destination") from exc
+                    if member.isdir():
+                        target.mkdir(mode=member.mode & 0o777, parents=True, exist_ok=False)
+                        continue
+                    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    stream = archive.extractfile(member)
+                    if stream is None:
+                        raise SafetyError("backup state archive member is unreadable")
+                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, member.mode & 0o777)
+                    with os.fdopen(fd, "wb") as output:
+                        shutil.copyfileobj(stream, output)
+                        output.flush()
+                        os.fsync(output.fileno())
+        except (OSError, tarfile.TarError) as exc:
+            raise SafetyError("could not safely restore private state") from exc
+
+    def _restore_volume(self, key: str, volume: str, backup_dir: Path) -> None:
+        if key not in BACKED_UP_VOLUME_KEYS or volume != volume_names(self.project)[key]:
+            raise SafetyError("restore volume is outside the exact allowlist")
+        archive = f"/backup/{BACKUP_VOLUME_DIR}/{key}.tar"
+        # CHOWN/FOWNER are required only here: --numeric-owner must restore
+        # archived service UIDs/GIDs (for example PostgreSQL's 999:999) and
+        # their archived modes into the exact named destination volume.  The
+        # command boundary rejects every fourth capability and every extra mount.
+        source_mount = f"type=volume,src={volume},dst=/destination"
+        backup_mount = f"type=bind,src={backup_dir},dst=/backup,readonly"
+        command = (
+            "docker", "run", "--rm", "--network", "none", "--read-only",
+            "--cap-drop", "ALL",
+            "--cap-add", "DAC_OVERRIDE", "--cap-add", "CHOWN", "--cap-add", "FOWNER",
+            "--security-opt", "no-new-privileges:true", "--user", "0:0",
+            "--entrypoint", "sh",
+            "--mount", source_mount,
+            "--mount", backup_mount,
+            RECOVERY_HELPER_IMAGE,
+            "-ec", f"tar --numeric-owner -C /destination -xf {archive}",
+        )
+        verify_recovery_helper_boundary(
+            command, source_mount=source_mount, backup_mount=backup_mount,
+            capabilities=frozenset({"DAC_OVERRIDE", "CHOWN", "FOWNER"}),
+        )
+        self.shell.run(*command, cwd=self.runtime, timeout=1200)
+
+    def _start_restored_stack(self) -> None:
+        """The explicit dependency order is part of the cold-restore witness."""
+        self._up_services("mattermost-postgres", "hrh-postgres", "hrh-migrate", timeout=900)
+        migrated = self.compose("wait", "hrh-migrate", check=False, timeout=900)
+        if migrated.returncode:
+            raise CommandError("restored HRH migration did not complete successfully")
+        self._up_services("mattermost", "operator-proxy", timeout=600)
+        self.control("wait-mm")
+        self._up_services("clinical-socket-init", "hrh", "hrh-tls", "clinical-adapter", timeout=900)
+        self.control("wait-hrh")
+        self._up_services("ingress", timeout=600)
+
+    def _assert_restored_admission(self, marker: Mapping[str, Any]) -> None:
+        """A bundle may not move this target onto a different subject line.
+
+        The historical cold-recovery path predates immutable subject admission,
+        so it had nothing to check here.  On this line the archived marker must
+        agree with the operator's sealed admission before any mutation.
+        """
+        expected_mode = "subject-admitted" if self.subject_admission else "exact-source"
+        if marker["image_mode"] != expected_mode:
+            raise SafetyError("restored marker image mode differs from the sealed target")
+        if _sealed_subject_binding(marker["subject_admission"]) != _sealed_subject_binding(
+            self.subject_admission
+        ):
+            raise SafetyError("restored subject admission differs from the sealed target")
+
+    # Only these four values are freshly generated on every `_env_values`
+    # call, so a restored environment cannot be compared against them.
+    GENERATED_ENV_KEYS = (
+        "CLINICAL_MM_DB_PASSWORD",
+        "CLINICAL_HRH_DB_PASSWORD",
+        "CLINICAL_HRH_SESSION_SECRET",
+        "CLINICAL_HRH_ENCRYPTION_KEY",
+    )
+
+    def _assert_restored_environment(self, marker: Mapping[str, Any], root: Path) -> None:
+        """The restored `compose.env` must select exactly the admitted target.
+
+        `compose.env` is the sole authority for Compose interpolation, so it
+        alone decides which images are started and which volumes are attached.
+        The marker's `compose_env_sha256` only proves the file is the one the
+        bundle carried -- whoever produced the bundle controls both. Matching
+        the archived marker's subject admission therefore proves nothing about
+        what Compose will actually run.
+
+        Restore does not pull and inspect RepoDigests the way `init` does, so
+        this is the check that keeps a bundle from starting an unadmitted image
+        or attaching a foreign volume.
+        """
+        try:
+            raw = (root / "compose.env").read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SafetyError("restored compose environment is unreadable") from exc
+        values: dict[str, str] = {}
+        for line in raw.splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or not key or key in values:
+                raise SafetyError("restored compose environment is malformed")
+            values[key] = value
+        expected = self._env_values(marker, seed_root=root)
+        if set(values) != set(expected):
+            raise SafetyError("restored compose environment has unknown or missing keys")
+        for key, value in expected.items():
+            if key in self.GENERATED_ENV_KEYS:
+                continue
+            if values[key] != value:
+                raise SafetyError(
+                    f"restored compose environment does not bind the admitted target: {key}"
+                )
+
+    @serialized_lifecycle
+    def restore(self, backup_dir: Path, expected_manifest_sha256: str) -> dict[str, Any]:
+        """Restore only a fully validated cold bundle into a clean destination."""
+        self._require_linux()
+        contract = self._backup_contract()
+        backup_dir = validate_backup_path(
+            backup_dir, state_dir=self.state_dir, forbidden_roots=(self.runtime, self.hrh),
+        )
+        if not self.state_dir.parent.is_dir():
+            raise SafetyError("restore state parent directory must already exist")
+        # A killed predecessor can have left an extracted state tree or a full
+        # private copy of a bundle beside the destination; both carry generated
+        # secret material.
+        self._reconcile_owned_initialization_orphans()
+        # Copy first: every later read is from private storage, so the external
+        # directory cannot be swapped between validation and use.
+        snapshot = _bundle.materialize_backup_snapshot(
+            contract, backup_dir, self.state_dir.parent, snapshot_stem=self.state_dir.name,
+        )
+        temporary = self.state_dir.parent / f".{self.state_dir.name}.recovering-{secrets.token_hex(8)}"
+        published_state = False
+        try:
+            manifest = _bundle.validate_backup_bundle(
+                contract, snapshot, expected_manifest_sha256, self.project, self.state_dir,
+            )
+            archived_marker = _bundle.validate_archived_marker(
+                contract, snapshot / BACKUP_STATE_ARCHIVE,
+                project=self.project, state_dir=self.state_dir, manifest=manifest,
+            )
+            self._assert_restored_admission(archived_marker)
+            frame = verify_source_frame(self.runtime, self.hrh, self.shell)
+            if frame != manifest["source"]:
+                raise SafetyError("current source frame differs from the validated backup source frame")
+            self._require_empty_restore_destination()
+
+            temporary.mkdir(mode=0o700)
+            self._extract_safe_state_archive(snapshot / BACKUP_STATE_ARCHIVE, temporary)
+            restored_marker = validate_marker_value(
+                json.loads((temporary / MARKER_NAME).read_text(encoding="utf-8")),
+                project=self.project, state_dir=self.state_dir,
+            )
+            if restored_marker != archived_marker:
+                raise SafetyError("extracted marker differs from the validated archived marker")
+            restored_marker["lifecycle"] = "recovering"
+            write_json_atomic(temporary / MARKER_NAME, restored_marker, mode=0o600)
+            if file_sha256(temporary / "compose.env") != manifest["compose_env_sha256"]:
+                raise SafetyError("restored compose environment differs from the validated backup")
+            self._assert_restored_environment(restored_marker, temporary)
+            fsync_directory(temporary)
+            if self.state_dir.exists():
+                self.state_dir.rmdir()
+            os.replace(temporary, self.state_dir)
+            fsync_directory(self.state_dir.parent)
+            published_state = True
+
+            marker = read_marker(self.state_dir, self.project)
+            self._create_volumes(marker)
+            for key in BACKED_UP_VOLUME_KEYS:
+                self._restore_volume(key, marker["volumes"][key], snapshot)
+            # The excluded transport socket is recreated empty by _create_volumes;
+            # clinical-socket-init rebuilds its socket during the ordered startup.
+            self._start_restored_stack()
+            status = self.status(_allow_recovering=True)
+            marker["lifecycle"] = "ready"
+            self._write_marker(marker)
+            receipt = {
+                "schema": BACKUP_SCHEMA,
+                "synthetic_only": True,
+                "project": self.project,
+                "state_id": marker["state_id"],
+                "manifest_sha256": expected_manifest_sha256,
+                "excluded_volume": EXCLUDED_RECOVERY_VOLUME,
+                "source": manifest["source"],
+                "status_observed_at": status["observed_at"],
+                "verification": "mechanical_restore_only",
+                "restored_at": datetime.now(UTC).isoformat(),
+                "nonclaims": [
+                    "not a causal recovery verification", "not a hot restore",
+                    "not encrypted", "not production",
+                ],
+            }
+            receipt_dir = self.state_dir / "evidence" / "recovery"
+            receipt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write_json_atomic(
+                receipt_dir / f"restore-{expected_manifest_sha256}.json", receipt, mode=0o600
+            )
+            return receipt
+        except Exception as exc:
+            if published_state:
+                # A failed post-publication step must remain non-operational.
+                # `destroy` accepts recovering state and reuses the exact
+                # resource allowlists for bounded cleanup.
+                try:
+                    failed_marker = read_marker(self.state_dir, self.project)
+                    failed_marker["lifecycle"] = "recovering"
+                    self._write_marker(failed_marker)
+                    self.compose("stop", *LONG_RUNNING_SERVICES, check=False)
+                except Exception:
+                    pass
+                raise SafetyError(
+                    "restore failed after controlled recovery state was published; "
+                    "run destroy before retrying"
+                ) from exc
+            raise
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+            if snapshot.exists():
+                shutil.rmtree(snapshot)
 
     def _volume_labels(self) -> dict[str, dict[str, str]]:
         names: set[str] = set(volume_names(self.project).values())
@@ -1482,6 +2111,10 @@ class ClinicalStaging:
         self._destroy_resources()
         result = {"schema": SCHEMA, "project": self.project, "state_id": marker["state_id"], "lifecycle": "destroyed"}
         shutil.rmtree(self.state_dir)
+        # Secret-bearing remnants of a killed backup or restore live beside the
+        # state directory, not inside it, so removing the target alone leaves
+        # them on disk.
+        self._reconcile_owned_initialization_orphans()
         return result
 
 
@@ -1498,6 +2131,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         sub.add_parser(name)
     refresh = sub.add_parser("refresh-policy")
     refresh.add_argument("--epoch", required=True)
+    backup = sub.add_parser("backup")
+    backup.add_argument("--backup-dir", type=Path, required=True)
+    restore = sub.add_parser("restore")
+    restore.add_argument("--backup-dir", type=Path, required=True)
+    restore.add_argument("--manifest-sha256", required=True)
     return parser.parse_args(argv)
 
 
@@ -1508,6 +2146,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         staging = ClinicalStaging(args.runtime_root, args.hrh_root, args.state_dir, args.project, args.port, subject_admission=admission)
         if args.command == "refresh-policy":
             result = staging.refresh_policy(args.epoch)
+        elif args.command == "backup":
+            result = staging.backup(args.backup_dir)
+        elif args.command == "restore":
+            result = staging.restore(args.backup_dir, args.manifest_sha256)
         else:
             result = getattr(staging, args.command)()
     except CommandError:
