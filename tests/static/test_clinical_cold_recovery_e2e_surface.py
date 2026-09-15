@@ -106,7 +106,9 @@ def test_witness_recomposes_the_non_recovery_controls_after_restore():
         assert control in source, control
     # Isolation and policy expiry are re-proven on the restored stack.
     assert '"denied", "denied_dm"' in source
-    assert '"policy", "cold-expired", "-1"' in source
+    # The lifetime itself is contracted below: it must clear the policy clock
+    # skew, which `-1` did not.
+    assert '"policy", "cold-expired", str(EXPIRED_POLICY_SECONDS)' in source
 
 
 def test_witness_binds_the_published_immutable_subjects_when_present():
@@ -158,3 +160,46 @@ def test_recovery_helper_image_matches_the_admitted_composed_subject():
         ROOT / "tests" / "deployment" / "clinical-composed-e2e" / "compose.yaml"
     ).read_text(encoding="utf-8")
     assert f"image: {module.RECOVERY_HELPER_IMAGE}" in compose
+
+
+def test_witness_reobserves_delivery_counts_after_restore():
+    """`post-count` is a cached value that the restore repopulates.
+
+    Reading it after restore without a fresh live observation would compare the
+    archived number with itself, so `already_delivered_not_redelivered` could
+    never fail. The live `expect` has to come first.
+    """
+    source = harness()
+    live = 'restored.control("expect", "cold-already-delivered", "reply")'
+    cached = 'restored.control("post-count", "cold-already-delivered")'
+    assert live in source
+    assert cached in source
+    assert source.index(live) < source.index(cached)
+
+
+def test_witness_expires_the_policy_past_the_clock_skew():
+    """A policy that expired one second ago is still valid.
+
+    The generated policy carries `clock_skew_seconds: 30` and the predicate is
+    `now - skew > expires_at`, so the fixture has to clear the skew or it
+    records a success it never observed.
+    """
+    source = harness()
+    assert "EXPIRED_POLICY_SECONDS" in source
+    namespace: dict = {}
+    for line in source.splitlines():
+        if line.startswith("EXPIRED_POLICY_SECONDS"):
+            exec(line, namespace)  # noqa: S102 - reading our own constant
+    value = namespace["EXPIRED_POLICY_SECONDS"]
+    assert value <= -60, "the expiry fixture must clear the 30s policy clock skew"
+    assert 'restored.control("policy", "cold-expired", str(EXPIRED_POLICY_SECONDS))' in source
+    assert '"cold-expired", "-1"' not in source
+
+
+def test_witness_waits_for_readiness_before_measuring_silence():
+    """Silence right after `up --detach` is unreadiness, not a fail-closed control."""
+    source = harness()
+    assert "restored._await_ingress_ready(started_at)" in source
+    ready = source.index("restored._await_ingress_ready(started_at)")
+    send = source.index('restored.control("send", "actor", "actor_dm", PATIENT, "cold-expired")')
+    assert ready < send

@@ -34,6 +34,11 @@ CANDIDATE_MANIFEST = os.environ.get("RESTRICTED_IMMUTABLE_CANDIDATE_MANIFEST")
 PATIENT = "018f22bb-414d-7cc4-b5a4-83cc8ec92cb1"
 PORT = int(os.environ.get("CLINICAL_E2E_RECOVERY_PORT", "18473"))
 DURATION_BOUND_SECONDS = 1800
+# The generated policy carries `clock_skew_seconds: 30` and the expiry
+# predicate is `now - skew > expires_at`, so a policy that expired one second
+# ago is still valid.  Clear the skew by a wide margin, or the expired-policy
+# control records a success it never observed.
+EXPIRED_POLICY_SECONDS = -300
 
 
 def load_wrapper():
@@ -367,6 +372,12 @@ def main() -> None:
             if int(restored.control("post-count", "cold-unknown")) != 0:
                 raise RuntimeError("restored unknown delivery produced a post")
 
+            # `post-count` reads a value cached in the controller_state volume,
+            # which the restore repopulates -- so reading it alone would compare
+            # the archived number with itself and could never see a redelivery.
+            # `expect ... reply` queries the live thread, requires exactly one
+            # bot reply with the exact message, and rewrites that cached count.
+            restored.control("expect", "cold-already-delivered", "reply")
             if (
                 int(restored.control("post-count", "cold-already-delivered"))
                 != delivered_before
@@ -395,8 +406,14 @@ def main() -> None:
             # Expired policy is a post-restore fail-closed control, not a new
             # backup feature.  It must not revive a response path.
             restored.compose("stop", "ingress")
-            restored.control("policy", "cold-expired", "-1")
+            restored.control("policy", "cold-expired", str(EXPIRED_POLICY_SECONDS))
             restored.compose("up", "--detach", "ingress")
+            # Without this barrier the no-reply window is also the ingress
+            # unreadiness window, so silence would prove nothing.
+            started_at = restored._container_inspections()["ingress"]["State"][
+                "StartedAt"
+            ]
+            restored._await_ingress_ready(started_at)
             restored.control("send", "actor", "actor_dm", PATIENT, "cold-expired")
             restored.control("expect", "cold-expired", "no-reply")
 

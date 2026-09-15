@@ -2147,6 +2147,11 @@ class ClinicalStaging:
             or mechanical.get("verification") != "mechanical_restore_only"
             or mechanical.get("state_id") != marker["state_id"]
             or mechanical.get("project") != self.project
+            or mechanical.get("schema") != BACKUP_SCHEMA
+            or mechanical.get("source") != {
+                key: marker[key]
+                for key in ("runtime_head", "runtime_tree", "hrh_head", "hrh_tree")
+            }
         ):
             raise SafetyError("mechanical restore receipt does not bind this verification")
         receipt = {
