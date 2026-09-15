@@ -108,38 +108,20 @@ def _frame(module) -> dict[str, str]:
 
 
 def make_target(module, tmp_path: Path, *, admitted: bool = True):
-    """Build a real stopped state directory and a staging instance for it."""
+    """Build a real stopped state directory and a staging instance for it.
+
+    The seed material and `compose.env` are produced by the staging module's
+    own helpers, so the bundle this target yields is a genuine one: the
+    restored sealed-environment check has something real to verify.
+    """
     runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
     runtime.mkdir()
     hrh.mkdir()
     state = tmp_path / f"{PROJECT}.synthetic-clinical-staging"
     state.mkdir(mode=0o700)
     (state / "evidence").mkdir(mode=0o700)
-    (state / "seed").mkdir(mode=0o700)
-    # Real state carries generated secret material; the canary proves it never
-    # reaches a published receipt.
-    (state / "seed" / "actor_password").write_text(SECRET_CANARY, encoding="ascii")
-    os.chmod(state / "seed" / "actor_password", 0o600)
-    env_raw = f"CLINICAL_MM_DB_PASSWORD={SECRET_CANARY}\n".encode("utf-8")
-    (state / "compose.env").write_bytes(env_raw)
-    os.chmod(state / "compose.env", 0o600)
 
     admission = _subject_admission() if admitted else None
-    marker = module.new_marker(
-        project=PROJECT,
-        state_dir=state,
-        state_id=secrets.token_hex(16),
-        env_sha256=hashlib.sha256(env_raw).hexdigest(),
-        lifecycle="stopped",
-        expected_images={
-            service: f"sha256:{index:064x}"
-            for index, service in enumerate(module.LONG_RUNNING_SERVICES, 1)
-        },
-        image_mode="subject-admitted" if admitted else "exact-source",
-        subject_admission=_marker_admission() if admitted else None,
-        **_frame(module),
-    )
-    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
     staging = module.ClinicalStaging(
         runtime,
         hrh,
@@ -149,7 +131,33 @@ def make_target(module, tmp_path: Path, *, admitted: bool = True):
         shell=QuietShell(),
         subject_admission=admission,
     )
-    return staging, marker
+    staging._seed_material(state)
+    # A recognizable value in the private seed; the published manifest and
+    # receipt must never carry it.
+    (state / "seed" / "actor_password").write_text(SECRET_CANARY, encoding="ascii")
+    os.chmod(state / "seed" / "actor_password", 0o600)
+
+    marker = module.new_marker(
+        project=PROJECT,
+        state_dir=state,
+        state_id=secrets.token_hex(16),
+        env_sha256="0" * 64,
+        lifecycle="stopped",
+        expected_images={
+            service: f"sha256:{index:064x}"
+            for index, service in enumerate(module.LONG_RUNNING_SERVICES, 1)
+        },
+        image_mode="subject-admitted" if admitted else "exact-source",
+        subject_admission=_marker_admission() if admitted else None,
+        **_frame(module),
+    )
+    values = staging._env_values(marker)
+    env_raw = staging._env_bytes(values)
+    (state / "compose.env").write_bytes(env_raw)
+    os.chmod(state / "compose.env", 0o600)
+    marker["compose_env_sha256"] = hashlib.sha256(env_raw).hexdigest()
+    module.write_json_atomic(state / module.MARKER_NAME, marker, mode=0o600)
+    return staging, marker, values
 
 
 def _stub_docker_backup(module, staging, monkeypatch, *, volumes_from):
@@ -181,11 +189,11 @@ def _stub_docker_backup(module, staging, monkeypatch, *, volumes_from):
 
 
 def make_bundle(module, tmp_path: Path, monkeypatch, *, admitted: bool = True):
-    staging, marker = make_target(module, tmp_path, admitted=admitted)
+    staging, marker, values = make_target(module, tmp_path, admitted=admitted)
     _stub_docker_backup(module, staging, monkeypatch, volumes_from=marker["volumes"])
     backup_dir = tmp_path / "cold-backup"
     receipt = staging.backup(backup_dir)
-    return staging, marker, backup_dir, receipt
+    return staging, marker, backup_dir, receipt, values
 
 
 def _stub_docker_restore(module, staging, monkeypatch):
@@ -315,7 +323,9 @@ def test_state_lock_alone_does_not_see_the_project_collision(module, tmp_path):
 
 @posix_only
 def test_backup_publishes_a_validatable_bundle(module, tmp_path, monkeypatch):
-    staging, marker, backup_dir, receipt = make_bundle(module, tmp_path, monkeypatch)
+    staging, marker, backup_dir, receipt, _values = make_bundle(
+        module, tmp_path, monkeypatch
+    )
     assert receipt["schema"] == module.BACKUP_SCHEMA
     assert receipt["excluded_volume"] == module.EXCLUDED_RECOVERY_VOLUME
     assert re.fullmatch("[a-f0-9]{64}", receipt["manifest_sha256"])
@@ -337,22 +347,24 @@ def test_backup_publishes_a_validatable_bundle(module, tmp_path, monkeypatch):
 def test_backup_receipt_and_manifest_carry_no_secret_or_private_path(
     module, tmp_path, monkeypatch
 ):
-    staging, _marker, backup_dir, receipt = make_bundle(module, tmp_path, monkeypatch)
+    staging, _marker, backup_dir, receipt, values = make_bundle(module, tmp_path, monkeypatch)
     published = json.dumps(receipt, sort_keys=True)
-    assert SECRET_CANARY not in published
+    generated = values["CLINICAL_MM_DB_PASSWORD"]
+    assert len(generated) >= 32
+    assert SECRET_CANARY not in published and generated not in published
     assert str(staging.state_dir) not in published
     assert "seed" not in published
     manifest_raw = (backup_dir / module.BACKUP_MANIFEST_NAME).read_text(
         encoding="utf-8"
     )
-    assert SECRET_CANARY not in manifest_raw
+    assert SECRET_CANARY not in manifest_raw and generated not in manifest_raw
     assert "subject_admission" not in manifest_raw
     assert "actor_password" not in manifest_raw
 
 
 @posix_only
 def test_backup_refuses_a_target_that_already_exists(module, tmp_path, monkeypatch):
-    staging, marker = make_target(module, tmp_path)
+    staging, marker, _values = make_target(module, tmp_path)
     _stub_docker_backup(module, staging, monkeypatch, volumes_from=marker["volumes"])
     existing = tmp_path / "cold-backup"
     existing.mkdir()
@@ -364,7 +376,7 @@ def test_backup_refuses_a_target_that_already_exists(module, tmp_path, monkeypat
 def test_backup_refuses_a_target_inside_state_or_build_context(
     module, tmp_path, monkeypatch
 ):
-    staging, marker = make_target(module, tmp_path)
+    staging, marker, _values = make_target(module, tmp_path)
     _stub_docker_backup(module, staging, monkeypatch, volumes_from=marker["volumes"])
     for candidate in (
         staging.state_dir / "inside",
@@ -378,7 +390,7 @@ def test_backup_refuses_a_target_inside_state_or_build_context(
 
 @posix_only
 def test_backup_requires_a_cold_marker(module, tmp_path, monkeypatch):
-    staging, marker = make_target(module, tmp_path)
+    staging, marker, _values = make_target(module, tmp_path)
     _stub_docker_backup(module, staging, monkeypatch, volumes_from=marker["volumes"])
     monkeypatch.undo()
     monkeypatch.setattr(staging, "_require_linux", lambda: None)
@@ -393,7 +405,7 @@ def test_backup_requires_a_cold_marker(module, tmp_path, monkeypatch):
 
 @posix_only
 def test_failed_backup_leaves_no_partial_bundle(module, tmp_path, monkeypatch):
-    staging, marker = make_target(module, tmp_path)
+    staging, marker, _values = make_target(module, tmp_path)
     _stub_docker_backup(module, staging, monkeypatch, volumes_from=marker["volumes"])
 
     def explode(*_args, **_kwargs):
@@ -411,7 +423,7 @@ def test_failed_backup_leaves_no_partial_bundle(module, tmp_path, monkeypatch):
 def test_backup_never_archives_the_excluded_transport_volume(
     module, tmp_path, monkeypatch
 ):
-    _source2, _marker, backup_dir, _receipt = make_bundle(module, tmp_path, monkeypatch)
+    _source2, _marker, backup_dir, _receipt, _values = make_bundle(module, tmp_path, monkeypatch)
     volumes = {item.name for item in (backup_dir / module.BACKUP_VOLUME_DIR).iterdir()}
     assert f"{module.EXCLUDED_RECOVERY_VOLUME}.tar" not in volumes
     assert volumes == {f"{key}.tar" for key in module.BACKED_UP_VOLUME_KEYS}
@@ -424,7 +436,7 @@ def test_backup_never_archives_the_excluded_transport_volume(
 
 @posix_only
 def test_restore_round_trips_into_a_clean_destination(module, tmp_path, monkeypatch):
-    source, marker, backup_dir, receipt = make_bundle(module, tmp_path, monkeypatch)
+    source, marker, backup_dir, receipt, values = make_bundle(module, tmp_path, monkeypatch)
     target = restore_target(module, source)
     _stub_docker_restore(module, target, monkeypatch)
     result = target.restore(backup_dir, receipt["manifest_sha256"])
@@ -459,7 +471,7 @@ def test_restore_round_trips_into_a_clean_destination(module, tmp_path, monkeypa
 def test_restore_refuses_a_bundle_from_another_subject_line(
     module, tmp_path, monkeypatch
 ):
-    source, _marker, backup_dir, receipt = make_bundle(module, tmp_path, monkeypatch)
+    source, _marker, backup_dir, receipt, values = make_bundle(module, tmp_path, monkeypatch)
     target = restore_target(module, source)
     other = _subject_admission()
     other["manifest_sha256"] = "9" * 64
@@ -476,7 +488,7 @@ def test_restore_refuses_a_bundle_from_another_subject_line(
 def test_restore_refuses_a_bundle_for_an_unadmitted_target(
     module, tmp_path, monkeypatch
 ):
-    source, _marker, backup_dir, receipt = make_bundle(module, tmp_path, monkeypatch)
+    source, _marker, backup_dir, receipt, values = make_bundle(module, tmp_path, monkeypatch)
     target = restore_target(module, source, admitted=False)
     _stub_docker_restore(module, target, monkeypatch)
     with pytest.raises(
@@ -494,7 +506,7 @@ def test_restore_refuses_a_bundle_for_an_unadmitted_target(
 def test_restore_refuses_a_corrupt_bundle_without_touching_the_destination(
     module, tmp_path, monkeypatch, corrupt
 ):
-    source, _marker, backup_dir, receipt = make_bundle(module, tmp_path, monkeypatch)
+    source, _marker, backup_dir, receipt, values = make_bundle(module, tmp_path, monkeypatch)
     target = restore_target(module, source)
     _stub_docker_restore(module, target, monkeypatch)
     manifest_sha = receipt["manifest_sha256"]
@@ -534,7 +546,7 @@ def test_restore_refuses_a_corrupt_bundle_without_touching_the_destination(
 
 @posix_only
 def test_restore_refuses_a_foreign_source_frame(module, tmp_path, monkeypatch):
-    source, _marker, backup_dir, receipt = make_bundle(module, tmp_path, monkeypatch)
+    source, _marker, backup_dir, receipt, values = make_bundle(module, tmp_path, monkeypatch)
     target = restore_target(module, source)
     _stub_docker_restore(module, target, monkeypatch)
     monkeypatch.setattr(
@@ -551,7 +563,7 @@ def test_restore_refuses_a_foreign_source_frame(module, tmp_path, monkeypatch):
 
 @posix_only
 def test_restore_refuses_a_non_empty_destination(module, tmp_path, monkeypatch):
-    source, _marker, backup_dir, receipt = make_bundle(module, tmp_path, monkeypatch)
+    source, _marker, backup_dir, receipt, values = make_bundle(module, tmp_path, monkeypatch)
     target = restore_target(module, source)
     target.state_dir.mkdir(mode=0o700, parents=True)
     (target.state_dir / "occupied").write_text("x", encoding="ascii")
@@ -565,7 +577,7 @@ def test_restore_refuses_a_non_empty_destination(module, tmp_path, monkeypatch):
 def test_restore_refuses_a_destination_with_conflicting_docker_state(
     module, tmp_path, monkeypatch
 ):
-    source, _marker, backup_dir, receipt = make_bundle(module, tmp_path, monkeypatch)
+    source, _marker, backup_dir, receipt, values = make_bundle(module, tmp_path, monkeypatch)
     target = restore_target(module, source)
     _stub_docker_restore(module, target, monkeypatch)
 
@@ -592,7 +604,7 @@ def test_restore_refuses_a_destination_with_conflicting_docker_state(
 def test_failure_after_publication_leaves_a_non_operational_recovering_target(
     module, tmp_path, monkeypatch
 ):
-    source, _marker, backup_dir, receipt = make_bundle(module, tmp_path, monkeypatch)
+    source, _marker, backup_dir, receipt, values = make_bundle(module, tmp_path, monkeypatch)
     target = restore_target(module, source)
     _stub_docker_restore(module, target, monkeypatch)
     stopped: list[tuple[str, ...]] = []
@@ -693,7 +705,7 @@ def test_recovery_helper_image_matches_the_admitted_composed_subject(module):
 def test_backup_helper_runs_read_only_with_one_capability(
     module, tmp_path, monkeypatch
 ):
-    staging, marker = make_target(module, tmp_path)
+    staging, marker, _values = make_target(module, tmp_path)
     captured: list[tuple[str, ...]] = []
 
     class CapturingShell(QuietShell):
@@ -721,7 +733,7 @@ def test_backup_helper_runs_read_only_with_one_capability(
 def test_restore_helper_gains_only_ownership_capabilities(
     module, tmp_path, monkeypatch
 ):
-    staging, marker = make_target(module, tmp_path)
+    staging, marker, _values = make_target(module, tmp_path)
     captured: list[tuple[str, ...]] = []
 
     class CapturingShell(QuietShell):
@@ -853,3 +865,217 @@ def test_cli_exposes_backup_and_restore_with_explicit_digests(module, tmp_path):
             "--backup-dir",
             str(tmp_path / "b"),
         ])
+
+
+# --------------------------------------------------------------------------
+# Backup leaves a target `destroy` can still reach
+# --------------------------------------------------------------------------
+
+
+@posix_only
+def test_backup_records_the_teardown_it_performs(module, tmp_path, monkeypatch):
+    source, marker, _backup_dir, receipt, _values = make_bundle(
+        module, tmp_path, monkeypatch
+    )
+    assert receipt["lifecycle"] == "cold"
+    assert receipt["archived_lifecycle"] == "stopped"
+    after = module.read_marker(source.state_dir, PROJECT)
+    assert after["lifecycle"] == "cold"
+    assert after["state_id"] == marker["state_id"]
+
+
+def test_a_torn_down_target_stays_destroyable(module):
+    """`backup` removes the Compose containers and networks it archived around.
+
+    A marker that still claimed `stopped` afterwards would make the exact-set
+    requirement in the destructive guards unsatisfiable, so `destroy` and
+    `reset` would refuse the target and its volumes could only be removed out
+    of band.
+    """
+    state_id = "a" * 32
+    volumes = set(module.volume_names(PROJECT).values())
+    labels = {
+        module.PROJECT_LABEL: PROJECT,
+        module.STATE_LABEL: state_id,
+        module.SYNTHETIC_LABEL: "true",
+    }
+    discovered = {name: labels for name in volumes}
+    # This is the shape a completed backup leaves: volumes, no services, no
+    # networks.
+    assert module.verify_destructive_resources(PROJECT, state_id, {}, {}, "cold") == (
+        [],
+        [],
+    )
+    assert module.verify_destructive_volumes(
+        PROJECT, state_id, volumes, discovered, "cold"
+    ) == sorted(volumes)
+    # The gap this closes: the same shape under a `stopped` marker is refused.
+    with pytest.raises(module.SafetyError, match="requires the exact service set"):
+        module.verify_destructive_resources(PROJECT, state_id, {}, {}, "stopped")
+    # `cold` is still not an operational state.
+    cold = {"lifecycle": "cold"}
+    with pytest.raises(module.SafetyError, match="rejects marker lifecycle"):
+        module.ClinicalStaging._require_lifecycle(cold, "status", {"ready"})
+    with pytest.raises(module.SafetyError, match="rejects marker lifecycle"):
+        module.ClinicalStaging._require_lifecycle(cold, "backup", {"stopped"})
+    # But `up` can rebuild it.
+    module.ClinicalStaging._require_lifecycle(cold, "up", {"ready", "stopped", "cold"})
+    assert "cold" not in module.SETTLED_LIFECYCLES
+    assert "cold" in module.LIFECYCLE_STATES
+
+
+# --------------------------------------------------------------------------
+# The restored sealed environment must select the admitted target
+# --------------------------------------------------------------------------
+
+
+def bundle_with_env(module, tmp_path, monkeypatch, mutate):
+    """Produce an internally consistent bundle whose compose.env was edited.
+
+    Every digest is recomputed, so the bundle validates; only the values
+    Compose will interpolate differ. This is the attack that
+    `compose_env_sha256` alone cannot catch, because whoever builds the bundle
+    controls both the file and the hash recorded for it.
+    """
+    staging, marker, _values = make_target(module, tmp_path)
+    raw = (staging.state_dir / "compose.env").read_text(encoding="utf-8")
+    edited = mutate(raw)
+    (staging.state_dir / "compose.env").write_text(edited, encoding="utf-8")
+    marker["compose_env_sha256"] = hashlib.sha256(edited.encode("utf-8")).hexdigest()
+    module.write_json_atomic(staging.state_dir / module.MARKER_NAME, marker, mode=0o600)
+    _stub_docker_backup(module, staging, monkeypatch, volumes_from=marker["volumes"])
+    backup_dir = tmp_path / "cold-backup"
+    receipt = staging.backup(backup_dir)
+    return staging, backup_dir, receipt
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("label", "mutate", "message"),
+    [
+        (
+            "foreign image",
+            lambda raw: re.sub(
+                r"CLINICAL_INGRESS_IMAGE=.*",
+                "CLINICAL_INGRESS_IMAGE=docker.io/library/mattermost:latest",
+                raw,
+            ),
+            "CLINICAL_INGRESS_IMAGE",
+        ),
+        (
+            "foreign volume",
+            lambda raw: re.sub(
+                r"CLINICAL_VOLUME_HRH_DB=.*",
+                "CLINICAL_VOLUME_HRH_DB=somebody_elses_volume",
+                raw,
+            ),
+            "CLINICAL_VOLUME_HRH_DB",
+        ),
+        (
+            "foreign hrh root",
+            lambda raw: re.sub(
+                r"CLINICAL_HRH_ROOT=.*", "CLINICAL_HRH_ROOT=/tmp/other", raw
+            ),
+            "CLINICAL_HRH_ROOT",
+        ),
+        (
+            "injected key",
+            lambda raw: raw + "CLINICAL_EXTRA=1\n",
+            "unknown or missing keys",
+        ),
+    ],
+)
+def test_restore_refuses_an_environment_that_selects_an_unadmitted_target(
+    module, tmp_path, monkeypatch, label, mutate, message
+):
+    source, backup_dir, receipt = bundle_with_env(module, tmp_path, monkeypatch, mutate)
+    target = restore_target(module, source)
+    _stub_docker_restore(module, target, monkeypatch)
+    with pytest.raises(module.SafetyError, match=message):
+        target.restore(backup_dir, receipt["manifest_sha256"])
+    assert not target.state_dir.exists(), label
+    assert not list(target.state_dir.parent.glob(".*recovering-*"))
+
+
+@posix_only
+def test_restore_refuses_a_malformed_environment(module, tmp_path, monkeypatch):
+    source, backup_dir, receipt = bundle_with_env(
+        module, tmp_path, monkeypatch, lambda raw: raw + "no-separator-line\n"
+    )
+    target = restore_target(module, source)
+    _stub_docker_restore(module, target, monkeypatch)
+    with pytest.raises(module.SafetyError, match="compose environment is malformed"):
+        target.restore(backup_dir, receipt["manifest_sha256"])
+    assert not target.state_dir.exists()
+
+
+# --------------------------------------------------------------------------
+# Secret-bearing remnants of a killed command
+# --------------------------------------------------------------------------
+
+
+@posix_only
+def test_killed_recovery_remnants_are_reconciled(module, tmp_path, monkeypatch):
+    source, _marker, _values = make_target(module, tmp_path)
+    parent = source.state_dir.parent
+    remnants = []
+    for shape in ("recovering", "bundle", "partial", "init"):
+        remnant = parent / f".{source.state_dir.name}.{shape}-{secrets.token_hex(8)}"
+        remnant.mkdir(mode=0o700)
+        (remnant / "compose.env").write_text(SECRET_CANARY, encoding="ascii")
+        remnants.append(remnant)
+    unrelated = parent / f".{source.state_dir.name}.unrelated-0000000000000000"
+    unrelated.mkdir(mode=0o700)
+
+    source._reconcile_owned_initialization_orphans()
+    assert all(not remnant.exists() for remnant in remnants)
+    assert unrelated.exists(), "cleanup must stay inside its exact name allowlist"
+
+
+@posix_only
+def test_remnant_cleanup_fails_closed_on_a_linked_remnant(module, tmp_path):
+    source, _marker, _values = make_target(module, tmp_path)
+    parent = source.state_dir.parent
+    remnant = parent / f".{source.state_dir.name}.bundle-{secrets.token_hex(8)}"
+    remnant.mkdir(mode=0o700)
+    (remnant / "escape").symlink_to("/etc/passwd")
+    with pytest.raises(module.SafetyError, match="contains a symlink"):
+        source._reconcile_owned_initialization_orphans()
+    assert remnant.exists()
+
+
+@posix_only
+def test_destroy_reconciles_remnants_beside_the_state_directory(
+    module, tmp_path, monkeypatch
+):
+    source, _marker, _values = make_target(module, tmp_path)
+    parent = source.state_dir.parent
+    remnant = parent / f".{source.state_dir.name}.bundle-{secrets.token_hex(8)}"
+    remnant.mkdir(mode=0o700)
+    (remnant / "compose.env").write_text(SECRET_CANARY, encoding="ascii")
+    monkeypatch.setattr(source, "_require_linux", lambda: None)
+    monkeypatch.setattr(source, "_destroy_resources", lambda: None)
+    result = source.destroy()
+    assert result["lifecycle"] == "destroyed"
+    assert not source.state_dir.exists()
+    assert not remnant.exists(), "destroy left a secret-bearing remnant on disk"
+
+
+@posix_only
+def test_per_state_lock_refuses_a_planted_symlink(module, tmp_path):
+    runtime, hrh = tmp_path / "runtime", tmp_path / "hrh"
+    runtime.mkdir()
+    hrh.mkdir()
+    state = tmp_path / f"{PROJECT}.synthetic-clinical-staging"
+    staging = module.ClinicalStaging(
+        runtime, hrh, state, PROJECT, 18443, shell=QuietShell()
+    )
+    state.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = state.parent / f".{state.name}.lifecycle.lock"
+    target = tmp_path / "planted"
+    target.write_bytes(b"")
+    lock.symlink_to(target)
+    with pytest.raises(OSError):
+        with staging._state_lifecycle_lock():
+            pass
+    assert target.read_bytes() == b""

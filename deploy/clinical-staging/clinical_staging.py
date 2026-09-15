@@ -92,12 +92,30 @@ RECOVERY_HELPER_IMAGE = (
     "postgres:17.10-bookworm@sha256:"
     "9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f"
 )
-LIFECYCLE_STATES = ("initializing", "finalizing", "ready", "stopped", "recovering")
-# `recovering` is a published-but-non-operational state.  It is deliberately
-# treated like `initializing` by the destructive guards: a restore that dies
-# between publishing the state directory and creating volumes must still be
-# cleanable by `destroy`, so an exact-set requirement here would strand it.
+LIFECYCLE_STATES = (
+    "initializing", "finalizing", "ready", "stopped", "cold", "recovering",
+)
+# `recovering` and `cold` are published-but-non-operational states.  They are
+# deliberately treated like `initializing` by the destructive guards:
+#
+# * a restore that dies between publishing the state directory and creating
+#   volumes must still be cleanable by `destroy`;
+# * `backup` must remove the stopped Compose containers before it can archive
+#   the volumes they still mount, which leaves a target whose volumes exist but
+#   whose services and networks do not.
+#
+# An exact-set requirement in either state would strand the target: `destroy`
+# and `reset` would refuse it and the volumes could only be removed out of
+# band.  The allowlist and label checks still apply, and `_create_volumes`
+# keeps its own exact post-check.
 SETTLED_LIFECYCLES = frozenset({"finalizing", "ready", "stopped"})
+# Remnant roots a dead lifecycle command can leave beside the state directory.
+ORPHAN_RE_TEMPLATES = (
+    r"^\.{state}\.init-[a-f0-9]{{16}}$",
+    r"^\.{state}\.recovering-[a-f0-9]{{16}}$",
+    r"^\.{state}\.bundle-[a-f0-9]{{16}}$",
+    r"^\.{state}\.partial-[a-f0-9]{{16}}$",
+)
 LONG_RUNNING_SERVICES = (
     "mattermost-postgres", "mattermost", "hrh-postgres", "hrh", "hrh-tls",
     "clinical-adapter", "ingress", "operator-proxy",
@@ -699,7 +717,7 @@ def verify_destructive_resources(
             raise SafetyError("finalizing/ready/stopped staging requires the exact service set")
         if set(networks) != allowed_networks:
             raise SafetyError("finalizing/ready/stopped staging requires the exact network set")
-    elif lifecycle not in {"initializing", "recovering"}:
+    elif lifecycle not in {"initializing", "recovering", "cold"}:
         raise SafetyError("unknown lifecycle for destructive resource verification")
     return sorted(containers), sorted(networks)
 
@@ -1015,8 +1033,12 @@ class ClinicalStaging:
                     self._lifecycle_thread_state.depth = 0
                 return
 
-            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            fd = os.open(
+                lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600
+            )
             try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise SafetyError("lifecycle lock is not a regular file")
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 self._lifecycle_thread_state.depth = 1
                 try:
@@ -1142,20 +1164,29 @@ class ClinicalStaging:
         policy_path.chmod(0o600)
 
     def _owned_initialization_orphans(self) -> list[Path]:
-        """Return only this target's bounded pre-rename initialization roots.
+        """Return only this target's bounded pre-rename remnant roots.
 
-        ``init`` already holds the per-target lifecycle lock before it calls
-        this helper.  The random suffix prevents an unrelated directory from
-        becoming a cleanup target through a predictable name.
+        The caller already holds the lifecycle lock.  The random suffix
+        prevents an unrelated directory from becoming a cleanup target through
+        a predictable name.
+
+        Cold recovery adds two more shapes.  A process killed mid-restore can
+        leave an extracted state tree (``.recovering-``) or a full private copy
+        of the bundle (``.bundle-``), and a killed backup can leave a partial
+        bundle (``.partial-``).  All three carry generated secret material, so
+        they belong to the same bounded cleanup as a dead ``init``.
         """
-        expression = re.compile(
-            INIT_ORPHAN_RE_TEMPLATE.format(state=re.escape(self.state_dir.name))
-        )
+        name = re.escape(self.state_dir.name)
+        expressions = [
+            re.compile(template.format(state=name)) for template in ORPHAN_RE_TEMPLATES
+        ]
+        if not self.state_dir.parent.is_dir():
+            return []
         candidates = [
             entry for entry in self.state_dir.parent.iterdir()
-            if expression.fullmatch(entry.name)
+            if any(expression.fullmatch(entry.name) for expression in expressions)
         ]
-        if len(candidates) > MAX_INITIALIZATION_ORPHANS:
+        if len(candidates) > MAX_INITIALIZATION_ORPHANS * len(ORPHAN_RE_TEMPLATES):
             raise SafetyError("too many initialization remnants; refusing cleanup")
         return candidates
 
@@ -1366,11 +1397,13 @@ class ClinicalStaging:
     def up(self) -> dict[str, Any]:
         self._require_linux()
         marker = self._verify_marker_and_source()
-        self._require_lifecycle(marker, "up", {"ready", "stopped"})
+        # `cold` is a stopped target whose Compose containers and networks were
+        # removed so its volumes could be archived.  `up` recreates them.
+        self._require_lifecycle(marker, "up", {"ready", "stopped", "cold"})
         self._up_services(*ONE_SHOT_SERVICES, *LONG_RUNNING_SERVICES, timeout=1200)
         self.control("wait-mm")
         self.control("wait-hrh")
-        if marker["lifecycle"] == "stopped":
+        if marker["lifecycle"] in {"stopped", "cold"}:
             marker["lifecycle"] = "ready"
             self._write_marker(marker)
         return self.status()
@@ -1714,6 +1747,13 @@ class ClinicalStaging:
             # Stop leaves Compose containers present.  Remove only the exact
             # already-validated stack, then reject every remaining mount,
             # including unlabeled debug/orphan containers, before each read.
+            #
+            # The marker records the teardown *before* it happens.  Afterwards
+            # this target no longer has the exact service and network set that
+            # a `stopped` marker promises, and `destroy`/`reset` would refuse a
+            # target that still claimed to be `stopped`.
+            marker["lifecycle"] = "cold"
+            self._write_marker(marker)
             self.compose("down", timeout=600)
             for key in BACKED_UP_VOLUME_KEYS:
                 self._assert_unmounted_backup_volumes(marker["volumes"])
@@ -1739,7 +1779,10 @@ class ClinicalStaging:
             "backup_dir": str(backup_dir),
             "manifest_sha256": file_sha256(backup_dir / BACKUP_MANIFEST_NAME),
             "excluded_volume": EXCLUDED_RECOVERY_VOLUME,
-            "lifecycle": "stopped",
+            # The bundle captures a stopped target; the target it was taken
+            # from is now cold and must be brought `up` before it serves again.
+            "archived_lifecycle": "stopped",
+            "lifecycle": "cold",
             "nonclaims": ["not a scheduled backup", "not encrypted", "not production"],
         }
 
@@ -1848,6 +1891,50 @@ class ClinicalStaging:
         ):
             raise SafetyError("restored subject admission differs from the sealed target")
 
+    # Only these four values are freshly generated on every `_env_values`
+    # call, so a restored environment cannot be compared against them.
+    GENERATED_ENV_KEYS = (
+        "CLINICAL_MM_DB_PASSWORD",
+        "CLINICAL_HRH_DB_PASSWORD",
+        "CLINICAL_HRH_SESSION_SECRET",
+        "CLINICAL_HRH_ENCRYPTION_KEY",
+    )
+
+    def _assert_restored_environment(self, marker: Mapping[str, Any], root: Path) -> None:
+        """The restored `compose.env` must select exactly the admitted target.
+
+        `compose.env` is the sole authority for Compose interpolation, so it
+        alone decides which images are started and which volumes are attached.
+        The marker's `compose_env_sha256` only proves the file is the one the
+        bundle carried -- whoever produced the bundle controls both. Matching
+        the archived marker's subject admission therefore proves nothing about
+        what Compose will actually run.
+
+        Restore does not pull and inspect RepoDigests the way `init` does, so
+        this is the check that keeps a bundle from starting an unadmitted image
+        or attaching a foreign volume.
+        """
+        try:
+            raw = (root / "compose.env").read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SafetyError("restored compose environment is unreadable") from exc
+        values: dict[str, str] = {}
+        for line in raw.splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or not key or key in values:
+                raise SafetyError("restored compose environment is malformed")
+            values[key] = value
+        expected = self._env_values(marker, seed_root=root)
+        if set(values) != set(expected):
+            raise SafetyError("restored compose environment has unknown or missing keys")
+        for key, value in expected.items():
+            if key in self.GENERATED_ENV_KEYS:
+                continue
+            if values[key] != value:
+                raise SafetyError(
+                    f"restored compose environment does not bind the admitted target: {key}"
+                )
+
     @serialized_lifecycle
     def restore(self, backup_dir: Path, expected_manifest_sha256: str) -> dict[str, Any]:
         """Restore only a fully validated cold bundle into a clean destination."""
@@ -1858,6 +1945,10 @@ class ClinicalStaging:
         )
         if not self.state_dir.parent.is_dir():
             raise SafetyError("restore state parent directory must already exist")
+        # A killed predecessor can have left an extracted state tree or a full
+        # private copy of a bundle beside the destination; both carry generated
+        # secret material.
+        self._reconcile_owned_initialization_orphans()
         # Copy first: every later read is from private storage, so the external
         # directory cannot be swapped between validation and use.
         snapshot = _bundle.materialize_backup_snapshot(
@@ -1891,6 +1982,7 @@ class ClinicalStaging:
             write_json_atomic(temporary / MARKER_NAME, restored_marker, mode=0o600)
             if file_sha256(temporary / "compose.env") != manifest["compose_env_sha256"]:
                 raise SafetyError("restored compose environment differs from the validated backup")
+            self._assert_restored_environment(restored_marker, temporary)
             fsync_directory(temporary)
             if self.state_dir.exists():
                 self.state_dir.rmdir()
@@ -2019,6 +2111,10 @@ class ClinicalStaging:
         self._destroy_resources()
         result = {"schema": SCHEMA, "project": self.project, "state_id": marker["state_id"], "lifecycle": "destroyed"}
         shutil.rmtree(self.state_dir)
+        # Secret-bearing remnants of a killed backup or restore live beside the
+        # state directory, not inside it, so removing the target alone leaves
+        # them on disk.
+        self._reconcile_owned_initialization_orphans()
         return result
 
 
