@@ -341,7 +341,16 @@ def test_resumed_initialization_seals_subject_admission_before_any_docker_action
     staging = module.ClinicalStaging(runtime, hrh, state, project, 18443, subject_admission=subject_a)
     monkeypatch.setattr(staging, "_require_linux", lambda: None)
     monkeypatch.setattr(module.os, "getuid", lambda: state.stat().st_uid, raising=False)
-    monkeypatch.setattr(module.stat, "S_IMODE", lambda _mode: 0o700)
+    # Narrow to the state directory's own inode.  A blanket S_IMODE override
+    # would also relax the durable operator lock's ownership/mode check, which
+    # every lifecycle command now passes through.
+    state_inode_mode = state.stat().st_mode
+    original_imode = module.stat.S_IMODE
+    monkeypatch.setattr(
+        module.stat,
+        "S_IMODE",
+        lambda mode: 0o700 if mode == state_inode_mode else original_imode(mode),
+    )
     monkeypatch.setattr(module, "verify_source_frame", lambda *_args: frame)
     monkeypatch.setattr(staging, "_create_volumes", lambda *_args: (_ for _ in ()).throw(RuntimeError("reached-after-admission")))
     with pytest.raises(RuntimeError, match="reached-after-admission"):
