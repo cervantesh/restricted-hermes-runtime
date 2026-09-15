@@ -30,7 +30,10 @@ assert SPEC and SPEC.loader
 ledger = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ledger)
 
-LEDGER_PATH = "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15.json"
+LEDGER_PATHS = (
+    "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15.json",
+    "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-blocked.json",
+)
 
 
 def git(*args: str) -> str:
@@ -220,9 +223,11 @@ def test_v2_ledgers_are_unaffected_by_the_v3_dispatch():
         assert ledger.verify_ledger(raw, repo_root=ROOT) == [], name
 
 
-def test_retained_v3_ledger_verifies_and_names_its_preceding_candidate():
+@pytest.mark.parametrize("path", LEDGER_PATHS)
+def test_retained_v3_ledger_verifies_and_names_its_preceding_candidate(path):
+    """Each retained v3 ledger stays valid, including the superseded one."""
     tracked = subprocess.run(
-        ["git", "-C", str(ROOT), "show", f"HEAD:{LEDGER_PATH}"],
+        ["git", "-C", str(ROOT), "show", f"HEAD:{path}"],
         capture_output=True,
         timeout=30,
         check=False,
@@ -232,7 +237,7 @@ def test_retained_v3_ledger_verifies_and_names_its_preceding_candidate():
     raw = tracked.stdout
     assert ledger.verify_ledger(raw, repo_root=ROOT) == []
     value = json.loads(raw)
-    ledger_commit = git("log", "-1", "--format=%H", "--", LEDGER_PATH)
+    ledger_commit = git("log", "-1", "--format=%H", "--", path)
     candidate = git("rev-parse", f"{ledger_commit}~1")
     assert value["candidate"] == {
         "revision": candidate,
