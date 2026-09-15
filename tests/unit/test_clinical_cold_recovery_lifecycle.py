@@ -1079,3 +1079,253 @@ def test_per_state_lock_refuses_a_planted_symlink(module, tmp_path):
         with staging._state_lifecycle_lock():
             pass
     assert target.read_bytes() == b""
+
+
+# --------------------------------------------------------------------------
+# Causal verification is gated on the composed drill, not on restore
+# --------------------------------------------------------------------------
+
+
+def _causal(module, **overrides):
+    checks = {name: True for name in module.CAUSAL_RECOVERY_CHECKS}
+    checks.update(overrides)
+    return checks
+
+
+def _restored_ready(module, tmp_path, monkeypatch):
+    """A restored, ready target holding a mechanical receipt."""
+    source, _marker, backup_dir, receipt, _values = make_bundle(
+        module, tmp_path, monkeypatch
+    )
+    target = restore_target(module, source)
+    _stub_docker_restore(module, target, monkeypatch)
+    target.restore(backup_dir, receipt["manifest_sha256"])
+    marker = module.read_marker(target.state_dir, PROJECT)
+    monkeypatch.setattr(target, "_verify_marker_and_source", lambda: marker)
+    return target, receipt["manifest_sha256"], marker
+
+
+@posix_only
+def test_causal_verification_binds_the_mechanical_receipt(module, tmp_path, monkeypatch):
+    target, manifest_sha, marker = _restored_ready(module, tmp_path, monkeypatch)
+    verified = target.finalize_cold_recovery_verification(
+        manifest_sha, _causal(module)
+    )
+    assert verified["verification"] == "causal_e2e_verified"
+    assert verified["manifest_sha256"] == manifest_sha
+    assert verified["state_id"] == marker["state_id"]
+    assert set(verified["causal_checks"]) == set(module.CAUSAL_RECOVERY_CHECKS)
+    assert "not a representative-host receipt" in verified["nonclaims"]
+    published = (
+        target.state_dir / "evidence" / "recovery" / f"verified-{manifest_sha}.json"
+    )
+    assert json.loads(published.read_text(encoding="utf-8")) == verified
+    # The mechanical receipt is not replaced or relabelled.
+    mechanical = json.loads(
+        (target.state_dir / "evidence" / "recovery" / f"restore-{manifest_sha}.json")
+        .read_text(encoding="utf-8")
+    )
+    assert mechanical["verification"] == "mechanical_restore_only"
+    assert SECRET_CANARY not in json.dumps(verified, sort_keys=True)
+
+
+@posix_only
+def test_causal_verification_refuses_an_incomplete_or_failed_drill(
+    module, tmp_path, monkeypatch
+):
+    target, manifest_sha, _marker = _restored_ready(module, tmp_path, monkeypatch)
+    one = sorted(module.CAUSAL_RECOVERY_CHECKS)[0]
+    for checks in (
+        {},
+        _causal(module, **{one: False}),
+        {key: value for key, value in _causal(module).items() if key != one},
+        {**_causal(module), "invented_check": True},
+    ):
+        with pytest.raises(module.SafetyError, match="incomplete or invalid"):
+            target.finalize_cold_recovery_verification(manifest_sha, checks)
+    assert not list(
+        (target.state_dir / "evidence" / "recovery").glob("verified-*.json")
+    )
+
+
+@posix_only
+def test_causal_verification_refuses_an_unbound_manifest(module, tmp_path, monkeypatch):
+    target, manifest_sha, _marker = _restored_ready(module, tmp_path, monkeypatch)
+    other = "b" * 64
+    assert other != manifest_sha
+    with pytest.raises(module.SafetyError, match="mechanical restore receipt is unavailable"):
+        target.finalize_cold_recovery_verification(other, _causal(module))
+    with pytest.raises(module.SafetyError, match="must be a lowercase SHA-256"):
+        target.finalize_cold_recovery_verification("not-a-digest", _causal(module))
+    assert not list(
+        (target.state_dir / "evidence" / "recovery").glob("verified-*.json")
+    )
+
+
+@posix_only
+def test_causal_verification_refuses_a_forged_mechanical_receipt(
+    module, tmp_path, monkeypatch
+):
+    target, manifest_sha, _marker = _restored_ready(module, tmp_path, monkeypatch)
+    path = target.state_dir / "evidence" / "recovery" / f"restore-{manifest_sha}.json"
+    forged = json.loads(path.read_text(encoding="utf-8"))
+    forged["verification"] = "causal_e2e_verified"
+    module.write_json_atomic(path, forged, mode=0o600)
+    with pytest.raises(module.SafetyError, match="does not bind this verification"):
+        target.finalize_cold_recovery_verification(manifest_sha, _causal(module))
+
+
+@posix_only
+def test_causal_verification_requires_a_ready_target(module, tmp_path, monkeypatch):
+    target, manifest_sha, marker = _restored_ready(module, tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        target, "_verify_marker_and_source", lambda: dict(marker, lifecycle="cold")
+    )
+    with pytest.raises(module.SafetyError, match="rejects marker lifecycle"):
+        target.finalize_cold_recovery_verification(manifest_sha, _causal(module))
+
+
+# --------------------------------------------------------------------------
+# Destroy proves its own bounded absence
+# --------------------------------------------------------------------------
+
+
+@posix_only
+@pytest.mark.parametrize("leftover", ["container", "network", "volume"])
+def test_destroy_fails_when_its_own_namespace_survives(module, tmp_path, monkeypatch, leftover):
+    source, _marker, _values = make_target(module, tmp_path)
+
+    class LingeringShell(QuietShell):
+        def run(self, *args: str, **kwargs):
+            if leftover == "container" and args[:4] == (
+                "docker", "container", "ls", "--all",
+            ):
+                return SimpleNamespace(
+                    returncode=0, stdout=f"{PROJECT}-ingress-1\n", stderr=""
+                )
+            if leftover == "network" and args[:3] == ("docker", "network", "inspect"):
+                return SimpleNamespace(returncode=0, stdout="[{}]", stderr="")
+            if leftover == "volume" and args[:3] == ("docker", "volume", "inspect"):
+                return SimpleNamespace(returncode=0, stdout="[{}]", stderr="")
+            return super().run(*args, **kwargs)
+
+    source.shell = LingeringShell()
+    monkeypatch.setattr(source, "_require_linux", lambda: None)
+    monkeypatch.setattr(source, "_destroy_resources", lambda: None)
+    with pytest.raises(module.SafetyError, match=f"project {leftover}s? remains? after destroy"):
+        source.destroy()
+
+
+@posix_only
+def test_destroy_absence_check_stays_inside_the_project_namespace(module, tmp_path):
+    source, _marker, _values = make_target(module, tmp_path)
+
+    class ForeignShell(QuietShell):
+        def run(self, *args: str, **kwargs):
+            if args[:4] == ("docker", "container", "ls", "--all"):
+                # Another project's containers must not fail this teardown.
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="clinicalstagingother-ingress-1\nunrelated\n",
+                    stderr="",
+                )
+            return super().run(*args, **kwargs)
+
+    source.shell = ForeignShell()
+    source._assert_destroyed_absent()
+
+
+# --------------------------------------------------------------------------
+# Ingress readiness is a bounded barrier, not a single observation
+# --------------------------------------------------------------------------
+
+
+READY_LINE = "mattermost_ingress_outcome=authenticated_ready\n"
+STARTED_AT = "2026-09-15T03:01:37.109884947Z"
+
+
+def _ready_target(module, tmp_path, monkeypatch, *, states, logs):
+    """A staging instance whose ingress inspections and logs are scripted."""
+    source, _marker, _values = make_target(module, tmp_path)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    inspections = list(states)
+    log_values = list(logs)
+
+    def next_inspection():
+        value = inspections.pop(0) if len(inspections) > 1 else inspections[0]
+        return {"ingress": {"State": value}}
+
+    def fake_compose(*args, **_kwargs):
+        if args[:2] == ("logs", "--no-color"):
+            assert args[3] == STARTED_AT, "the window must be the container start time"
+            value = log_values.pop(0) if len(log_values) > 1 else log_values[0]
+            return SimpleNamespace(returncode=0, stdout=value, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(source, "_container_inspections", next_inspection)
+    monkeypatch.setattr(source, "compose", fake_compose)
+    return source
+
+
+@posix_only
+def test_ingress_readiness_waits_instead_of_racing(module, tmp_path, monkeypatch):
+    """Restore starts ingress moments before status observes it."""
+    running = {"Running": True, "Status": "running"}
+    source = _ready_target(
+        module,
+        tmp_path,
+        monkeypatch,
+        states=[running],
+        logs=["", "", READY_LINE],
+    )
+    source._await_ingress_ready(STARTED_AT)
+
+
+@posix_only
+def test_ingress_readiness_fails_fast_when_ingress_exits(module, tmp_path, monkeypatch):
+    source = _ready_target(
+        module,
+        tmp_path,
+        monkeypatch,
+        states=[{"Running": False, "Status": "exited"}],
+        logs=[""],
+    )
+    with pytest.raises(module.SafetyError, match="exited before authenticated readiness"):
+        source._await_ingress_ready(STARTED_AT)
+
+
+@posix_only
+def test_ingress_readiness_still_fails_closed_on_timeout(module, tmp_path, monkeypatch):
+    source = _ready_target(
+        module,
+        tmp_path,
+        monkeypatch,
+        states=[{"Running": True, "Status": "running"}],
+        logs=[""],
+    )
+    clock = iter([0.0, 0.0, 1000.0, 1000.0, 2000.0, 2000.0])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(clock))
+    with pytest.raises(module.SafetyError, match="not authenticated-ready"):
+        source._await_ingress_ready(STARTED_AT)
+
+
+@posix_only
+def test_ingress_readiness_never_accepts_an_earlier_run(module, tmp_path, monkeypatch):
+    """The window is the container's own start time, so a stale line cannot pass."""
+    source, _marker, _values = make_target(module, tmp_path)
+    windows: list[str] = []
+
+    def fake_compose(*args, **_kwargs):
+        if args[:2] == ("logs", "--no-color"):
+            windows.append(args[3])
+            return SimpleNamespace(returncode=0, stdout=READY_LINE, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        source,
+        "_container_inspections",
+        lambda: {"ingress": {"State": {"Running": True, "Status": "running"}}},
+    )
+    monkeypatch.setattr(source, "compose", fake_compose)
+    source._await_ingress_ready(STARTED_AT)
+    assert windows == [STARTED_AT]

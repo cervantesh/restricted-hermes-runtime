@@ -38,6 +38,18 @@ RECEIPTS = (
     ("clinical_egress", "docs/evidence/clinical-egress-wsl-v2-receipt-2026-09-11.json", "4ff9699d7839c4d00be6aa6ef3fbcac95bc4c3b7", "9446b5559fc115be40109cd00b6c57779bba7c34", "restricted-runtime-clinical-egress-witness.v2"),
     ("clinical_composed", "docs/evidence/clinical-composed-receipt-2026-09-11.json", "14793b98d310fab44ef4bc22086c55039e279d46", "cc83f7c4cad7e6f4da063c4ce9fcc90ad90bce19", "restricted-runtime-composed-e2e-receipt.v1"),
 )
+# Receipts produced by executing the composed cycle at a revision this
+# candidate descends from.  Their head/tree are not pinned here: the ancestry
+# is established from git at build and verify time, so a rebase that moves the
+# candidate away from them fails the ledger instead of silently passing.
+COLD_RECOVERY_RECEIPTS = (
+    (
+        "clinical_cold_recovery",
+        "docs/evidence/clinical-cold-recovery-receipt-2026-09-15.json",
+        "restricted-synthetic-clinical-cold-backup.v1",
+        "candidate_ancestor",
+    ),
+)
 FROZEN_HRH_SOURCE = {
     "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
     "hrh_tree": "f217b0b1cf7f438422528dfe178d81b78212c68b",
@@ -159,6 +171,8 @@ def verify_ledger(raw: bytes, *, repo_root: Path) -> list[str]:
     value = _canonical(raw)
     if value is None:
         return ["canonical"]
+    if value.get("schema") == SCHEMA_V3:
+        return _verify_ledger_v3(value, repo_root=repo_root)
     required_fields = {"schema", "synthetic_non_phi_only", "candidate", "required_source_lines", "retained_receipts", "historical_receipts_only", "claims"}
     if set(value) != required_fields or value.get("schema") != SCHEMA or value.get("synthetic_non_phi_only") is not True or value.get("historical_receipts_only") is not True:
         return ["schema"]
@@ -231,6 +245,251 @@ def verify_ledger(raw: bytes, *, repo_root: Path) -> list[str]:
     return []
 
 
+# ---------------------------------------------------------------------------
+# v3: per-ledger receipt sets with explicit provenance
+#
+# v2 pins one global receipt set, so every v2 ledger must retain exactly the
+# same two receipts.  That was right while every retained receipt was
+# pre-reconciliation history, but it cannot express a receipt produced by
+# executing the composed cycle at a revision this candidate descends from.
+#
+# v3 therefore carries its own receipt list, and each entry declares its
+# provenance:
+#
+#   historical          - a record of an earlier execution.  Its source frame
+#                         is deliberately NOT required to be in this
+#                         candidate's ancestry, and it never proves that this
+#                         candidate executed.
+#   candidate_ancestor  - executed at a revision that IS an ancestor of the
+#                         named candidate.  Still not exact-head evidence: the
+#                         candidate's own tree differs.
+#
+# A per-ledger set cannot be used to hide evidence, because every claim is
+# gated on what the ledger actually lists: dropping a receipt can only make a
+# claim unverifiable, never true.  The v2 set remains a floor.
+# ---------------------------------------------------------------------------
+
+SCHEMA_V3 = "restricted-runtime-reconciled-candidate-ledger.v3"
+COLD_RECOVERY_SCHEMA = "restricted-synthetic-clinical-cold-backup.v1"
+PROVENANCE = ("historical", "candidate_ancestor")
+V3_CLAIMS = {
+    "bounded_source_reconciliation",
+    "historical_receipts_are_candidate_evidence",
+    "published_immutable_subjects_reverified",
+    "representative_host_verified",
+    "phi_authorized",
+    "deployment_conformant",
+    "cold_recovery_replayed_on_candidate_ancestor",
+}
+V3_FALSE_CLAIMS = {
+    "historical_receipts_are_candidate_evidence",
+    "published_immutable_subjects_reverified",
+    "representative_host_verified",
+    "phi_authorized",
+    "deployment_conformant",
+}
+
+
+def build_ledger_v3(
+    *, repo_root: Path, candidate_revision: str, extra_receipts: tuple = ()
+) -> dict[str, Any]:
+    """Build a v3 ledger: the v2 receipt floor plus declared extra receipts."""
+    candidate_revision = _git(repo_root, "rev-parse", "--verify", f"{candidate_revision}^{{commit}}")
+    candidate_tree = _tree(repo_root, candidate_revision)
+    source_lines = [
+        {"name": name, "revision": revision, "tree": _tree(repo_root, revision)}
+        for name, revision in REQUIRED_LINES
+    ]
+    receipts: list[dict[str, Any]] = []
+    declared = [
+        (name, relative, schema, "historical")
+        for name, relative, _head, _tree_sha, schema in RECEIPTS
+    ] + list(extra_receipts)
+    for name, relative, schema, provenance in declared:
+        if provenance not in PROVENANCE:
+            raise ValueError(f"{name}: unknown receipt provenance")
+        tracked = _git_bytes(repo_root, "show", f"HEAD:{relative}")
+        value = _read_json_bytes(tracked)
+        source = _receipt_source(value) if value else None
+        if source is None or value.get("schema") != schema:
+            raise ValueError(f"{name}: retained receipt has unexpected source or schema")
+        if any(source[key] != expected for key, expected in FROZEN_HRH_SOURCE.items()):
+            raise ValueError(f"{name}: retained receipt names a foreign HRH source")
+        if provenance == "candidate_ancestor":
+            if _tree(repo_root, source["runtime_head"]) != source["runtime_tree"]:
+                raise ValueError(f"{name}: receipt tree is not that revision's tree")
+            if not _ancestor(repo_root, source["runtime_head"], candidate_revision):
+                raise ValueError(f"{name}: receipt revision is not a candidate ancestor")
+        receipts.append({
+            "name": name,
+            "path": relative,
+            "schema": schema,
+            "provenance": provenance,
+            "sha256": _sha_bytes(tracked),
+            "source": source,
+        })
+    replayed = any(
+        item["provenance"] == "candidate_ancestor" and item["schema"] == COLD_RECOVERY_SCHEMA
+        for item in receipts
+    )
+    return {
+        "schema": SCHEMA_V3,
+        "synthetic_non_phi_only": True,
+        "candidate": {"revision": candidate_revision, "tree": candidate_tree},
+        "required_source_lines": source_lines,
+        "retained_receipts": receipts,
+        "historical_receipts_only": all(
+            item["provenance"] == "historical" for item in receipts
+        ),
+        "claims": {
+            "bounded_source_reconciliation": True,
+            "historical_receipts_are_candidate_evidence": False,
+            "published_immutable_subjects_reverified": False,
+            "representative_host_verified": False,
+            "phi_authorized": False,
+            "deployment_conformant": False,
+            "cold_recovery_replayed_on_candidate_ancestor": replayed,
+        },
+    }
+
+
+def _verify_ledger_v3(value: dict[str, Any], *, repo_root: Path) -> list[str]:
+    required_fields = {
+        "schema", "synthetic_non_phi_only", "candidate", "required_source_lines",
+        "retained_receipts", "historical_receipts_only", "claims",
+    }
+    if (
+        set(value) != required_fields
+        or value.get("synthetic_non_phi_only") is not True
+        or not isinstance(value.get("historical_receipts_only"), bool)
+    ):
+        return ["schema"]
+    candidate = value.get("candidate")
+    if (
+        not isinstance(candidate, dict)
+        or set(candidate) != {"revision", "tree"}
+        or not isinstance(candidate["revision"], str)
+        or not SHA.fullmatch(candidate["revision"])
+        or not isinstance(candidate["tree"], str)
+        or not SHA.fullmatch(candidate["tree"])
+    ):
+        return ["candidate"]
+    try:
+        if _tree(repo_root, candidate["revision"]) != candidate["tree"]:
+            return ["candidate-tree"]
+    except ValueError:
+        return ["candidate-revision"]
+
+    lines = value.get("required_source_lines")
+    if not isinstance(lines, list) or len(lines) != len(REQUIRED_LINES):
+        return ["source-lines"]
+    expected_lines = {name: revision for name, revision in REQUIRED_LINES}
+    seen: set[str] = set()
+    for item in lines:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"name", "revision", "tree"}
+            or not isinstance(item.get("name"), str)
+        ):
+            return ["source-lines"]
+        name = item["name"]
+        if (
+            name in seen
+            or expected_lines.get(name) != item.get("revision")
+            or not isinstance(item.get("tree"), str)
+            or not SHA.fullmatch(item["tree"])
+        ):
+            return ["source-lines"]
+        seen.add(name)
+        try:
+            if _tree(repo_root, item["revision"]) != item["tree"] or not _ancestor(
+                repo_root, item["revision"], candidate["revision"]
+            ):
+                return ["source-lines"]
+        except ValueError:
+            return ["source-lines"]
+    if seen != set(expected_lines):
+        return ["source-lines"]
+
+    receipts = value.get("retained_receipts")
+    if not isinstance(receipts, list) or not receipts:
+        return ["receipts"]
+    floor = {name: (path, head, tree, schema) for name, path, head, tree, schema in RECEIPTS}
+    seen_receipts: set[str] = set()
+    replayed_names: set[str] = set()
+    for item in receipts:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"name", "path", "schema", "provenance", "sha256", "source"}
+            or not isinstance(item.get("name"), str)
+            or not isinstance(item.get("path"), str)
+            or not isinstance(item.get("schema"), str)
+            or item.get("provenance") not in PROVENANCE
+            or not isinstance(item.get("sha256"), str)
+            or not RAW_SHA.fullmatch(item["sha256"])
+        ):
+            return ["receipts"]
+        name = item["name"]
+        source = _source(item.get("source"))
+        if name in seen_receipts or source is None:
+            return ["receipts"]
+        if any(source[key] != expected for key, expected in FROZEN_HRH_SOURCE.items()):
+            return ["receipts"]
+        pinned = floor.get(name)
+        if pinned is not None and (
+            item["path"] != pinned[0]
+            or source["runtime_head"] != pinned[1]
+            or source["runtime_tree"] != pinned[2]
+            or item["schema"] != pinned[3]
+            or item["provenance"] != "historical"
+        ):
+            return ["receipts"]
+        try:
+            tracked = _git_bytes(repo_root, "show", f"HEAD:{item['path']}")
+        except ValueError:
+            return ["receipts"]
+        retained = _read_json_bytes(tracked)
+        if (
+            _sha_bytes(tracked) != item["sha256"]
+            or retained is None
+            or retained.get("schema") != item["schema"]
+            or _receipt_source(retained) != source
+        ):
+            return ["receipts"]
+        if item["provenance"] == "candidate_ancestor":
+            # This is the whole difference from a historical receipt, so it is
+            # the one thing that must be established rather than declared.
+            try:
+                if _tree(repo_root, source["runtime_head"]) != source["runtime_tree"]:
+                    return ["receipt-ancestry"]
+            except ValueError:
+                return ["receipt-ancestry"]
+            if not _ancestor(repo_root, source["runtime_head"], candidate["revision"]):
+                return ["receipt-ancestry"]
+            if item["schema"] == COLD_RECOVERY_SCHEMA:
+                replayed_names.add(name)
+        seen_receipts.add(name)
+    if not set(floor) <= seen_receipts:
+        return ["receipts"]
+    if value["historical_receipts_only"] != all(
+        item["provenance"] == "historical" for item in receipts
+    ):
+        return ["provenance"]
+
+    claims = value.get("claims")
+    if not isinstance(claims, dict) or set(claims) != V3_CLAIMS:
+        return ["claims"]
+    if claims.get("bounded_source_reconciliation") is not True:
+        return ["claims"]
+    if any(claims.get(name) is not False for name in V3_FALSE_CLAIMS):
+        return ["claims"]
+    # A replay claim is only true if a qualifying receipt is actually listed
+    # and verified above.  It can never be asserted into existence.
+    if claims["cold_recovery_replayed_on_candidate_ancestor"] is not bool(replayed_names):
+        return ["claims"]
+    return []
+
+
 def write_new(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = None
@@ -258,6 +517,7 @@ def write_new(path: Path, content: bytes) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-revision")
+    parser.add_argument("--schema", choices=("v2", "v3"), default="v2")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--verify", type=Path)
     parser.add_argument("--repo-root", type=Path, default=ROOT)
@@ -275,7 +535,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if not args.candidate_revision:
             parser.error("--candidate-revision is required with --output")
-        ledger = build_ledger(repo_root=repo_root, candidate_revision=args.candidate_revision)
+        if args.schema == "v3":
+            ledger = build_ledger_v3(
+                repo_root=repo_root,
+                candidate_revision=args.candidate_revision,
+                extra_receipts=COLD_RECOVERY_RECEIPTS,
+            )
+        else:
+            ledger = build_ledger(repo_root=repo_root, candidate_revision=args.candidate_revision)
         write_new(args.output, canonical_bytes(ledger))
         print("candidate ledger: wrote " + str(args.output))
         return 0
