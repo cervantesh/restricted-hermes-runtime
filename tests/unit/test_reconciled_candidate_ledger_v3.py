@@ -145,7 +145,12 @@ def test_v3_rejects_a_replay_claim_without_a_qualifying_receipt(good):
         for item in value["retained_receipts"]
         if item["schema"] != ledger.COLD_RECOVERY_SCHEMA
     ]
-    value["historical_receipts_only"] = True
+    # Other candidate_ancestor evidence (the egress witness) may remain, so
+    # keep the provenance summary consistent: the only thing under test is a
+    # claim whose own evidence is gone.
+    value["historical_receipts_only"] = all(
+        item["provenance"] == "historical" for item in value["retained_receipts"]
+    )
     # Claim retained, evidence removed.
     assert value["claims"]["cold_recovery_replayed_on_candidate_ancestor"] is True
     assert verify(value) == ["claims"]
