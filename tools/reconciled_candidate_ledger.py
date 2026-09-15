@@ -49,6 +49,16 @@ COLD_RECOVERY_RECEIPTS = (
         "restricted-synthetic-clinical-cold-backup.v1",
         "candidate_ancestor",
     ),
+    # A later replay of the same cycle that also carries the definitive
+    # rejection across the fence.  The earlier run is kept rather than
+    # replaced: it is a real execution, and superseding coverage is not a
+    # reason to drop evidence.
+    (
+        "clinical_cold_recovery_blocked",
+        "docs/evidence/clinical-cold-recovery-receipt-2026-09-15-blocked.json",
+        "restricted-synthetic-clinical-cold-backup.v1",
+        "candidate_ancestor",
+    ),
 )
 FROZEN_HRH_SOURCE = {
     "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
