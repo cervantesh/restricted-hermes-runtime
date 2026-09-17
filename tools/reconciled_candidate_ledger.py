@@ -49,6 +49,54 @@ COLD_RECOVERY_RECEIPTS = (
         "restricted-synthetic-clinical-cold-backup.v1",
         "candidate_ancestor",
     ),
+    # A later replay of the same cycle that also carries the definitive
+    # rejection across the fence.  The earlier run is kept rather than
+    # replaced: it is a real execution, and superseding coverage is not a
+    # reason to drop evidence.
+    (
+        "clinical_cold_recovery_blocked",
+        "docs/evidence/clinical-cold-recovery-receipt-2026-09-15-blocked.json",
+        "restricted-synthetic-clinical-cold-backup.v1",
+        "candidate_ancestor",
+    ),
+    # The run after two causal checks stopped being vacuous.  The two earlier
+    # receipts record real executions and real terminal contracts, but their
+    # harness could not have failed `already_delivered_not_redelivered` or
+    # `expired_policy_fails_closed`.  Each receipt pins its own
+    # `source.runtime_head`, so which harness produced which is checkable.
+    (
+        "clinical_cold_recovery_observed",
+        "docs/evidence/clinical-cold-recovery-receipt-2026-09-15-observed.json",
+        "restricted-synthetic-clinical-cold-backup.v1",
+        "candidate_ancestor",
+    ),
+)
+# The egress witness replayed on this line, rather than the 2026-09-11 run the
+# v2 floor pins as historical.  Same shape of evidence, current provenance.
+# The subjects published by immutable-candidate-2026-09-17-cold-recovery-v1 at
+# 5ed4204be5483770d9f0275ccdec6eabf5a8eed1.  A receipt only counts as having
+# re-verified them if the images it actually restored are these exact digests;
+# `subject_admitted: true` alone is a label, and labels are what this schema
+# stopped trusting.
+PUBLISHED_SUBJECT_DIGESTS = {
+    "ingress": "sha256:5f269bc218f3523e2c156c5fe93a50d6537a2d70f6b2f497a4fe89bc9750cc60",
+    "clinical-adapter": "sha256:a6ad203f1a9b44335b9cf295e873cd8151b45d66158db6b6aeb4762d021ff039",
+}
+SUBJECT_ADMITTED_RECEIPTS = (
+    (
+        "clinical_cold_recovery_subject_admitted",
+        "docs/evidence/clinical-cold-recovery-receipt-2026-09-17-subject-admitted.json",
+        "restricted-synthetic-clinical-cold-backup.v1",
+        "candidate_ancestor",
+    ),
+)
+EGRESS_RECEIPTS = (
+    (
+        "clinical_egress_replayed",
+        "docs/evidence/clinical-egress-receipt-2026-09-15.json",
+        "restricted-runtime-clinical-egress-witness.v2",
+        "candidate_ancestor",
+    ),
 )
 FROZEN_HRH_SOURCE = {
     "hrh_head": "ad13735e9881a48580a9e138daac137f8c865dea",
@@ -283,11 +331,81 @@ V3_CLAIMS = {
 }
 V3_FALSE_CLAIMS = {
     "historical_receipts_are_candidate_evidence",
-    "published_immutable_subjects_reverified",
     "representative_host_verified",
     "phi_authorized",
     "deployment_conformant",
 }
+
+
+def _is_cold_recovery_witness(value: Mapping[str, Any]) -> bool:
+    """Is this the composed drill's report, or merely a restore receipt?
+
+    `backup()`, `restore()` and the composed witness all publish
+    `COLD_RECOVERY_SCHEMA`, so the schema string cannot separate them. Gating
+    the replay claim on the schema alone let a `mechanical_restore_only`
+    receipt -- which by its own text proves the bytes came back and the stack
+    started, and nothing about behavior -- satisfy a claim about the composed
+    cycle.
+
+    So the gate is the substance rather than the label: the terminal delivery
+    contracts the drill exists to observe, each on its own record, each with
+    its payload erased, plus the controls re-checked on the restored stack. A
+    label can be set to anything; these have to be produced.
+    """
+    if value.get("verification") is not None:
+        # `mechanical_restore_only` / `causal_e2e_verified` are restore-side
+        # receipts about one lifecycle call, not the composed drill's report.
+        return False
+    if value.get("synthetic_only") is not True:
+        return False
+    required_terminals = ("source_deletion_after", "unknown_delivery_after")
+    tags: set[str] = set()
+    for name in required_terminals:
+        record = value.get(name)
+        if not isinstance(record, dict):
+            return False
+        if record.get("state") not in {"AMBIGUOUS", "BLOCKED"}:
+            return False
+        if record.get("nonce_erased") is not True or record.get("ciphertext_erased") is not True:
+            return False
+        tag = record.get("record_tag")
+        if not isinstance(tag, str) or not RAW_SHA.fullmatch(tag):
+            return False
+        tags.add(tag)
+    if len(tags) != len(required_terminals):
+        return False
+    probe = value.get("restored_tls_probe")
+    if not isinstance(probe, dict) or probe.get("verified") is not True:
+        return False
+    images = value.get("restored_built_images")
+    if not isinstance(images, dict) or not images:
+        return False
+    return all(
+        isinstance(digest, str) and digest.startswith("sha256:") for digest in images.values()
+    )
+
+
+def _is_subject_admitted_witness(value: Mapping[str, Any]) -> bool:
+    """Did this run actually execute the published immutable subjects?
+
+    `published_immutable_subjects_reverified` was a permanently-false
+    placeholder while no run could reach subject-admitted mode: the published
+    manifest named a different source revision, and `read_subject_admission`
+    requires it to equal the runtime HEAD.  It is now gated on evidence rather
+    than pinned false -- and on the digests the run restored, not on its own
+    `subject_admitted` flag.
+    """
+    if not _is_cold_recovery_witness(value):
+        return False
+    if value.get("subject_admitted") is not True:
+        return False
+    images = value.get("restored_built_images")
+    if not isinstance(images, dict):
+        return False
+    return all(
+        images.get(service) == digest
+        for service, digest in PUBLISHED_SUBJECT_DIGESTS.items()
+    )
 
 
 def build_ledger_v3(
@@ -320,6 +438,10 @@ def build_ledger_v3(
                 raise ValueError(f"{name}: receipt tree is not that revision's tree")
             if not _ancestor(repo_root, source["runtime_head"], candidate_revision):
                 raise ValueError(f"{name}: receipt revision is not a candidate ancestor")
+            if schema == COLD_RECOVERY_SCHEMA and not _is_cold_recovery_witness(value):
+                raise ValueError(
+                    f"{name}: receipt is not a composed cold-recovery witness report"
+                )
         receipts.append({
             "name": name,
             "path": relative,
@@ -330,6 +452,14 @@ def build_ledger_v3(
         })
     replayed = any(
         item["provenance"] == "candidate_ancestor" and item["schema"] == COLD_RECOVERY_SCHEMA
+        for item in receipts
+    )
+    reverified = any(
+        item["provenance"] == "candidate_ancestor"
+        and item["schema"] == COLD_RECOVERY_SCHEMA
+        and _is_subject_admitted_witness(
+            _read_json_bytes(_git_bytes(repo_root, "show", f"HEAD:{item['path']}")) or {}
+        )
         for item in receipts
     )
     return {
@@ -344,7 +474,7 @@ def build_ledger_v3(
         "claims": {
             "bounded_source_reconciliation": True,
             "historical_receipts_are_candidate_evidence": False,
-            "published_immutable_subjects_reverified": False,
+            "published_immutable_subjects_reverified": reverified,
             "representative_host_verified": False,
             "phi_authorized": False,
             "deployment_conformant": False,
@@ -417,6 +547,7 @@ def _verify_ledger_v3(value: dict[str, Any], *, repo_root: Path) -> list[str]:
     floor = {name: (path, head, tree, schema) for name, path, head, tree, schema in RECEIPTS}
     seen_receipts: set[str] = set()
     replayed_names: set[str] = set()
+    reverified_names: set[str] = set()
     for item in receipts:
         if (
             not isinstance(item, dict)
@@ -466,8 +597,12 @@ def _verify_ledger_v3(value: dict[str, Any], *, repo_root: Path) -> list[str]:
                 return ["receipt-ancestry"]
             if not _ancestor(repo_root, source["runtime_head"], candidate["revision"]):
                 return ["receipt-ancestry"]
-            if item["schema"] == COLD_RECOVERY_SCHEMA:
+            if item["schema"] == COLD_RECOVERY_SCHEMA and _is_cold_recovery_witness(
+                retained
+            ):
                 replayed_names.add(name)
+                if _is_subject_admitted_witness(retained):
+                    reverified_names.add(name)
         seen_receipts.add(name)
     if not set(floor) <= seen_receipts:
         return ["receipts"]
@@ -486,6 +621,8 @@ def _verify_ledger_v3(value: dict[str, Any], *, repo_root: Path) -> list[str]:
     # A replay claim is only true if a qualifying receipt is actually listed
     # and verified above.  It can never be asserted into existence.
     if claims["cold_recovery_replayed_on_candidate_ancestor"] is not bool(replayed_names):
+        return ["claims"]
+    if claims["published_immutable_subjects_reverified"] is not bool(reverified_names):
         return ["claims"]
     return []
 
@@ -539,7 +676,9 @@ def main(argv: list[str] | None = None) -> int:
             ledger = build_ledger_v3(
                 repo_root=repo_root,
                 candidate_revision=args.candidate_revision,
-                extra_receipts=COLD_RECOVERY_RECEIPTS,
+                extra_receipts=(
+                    COLD_RECOVERY_RECEIPTS + SUBJECT_ADMITTED_RECEIPTS + EGRESS_RECEIPTS
+                ),
             )
         else:
             ledger = build_ledger(repo_root=repo_root, candidate_revision=args.candidate_revision)
