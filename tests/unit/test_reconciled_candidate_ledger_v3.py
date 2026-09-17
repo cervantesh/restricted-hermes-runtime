@@ -37,6 +37,7 @@ LEDGER_PATHS = (
     "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-blocked.json",
     "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-observed.json",
     "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-15-egress.json",
+    "docs/evidence/reconciled-cold-recovery-candidate-ledger-2026-09-17-published.json",
 )
 
 
@@ -54,7 +55,11 @@ def build(candidate: str | None = None) -> dict:
     return ledger.build_ledger_v3(
         repo_root=ROOT,
         candidate_revision=candidate or git("rev-parse", "HEAD"),
-        extra_receipts=ledger.COLD_RECOVERY_RECEIPTS + ledger.EGRESS_RECEIPTS,
+        extra_receipts=(
+            ledger.COLD_RECOVERY_RECEIPTS
+            + ledger.SUBJECT_ADMITTED_RECEIPTS
+            + ledger.EGRESS_RECEIPTS
+        ),
     )
 
 
@@ -86,14 +91,16 @@ def test_v3_keeps_every_escalated_claim_false(good):
     claims = good["claims"]
     assert claims["bounded_source_reconciliation"] is True
     assert claims["cold_recovery_replayed_on_candidate_ancestor"] is True
+    # These stay pinned false: no evidence in this repository can raise them.
     for name in (
         "historical_receipts_are_candidate_evidence",
-        "published_immutable_subjects_reverified",
         "representative_host_verified",
         "phi_authorized",
         "deployment_conformant",
     ):
         assert claims[name] is False, name
+    # This one is gated, not pinned, and its own controls live below.
+    assert isinstance(claims["published_immutable_subjects_reverified"], bool)
 
 
 def test_v3_retains_the_v2_receipt_floor_as_historical(good):
@@ -188,7 +195,9 @@ def test_v3_rejects_a_foreign_hrh_frame(good):
         {"representative_host_verified": True},
         {"phi_authorized": True},
         {"deployment_conformant": True},
-        {"published_immutable_subjects_reverified": True},
+        # Gated, not pinned: claiming *less* than the listed evidence is a
+        # mismatch too, so the falsifier runs in the other direction.
+        {"published_immutable_subjects_reverified": False},
         {"historical_receipts_are_candidate_evidence": True},
         {"bounded_source_reconciliation": False},
     ],
@@ -324,7 +333,9 @@ def test_v3_rejects_a_mechanical_restore_receipt_as_replay_evidence(good):
         assert value["claims"]["cold_recovery_replayed_on_candidate_ancestor"] is True
         assert verify(value) == ["claims"]
         # The same ledger is accepted once it stops claiming more than it has.
+        # Both cold-recovery claims rest on the receipts just substituted.
         value["claims"]["cold_recovery_replayed_on_candidate_ancestor"] = False
+        value["claims"]["published_immutable_subjects_reverified"] = False
         assert verify(value) == []
 
 
@@ -384,3 +395,120 @@ def test_v3_replay_claim_needs_a_complete_witness(good, label, mutate):
     blobs = substitute_cold_receipts(value, damaged)
     with tracked_bytes(blobs):
         assert verify(value) == ["claims"], label
+
+
+# --------------------------------------------------------------------------
+# `published_immutable_subjects_reverified` is gated on the digests the run
+# restored, not on the receipt's own subject_admitted flag.
+# --------------------------------------------------------------------------
+
+
+def subject_admitted_entry(value: dict) -> dict:
+    for item in value["retained_receipts"]:
+        if item["name"].endswith("subject_admitted"):
+            return item
+    raise AssertionError("the subject-admitted receipt is not listed")
+
+
+def real_receipt(path: str) -> dict:
+    return json.loads(
+        subprocess.run(
+            ["git", "-C", str(ROOT), "show", f"HEAD:{path}"],
+            capture_output=True,
+            check=True,
+            timeout=30,
+        ).stdout.decode("utf-8")
+    )
+
+
+def test_v3_reverified_claim_is_true_only_with_the_published_digests(good):
+    assert good["claims"]["published_immutable_subjects_reverified"] is True
+    entry = subject_admitted_entry(good)
+    receipt = real_receipt(entry["path"])
+    assert receipt["subject_admitted"] is True
+    for service, digest in ledger.PUBLISHED_SUBJECT_DIGESTS.items():
+        assert receipt["restored_built_images"][service] == digest, service
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    [
+        # An exact-source run: everything else identical, no published subjects.
+        ("exact source", lambda v: v.update(subject_admitted=False)),
+        # The flag says subject-admitted but the images are not the published
+        # ones.  This is the label-without-substance case.
+        (
+            "forged flag",
+            lambda v: v["restored_built_images"].update(ingress="sha256:" + "e" * 64),
+        ),
+        (
+            "adapter substituted",
+            lambda v: v["restored_built_images"].update(
+                **{"clinical-adapter": "sha256:" + "d" * 64}
+            ),
+        ),
+        # Not a composed witness at all.
+        ("no terminals", lambda v: v.pop("unknown_delivery_after")),
+    ],
+)
+def test_v3_rejects_a_reverified_claim_without_the_published_subjects(
+    good, label, mutate
+):
+    value = copy.deepcopy(good)
+    entry = subject_admitted_entry(value)
+    receipt = real_receipt(entry["path"])
+
+    def damaged(source):
+        item = copy.deepcopy(receipt)
+        item["source"] = dict(source)
+        mutate(item)
+        return item
+
+    raw = (json.dumps(damaged(entry["source"]), sort_keys=True) + "\n").encode("utf-8")
+    entry["path"] = "docs/evidence/substituted-subject.json"
+    entry["sha256"] = hashlib.sha256(raw).hexdigest()
+    with tracked_bytes({"substituted-subject.json": raw}):
+        assert value["claims"]["published_immutable_subjects_reverified"] is True
+        assert verify(value) == ["claims"], label
+        # Truthful about weaker evidence is accepted.
+        value["claims"]["published_immutable_subjects_reverified"] = False
+        assert verify(value) == [], label
+
+
+def test_v3_builder_refuses_a_subject_entry_that_is_not_a_witness(good):
+    entry = subject_admitted_entry(good)
+    receipt = real_receipt(entry["path"])
+    broken = copy.deepcopy(receipt)
+    broken.pop("source_deletion_after")
+    raw = (json.dumps(broken, sort_keys=True) + "\n").encode("utf-8")
+    with tracked_bytes({"substituted-subject-builder.json": raw}):
+        with pytest.raises(ValueError, match="not a composed cold-recovery witness"):
+            ledger.build_ledger_v3(
+                repo_root=ROOT,
+                candidate_revision=git("rev-parse", "HEAD"),
+                extra_receipts=(
+                    (
+                        "substituted",
+                        "docs/evidence/substituted-subject-builder.json",
+                        ledger.COLD_RECOVERY_SCHEMA,
+                        "candidate_ancestor",
+                    ),
+                ),
+            )
+
+
+def test_v3_retained_ledgers_without_a_published_run_keep_the_claim_false():
+    """The claim set is unchanged, so earlier ledgers must still verify."""
+    for name in (
+        "reconciled-cold-recovery-candidate-ledger-2026-09-15.json",
+        "reconciled-cold-recovery-candidate-ledger-2026-09-15-egress.json",
+    ):
+        raw = subprocess.run(
+            ["git", "-C", str(ROOT), "show", f"HEAD:docs/evidence/{name}"],
+            capture_output=True,
+            check=True,
+            timeout=30,
+        ).stdout
+        value = json.loads(raw)
+        assert value["claims"]["published_immutable_subjects_reverified"] is False
+        assert ledger.verify_ledger(raw, repo_root=ROOT) == [], name
